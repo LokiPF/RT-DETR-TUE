@@ -14,13 +14,13 @@ Build a real-time-capable RT-DETR variant that produces, for each retained detec
 
 The intended interpretation is:
 
-$$
+```math
 \text{predictive localization uncertainty}
 =
 \text{aleatoric uncertainty}
 +
 \text{TU-conditioned excess uncertainty}.
-$$
+```
 
 Topological uncertainty (TU) is not claimed to be a Bayesian posterior variance. It is an activation-novelty score that must be calibrated against observed classification and localization errors.
 
@@ -95,13 +95,13 @@ Topological uncertainty (TU) is not claimed to be a Bayesian posterior variance.
 
 For decoder layer $\ell$ and query $q$:
 
-$$
+```math
 h_{\ell,q}
 \xrightarrow{\text{decoder FFN}}
 z_{\ell,q}
 \xrightarrow{\text{bbox MLP}}
 \Delta b_{\ell,q}.
-$$
+```
 
 The FFN and bbox-head weights are shared across queries. Query-specific topology comes from the different activation vectors.
 
@@ -141,15 +141,15 @@ The FFN and bbox-head weights are shared across queries. Query-specific topology
 
 - [ ] Change each deployed bbox head from four outputs to eight:
 
-    $$
+    ```math
     (\mu_{cx},\mu_{cy},\mu_w,\mu_h,s_{cx},s_{cy},s_w,s_h).
-    $$
+    ```
 
 - [ ] Convert raw scale values into positive Laplace scales:
 
-    $$
+    ```math
     b_j=\operatorname{softplus}(s_j)+\epsilon.
-    $$
+    ```
 
 - [ ] Choose and document:
   - `epsilon`.
@@ -165,14 +165,14 @@ The FFN and bbox-head weights are shared across queries. Query-specific topology
 - [ ] Do not initially include predicted variance in the matching cost.
 - [ ] Replace or augment L1 with Laplace negative log-likelihood:
 
-    $$
+    ```math
     \mathcal L_{\text{Laplace}}
     =
     \sum_j\left(
     \frac{|y_j-\mu_j|}{b_j}
     +\log(2b_j)
     \right).
-    $$
+    ```
 
 - [ ] Retain GIoU on the mean bbox.
 - [ ] Tune the relative weights of:
@@ -194,18 +194,18 @@ The FFN and bbox-head weights are shared across queries. Query-specific topology
 
 - [ ] Start with diagonal aleatoric covariance:
 
-    $$
+    ```math
     \Sigma_{\text{alea}}
     =
     \operatorname{diag}(2b^2).
-    $$
+    ```
 
 - [ ] Keep covariance in normalized `cxcywh` coordinates during training and calibration.
 - [ ] Implement a Jacobian transform to `xyxy` covariance for output:
 
-    $$
+    ```math
     \Sigma_{xyxy}=J\Sigma_{cxcywh}J^\top.
-    $$
+    ```
 
 - [ ] Add tests verifying:
   - Positive scales.
@@ -223,9 +223,9 @@ The FFN and bbox-head weights are shared across queries. Query-specific topology
 
 For a linear transition with input activation $x_q$ and shared weights $W$, define:
 
-$$
+```math
 e_{ij,q}=|W_{ij}x_{q,i}|.
-$$
+```
 
 - [ ] Implement activation-graph extraction for a generic `Linear` layer.
 - [ ] Exclude bias initially to match the original TU definition.
@@ -237,11 +237,11 @@ $$
 - [ ] Store its sorted edge-weight vector as the one-dimensional persistence diagram.
 - [ ] Implement the diagram distance:
 
-    $$
+    ```math
     d(D,D')
     =
     \sqrt{\frac{1}{N}\sum_{i=1}^{N}(w_i-w'_i)^2}.
-    $$
+    ```
 
 - [ ] Verify the implementation against a small reference graph where the MST can be checked manually.
 
@@ -324,23 +324,23 @@ $$
 
 - [ ] Compute localization TU:
 
-    $$
+    ```math
     TU^{box}_q
     =
     \frac{1}{|L_{box}|}
     \sum_{\ell\in L_{box}}
     \widetilde d(D_{\ell,q},\bar D_{\ell,c(q),s(q)}).
-    $$
+    ```
 
 - [ ] Compute classification TU:
 
-    $$
+    ```math
     TU^{cls}_q
     =
     \frac{1}{|L_{cls}|}
     \sum_{\ell\in L_{cls}}
     \widetilde d(D_{\ell,q},\bar D_{\ell,c(q)}).
-    $$
+    ```
 
 - [ ] Keep `TU_box` and `TU_cls` separate.
 - [ ] Log the individual transition distances in addition to the aggregate.
@@ -364,9 +364,9 @@ TU must outperform simpler novelty measures to justify its complexity.
 - [ ] Implement Euclidean distance from the final query embedding to a class prototype.
 - [ ] Implement class-conditional Mahalanobis distance:
 
-    $$
+    ```math
     u_q=(h_q-\bar h_c)^\top C_c^{-1}(h_q-\bar h_c).
-    $$
+    ```
 
 - [ ] Implement k-nearest-neighbour distance in query-embedding space.
 - [ ] Implement confidence-only calibration.
@@ -422,14 +422,14 @@ Define classification correctness before fitting:
   - Logistic calibration.
 - [ ] Fit a TU-aware calibrator:
 
-    $$
+    ```math
     \hat p_q
     =
     g_{\text{cls}}(
     \text{raw logit or margin},
     TU^{cls}_q
     ).
-    $$
+    ```
 
 - [ ] Start with a low-capacity monotonic or logistic model.
 - [ ] Test whether `TU_box` adds useful classification information.
@@ -454,26 +454,26 @@ Define classification correctness before fitting:
 
 Start with:
 
-$$
+```math
 \Sigma_{\text{total},q}
 =
 \alpha(TU^{box}_q,c_q,s_q)\Sigma_{\text{alea},q},
 \qquad \alpha\ge 1.
-$$
+```
 
-$$
+```math
 \Sigma_{\text{epi-TU},q}
 =
 (\alpha-1)\Sigma_{\text{alea},q}.
-$$
+```
 
 - [ ] Compute normalized squared residuals:
 
-    $$
+    ```math
     m_i
     =
     r_i^\top\Sigma_{\text{alea},i}^{-1}r_i.
-    $$
+    ```
 
 - [ ] Fit a low-capacity monotonic mapping from `TU_box` to $\alpha$.
 - [ ] Compare:
@@ -491,21 +491,21 @@ Only attempt these after the scalar model:
 
 - [ ] Coordinate-specific inflation:
 
-    $$
+    ```math
     \Sigma_{\text{total}}
     =
     \operatorname{diag}(
     \alpha_j(TU)\sigma^2_{\text{alea},j}
     ).
-    $$
+    ```
 
 - [ ] Class/size residual-shape template:
 
-    $$
+    ```math
     \Sigma_{\text{epi-TU}}
     =
     g(TU)C_{c,s}.
-    $$
+    ```
 
 - [ ] Full covariance using a Cholesky parameterization.
 - [ ] Confirm every covariance remains positive semidefinite.
@@ -529,29 +529,29 @@ Only attempt these after the scalar model:
 
 For calibration item $i$, define:
 
-$$
+```math
 s_i
 =
 \max_j
 \frac{|y_{ij}-\mu_{ij}|}
 {\sqrt{\Sigma_{\text{total},i,jj}}}.
-$$
+```
 
 - [ ] Calculate the finite-sample conformal quantile using the corrected rank:
 
-    $$
+    ```math
     k=\left\lceil(n+1)(1-\delta)\right\rceil.
-    $$
+    ```
 
 - [ ] Store $q_{0.90}$, $q_{0.95}$, or other required levels.
 - [ ] At inference, return:
 
-    $$
+    ```math
     \mu_{qj}
     \pm
     q_{1-\delta}
     \sqrt{\Sigma_{\text{total},q,jj}}.
-    $$
+    ```
 
 - [ ] Evaluate empirical joint coverage, not only coordinate-wise coverage.
 - [ ] Test Mondrian conformal calibration by:
