@@ -14,13 +14,13 @@ Build a real-time-capable RT-DETR variant that produces, for each retained detec
 
 The intended interpretation is:
 
-\[
+$$
 \text{predictive localization uncertainty}
 =
 \text{aleatoric uncertainty}
 +
 \text{TU-conditioned excess uncertainty}.
-\]
+$$
 
 Topological uncertainty (TU) is not claimed to be a Bayesian posterior variance. It is an activation-novelty score that must be calibrated against observed classification and localization errors.
 
@@ -93,15 +93,15 @@ Topological uncertainty (TU) is not claimed to be a Bayesian posterior variance.
 
 ## 2. Design the per-query data flow
 
-For decoder layer \(\ell\) and query \(q\):
+For decoder layer $\ell$ and query $q$:
 
-\[
+$$
 h_{\ell,q}
 \xrightarrow{\text{decoder FFN}}
 z_{\ell,q}
 \xrightarrow{\text{bbox MLP}}
 \Delta b_{\ell,q}.
-\]
+$$
 
 The FFN and bbox-head weights are shared across queries. Query-specific topology comes from the different activation vectors.
 
@@ -127,7 +127,7 @@ The FFN and bbox-head weights are shared across queries. Query-specific topology
   - Decoder query index.
   - Predicted class.
   - Predicted bbox.
-  - Postprocessing top-\(K\) result.
+  - Postprocessing top-$K$ result.
 - [ ] Avoid assuming that a query index has a fixed semantic meaning.
 - [ ] Add shape and index-alignment assertions.
 
@@ -141,15 +141,15 @@ The FFN and bbox-head weights are shared across queries. Query-specific topology
 
 - [ ] Change each deployed bbox head from four outputs to eight:
 
-\[
-(\mu_{cx},\mu_{cy},\mu_w,\mu_h,s_{cx},s_{cy},s_w,s_h).
-\]
+    $$
+    (\mu_{cx},\mu_{cy},\mu_w,\mu_h,s_{cx},s_{cy},s_w,s_h).
+    $$
 
 - [ ] Convert raw scale values into positive Laplace scales:
 
-\[
-b_j=\operatorname{softplus}(s_j)+\epsilon.
-\]
+    $$
+    b_j=\operatorname{softplus}(s_j)+\epsilon.
+    $$
 
 - [ ] Choose and document:
   - `epsilon`.
@@ -165,14 +165,14 @@ b_j=\operatorname{softplus}(s_j)+\epsilon.
 - [ ] Do not initially include predicted variance in the matching cost.
 - [ ] Replace or augment L1 with Laplace negative log-likelihood:
 
-\[
-\mathcal L_{\text{Laplace}}
-=
-\sum_j\left(
-\frac{|y_j-\mu_j|}{b_j}
-+\log(2b_j)
-\right).
-\]
+    $$
+    \mathcal L_{\text{Laplace}}
+    =
+    \sum_j\left(
+    \frac{|y_j-\mu_j|}{b_j}
+    +\log(2b_j)
+    \right).
+    $$
 
 - [ ] Retain GIoU on the mean bbox.
 - [ ] Tune the relative weights of:
@@ -194,18 +194,18 @@ b_j=\operatorname{softplus}(s_j)+\epsilon.
 
 - [ ] Start with diagonal aleatoric covariance:
 
-\[
-\Sigma_{\text{alea}}
-=
-\operatorname{diag}(2b^2).
-\]
+    $$
+    \Sigma_{\text{alea}}
+    =
+    \operatorname{diag}(2b^2).
+    $$
 
 - [ ] Keep covariance in normalized `cxcywh` coordinates during training and calibration.
 - [ ] Implement a Jacobian transform to `xyxy` covariance for output:
 
-\[
-\Sigma_{xyxy}=J\Sigma_{cxcywh}J^\top.
-\]
+    $$
+    \Sigma_{xyxy}=J\Sigma_{cxcywh}J^\top.
+    $$
 
 - [ ] Add tests verifying:
   - Positive scales.
@@ -221,11 +221,11 @@ b_j=\operatorname{softplus}(s_j)+\epsilon.
 
 ### 4.1 Faithful activation-graph construction
 
-For a linear transition with input activation \(x_q\) and shared weights \(W\), define:
+For a linear transition with input activation $x_q$ and shared weights $W$, define:
 
-\[
+$$
 e_{ij,q}=|W_{ij}x_{q,i}|.
-\]
+$$
 
 - [ ] Implement activation-graph extraction for a generic `Linear` layer.
 - [ ] Exclude bias initially to match the original TU definition.
@@ -237,11 +237,11 @@ e_{ij,q}=|W_{ij}x_{q,i}|.
 - [ ] Store its sorted edge-weight vector as the one-dimensional persistence diagram.
 - [ ] Implement the diagram distance:
 
-\[
-d(D,D')
-=
-\sqrt{\frac{1}{N}\sum_{i=1}^{N}(w_i-w'_i)^2}.
-\]
+    $$
+    d(D,D')
+    =
+    \sqrt{\frac{1}{N}\sum_{i=1}^{N}(w_i-w'_i)^2}.
+    $$
 
 - [ ] Verify the implementation against a small reference graph where the MST can be checked manually.
 
@@ -324,23 +324,23 @@ d(D,D')
 
 - [ ] Compute localization TU:
 
-\[
-TU^{box}_q
-=
-\frac{1}{|L_{box}|}
-\sum_{\ell\in L_{box}}
-\widetilde d(D_{\ell,q},\bar D_{\ell,c(q),s(q)}).
-\]
+    $$
+    TU^{box}_q
+    =
+    \frac{1}{|L_{box}|}
+    \sum_{\ell\in L_{box}}
+    \widetilde d(D_{\ell,q},\bar D_{\ell,c(q),s(q)}).
+    $$
 
 - [ ] Compute classification TU:
 
-\[
-TU^{cls}_q
-=
-\frac{1}{|L_{cls}|}
-\sum_{\ell\in L_{cls}}
-\widetilde d(D_{\ell,q},\bar D_{\ell,c(q)}).
-\]
+    $$
+    TU^{cls}_q
+    =
+    \frac{1}{|L_{cls}|}
+    \sum_{\ell\in L_{cls}}
+    \widetilde d(D_{\ell,q},\bar D_{\ell,c(q)}).
+    $$
 
 - [ ] Keep `TU_box` and `TU_cls` separate.
 - [ ] Log the individual transition distances in addition to the aggregate.
@@ -364,9 +364,9 @@ TU must outperform simpler novelty measures to justify its complexity.
 - [ ] Implement Euclidean distance from the final query embedding to a class prototype.
 - [ ] Implement class-conditional Mahalanobis distance:
 
-\[
-u_q=(h_q-\bar h_c)^\top C_c^{-1}(h_q-\bar h_c).
-\]
+    $$
+    u_q=(h_q-\bar h_c)^\top C_c^{-1}(h_q-\bar h_c).
+    $$
 
 - [ ] Implement k-nearest-neighbour distance in query-embedding space.
 - [ ] Implement confidence-only calibration.
@@ -422,14 +422,14 @@ Define classification correctness before fitting:
   - Logistic calibration.
 - [ ] Fit a TU-aware calibrator:
 
-\[
-\hat p_q
-=
-g_{\text{cls}}(
-\text{raw logit or margin},
-TU^{cls}_q
-).
-\]
+    $$
+    \hat p_q
+    =
+    g_{\text{cls}}(
+    \text{raw logit or margin},
+    TU^{cls}_q
+    ).
+    $$
 
 - [ ] Start with a low-capacity monotonic or logistic model.
 - [ ] Test whether `TU_box` adds useful classification information.
@@ -454,34 +454,34 @@ TU^{cls}_q
 
 Start with:
 
-\[
+$$
 \Sigma_{\text{total},q}
 =
 \alpha(TU^{box}_q,c_q,s_q)\Sigma_{\text{alea},q},
 \qquad \alpha\ge 1.
-\]
+$$
 
-\[
+$$
 \Sigma_{\text{epi-TU},q}
 =
 (\alpha-1)\Sigma_{\text{alea},q}.
-\]
+$$
 
 - [ ] Compute normalized squared residuals:
 
-\[
-m_i
-=
-r_i^\top\Sigma_{\text{alea},i}^{-1}r_i.
-\]
+    $$
+    m_i
+    =
+    r_i^\top\Sigma_{\text{alea},i}^{-1}r_i.
+    $$
 
-- [ ] Fit a low-capacity monotonic mapping from `TU_box` to \(\alpha\).
+- [ ] Fit a low-capacity monotonic mapping from `TU_box` to $\alpha$.
 - [ ] Compare:
   - Isotonic regression.
   - Monotonic spline.
-  - Binned estimate \(\mathbb E[m\mid TU]/4\).
+  - Binned estimate $\mathbb E[m\mid TU]/4$.
   - Direct Gaussian quasi-NLL optimization.
-- [ ] Constrain \(\alpha\ge1\) for the initial interpretation.
+- [ ] Constrain $\alpha\ge1$ for the initial interpretation.
 - [ ] Compare global, per-class, and class-and-size mappings.
 - [ ] Use hierarchical fallbacks for sparse classes.
 
@@ -491,21 +491,21 @@ Only attempt these after the scalar model:
 
 - [ ] Coordinate-specific inflation:
 
-\[
-\Sigma_{\text{total}}
-=
-\operatorname{diag}(
-\alpha_j(TU)\sigma^2_{\text{alea},j}
-).
-\]
+    $$
+    \Sigma_{\text{total}}
+    =
+    \operatorname{diag}(
+    \alpha_j(TU)\sigma^2_{\text{alea},j}
+    ).
+    $$
 
 - [ ] Class/size residual-shape template:
 
-\[
-\Sigma_{\text{epi-TU}}
-=
-g(TU)C_{c,s}.
-\]
+    $$
+    \Sigma_{\text{epi-TU}}
+    =
+    g(TU)C_{c,s}.
+    $$
 
 - [ ] Full covariance using a Cholesky parameterization.
 - [ ] Confirm every covariance remains positive semidefinite.
@@ -527,31 +527,31 @@ g(TU)C_{c,s}.
 
 ### 11.2 Joint axis-aligned conformal intervals
 
-For calibration item \(i\), define:
+For calibration item $i$, define:
 
-\[
+$$
 s_i
 =
 \max_j
 \frac{|y_{ij}-\mu_{ij}|}
 {\sqrt{\Sigma_{\text{total},i,jj}}}.
-\]
+$$
 
 - [ ] Calculate the finite-sample conformal quantile using the corrected rank:
 
-\[
-k=\left\lceil(n+1)(1-\delta)\right\rceil.
-\]
+    $$
+    k=\left\lceil(n+1)(1-\delta)\right\rceil.
+    $$
 
-- [ ] Store \(q_{0.90}\), \(q_{0.95}\), or other required levels.
+- [ ] Store $q_{0.90}$, $q_{0.95}$, or other required levels.
 - [ ] At inference, return:
 
-\[
-\mu_{qj}
-\pm
-q_{1-\delta}
-\sqrt{\Sigma_{\text{total},q,jj}}.
-\]
+    $$
+    \mu_{qj}
+    \pm
+    q_{1-\delta}
+    \sqrt{\Sigma_{\text{total},q,jj}}.
+    $$
 
 - [ ] Evaluate empirical joint coverage, not only coordinate-wise coverage.
 - [ ] Test Mondrian conformal calibration by:
@@ -591,7 +591,7 @@ q_{1-\delta}
 
 ### 12.2 Reduce topology cost
 
-- [ ] Compute TU only for retained top-\(K\) detections.
+- [ ] Compute TU only for retained top-$K$ detections.
 - [ ] Begin with only the final decoder layer.
 - [ ] Begin with only the bbox MLP transition that gives the best quality/latency ratio.
 - [ ] Compare full graphs with fixed sparse graphs.
@@ -628,20 +628,20 @@ q_{1-\delta}
 
 - [ ] Return a stable per-detection record containing:
 
-```text
-box_mean_xyxy
-class_id
-score_raw
-score_calibrated
-tu_cls
-tu_box
-aleatoric_covariance
-tu_excess_covariance
-total_covariance
-box_interval_90
-box_interval_95
-prototype_fallback_level
-```
+    ```text
+    box_mean_xyxy
+    class_id
+    score_raw
+    score_calibrated
+    tu_cls
+    tu_box
+    aleatoric_covariance
+    tu_excess_covariance
+    total_covariance
+    box_interval_90
+    box_interval_95
+    prototype_fallback_level
+    ```
 
 - [ ] Include an uncertainty-version identifier tied to:
   - Model checkpoint.
@@ -665,7 +665,7 @@ prototype_fallback_level
 - [ ] Reordering queries reorders TU scores identically.
 - [ ] Batching does not change individual TU values.
 - [ ] Instrumentation does not change predicted logits or boxes.
-- [ ] Top-\(K\) indices select the correct cached activations.
+- [ ] Top-$K$ indices select the correct cached activations.
 
 ### Topology tests
 
@@ -680,7 +680,7 @@ prototype_fallback_level
 - [ ] Aleatoric scales are positive and finite.
 - [ ] Covariances are symmetric and positive semidefinite.
 - [ ] Coordinate transformations are correct.
-- [ ] Inflation mapping is monotonic and \(\alpha\ge1\).
+- [ ] Inflation mapping is monotonic and $\alpha\ge1$.
 - [ ] Conformal quantile indexing is correct for small synthetic datasets.
 - [ ] Requested joint coverage is recovered on simulated calibrated data.
 
@@ -752,7 +752,7 @@ Localization uncertainty:
 Failure and OOD ranking:
 
 - [ ] AUROC/AUPR for detecting IoU below chosen thresholds.
-- [ ] Spearman correlation with \(1-\mathrm{IoU}\).
+- [ ] Spearman correlation with $1-\mathrm{IoU}$.
 - [ ] Risk-coverage curves.
 - [ ] OOD/corruption AUROC where labels permit.
 
@@ -803,7 +803,7 @@ Efficiency:
 
 - [ ] Instrument the final bbox MLP.
 - [ ] Compute full-graph `TU_box` offline for matched detections.
-- [ ] Compare `TU_box`, confidence, Mahalanobis distance, and \(1-\mathrm{IoU}\).
+- [ ] Compare `TU_box`, confidence, Mahalanobis distance, and $1-\mathrm{IoU}$.
 - [ ] Plot localization error by TU decile.
 
 **Gate A:** stop or redesign if TU has no relationship with localization error.
@@ -960,4 +960,3 @@ The project is paper-ready only if the final evidence supports all of the follow
 - [ ] Detection AP remains competitive.
 - [ ] End-to-end uncertainty inference remains within the declared real-time budget.
 - [ ] Limitations and coverage assumptions are reported clearly.
-
