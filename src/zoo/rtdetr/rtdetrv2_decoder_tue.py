@@ -454,6 +454,21 @@ class RTDETRTransformerv2TUE(nn.Module):
             torch.empty(0),
             persistent=False,
         )
+        self.register_buffer(
+            "bbox_tu_class_size_means",
+            torch.empty(0),
+            persistent=False,
+        )
+        self.register_buffer(
+            "bbox_tu_class_size_valid",
+            torch.empty(0, dtype=torch.bool),
+            persistent=False,
+        )
+        self.register_buffer(
+            "bbox_tu_area_thresholds",
+            torch.empty(0),
+            persistent=False,
+        )
 
         # TODO: move to config
         self.tu_enabled = tu_enabled
@@ -496,7 +511,28 @@ class RTDETRTransformerv2TUE(nn.Module):
         if metadata["bbox_layer_out_features"] != bbox_layer.out_features:
             raise ValueError("Prototype output dimension does not match bbox layer.")
 
-        signature_length = metadata["signature_length"]
+        signature_length = int(metadata["signature_length"])
+
+        size_names = metadata.get(
+            "size_bucket_names",
+            ["small", "medium", "large"],
+        )
+        size_to_id = {
+            name: index for index, name in enumerate(size_names)
+        }
+        num_size_buckets = len(size_names)
+
+        class_size_means = torch.zeros(
+            self.num_classes,
+            num_size_buckets,
+            signature_length,
+            dtype=torch.float32,
+        )
+        class_size_valid = torch.zeros(
+            self.num_classes,
+            num_size_buckets,
+            dtype=torch.bool,
+        )
 
         class_means = torch.zeros(
             self.num_classes,
@@ -508,27 +544,77 @@ class RTDETRTransformerv2TUE(nn.Module):
             dtype=torch.bool,
         )
 
-        for class_key, value in prototypes["class"].items():
-            class_id = int(class_key)
+        # Keys look like "17:small".
+        for key, value in prototypes.get("class_size", {}).items():
+            class_text, size_name = key.split(":", maxsplit=1)
+
+            class_id = int(class_text)
+            size_id = size_to_id.get(size_name)
+            count = int(value.get("count", 0))
 
             if (
-                    0 <= class_id < self.num_classes
-                    and value["count"] >= self.tu_min_samples
-                ):
-                class_means[class_id] = value["mean"].float()
+                0 <= class_id < self.num_classes
+                and size_id is not None
+                and count >= self.tu_min_samples
+            ):
+                mean = value["mean"].float().flatten()
+
+                if mean.numel() != signature_length:
+                    raise ValueError(
+                        f"Prototype {key} has signature length "
+                        f"{mean.numel()}, expected {signature_length}."
+                    )
+
+                class_size_means[class_id, size_id] = mean
+                class_size_valid[class_id, size_id] = True
+
+        # Class-only fallback.
+        for class_key, value in prototypes["class"].items():
+            class_id = int(class_key)
+            count = int(value.get("count", 0))
+
+            if (
+                0 <= class_id < self.num_classes
+                and count >= self.tu_min_samples
+            ):
+                class_means[class_id] = value["mean"].float().flatten()
                 class_valid[class_id] = True
 
-        global_mean = prototypes["global"]["mean"].float()
+        global_mean = prototypes["global"]["mean"].float().flatten()
+
+        area_metadata = metadata["normalized_area_thresholds"]
+        area_thresholds = torch.tensor(
+            [
+                float(area_metadata["small_max"]),
+                float(area_metadata["medium_max"]),
+            ],
+            dtype=torch.float32,
+        )
 
         device = bbox_layer.weight.device
+
+        self.bbox_tu_class_size_means = class_size_means.to(device)
+        self.bbox_tu_class_size_valid = class_size_valid.to(device)
         self.bbox_tu_class_means = class_means.to(device)
         self.bbox_tu_class_valid = class_valid.to(device)
         self.bbox_tu_global_mean = global_mean.to(device)
+        self.bbox_tu_area_thresholds = area_thresholds.to(device)
 
         self.bbox_tu_loaded = True
 
+        print(
+            "[TU] loaded "
+            f"{int(class_size_valid.sum())} valid class/size prototypes, "
+            f"{int(class_valid.sum())} class fallbacks"
+        )
+
     @torch.no_grad()
-    def calculate_bbox_tu(self, activation, predicted_class):
+    def calculate_bbox_tu(
+        self,
+        activation,
+        predicted_class,
+        predicted_size,
+    ):
         eval_idx = self.decoder.eval_idx
         weight = self.dec_bbox_head[eval_idx].layers[-1].weight
 
@@ -536,14 +622,30 @@ class RTDETRTransformerv2TUE(nn.Module):
             activation,
             weight,
             edge_score="abs_wx",
+        ).to(weight.device)
+
+        class_id = int(predicted_class)
+        size_id = int(predicted_size)
+
+        use_class_size = (
+            0 <= class_id < self.num_classes
+            and 0 <= size_id < self.bbox_tu_class_size_valid.shape[1]
+            and bool(
+                self.bbox_tu_class_size_valid[class_id, size_id].item()
+            )
         )
 
-        if self.bbox_tu_class_valid[predicted_class]:
-            mean_diagram = self.bbox_tu_class_means[predicted_class]
+        if use_class_size:
+            mean_diagram = self.bbox_tu_class_size_means[
+                class_id, size_id
+            ]
+        elif (
+            0 <= class_id < self.num_classes
+            and bool(self.bbox_tu_class_valid[class_id].item())
+        ):
+            mean_diagram = self.bbox_tu_class_means[class_id]
         else:
             mean_diagram = self.bbox_tu_global_mean
-
-        mean_diagram = mean_diagram.to(signature.device)
 
         return torch.sqrt(
             torch.mean((signature - mean_diagram) ** 2)
@@ -801,6 +903,22 @@ class RTDETRTransformerv2TUE(nn.Module):
             query_scores = probabilities.amax(dim=-1)
             query_classes = probabilities.argmax(dim=-1)
 
+            predicted_boxes = out["pred_boxes"]  # normalized cxcywh
+
+            predicted_areas = (
+                predicted_boxes[..., 2].clamp_min(0)
+                * predicted_boxes[..., 3].clamp_min(0)
+            )
+
+            small_max = self.bbox_tu_area_thresholds[0]
+            medium_max = self.bbox_tu_area_thresholds[1]
+
+            # 0=small, 1=medium, 2=large
+            query_sizes = (
+                (predicted_areas >= small_max).long()
+                + (predicted_areas >= medium_max).long()
+            )
+
             k = min(self.bbox_tu_topk, logits.shape[1])
             query_indices = query_scores.topk(k, dim=1).indices
 
@@ -814,15 +932,17 @@ class RTDETRTransformerv2TUE(nn.Module):
             for batch_index in range(logits.shape[0]):
                 for query_index_tensor in query_indices[batch_index]:
                     query_index = query_index_tensor.item()
-                    predicted_class = query_classes[
-                        batch_index, query_index
-                    ].item()
+                    predicted_class = int(
+                        query_classes[batch_index, query_index].item()
+                    )
+                    predicted_size = int(
+                        query_sizes[batch_index, query_index].item()
+                    )
 
-                    bbox_tu[batch_index, query_index] = (
-                        self.calculate_bbox_tu(
-                            activations[batch_index, query_index],
-                            predicted_class,
-                        )
+                    bbox_tu[batch_index, query_index] = self.calculate_bbox_tu(
+                        activations[batch_index, query_index],
+                        predicted_class,
+                        predicted_size,
                     )
 
             out["bbox_tu"] = bbox_tu

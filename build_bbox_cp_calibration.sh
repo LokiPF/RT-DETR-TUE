@@ -9,4 +9,5 @@ python tools/build_bbox_cp_calibration.py \
     --tu-topk 50 \
     --target-box-format auto \
     --target-box-units auto \
-    --confidence-threshold 0.5
+    --confidence-threshold 0.5 \
+    --device cuda
