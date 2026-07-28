@@ -12,3 +12,6 @@ from .rtdetr_postprocessor import RTDETRPostProcessor
 # v2
 from .rtdetrv2_decoder import RTDETRTransformerv2
 from .rtdetrv2_criterion import RTDETRCriterionv2
+
+# topological uncertainty estimation
+from .rtdetrv2_decoder_tue import RTDETRTransformerv2TUE

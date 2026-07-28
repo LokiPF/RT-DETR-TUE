@@ -12,6 +12,9 @@ import torch.nn.functional as F
 import torch.nn.init as init 
 from typing import List
 
+from .topological_uncertainty import (
+    maximum_spanning_tree_signature,
+)
 from .denoising import get_contrastive_denoising_training_group
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
@@ -303,6 +306,17 @@ class TransformerDecoder(nn.Module):
                 bbox_delta + inverse_sigmoid(ref_points_detach)
             )
 
+            if collect_this_layer:
+                tu_payload = {
+                    # Input to final 256 -> 4 bbox layer:
+                    "bbox_last_input": bbox_inputs[-1].detach(),
+            
+                    # Input to the classification head:
+                    "decoder_output": output.detach(),
+            
+                    "decoder_layer": i,
+                }
+
             if self.training:
                 dec_out_logits.append(score_head[i](output))
                 if i == 0:
@@ -318,17 +332,6 @@ class TransformerDecoder(nn.Module):
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach()
 
-            if collect_this_layer:
-                tu_payload = {
-                    # Input to final 256 -> 4 bbox layer:
-                    "bbox_last_input": bbox_inputs[-1].detach(),
-
-                    # Input to the classification head:
-                    "decoder_output": output.detach(),
-
-                    "decoder_layer": i,
-                }
-
         return (
                     torch.stack(dec_out_bboxes),
                     torch.stack(dec_out_logits),
@@ -341,28 +344,32 @@ class RTDETRTransformerv2TUE(nn.Module):
     __share__ = ['num_classes', 'eval_spatial_size']
 
     def __init__(self,
-                 num_classes=80,
-                 hidden_dim=256,
-                 num_queries=300,
-                 feat_channels=[512, 1024, 2048],
-                 feat_strides=[8, 16, 32],
-                 num_levels=3,
-                 num_points=4,
-                 nhead=8,
-                 num_layers=6,
-                 dim_feedforward=1024,
-                 dropout=0.,
-                 activation="relu",
-                 num_denoising=100,
-                 label_noise_ratio=0.5,
-                 box_noise_scale=1.0,
-                 learn_query_content=False,
-                 eval_spatial_size=None,
-                 eval_idx=-1,
-                 eps=1e-2, 
-                 aux_loss=True, 
-                 cross_attn_method='default', 
-                 query_select_method='default'):
+                num_classes=80,
+                hidden_dim=256,
+                num_queries=300,
+                feat_channels=[512, 1024, 2048],
+                feat_strides=[8, 16, 32],
+                num_levels=3,
+                num_points=4,
+                nhead=8,
+                num_layers=6,
+                dim_feedforward=1024,
+                dropout=0.,
+                activation="relu",
+                num_denoising=100,
+                label_noise_ratio=0.5,
+                box_noise_scale=1.0,
+                learn_query_content=False,
+                eval_spatial_size=None,
+                eval_idx=-1,
+                eps=1e-2, 
+                aux_loss=True, 
+                cross_attn_method='default', 
+                query_select_method='default',
+                tu_enabled=False,
+                tu_prototype_path=None,
+                tu_topk=50,
+                tu_min_samples=20,):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -432,6 +439,29 @@ class RTDETRTransformerv2TUE(nn.Module):
             MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_layers)
         ])
 
+        self.register_buffer(
+            "bbox_tu_class_means",
+            torch.empty(0),
+            persistent=False,
+        )
+        self.register_buffer(
+            "bbox_tu_class_valid",
+            torch.empty(0, dtype=torch.bool),
+            persistent=False,
+        )
+        self.register_buffer(
+            "bbox_tu_global_mean",
+            torch.empty(0),
+            persistent=False,
+        )
+
+        # TODO: move to config
+        self.tu_enabled = tu_enabled
+        self.tu_prototype_path = tu_prototype_path
+        self.bbox_tu_topk = tu_topk
+        self.tu_min_samples = tu_min_samples
+        self.bbox_tu_loaded = False
+
         # init encoder output anchors and valid_mask
         if self.eval_spatial_size:
             anchors, valid_mask = self._generate_anchors()
@@ -439,11 +469,90 @@ class RTDETRTransformerv2TUE(nn.Module):
             self.register_buffer('valid_mask', valid_mask)
 
         self._reset_parameters()
+
+    @torch.no_grad()
+    def load_tu_prototypes(self, path):
+        try:
+            artifact = torch.load(
+                path,
+                map_location="cpu",
+                weights_only=False,
+            )
+        except TypeError:
+            artifact = torch.load(path, map_location="cpu")
+
+        metadata = artifact["metadata"]
+        prototypes = artifact["prototypes"]
+
+        eval_idx = self.decoder.eval_idx
+        bbox_layer = self.dec_bbox_head[eval_idx].layers[-1]
+
+        if metadata["decoder_eval_index"] != eval_idx:
+            raise ValueError("Prototype decoder index does not match model.")
+
+        if metadata["bbox_layer_in_features"] != bbox_layer.in_features:
+            raise ValueError("Prototype input dimension does not match bbox layer.")
+
+        if metadata["bbox_layer_out_features"] != bbox_layer.out_features:
+            raise ValueError("Prototype output dimension does not match bbox layer.")
+
+        signature_length = metadata["signature_length"]
+
+        class_means = torch.zeros(
+            self.num_classes,
+            signature_length,
+            dtype=torch.float32,
+        )
+        class_valid = torch.zeros(
+            self.num_classes,
+            dtype=torch.bool,
+        )
+
+        for class_key, value in prototypes["class"].items():
+            class_id = int(class_key)
+
+            if (
+                    0 <= class_id < self.num_classes
+                    and value["count"] >= self.tu_min_samples
+                ):
+                class_means[class_id] = value["mean"].float()
+                class_valid[class_id] = True
+
+        global_mean = prototypes["global"]["mean"].float()
+
+        device = bbox_layer.weight.device
+        self.bbox_tu_class_means = class_means.to(device)
+        self.bbox_tu_class_valid = class_valid.to(device)
+        self.bbox_tu_global_mean = global_mean.to(device)
+
+        self.bbox_tu_loaded = True
+
+    @torch.no_grad()
+    def calculate_bbox_tu(self, activation, predicted_class):
+        eval_idx = self.decoder.eval_idx
+        weight = self.dec_bbox_head[eval_idx].layers[-1].weight
+
+        signature = maximum_spanning_tree_signature(
+            activation,
+            weight,
+            edge_score="abs_wx",
+        )
+
+        if self.bbox_tu_class_valid[predicted_class]:
+            mean_diagram = self.bbox_tu_class_means[predicted_class]
+        else:
+            mean_diagram = self.bbox_tu_global_mean
+
+        mean_diagram = mean_diagram.to(signature.device)
+
+        return torch.sqrt(
+            torch.mean((signature - mean_diagram) ** 2)
+        )
         
     def _reset_parameters(self):
         bias = bias_init_with_prob(0.01)
         init.constant_(self.enc_score_head.bias, bias)
-        init.constant_(self.enc_bbox_head.layers[-1].weight, 0)
+        init.constant_(self.enc_bbox_head.layers[-1].weight, 0) # type: ignore
         init.constant_(self.enc_bbox_head.layers[-1].bias, 0)
 
         for _cls, _reg in zip(self.dec_score_head, self.dec_bbox_head):
@@ -604,26 +713,46 @@ class RTDETRTransformerv2TUE(nn.Module):
 
 
     def forward(self, feats, targets=None, collect_tu=False):
-        # input projection and embedding
+        need_tu_activations = (
+            not self.training
+            and (collect_tu or self.tu_enabled)
+        )
+
         memory, spatial_shapes = self._get_encoder_input(feats)
-        
-        # prepare denoising training
+
         if self.training and self.num_denoising > 0:
-            denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = \
-                get_contrastive_denoising_training_group(targets, \
-                    self.num_classes, 
-                    self.num_queries, 
-                    self.denoising_class_embed, 
-                    num_denoising=self.num_denoising, 
-                    label_noise_ratio=self.label_noise_ratio, 
-                    box_noise_scale=self.box_noise_scale, )
+            (
+                denoising_logits,
+                denoising_bbox_unact,
+                attn_mask,
+                dn_meta,
+            ) = get_contrastive_denoising_training_group(
+                targets,
+                self.num_classes,
+                self.num_queries,
+                self.denoising_class_embed,
+                num_denoising=self.num_denoising,
+                label_noise_ratio=self.label_noise_ratio,
+                box_noise_scale=self.box_noise_scale,
+            )
         else:
-            denoising_logits, denoising_bbox_unact, attn_mask, dn_meta = None, None, None, None
+            denoising_logits = None
+            denoising_bbox_unact = None
+            attn_mask = None
+            dn_meta = None
 
-        init_ref_contents, init_ref_points_unact, enc_topk_bboxes_list, enc_topk_logits_list = \
-            self._get_decoder_input(memory, spatial_shapes, denoising_logits, denoising_bbox_unact)
+        (
+            init_ref_contents,
+            init_ref_points_unact,
+            enc_topk_bboxes_list,
+            enc_topk_logits_list,
+        ) = self._get_decoder_input(
+            memory,
+            spatial_shapes,
+            denoising_logits,
+            denoising_bbox_unact,
+        )
 
-        # decoder
         out_bboxes, out_logits, tu_payload = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
@@ -633,26 +762,93 @@ class RTDETRTransformerv2TUE(nn.Module):
             self.dec_score_head,
             self.query_pos_head,
             attn_mask=attn_mask,
-            collect_tu=collect_tu
-            )
+            collect_tu=need_tu_activations,
+        )
 
         if self.training and dn_meta is not None:
-            dn_out_bboxes, out_bboxes = torch.split(out_bboxes, dn_meta['dn_num_split'], dim=2)
-            dn_out_logits, out_logits = torch.split(out_logits, dn_meta['dn_num_split'], dim=2)
+            dn_out_bboxes, out_bboxes = torch.split(
+                out_bboxes,
+                dn_meta["dn_num_split"],
+                dim=2,
+            )
+            dn_out_logits, out_logits = torch.split(
+                out_logits,
+                dn_meta["dn_num_split"],
+                dim=2,
+            )
 
-        out = {'pred_logits': out_logits[-1], 'pred_boxes': out_bboxes[-1]}
+        out = {
+            "pred_logits": out_logits[-1],
+            "pred_boxes": out_bboxes[-1],
+        }
 
-        if collect_tu:
+        # Calculate bbox TU only during enabled evaluation
+        if self.tu_enabled and not self.training:
+            if not self.bbox_tu_loaded:
+                raise RuntimeError(
+                    "BBox TU is enabled, but prototypes were not loaded."
+                )
+
+            if tu_payload is None:
+                raise RuntimeError(
+                    "TU activation payload was not collected."
+                )
+
+            logits = out["pred_logits"]
+            activations = tu_payload["bbox_last_input"]
+
+            probabilities = logits.sigmoid()
+            query_scores = probabilities.amax(dim=-1)
+            query_classes = probabilities.argmax(dim=-1)
+
+            k = min(self.bbox_tu_topk, logits.shape[1])
+            query_indices = query_scores.topk(k, dim=1).indices
+
+            bbox_tu = torch.full(
+                logits.shape[:2],
+                float("nan"),
+                dtype=torch.float32,
+                device=logits.device,
+            )
+
+            for batch_index in range(logits.shape[0]):
+                for query_index_tensor in query_indices[batch_index]:
+                    query_index = query_index_tensor.item()
+                    predicted_class = query_classes[
+                        batch_index, query_index
+                    ].item()
+
+                    bbox_tu[batch_index, query_index] = (
+                        self.calculate_bbox_tu(
+                            activations[batch_index, query_index],
+                            predicted_class,
+                        )
+                    )
+
+            out["bbox_tu"] = bbox_tu
+
+        if collect_tu and not self.training:
             out["tu_activations"] = tu_payload
 
         if self.training and self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])
-            out['enc_aux_outputs'] = self._set_aux_loss(enc_topk_logits_list, enc_topk_bboxes_list)
-            out['enc_meta'] = {'class_agnostic': self.query_select_method == 'agnostic'}
+            out["aux_outputs"] = self._set_aux_loss(
+                out_logits[:-1],
+                out_bboxes[:-1],
+            )
+            out["enc_aux_outputs"] = self._set_aux_loss(
+                enc_topk_logits_list,
+                enc_topk_bboxes_list,
+            )
+            out["enc_meta"] = {
+                "class_agnostic": self.query_select_method == "agnostic"
+            }
 
             if dn_meta is not None:
-                out['dn_aux_outputs'] = self._set_aux_loss(dn_out_logits, dn_out_bboxes)
-                out['dn_meta'] = dn_meta
+                out["dn_aux_outputs"] = self._set_aux_loss(
+                    dn_out_logits,
+                    dn_out_bboxes,
+                )
+                out["dn_meta"] = dn_meta
 
         return out
 
