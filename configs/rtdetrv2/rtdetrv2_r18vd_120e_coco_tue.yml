@@ -1,0 +1,25 @@
+__include__: [
+  './rtdetrv2_r18vd_120e_coco.yml',
+]
+
+RTDETR:
+  decoder: RTDETRTransformerv2TUE
+
+RTDETRTransformerv2TUE:
+  feat_channels: [256, 256, 256]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  num_levels: 3
+
+  num_layers: 3
+  num_queries: 300
+
+  num_denoising: 100
+  label_noise_ratio: 0.5
+  box_noise_scale: 1.0
+
+  eval_idx: -1
+
+  num_points: [4, 4, 4]
+  cross_attn_method: default
+  query_select_method: default
