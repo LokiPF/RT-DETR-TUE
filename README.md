@@ -7,9 +7,13 @@ Run ```./deterministic_training.sh```. The default seed is ```42```.
 
 Run ```./build_tu_prototype.sh```.
 
-The Fréchet mean for the bboxes is saved in ```pretrained_weights/bbox_prototypes.pth```.
+The Fréchet mean on COCO for the bboxes is saved in ```pretrained_weights/bbox_prototypes.pth```.
 
 ## Conformal Probability (CP) Calibration
+
+Run ```./build_bbox_cp_calibration.sh```.
+
+The Fréchet mean for the bboxes is saved in ```pretrained_weights/bbox_prototypes.pth```.
 
 ## Pipeline
 
