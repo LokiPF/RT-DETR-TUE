@@ -60,7 +60,6 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence,
 
 import torch
 from torch import Tensor, nn
-from tqdm import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -169,6 +168,25 @@ def parse_args() -> argparse.Namespace:
         "--allow-wrong-class",
         action="store_true",
         help="Include matched predictions whose predicted class is incorrect.",
+    )
+    parser.add_argument(
+        "--target-box-format",
+        choices=("auto", "xyxy", "cxcywh"),
+        default="auto",
+        help=(
+            "Format of dataloader target boxes before calibration. `auto` "
+            "uses torchvision BoundingBoxes metadata when available, then "
+            "RT-DETR's val/train conventions."
+        ),
+    )
+    parser.add_argument(
+        "--target-box-units",
+        choices=("auto", "absolute", "normalized"),
+        default="auto",
+        help=(
+            "Units of dataloader target boxes. `auto` treats coordinates "
+            "larger than 2 as pixels and otherwise as normalized."
+        ),
     )
     parser.add_argument(
         "--max-images",
@@ -409,6 +427,122 @@ def box_cxcywh_to_xyxy(boxes: Tensor) -> Tensor:
         ),
         dim=-1,
     )
+
+
+def box_xyxy_to_cxcywh(boxes: Tensor) -> Tensor:
+    x1, y1, x2, y2 = boxes.unbind(-1)
+    return torch.stack(
+        (
+            0.5 * (x1 + x2),
+            0.5 * (y1 + y2),
+            x2 - x1,
+            y2 - y1,
+        ),
+        dim=-1,
+    )
+
+
+def _metadata_box_format(boxes: Tensor) -> Optional[str]:
+    metadata_format = getattr(boxes, "format", None)
+    if metadata_format is None:
+        return None
+    name = str(metadata_format).upper()
+    if "CXCYWH" in name:
+        return "cxcywh"
+    if "XYXY" in name:
+        return "xyxy"
+    return None
+
+
+def _target_canvas_size(
+    boxes: Tensor,
+    target: Mapping[str, Any],
+    sample_height: int,
+    sample_width: int,
+) -> Tuple[int, int]:
+    canvas_size = getattr(boxes, "canvas_size", None)
+    if canvas_size is not None and len(canvas_size) == 2:
+        return int(canvas_size[0]), int(canvas_size[1])
+
+    target_size = target.get("size")
+    if isinstance(target_size, Tensor) and target_size.numel() >= 2:
+        flat_size = target_size.detach().reshape(-1).cpu()
+        return int(flat_size[-2].item()), int(flat_size[-1].item())
+    if isinstance(target_size, (list, tuple)) and len(target_size) >= 2:
+        return int(target_size[-2]), int(target_size[-1])
+
+    return sample_height, sample_width
+
+
+def normalize_target_boxes_for_matcher(
+    target: Mapping[str, Any],
+    sample_height: int,
+    sample_width: int,
+    requested_format: str,
+    requested_units: str,
+) -> Tuple[Dict[str, Any], str]:
+    """Return a target whose boxes are normalized cxcywh, as RT-DETR expects."""
+    boxes = target.get("boxes")
+    if not isinstance(boxes, Tensor):
+        raise TypeError("Every target must contain a Tensor under `boxes`.")
+    if boxes.ndim != 2 or boxes.shape[-1] != 4:
+        raise ValueError(
+            f"Target boxes must have shape [N, 4], got {tuple(boxes.shape)}."
+        )
+
+    box_format = requested_format
+    if box_format == "auto":
+        box_format = _metadata_box_format(boxes) or ""
+
+    box_units = requested_units
+    if box_units == "auto":
+        if boxes.numel() > 0:
+            maximum_magnitude = float(boxes.detach().abs().max().cpu())
+            box_units = "absolute" if maximum_magnitude > 2.0 else "normalized"
+        else:
+            box_units = "absolute" if box_format == "xyxy" else "normalized"
+
+    if not box_format:
+        # RT-DETRv2's standard val pipeline keeps pixel xyxy targets, while
+        # ConvertBoxes in the train pipeline produces normalized cxcywh.
+        box_format = "xyxy" if box_units == "absolute" else "cxcywh"
+
+    boxes_float = boxes.to(dtype=torch.float32)
+    boxes_xyxy = (
+        boxes_float
+        if box_format == "xyxy"
+        else box_cxcywh_to_xyxy(boxes_float)
+    )
+
+    if box_units == "absolute":
+        canvas_height, canvas_width = _target_canvas_size(
+            boxes,
+            target,
+            sample_height,
+            sample_width,
+        )
+        if canvas_height <= 0 or canvas_width <= 0:
+            raise ValueError(
+                f"Invalid target canvas size {(canvas_height, canvas_width)}."
+            )
+        divisor = boxes_xyxy.new_tensor(
+            (canvas_width, canvas_height, canvas_width, canvas_height)
+        )
+        boxes_xyxy = boxes_xyxy / divisor
+
+    if boxes_xyxy.numel() > 0:
+        low = float(boxes_xyxy.detach().min().cpu())
+        high = float(boxes_xyxy.detach().max().cpu())
+        if low < -0.05 or high > 1.05:
+            raise ValueError(
+                "Converted target boxes are not normalized image coordinates "
+                f"(range {low:.4f}..{high:.4f}). Check --target-box-format "
+                "and --target-box-units."
+            )
+
+    normalized_target = dict(target)
+    normalized_target["boxes"] = box_xyxy_to_cxcywh(boxes_xyxy)
+    return normalized_target, f"{box_format}_{box_units}"
 
 
 def aligned_box_iou(boxes1: Tensor, boxes2: Tensor) -> Tensor:
@@ -697,20 +831,10 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     rejected_nonfinite_tu = 0
     rejected_low_confidence = 0
     rejected_wrong_class = 0
-
-    try:
-        total_batches = len(dataloader)
-    except TypeError:
-        total_batches = None
-    progress = tqdm(
-        dataloader,
-        total=total_batches,
-        desc=f"[{args.split}] calibration",
-        unit="batch",
-    )
+    target_box_conversions: Dict[str, int] = {}
 
     with torch.inference_mode():
-        for batch_index, batch in enumerate(progress):
+        for batch_index, batch in enumerate(dataloader):
             if args.max_images is not None and images_seen >= args.max_images:
                 break
 
@@ -729,7 +853,29 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 images_seen + index for index in range(batch_size)
             ]
             samples = samples.to(device, non_blocking=True)
-            targets = move_targets_to_device(targets_cpu, device)
+            moved_targets = move_targets_to_device(targets_cpu, device)
+            sample_height, sample_width = int(samples.shape[-2]), int(
+                samples.shape[-1]
+            )
+            targets = []
+            for target in moved_targets:
+                normalized_target, conversion = normalize_target_boxes_for_matcher(
+                    target,
+                    sample_height,
+                    sample_width,
+                    args.target_box_format,
+                    args.target_box_units,
+                )
+                targets.append(normalized_target)
+                target_box_conversions[conversion] = (
+                    target_box_conversions.get(conversion, 0) + 1
+                )
+
+            if batch_index == 0:
+                print(
+                    "[data] converted target boxes to normalized cxcywh for "
+                    f"matching/calibration; detected={target_box_conversions}"
+                )
 
             outputs = model(samples)
             if not isinstance(outputs, Mapping):
@@ -827,20 +973,15 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 accepted += kept_count
 
             images_seen += batch_size
-            progress.set_postfix(
-                images=images_seen, matches=matches_seen, accepted=accepted
-            )
             if (
                 args.progress_every > 0
                 and (batch_index + 1) % args.progress_every == 0
             ):
-                progress.write(
+                print(
                     f"[progress] batches={batch_index + 1}, "
                     f"images={images_seen}, matches={matches_seen}, "
                     f"accepted={accepted}"
                 )
-
-    progress.close()
 
     if accepted < 2 * args.min_detections:
         raise RuntimeError(
@@ -969,6 +1110,9 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
         "scale_floor": args.scale_floor,
         "confidence_threshold": args.confidence_threshold,
         "require_correct_class": not args.allow_wrong_class,
+        "target_box_format_requested": args.target_box_format,
+        "target_box_units_requested": args.target_box_units,
+        "target_box_conversions": target_box_conversions,
         "seed": args.seed,
         "device": str(device),
         "torch_version": torch.__version__,

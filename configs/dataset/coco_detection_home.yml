@@ -36,7 +36,7 @@ val_dataloader:
   dataset: 
     type: CocoDetection
     img_folder: /home/philip/datasets/coco/val2017/
-    ann_file: /home/philip/datasets/coco/annotations/instances_val2017.json
+    ann_file: /home/philip/datasets/coco/annotations/instances_calibration2017.json
     return_masks: False
     transforms:
       type: Compose
