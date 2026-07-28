@@ -60,6 +60,7 @@ from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence,
 
 import torch
 from torch import Tensor, nn
+from tqdm import tqdm
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -697,8 +698,19 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
     rejected_low_confidence = 0
     rejected_wrong_class = 0
 
+    try:
+        total_batches = len(dataloader)
+    except TypeError:
+        total_batches = None
+    progress = tqdm(
+        dataloader,
+        total=total_batches,
+        desc=f"[{args.split}] calibration",
+        unit="batch",
+    )
+
     with torch.inference_mode():
-        for batch_index, batch in enumerate(dataloader):
+        for batch_index, batch in enumerate(progress):
             if args.max_images is not None and images_seen >= args.max_images:
                 break
 
@@ -815,15 +827,20 @@ def run(args: argparse.Namespace) -> Dict[str, Any]:
                 accepted += kept_count
 
             images_seen += batch_size
+            progress.set_postfix(
+                images=images_seen, matches=matches_seen, accepted=accepted
+            )
             if (
                 args.progress_every > 0
                 and (batch_index + 1) % args.progress_every == 0
             ):
-                print(
+                progress.write(
                     f"[progress] batches={batch_index + 1}, "
                     f"images={images_seen}, matches={matches_seen}, "
                     f"accepted={accepted}"
                 )
+
+    progress.close()
 
     if accepted < 2 * args.min_detections:
         raise RuntimeError(
