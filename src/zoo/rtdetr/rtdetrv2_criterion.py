@@ -115,6 +115,53 @@ class RTDETRCriterionv2(nn.Module):
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
+    def loss_bbox_uncertainty(
+        self,
+        outputs,
+        targets,
+        indices,
+        num_boxes,
+    ):
+        assert "pred_bbox_std" in outputs
+
+        idx = self._get_src_permutation_idx(indices)
+
+        pred_boxes = outputs["pred_boxes"][idx]
+        pred_std = outputs["pred_bbox_std"][idx]
+
+        target_boxes = torch.cat([
+            target["boxes"][target_idx]
+            for target, (_, target_idx) in zip(targets, indices)
+        ])
+
+        pred_xyxy = box_cxcywh_to_xyxy(pred_boxes)
+        target_xyxy = box_cxcywh_to_xyxy(target_boxes)
+
+        valid = torch.isfinite(pred_std).all(dim=-1)
+
+        if not valid.any():
+            zero = torch.nan_to_num(pred_std).sum() * 0.0
+            return {"loss_bbox_nll": zero}
+
+        pred_xyxy = pred_xyxy[valid]
+        target_xyxy = target_xyxy[valid]
+        pred_std = pred_std[valid].clamp_min(1e-6)
+
+        residual = target_xyxy - pred_xyxy
+
+        coordinate_nll = (
+            0.5 * (residual / pred_std).square()
+            + torch.log(pred_std)
+            + 0.5 * torch.log(
+                pred_std.new_tensor(2.0 * torch.pi)
+            )
+        )
+
+        return {
+            "loss_bbox_nll": coordinate_nll.sum() / num_boxes
+        }
+
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -163,6 +210,23 @@ class RTDETRCriterionv2(nn.Module):
             l_dict = self.get_loss(loss, outputs, targets, indices, num_boxes, **meta)
             l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
             losses.update(l_dict)
+
+        if (
+                    "pred_bbox_std" in outputs
+                    and "loss_bbox_nll" in self.weight_dict
+                ):
+                    uncertainty_losses = self.loss_bbox_uncertainty(
+                        outputs,
+                        targets,
+                        indices,
+                        num_boxes,
+                    )
+                    uncertainty_losses = {
+                        name: value * self.weight_dict[name]
+                        for name, value in uncertainty_losses.items()
+                    }
+                    losses.update(uncertainty_losses)
+        
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:

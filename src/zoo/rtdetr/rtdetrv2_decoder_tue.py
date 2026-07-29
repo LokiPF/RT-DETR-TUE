@@ -10,10 +10,11 @@ import torch
 import torch.nn as nn 
 import torch.nn.functional as F 
 import torch.nn.init as init 
-from typing import List
+from typing import List, Optional
 
 from .topological_uncertainty import (
     maximum_spanning_tree_signature,
+    maximum_spanning_tree_signature_batch,
 )
 from .denoising import get_contrastive_denoising_training_group
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
@@ -21,7 +22,10 @@ from .utils import bias_init_with_prob
 
 from ...core import register
 
-__all__ = ["RTDETRTransformerv2TUE"]
+__all__ = [
+    "RTDETRTransformerv2TUE",
+    "bbox_gaussian_nll",
+]
 
 
 class MLP(nn.Module):
@@ -45,6 +49,166 @@ class MLP(nn.Module):
             return x, layer_inputs
 
         return x
+
+
+class BBoxUncertaintyHead(nn.Module):
+    """Predict normalized xyxy standard deviations for one decoder query."""
+
+    def __init__(
+        self,
+        decoder_dim,
+        hidden_dim=64,
+        num_layers=2,
+        min_std=1e-4,
+        max_std=1.0,
+        initial_std=0.05,
+        act="relu",
+    ):
+        super().__init__()
+
+        if num_layers < 1:
+            raise ValueError("bbox_uncertainty_num_layers must be at least 1.")
+        if not 0 < min_std < initial_std < max_std:
+            raise ValueError(
+                "Require 0 < min_std < initial_std < max_std for the "
+                "bbox uncertainty head."
+            )
+
+        # h + TU + confidence + log(area) + |decoder bbox refinement|
+        input_dim = decoder_dim + 1 + 1 + 1 + 4
+        self.decoder_feature_norm = nn.LayerNorm(decoder_dim)
+        self.mlp = MLP(
+            input_dim,
+            hidden_dim,
+            4,
+            num_layers,
+            act=act,
+        )
+        self.min_std = float(min_std)
+        self.max_std = float(max_std)
+        self.initial_std = float(initial_std)
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        for layer in self.mlp.layers:
+            init.xavier_uniform_(layer.weight)
+            init.constant_(layer.bias, 0)
+
+        # Start with a constant, useful scale. The head then learns departures
+        # from it rather than beginning with arbitrary query-dependent widths.
+        final_layer = self.mlp.layers[-1]
+        init.constant_(final_layer.weight, 0)
+        softplus_target = self.initial_std - self.min_std
+        initial_bias = math.log(math.expm1(softplus_target))
+        init.constant_(final_layer.bias, initial_bias)
+
+    def forward(
+        self,
+        decoder_features,
+        bbox_tu,
+        confidence,
+        log_area,
+        abs_bbox_refinement,
+    ):
+        scalar_features = torch.cat(
+            (
+                bbox_tu.unsqueeze(-1),
+                confidence.unsqueeze(-1),
+                log_area.unsqueeze(-1),
+                abs_bbox_refinement,
+            ),
+            dim=-1,
+        )
+        features = torch.cat(
+            (
+                self.decoder_feature_norm(decoder_features),
+                scalar_features,
+            ),
+            dim=-1,
+        )
+        raw_std = self.mlp(features)
+        std = F.softplus(raw_std) + self.min_std
+        return std.clamp_max(self.max_std)
+
+
+def bbox_gaussian_nll(
+    pred_xyxy,
+    target_xyxy,
+    pred_std_xyxy,
+    valid_mask: Optional[torch.Tensor] = None,
+    reduction="mean",
+):
+    """Gaussian NLL for already matched, normalized xyxy boxes.
+
+    Args:
+        pred_xyxy: Tensor [..., 4] containing matched predicted box means.
+        target_xyxy: Tensor [..., 4] containing the corresponding targets.
+        pred_std_xyxy: Tensor [..., 4] from ``out["pred_bbox_std"]``.
+        valid_mask: Optional boolean tensor with shape ``pred_xyxy.shape[:-1]``.
+        reduction: ``"none"``, ``"mean"``, or ``"sum"``. ``"none"`` returns
+            one summed four-coordinate loss per matched box.
+    """
+    if pred_xyxy.shape != target_xyxy.shape:
+        raise ValueError("Predicted and target xyxy tensors must have equal shape.")
+    if pred_xyxy.shape != pred_std_xyxy.shape or pred_xyxy.shape[-1] != 4:
+        raise ValueError("BBox means and standard deviations must have shape [..., 4].")
+    if reduction not in ("none", "mean", "sum"):
+        raise ValueError(f"Unsupported reduction: {reduction}")
+
+    finite_mask = (
+        torch.isfinite(pred_xyxy).all(dim=-1)
+        & torch.isfinite(target_xyxy).all(dim=-1)
+        & torch.isfinite(pred_std_xyxy).all(dim=-1)
+    )
+    if valid_mask is not None:
+        if valid_mask.shape != pred_xyxy.shape[:-1]:
+            raise ValueError(
+                "valid_mask must have shape pred_xyxy.shape[:-1]."
+            )
+        finite_mask = finite_mask & valid_mask.to(
+            device=finite_mask.device,
+            dtype=torch.bool,
+        )
+
+    coordinate_mask = finite_mask.unsqueeze(-1)
+    safe_pred = torch.where(
+        coordinate_mask,
+        pred_xyxy,
+        torch.zeros_like(pred_xyxy),
+    )
+    safe_target = torch.where(
+        coordinate_mask,
+        target_xyxy,
+        torch.zeros_like(target_xyxy),
+    )
+    safe_std = torch.where(
+        coordinate_mask,
+        pred_std_xyxy,
+        torch.ones_like(pred_std_xyxy),
+    )
+    std = safe_std.clamp_min(torch.finfo(pred_std_xyxy.dtype).eps)
+    residual = safe_target - safe_pred
+    coordinate_nll = (
+        0.5 * (residual / std).square()
+        + torch.log(std)
+        + 0.5 * math.log(2.0 * math.pi)
+    )
+    per_box_nll = coordinate_nll.sum(dim=-1)
+
+    if reduction == "none":
+        return torch.where(
+            finite_mask,
+            per_box_nll,
+            torch.full_like(per_box_nll, float("nan")),
+        )
+
+    valid_losses = per_box_nll[finite_mask]
+    if valid_losses.numel() == 0:
+        # Keep a differentiable zero when a batch has no matched valid boxes.
+        return pred_std_xyxy.sum() * 0.0
+    if reduction == "sum":
+        return valid_losses.sum()
+    return valid_losses.mean()
 
 
 class MSDeformableAttention(nn.Module):
@@ -290,7 +454,6 @@ class TransformerDecoder(nn.Module):
 
             collect_this_layer = (
                 collect_tu
-                and not self.training
                 and i == self.eval_idx
             )
 
@@ -309,11 +472,14 @@ class TransformerDecoder(nn.Module):
             if collect_this_layer:
                 tu_payload = {
                     # Input to final 256 -> 4 bbox layer:
-                    "bbox_last_input": bbox_inputs[-1].detach(),
-            
-                    # Input to the classification head:
-                    "decoder_output": output.detach(),
-            
+                    "bbox_last_input": bbox_inputs[-1],
+
+                    # Query embedding used by the classification and bbox heads.
+                    "decoder_output": output,
+
+                    # Reference before this layer's bbox refinement (cxcywh).
+                    "previous_ref_bbox": ref_points_detach,
+
                     "decoder_layer": i,
                 }
 
@@ -369,7 +535,16 @@ class RTDETRTransformerv2TUE(nn.Module):
                 tu_enabled=False,
                 tu_prototype_path=None,
                 tu_topk=50,
-                tu_min_samples=20,):
+                tu_min_samples=20,
+                bbox_uncertainty_enabled=False,
+                bbox_uncertainty_input_mode="all",
+                bbox_uncertainty_hidden_dim=64,
+                bbox_uncertainty_num_layers=2,
+                bbox_uncertainty_min_std=1e-4,
+                bbox_uncertainty_max_std=1.0,
+                bbox_uncertainty_initial_std=0.05,
+                bbox_uncertainty_detach_inputs=True,
+                bbox_uncertainty_train_tu_topk=0,):
         super().__init__()
         assert len(feat_channels) <= num_levels
         assert len(feat_strides) == len(feat_channels)
@@ -400,6 +575,15 @@ class RTDETRTransformerv2TUE(nn.Module):
         decoder_layer = TransformerDecoderLayer(hidden_dim, nhead, dim_feedforward, dropout, \
             activation, num_levels, num_points, cross_attn_method=cross_attn_method)
         self.decoder = TransformerDecoder(hidden_dim, decoder_layer, num_layers, eval_idx)
+        if (
+            bbox_uncertainty_enabled
+            and self.decoder.eval_idx != num_layers - 1
+        ):
+            raise ValueError(
+                "The bbox uncertainty head currently requires eval_idx to "
+                "select the final decoder layer, so training and inference "
+                "use the same query features."
+            )
 
         # denoising
         self.num_denoising = num_denoising
@@ -439,6 +623,46 @@ class RTDETRTransformerv2TUE(nn.Module):
             MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_layers)
         ])
 
+        self.bbox_uncertainty_enabled = bbox_uncertainty_enabled
+        valid_uncertainty_input_modes = (
+            "all",
+            "features_only",
+            "tu_only",
+        )
+        if bbox_uncertainty_input_mode not in valid_uncertainty_input_modes:
+            raise ValueError(
+                "bbox_uncertainty_input_mode must be one of "
+                f"{valid_uncertainty_input_modes}."
+            )
+        self.bbox_uncertainty_input_mode = bbox_uncertainty_input_mode
+        self.bbox_uncertainty_use_tu = (
+            bbox_uncertainty_input_mode != "features_only"
+        )
+        self.bbox_uncertainty_detach_inputs = (
+            bbox_uncertainty_detach_inputs
+        )
+        self.bbox_uncertainty_train_tu_topk = int(
+            bbox_uncertainty_train_tu_topk
+        )
+        if self.bbox_uncertainty_train_tu_topk < 0:
+            raise ValueError(
+                "bbox_uncertainty_train_tu_topk must be non-negative; "
+                "zero means all queries."
+            )
+
+        if self.bbox_uncertainty_enabled:
+            self.bbox_uncertainty_head = BBoxUncertaintyHead(
+                decoder_dim=hidden_dim,
+                hidden_dim=bbox_uncertainty_hidden_dim,
+                num_layers=bbox_uncertainty_num_layers,
+                min_std=bbox_uncertainty_min_std,
+                max_std=bbox_uncertainty_max_std,
+                initial_std=bbox_uncertainty_initial_std,
+                act=activation,
+            )
+        else:
+            self.bbox_uncertainty_head = None
+
         self.register_buffer(
             "bbox_tu_class_means",
             torch.empty(0),
@@ -470,7 +694,6 @@ class RTDETRTransformerv2TUE(nn.Module):
             persistent=False,
         )
 
-        # TODO: move to config
         self.tu_enabled = tu_enabled
         self.tu_prototype_path = tu_prototype_path
         self.bbox_tu_topk = tu_topk
@@ -484,6 +707,9 @@ class RTDETRTransformerv2TUE(nn.Module):
             self.register_buffer('valid_mask', valid_mask)
 
         self._reset_parameters()
+
+        if self.tu_prototype_path is not None:
+            self.load_tu_prototypes(self.tu_prototype_path)
 
     @torch.no_grad()
     def load_tu_prototypes(self, path):
@@ -650,7 +876,212 @@ class RTDETRTransformerv2TUE(nn.Module):
         return torch.sqrt(
             torch.mean((signature - mean_diagram) ** 2)
         )
-        
+
+    @torch.no_grad()
+    def _calculate_bbox_tu_batch(
+        self,
+        logits,
+        predicted_boxes,
+        activations,
+        topk,
+    ):
+        """Calculate TU for all queries, or only the top-k by confidence."""
+        if not self.bbox_tu_loaded:
+            raise RuntimeError(
+                "BBox TU is required, but prototypes were not loaded. "
+                "Set tu_prototype_path in the config or call "
+                "load_tu_prototypes(path)."
+            )
+
+        if activations.shape[:2] != logits.shape[:2]:
+            raise ValueError(
+                "TU activation/query shape does not match decoder logits."
+            )
+
+        probabilities = logits.sigmoid()
+        query_scores = probabilities.amax(dim=-1)
+        query_classes = probabilities.argmax(dim=-1)
+
+        predicted_areas = (
+            predicted_boxes[..., 2].clamp_min(0)
+            * predicted_boxes[..., 3].clamp_min(0)
+        )
+        small_max = self.bbox_tu_area_thresholds[0]
+        medium_max = self.bbox_tu_area_thresholds[1]
+        query_sizes = (
+            (predicted_areas >= small_max).long()
+            + (predicted_areas >= medium_max).long()
+        )
+
+        query_count = logits.shape[1]
+        selected_mask = torch.ones(
+            logits.shape[:2],
+            dtype=torch.bool,
+            device=logits.device,
+        )
+        if topk is not None and 0 < int(topk) < query_count:
+            query_indices = query_scores.topk(
+                int(topk),
+                dim=1,
+            ).indices
+            selected_mask.zero_()
+            selected_mask.scatter_(1, query_indices, True)
+
+        bbox_tu = torch.full(
+            logits.shape[:2],
+            float("nan"),
+            dtype=torch.float32,
+            device=logits.device,
+        )
+
+        selected_activations = activations[selected_mask]
+        selected_classes = query_classes[selected_mask]
+        selected_sizes = query_sizes[selected_mask]
+
+        eval_idx = self.decoder.eval_idx
+        weight = self.dec_bbox_head[eval_idx].layers[-1].weight
+        signatures = maximum_spanning_tree_signature_batch(
+            selected_activations,
+            weight,
+            edge_score="abs_wx",
+        )
+
+        # Vectorized class/size -> class -> global prototype fallback.
+        mean_diagrams = self.bbox_tu_global_mean.unsqueeze(0).expand(
+            signatures.shape[0],
+            -1,
+        ).clone()
+
+        class_valid = self.bbox_tu_class_valid[selected_classes]
+        mean_diagrams[class_valid] = self.bbox_tu_class_means[
+            selected_classes[class_valid]
+        ]
+
+        class_size_valid = self.bbox_tu_class_size_valid[
+            selected_classes,
+            selected_sizes,
+        ]
+        mean_diagrams[class_size_valid] = (
+            self.bbox_tu_class_size_means[
+                selected_classes[class_size_valid],
+                selected_sizes[class_size_valid],
+            ]
+        )
+
+        selected_tu = torch.sqrt(
+            torch.mean(
+                (signatures - mean_diagrams) ** 2,
+                dim=-1,
+            )
+        )
+        bbox_tu[selected_mask] = selected_tu
+
+        return bbox_tu
+
+    def _predict_bbox_uncertainty(
+        self,
+        logits,
+        predicted_boxes,
+        decoder_payload,
+        bbox_tu=None,
+    ):
+        """Run the lightweight uncertainty head.
+
+        ``predicted_boxes`` and ``previous_ref_bbox`` use normalized cxcywh.
+        The four returned standard deviations correspond to normalized
+        ``(x1, y1, x2, y2)`` coordinates.
+        """
+        if self.bbox_uncertainty_head is None:
+            raise RuntimeError("BBox uncertainty head is not enabled.")
+        if decoder_payload is None:
+            raise RuntimeError(
+                "Decoder features required by the bbox uncertainty head "
+                "were not collected."
+            )
+
+        decoder_features = decoder_payload["decoder_output"]
+        previous_ref_bbox = decoder_payload["previous_ref_bbox"]
+        if decoder_features.shape[:2] != predicted_boxes.shape[:2]:
+            raise ValueError(
+                "Uncertainty decoder features do not match predicted boxes."
+            )
+        if previous_ref_bbox.shape != predicted_boxes.shape:
+            raise ValueError(
+                "Previous references do not match predicted box shape."
+            )
+
+        probabilities = logits.sigmoid()
+        confidence = probabilities.amax(dim=-1)
+        area = (
+            predicted_boxes[..., 2].clamp_min(self.eps)
+            * predicted_boxes[..., 3].clamp_min(self.eps)
+        )
+        log_area = area.log()
+        abs_refinement = (predicted_boxes - previous_ref_bbox).abs()
+
+        if self.bbox_uncertainty_use_tu:
+            if bbox_tu is None:
+                raise RuntimeError(
+                    "This bbox uncertainty input mode requires bbox TU values."
+                )
+            valid_mask = torch.isfinite(bbox_tu)
+            # log1p reduces scale skew while preserving TU ordering.
+            tu_feature = torch.log1p(
+                torch.nan_to_num(
+                    bbox_tu,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).clamp_min(0)
+            )
+        else:
+            valid_mask = torch.ones_like(confidence, dtype=torch.bool)
+            tu_feature = torch.zeros_like(confidence)
+
+        if self.bbox_uncertainty_input_mode == "tu_only":
+            decoder_features = torch.zeros_like(decoder_features)
+            confidence = torch.zeros_like(confidence)
+            log_area = torch.zeros_like(log_area)
+            abs_refinement = torch.zeros_like(abs_refinement)
+
+        if self.bbox_uncertainty_detach_inputs:
+            decoder_features = decoder_features.detach()
+            confidence = confidence.detach()
+            log_area = log_area.detach()
+            abs_refinement = abs_refinement.detach()
+            tu_feature = tu_feature.detach()
+
+        pred_std = self.bbox_uncertainty_head(
+            decoder_features,
+            tu_feature.to(decoder_features.dtype),
+            confidence.to(decoder_features.dtype),
+            log_area.to(decoder_features.dtype),
+            abs_refinement.to(decoder_features.dtype),
+        )
+        pred_std = torch.where(
+            valid_mask.unsqueeze(-1),
+            pred_std,
+            torch.full_like(pred_std, float("nan")),
+        )
+        return pred_std, valid_mask
+
+    def freeze_detector_for_bbox_uncertainty(self):
+        """Freeze RT-DETR and leave only the uncertainty head trainable."""
+        if self.bbox_uncertainty_head is None:
+            raise RuntimeError(
+                "Enable bbox_uncertainty_enabled before freezing the model."
+            )
+
+        for parameter in self.parameters():
+            parameter.requires_grad_(False)
+        for parameter in self.bbox_uncertainty_head.parameters():
+            parameter.requires_grad_(True)
+
+        # Deterministic detector features; only the small head stays in train
+        # mode. Call this after any outer trainer calls model.train().
+        self.eval()
+        self.bbox_uncertainty_head.train()
+
     def _reset_parameters(self):
         bias = bias_init_with_prob(0.01)
         init.constant_(self.enc_score_head.bias, bias)
@@ -815,9 +1246,17 @@ class RTDETRTransformerv2TUE(nn.Module):
 
 
     def forward(self, feats, targets=None, collect_tu=False):
-        need_tu_activations = (
-            not self.training
-            and (collect_tu or self.tu_enabled)
+        need_bbox_tu = (
+            (self.tu_enabled and not self.training)
+            or (
+                self.bbox_uncertainty_enabled
+                and self.bbox_uncertainty_use_tu
+            )
+        )
+        need_decoder_payload = (
+            collect_tu
+            or need_bbox_tu
+            or self.bbox_uncertainty_enabled
         )
 
         memory, spatial_shapes = self._get_encoder_input(feats)
@@ -864,7 +1303,7 @@ class RTDETRTransformerv2TUE(nn.Module):
             self.dec_score_head,
             self.query_pos_head,
             attn_mask=attn_mask,
-            collect_tu=need_tu_activations,
+            collect_tu=need_decoder_payload,
         )
 
         if self.training and dn_meta is not None:
@@ -878,77 +1317,66 @@ class RTDETRTransformerv2TUE(nn.Module):
                 dn_meta["dn_num_split"],
                 dim=2,
             )
+            if tu_payload is not None:
+                # The decoder payload contains denoising queries first. The
+                # uncertainty head is trained only on the regular queries,
+                # whose Hungarian assignments are produced by the criterion.
+                for key in (
+                    "bbox_last_input",
+                    "decoder_output",
+                    "previous_ref_bbox",
+                ):
+                    _, tu_payload[key] = torch.split(
+                        tu_payload[key],
+                        dn_meta["dn_num_split"],
+                        dim=1,
+                    )
 
         out = {
             "pred_logits": out_logits[-1],
             "pred_boxes": out_bboxes[-1],
         }
 
-        # Calculate bbox TU only during enabled evaluation
-        if self.tu_enabled and not self.training:
-            if not self.bbox_tu_loaded:
-                raise RuntimeError(
-                    "BBox TU is enabled, but prototypes were not loaded."
-                )
-
+        bbox_tu = None
+        if need_bbox_tu:
             if tu_payload is None:
                 raise RuntimeError(
                     "TU activation payload was not collected."
                 )
-
-            logits = out["pred_logits"]
-            activations = tu_payload["bbox_last_input"]
-
-            probabilities = logits.sigmoid()
-            query_scores = probabilities.amax(dim=-1)
-            query_classes = probabilities.argmax(dim=-1)
-
-            predicted_boxes = out["pred_boxes"]  # normalized cxcywh
-
-            predicted_areas = (
-                predicted_boxes[..., 2].clamp_min(0)
-                * predicted_boxes[..., 3].clamp_min(0)
+            tu_topk = (
+                self.bbox_uncertainty_train_tu_topk
+                if (
+                    self.bbox_uncertainty_head is not None
+                    and self.bbox_uncertainty_head.training
+                )
+                else self.bbox_tu_topk
             )
-
-            small_max = self.bbox_tu_area_thresholds[0]
-            medium_max = self.bbox_tu_area_thresholds[1]
-
-            # 0=small, 1=medium, 2=large
-            query_sizes = (
-                (predicted_areas >= small_max).long()
-                + (predicted_areas >= medium_max).long()
+            bbox_tu = self._calculate_bbox_tu_batch(
+                out["pred_logits"],
+                out["pred_boxes"],
+                tu_payload["bbox_last_input"],
+                topk=tu_topk,
             )
-
-            k = min(self.bbox_tu_topk, logits.shape[1])
-            query_indices = query_scores.topk(k, dim=1).indices
-
-            bbox_tu = torch.full(
-                logits.shape[:2],
-                float("nan"),
-                dtype=torch.float32,
-                device=logits.device,
-            )
-
-            for batch_index in range(logits.shape[0]):
-                for query_index_tensor in query_indices[batch_index]:
-                    query_index = query_index_tensor.item()
-                    predicted_class = int(
-                        query_classes[batch_index, query_index].item()
-                    )
-                    predicted_size = int(
-                        query_sizes[batch_index, query_index].item()
-                    )
-
-                    bbox_tu[batch_index, query_index] = self.calculate_bbox_tu(
-                        activations[batch_index, query_index],
-                        predicted_class,
-                        predicted_size,
-                    )
-
             out["bbox_tu"] = bbox_tu
 
+        if self.bbox_uncertainty_enabled:
+            pred_bbox_std, uncertainty_valid = (
+                self._predict_bbox_uncertainty(
+                    out["pred_logits"],
+                    out["pred_boxes"],
+                    tu_payload,
+                    bbox_tu=bbox_tu,
+                )
+            )
+            out["pred_bbox_std"] = pred_bbox_std
+            out["pred_bbox_log_std"] = pred_bbox_std.log()
+            out["bbox_uncertainty_valid"] = uncertainty_valid
+
         if collect_tu and not self.training:
-            out["tu_activations"] = tu_payload
+            out["tu_activations"] = {
+                key: value.detach() if torch.is_tensor(value) else value
+                for key, value in tu_payload.items()
+            }
 
         if self.training and self.aux_loss:
             out["aux_outputs"] = self._set_aux_loss(
@@ -980,3 +1408,4 @@ class RTDETRTransformerv2TUE(nn.Module):
         # as a dict having both a Tensor and a list.
         return [{'pred_logits': a, 'pred_boxes': b}
                 for a, b in zip(outputs_class, outputs_coord)]
+

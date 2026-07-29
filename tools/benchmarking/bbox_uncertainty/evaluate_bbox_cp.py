@@ -40,9 +40,11 @@ import torch
 from torch import Tensor, nn
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+REPO_ROOT = Path(__file__).resolve().parents[3]
+TOOLS_DIR = REPO_ROOT / "tools"
+for _path in (REPO_ROOT, TOOLS_DIR):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 try:
     from src.core import YAMLConfig

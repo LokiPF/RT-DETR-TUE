@@ -6,3 +6,4 @@ tensorboard
 scipy
 supervisely
 tqdm
+scikit-learn

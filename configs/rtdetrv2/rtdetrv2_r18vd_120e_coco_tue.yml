@@ -23,3 +23,16 @@ RTDETRTransformerv2TUE:
   num_points: [4, 4, 4]
   cross_attn_method: default
   query_select_method: default
+
+  tu_prototype_path: output/tu/bbox_prototypes.pth
+  tu_topk: 50
+
+  bbox_uncertainty_enabled: True
+  bbox_uncertainty_input_mode: all
+  bbox_uncertainty_hidden_dim: 64
+  bbox_uncertainty_num_layers: 2
+  bbox_uncertainty_min_std: 0.0001
+  bbox_uncertainty_max_std: 1.0
+  bbox_uncertainty_initial_std: 0.05
+  bbox_uncertainty_detach_inputs: True
+  bbox_uncertainty_train_tu_topk: 0

@@ -21,7 +21,26 @@ class DetSolver(BaseSolver):
         print("Start training")
         self.train()
         args = self.cfg
+        raw_model = (
+            self.model.module
+            if hasattr(self.model, "module")
+            else self.model
+        )
 
+        # Freeze the entire detector.
+        for parameter in raw_model.parameters():
+            parameter.requires_grad_(False)
+
+        # Enable only the uncertainty head.
+        head = raw_model.decoder.bbox_uncertainty_head
+        for parameter in head.parameters():
+            parameter.requires_grad_(True)
+
+        raw_model.eval()
+        head.train()
+        for name, parameter in raw_model.named_parameters():
+            if parameter.requires_grad:
+                print(name, parameter.numel())
         n_parameters = sum([p.numel() for p in self.model.parameters() if p.requires_grad])
         print(f'number of trainable parameters: {n_parameters}')
 
@@ -143,7 +162,7 @@ class DetSolver(BaseSolver):
         return
 
     def _strip_state_dict(self, state_dict):
-        if not self.cfg.yaml_cfg['save_optimizer'] and "optimizer" in state_dict:
+        if not self.cfg.yaml_cfg.get('save_optimizer', True) and "optimizer" in state_dict:
             state_dict.pop("optimizer")
-        if not self.cfg.yaml_cfg['save_ema'] and "ema" in state_dict:
+        if not self.cfg.yaml_cfg.get('save_ema', True) and "ema" in state_dict:
             state_dict.pop("model")  # keep ema as a model
