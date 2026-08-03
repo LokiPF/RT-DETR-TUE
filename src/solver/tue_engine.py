@@ -17,7 +17,6 @@ import torch.amp
 from torch.utils.tensorboard import SummaryWriter
 from torch.cuda.amp.grad_scaler import GradScaler
 
-from ..misc.tue_utils import get_captured_persistence_diagrams, LayerClassBuckets
 from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from supervisely.nn.training import train_logger
@@ -33,91 +32,9 @@ from torch import Tensor, nn
 
 from ..misc.tue_utils import (
     LayerClassBuckets,
-    get_captured_persistence_diagrams,
+    get_captured_persistence_diagrams, hook_decoder_layers,
 )
 from ..misc import MetricLogger, SmoothedValue
-
-
-def hook_decoder_layers(
-    transformer: nn.Module,
-    decoder_layers: int | Iterable[int] | None = None,
-) -> tuple[
-    dict[int, dict[str, Tensor]],
-    list[torch.utils.hooks.RemovableHandle],
-    list[int],
-]:
-    """
-    Capture the input to each selected decoder classification head.
-
-    Decoder-layer outputs are captured because intermediate classification
-    heads are not normally executed during evaluation.
-    """
-    decoder = transformer.decoder
-    heads = transformer.dec_score_head
-    num_layers = len(decoder.layers)
-
-    if decoder_layers is None:
-        requested_layers = list(range(num_layers))
-    elif isinstance(decoder_layers, int):
-        requested_layers = [decoder_layers]
-    else:
-        requested_layers = list(decoder_layers)
-
-    normalized_layers: list[int] = []
-
-    for layer_id in requested_layers:
-        if not -num_layers <= layer_id < num_layers:
-            raise IndexError(f"Invalid decoder layer: {layer_id}")
-
-        layer_id = layer_id % num_layers
-
-        if layer_id not in normalized_layers:
-            normalized_layers.append(layer_id)
-
-    captures: dict[int, dict[str, Tensor]] = {}
-    handles: list[torch.utils.hooks.RemovableHandle] = []
-
-    for layer_id in normalized_layers:
-        decoder_layer = decoder.layers[layer_id]
-        classification_head = heads[layer_id]
-
-        def make_hook(
-            index: int,
-            head: nn.Linear,
-        ):
-            def hook(
-                module: nn.Module,
-                inputs: tuple[Tensor, ...],
-                output: Tensor,
-            ) -> None:
-                features = output.detach()
-                weight = head.weight.detach()
-                bias = (
-                    head.bias.detach()
-                    if head.bias is not None
-                    else None
-                )
-
-                captures[index] = {
-                    "input": features,
-                    "weight": weight,
-                    "logits": F.linear(
-                        features,
-                        weight,
-                        bias,
-                    ).detach(),
-                }
-
-            return hook
-
-        handle = decoder_layer.register_forward_hook(
-            make_hook(layer_id, classification_head)
-        )
-
-        handles.append(handle)
-
-    return captures, handles, normalized_layers
-
 
 @torch.inference_mode()
 def collect_persistence_one_epoch(
@@ -181,7 +98,7 @@ def collect_persistence_one_epoch(
             captures.clear()
             samples = samples.to(device)
 
-            outputs = model(samples)
+            outputs = model(samples, build_frechet_mean=True)
 
             # [B, num_queries, num_classes]
             probabilities = outputs["pred_logits"].sigmoid()
@@ -235,14 +152,14 @@ def collect_persistence_one_epoch(
                                 query_id,
                             ].item()
                         )
-                        start_time = time.perf_counter()
+                        #start_time = time.perf_counter()
                         buckets.update(
                             diagram=diagram,
                             layer_id=layer_id,
                             class_id=class_id,
                         )
-                        end_time = time.perf_counter()
-                        elapsed_times = np.append(elapsed_times, end_time-start_time)
+                        # end_time = time.perf_counter()
+                        #elapsed_times = np.append(elapsed_times, end_time-start_time)
 
             global_step = epoch * len(data_loader) + step
 

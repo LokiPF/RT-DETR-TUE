@@ -1,12 +1,109 @@
 from __future__ import annotations
 
-import torch
-from torch import Tensor
+from typing import Iterable
 
+import torch
+from torch import Tensor, nn
+import torch.nn.functional as F
 
 # The graph structure is identical for every query with the same dimensions.
 _EDGE_INDEX_CACHE: dict[tuple[int, int], Tensor] = {}
 
+def hook_decoder_layers(
+    transformer: nn.Module,
+    decoder_layers: int | Iterable[int] | None = None,
+) -> tuple[
+    dict[int, dict[str, Tensor]],
+    list[torch.utils.hooks.RemovableHandle],
+    list[int],
+]:
+    """
+    Capture the input to each selected decoder classification head.
+
+    Decoder-layer outputs are captured because intermediate classification
+    heads are not normally executed during evaluation.
+    """
+    decoder = transformer.decoder
+    heads = transformer.dec_score_head
+    num_layers = len(decoder.layers)
+
+    if decoder_layers is None:
+        requested_layers = list(range(num_layers))
+    elif isinstance(decoder_layers, int):
+        requested_layers = [decoder_layers]
+    else:
+        requested_layers = list(decoder_layers)
+
+    normalized_layers: list[int] = []
+
+    for layer_id in requested_layers:
+        if not -num_layers <= layer_id < num_layers:
+            raise IndexError(f"Invalid decoder layer: {layer_id}")
+
+        layer_id = layer_id % num_layers
+
+        if layer_id not in normalized_layers:
+            normalized_layers.append(layer_id)
+
+    captures: dict[int, dict[str, Tensor]] = {}
+    handles: list[torch.utils.hooks.RemovableHandle] = []
+
+    for layer_id in normalized_layers:
+        decoder_layer = decoder.layers[layer_id]
+        classification_head = heads[layer_id]
+
+        def make_hook(
+            index: int,
+            head: nn.Linear,
+        ):
+            def hook(
+                module: nn.Module,
+                inputs: tuple[Tensor, ...],
+                output: Tensor,
+            ) -> None:
+                features = output.detach()
+                weight = head.weight.detach()
+                bias = (
+                    head.bias.detach()
+                    if head.bias is not None
+                    else None
+                )
+
+                captures[index] = {
+                    "input": features,
+                    "weight": weight,
+                    "logits": F.linear(
+                        features,
+                        weight,
+                        bias,
+                    ).detach(),
+                }
+
+            return hook
+
+        handle = decoder_layer.register_forward_hook(
+            make_hook(layer_id, classification_head)
+        )
+
+        handles.append(handle)
+
+    return captures, handles, normalized_layers
+
+def diagram_distance(diagram: Tensor, reference: Tensor) -> Tensor:
+    """Compute the paper's distance between two 1-D diagrams."""
+    diagram = torch.sort(
+        diagram.detach().cpu().float().flatten(),
+        descending=True,
+    ).values
+    reference = reference.detach().cpu().float().flatten()
+
+    if diagram.shape != reference.shape:
+        raise ValueError(
+            "Diagram/reference shape mismatch: "
+            f"{tuple(diagram.shape)} versus {tuple(reference.shape)}"
+        )
+
+    return torch.sqrt(torch.mean((diagram - reference) ** 2))
 
 def _get_bipartite_edge_index(
     num_inputs: int,
@@ -156,6 +253,222 @@ def get_maximum_spanning_tree(
         weights_cpu.index_select(0, selected_indices),
     )
 
+@torch.no_grad()
+def _batched_prim(
+    weight_matrix: Tensor,
+    layer_inputs: Tensor,
+) -> Tensor:
+    """
+    Compute maximum-spanning-tree weights for multiple queries.
+
+    Args:
+        weight_matrix: [C, H]
+        layer_inputs:  [K, H]
+
+    Returns:
+        Sorted MST weights: [K, H + C - 1]
+    """
+    if weight_matrix.ndim != 2:
+        raise ValueError("weight_matrix must have shape [C, H]")
+
+    if layer_inputs.ndim != 2:
+        raise ValueError("layer_inputs must have shape [K, H]")
+
+    device = layer_inputs.device
+
+    weight_matrix = weight_matrix.detach().to(
+        device=device,
+        dtype=torch.float32,
+    )
+    layer_inputs = layer_inputs.detach().to(
+        device=device,
+        dtype=torch.float32,
+    )
+
+    num_queries = layer_inputs.shape[0]
+    num_outputs, num_inputs = weight_matrix.shape
+
+    if layer_inputs.shape[1] != num_inputs:
+        raise ValueError("Input dimensions do not match")
+
+    if num_queries == 0:
+        return torch.empty(
+            (0, num_inputs + num_outputs - 1),
+            device=device,
+        )
+
+    # [K, C, H]
+    edge_weights = torch.abs(
+        layer_inputs[:, None, :]
+        * weight_matrix[None, :, :]
+    )
+
+    selected_inputs = torch.zeros(
+        (num_queries, num_inputs),
+        dtype=torch.bool,
+        device=device,
+    )
+    selected_outputs = torch.zeros(
+        (num_queries, num_outputs),
+        dtype=torch.bool,
+        device=device,
+    )
+
+    # Start each tree from input vertex zero.
+    selected_inputs[:, 0] = True
+
+    best_input_weights = torch.full(
+        (num_queries, num_inputs),
+        -torch.inf,
+        device=device,
+    )
+
+    # Every output can initially connect to input zero.
+    best_output_weights = edge_weights[:, :, 0].clone()
+
+    mst_weights = torch.empty(
+        (
+            num_queries,
+            num_inputs + num_outputs - 1,
+        ),
+        dtype=edge_weights.dtype,
+        device=device,
+    )
+
+    for step in range(num_inputs + num_outputs - 1):
+        input_candidates = best_input_weights.masked_fill(
+            selected_inputs,
+            -torch.inf,
+        )
+        output_candidates = best_output_weights.masked_fill(
+            selected_outputs,
+            -torch.inf,
+        )
+
+        candidates = torch.cat(
+            [input_candidates, output_candidates],
+            dim=1,
+        )
+
+        selected_weight, selected_vertex = candidates.max(dim=1)
+        mst_weights[:, step] = selected_weight
+
+        is_input = selected_vertex < num_inputs
+
+        input_index = selected_vertex.clamp(
+            max=num_inputs - 1
+        )
+        output_index = (
+            selected_vertex - num_inputs
+        ).clamp(
+            min=0,
+            max=num_outputs - 1,
+        )
+
+        # Mark selected input vertices without affecting batches
+        # that selected an output vertex.
+        previous_input_state = selected_inputs.gather(
+            1,
+            input_index[:, None],
+        )
+        selected_inputs.scatter_(
+            1,
+            input_index[:, None],
+            previous_input_state | is_input[:, None],
+        )
+
+        previous_output_state = selected_outputs.gather(
+            1,
+            output_index[:, None],
+        )
+        selected_outputs.scatter_(
+            1,
+            output_index[:, None],
+            previous_output_state | (~is_input)[:, None],
+        )
+
+        # If an input was selected, update connections to outputs.
+        new_output_weights = edge_weights.gather(
+            2,
+            input_index[:, None, None].expand(
+                -1,
+                num_outputs,
+                1,
+            ),
+        ).squeeze(2)
+
+        best_output_weights = torch.where(
+            is_input[:, None],
+            torch.maximum(
+                best_output_weights,
+                new_output_weights,
+            ),
+            best_output_weights,
+        )
+
+        # If an output was selected, update connections to inputs.
+        new_input_weights = edge_weights.gather(
+            1,
+            output_index[:, None, None].expand(
+                -1,
+                1,
+                num_inputs,
+            ),
+        ).squeeze(1)
+
+        best_input_weights = torch.where(
+            (~is_input)[:, None],
+            torch.maximum(
+                best_input_weights,
+                new_input_weights,
+            ),
+            best_input_weights,
+        )
+
+    return torch.sort(
+        mst_weights,
+        dim=1,
+        descending=True,
+    ).values
+
+@torch.no_grad()
+def get_persistence_diagrams_batched(
+    weight_matrix: Tensor,
+    layer_inputs: Tensor,
+    chunk_size: int = 64,
+) -> Tensor:
+    """
+    Args:
+        weight_matrix: [C, H]
+        layer_inputs:  [K, H]
+
+    Returns:
+        diagrams: [K, H + C - 1]
+    """
+    if layer_inputs.shape[0] == 0:
+        diagram_size = (
+            weight_matrix.shape[0]
+            + weight_matrix.shape[1]
+            - 1
+        )
+
+        return torch.empty(
+            (0, diagram_size),
+            device=layer_inputs.device,
+        )
+
+    chunks = [
+        _batched_prim(
+            weight_matrix,
+            input_chunk,
+        )
+        for input_chunk in layer_inputs.split(
+            chunk_size,
+            dim=0,
+        )
+    ]
+
+    return torch.cat(chunks, dim=0)
 
 @torch.no_grad()
 def get_persistence_diagram(
@@ -190,74 +503,68 @@ def get_captured_persistence_diagrams(
     captures: dict[int, dict[str, Tensor]],
     query_indices: list[Tensor],
     decoder_layer_indices: int | list[int] | None = None,
+    chunk_size: int = 64,
 ) -> dict[int, list[dict[int, Tensor]]]:
-    """
-    Compute diagrams for selected queries at selected decoder layers.
-
-    Returns:
-        {
-            layer_id: [
-                {query_id: diagram, ...},  # batch item 0
-                {query_id: diagram, ...},  # batch item 1
-            ]
-        }
-    """
     if decoder_layer_indices is None:
         decoder_layer_indices = sorted(captures)
     elif isinstance(decoder_layer_indices, int):
         decoder_layer_indices = [decoder_layer_indices]
 
-    results: dict[int, list[dict[int, Tensor]]] = {}
+    results = {}
 
     for layer_id in decoder_layer_indices:
-        if layer_id not in captures:
-            raise KeyError(
-                f"Decoder layer {layer_id} was not captured"
-            )
-
         capture = captures[layer_id]
-
         layer_inputs = capture["input"]
-        weight_matrix = capture["weight"].detach().cpu()
+        weight_matrix = capture["weight"]
 
-        if len(query_indices) != layer_inputs.shape[0]:
-            raise ValueError(
-                "query_indices must contain one tensor per batch item"
-            )
+        batch_results = [
+            {} for _ in range(layer_inputs.shape[0])
+        ]
 
-        batch_results: list[dict[int, Tensor]] = []
+        selected_inputs = []
+        locations: list[tuple[int, int]] = []
 
         for batch_id, indices in enumerate(query_indices):
             query_ids = indices.detach().to(
-                device="cpu",
+                device=layer_inputs.device,
                 dtype=torch.long,
             )
 
             if query_ids.numel() == 0:
-                batch_results.append({})
                 continue
 
-            if query_ids.min() < 0 or query_ids.max() >= layer_inputs.shape[1]:
-                raise IndexError("Query index is out of range")
-
-            # Transfer only selected query features to the CPU.
-            selected_inputs = layer_inputs[batch_id].index_select(
-                0,
-                query_ids.to(layer_inputs.device),
-            ).detach().cpu()
-
-            image_results: dict[int, Tensor] = {}
-
-            for query_id, layer_input in zip(
-                query_ids.tolist(),
-                selected_inputs,
-            ):
-                image_results[query_id] = get_persistence_diagram(
-                    weight_matrix=weight_matrix,
-                    layer_input=layer_input,
+            selected_inputs.append(
+                layer_inputs[batch_id].index_select(
+                    0,
+                    query_ids,
                 )
+            )
 
-            batch_results.append(image_results)
+            locations.extend(
+                (batch_id, query_id)
+                for query_id in query_ids.cpu().tolist()
+            )
+
+        if selected_inputs:
+            flat_inputs = torch.cat(
+                selected_inputs,
+                dim=0,
+            )
+
+            flat_diagrams = get_persistence_diagrams_batched(
+                weight_matrix=weight_matrix,
+                layer_inputs=flat_inputs,
+                chunk_size=chunk_size,
+            ).cpu()
+
+            # This loop only reconstructs the output structure;
+            # the expensive MST work is already batched.
+            for location, diagram in zip(
+                locations,
+                flat_diagrams,
+            ):
+                batch_id, query_id = location
+                batch_results[batch_id][query_id] = diagram
 
         results[layer_id] = batch_results
 

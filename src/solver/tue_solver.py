@@ -19,12 +19,13 @@ class TUESolver(BaseSolver):
 
     def fit(self):
         print("Starting persistence analysis")
+        self.train() # this is necessary to load the train dataloader
         self.eval()
 
         args = self.cfg
         start_time = time.time()
 
-        data_loader = self.val_dataloader
+        data_loader = self.train_dataloader
 
         # Makes distributed sampling deterministic.
         if hasattr(data_loader, "set_epoch"):
