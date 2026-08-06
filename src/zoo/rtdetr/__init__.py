@@ -15,3 +15,4 @@ from .rtdetrv2_criterion import RTDETRCriterionv2
 
 # uncertaity estimation
 from .tue_rtdetrv2_decoder import TUERTDETRTransformerv2
+from .tue_rtdetr import TUERTDETR
