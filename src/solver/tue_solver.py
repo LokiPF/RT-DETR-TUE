@@ -47,6 +47,7 @@ class TUESolver(BaseSolver):
 
         buckets, persistence_stats = collect_persistence_one_epoch(
             model=model,
+            matcher=self.criterion.matcher,
             data_loader=data_loader,
             device=self.device,
             epoch=0,

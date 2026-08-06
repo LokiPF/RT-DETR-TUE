@@ -5,6 +5,7 @@ from collections.abc import Iterable
 import torch
 import torch.nn as nn
 from torch import Tensor
+import torch.nn.functional as F
 
 from ...core import register
 from ...misc.tue_utils import (
@@ -14,6 +15,15 @@ from ...misc.tue_utils import (
 
 __all__ = ["TUERTDETR"]
 
+class UncTemp(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a = nn.Parameter(torch.zeros(1))
+        self.b = nn.Parameter(torch.zeros(1))
+
+    def forward(self, logit, unc):
+        T = F.softplus(self.a * unc + self.b) + 1e-3
+        return logit / T.unsqueeze(-1)
 
 @torch.no_grad()
 def diagram_distance(
@@ -81,6 +91,7 @@ class TUERTDETR(nn.Module):
         self.backbone = backbone
         self.encoder = encoder
         self.decoder = decoder
+        self.unc_temp = UncTemp()
 
         persistence_state = torch.load(
             frechet_means,
@@ -168,11 +179,11 @@ class TUERTDETR(nn.Module):
         x: Tensor,
         targets=None,
     ) -> dict[str, Tensor]:
-        if self.training:
-            raise RuntimeError(
-                "TUERTDETR persistence scoring must run in eval mode. "
-                "Call model.eval() before inference."
-            )
+        # if self.training:
+        #     raise RuntimeError(
+        #         "TUERTDETR persistence scoring must run in eval mode. "
+        #         "Call model.eval() before inference."
+        #     )
 
         features = self.backbone(x)
         features = self.encoder(features)
@@ -312,6 +323,23 @@ class TUERTDETR(nn.Module):
         outputs["tue_uncertainty"] = torch.nanmean(
             distances.to(output_device),
             dim=-1,
+        )
+
+        logits, unc = outputs['pred_logits'], outputs['tue_uncertainty']
+
+        # unc is NaN wherever no query passed the confidence threshold (or
+        # had no Frechet reference), which is most queries. Only rescale
+        # logits where the uncertainty signal is actually defined; leave
+        # the rest untouched so NaNs don't reach the matcher/loss.
+        has_uncertainty = ~torch.isnan(unc)
+        calibrated_logits = self.unc_temp(
+            logits,
+            torch.nan_to_num(unc, nan=0.0),
+        )
+        outputs['pred_logits'] = torch.where(
+            has_uncertainty.unsqueeze(-1),
+            calibrated_logits,
+            logits,
         )
 
         return outputs

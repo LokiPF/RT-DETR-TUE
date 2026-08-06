@@ -22,6 +22,11 @@ class DetSolver(BaseSolver):
         self.train()
         args = self.cfg
 
+        print("Freezing RT-DETR weights. Only training UncTemp head")
+        for name, param in self.model.named_parameters():
+            if 'unc_temp' not in name:
+                param.requires_grad = False
+
         n_parameters = sum([p.numel() for p in self.model.parameters() if p.requires_grad])
         print(f'number of trainable parameters: {n_parameters}')
 

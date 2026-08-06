@@ -13,7 +13,16 @@ RTDETR:
   backbone: PResNet
   encoder: HybridEncoder
   decoder: RTDETRTransformerv2
-  
+
+TUERTDETR:
+  backbone: PResNet
+  encoder: HybridEncoder
+  decoder: TUERTDETRTransformerv2
+  frechet_means: output/rtdetrv2_r18vd_120e_coco_tue/calibrated_frechet_means.pth # output/rtdetrv2_r18vd_120e_coco_tue/frechet_means.pth
+  decoder_layers: null
+  tue_confidence_threshold: 0.5
+#  tue_normalization: none #robust_z
+#  tue_calibration: class_conformal
 
 PResNet:
   depth: 50
