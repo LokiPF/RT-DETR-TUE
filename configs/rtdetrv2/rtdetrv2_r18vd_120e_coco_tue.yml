@@ -66,3 +66,6 @@ train_dataloader:
   collate_fn:
     scales: ~
   total_batch_size: 16
+
+val_dataloader:
+  total_batch_size: 64
