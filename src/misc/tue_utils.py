@@ -12,19 +12,55 @@ _EDGE_INDEX_CACHE: dict[tuple[int, int], Tensor] = {}
 def hook_decoder_layers(
     transformer: nn.Module,
     decoder_layers: int | Iterable[int] | None = None,
+    head_task: str = "score",
+    bbox_head_layer: int = -1,
 ) -> tuple[
     dict[int, dict[str, Tensor]],
     list[torch.utils.hooks.RemovableHandle],
     list[int],
 ]:
     """
-    Capture the input to each selected decoder classification head.
+    Capture a linear prediction layer for each selected decoder layer.
 
-    Decoder-layer outputs are captured because intermediate classification
-    heads are not normally executed during evaluation.
+    For the score task, decoder-layer outputs are captured and the
+    corresponding score projection is reconstructed because intermediate
+    score heads are not normally executed during evaluation.
+
+    For the bbox task, the selected linear layer inside each bbox MLP is
+    hooked directly. Bbox heads are executed during evaluation because their
+    predictions refine the reference points used by the next decoder layer.
+    The corresponding score logits are also reconstructed so bbox diagrams
+    can still be compared with class-conditioned reference means.
+
+    Args:
+        transformer:
+            RT-DETR transformer containing ``decoder``, ``dec_score_head``,
+            and ``dec_bbox_head``.
+
+        decoder_layers:
+            Decoder layers to capture. Negative indices are supported.
+
+        head_task:
+            Either ``"score"`` or ``"bbox"``.
+
+        bbox_head_layer:
+            Linear layer within each bbox MLP to capture. Negative indices
+            are supported. The default, ``-1``, captures the final layer that
+            produces the four box deltas. This argument is used only when
+            ``head_task="bbox"``.
+
+    Notes:
+        The persistence-diagram utilities operate on one linear layer at a
+        time. To analyse multiple bbox MLP layers, call this function once per
+        ``bbox_head_layer`` and keep separate reference means for each layer.
     """
     decoder = transformer.decoder
-    heads = transformer.dec_score_head
+    if head_task == "score":
+        heads = transformer.dec_score_head
+    elif head_task == "bbox":
+        heads = transformer.dec_bbox_head
+    else:
+        raise ValueError(f"Invalid head task: {head_task}")
     num_layers = len(decoder.layers)
 
     if decoder_layers is None:
@@ -49,41 +85,142 @@ def hook_decoder_layers(
     handles: list[torch.utils.hooks.RemovableHandle] = []
 
     for layer_id in normalized_layers:
-        decoder_layer = decoder.layers[layer_id]
-        classification_head = heads[layer_id]
+        if head_task == "score":
+            decoder_layer = decoder.layers[layer_id]
+            score_head = heads[layer_id]
 
-        def make_hook(
-            index: int,
-            head: nn.Linear,
-        ):
-            def hook(
-                module: nn.Module,
-                inputs: tuple[Tensor, ...],
-                output: Tensor,
-            ) -> None:
-                features = output.detach()
-                weight = head.weight.detach()
-                bias = (
-                    head.bias.detach()
-                    if head.bias is not None
-                    else None
+            if not isinstance(score_head, nn.Linear):
+                raise TypeError(
+                    "Expected every score head to be nn.Linear, "
+                    f"got {type(score_head).__name__} at decoder layer "
+                    f"{layer_id}"
                 )
 
-                captures[index] = {
-                    "input": features,
-                    "weight": weight,
-                    "logits": F.linear(
+            def make_score_hook(
+                index: int,
+                head: nn.Linear,
+            ):
+                def hook(
+                    module: nn.Module,
+                    inputs: tuple[Tensor, ...],
+                    output: Tensor,
+                ) -> None:
+                    features = output.detach()
+                    weight = head.weight.detach()
+                    bias = (
+                        head.bias.detach()
+                        if head.bias is not None
+                        else None
+                    )
+                    head_output = F.linear(
                         features,
                         weight,
                         bias,
-                    ).detach(),
-                }
+                    ).detach()
 
-            return hook
+                    captures[index] = {
+                        "input": features,
+                        "weight": weight,
+                        "output": head_output,
+                        # Kept for compatibility with classification code.
+                        "logits": head_output,
+                    }
 
-        handle = decoder_layer.register_forward_hook(
-            make_hook(layer_id, classification_head)
-        )
+                return hook
+
+            handle = decoder_layer.register_forward_hook(
+                make_score_hook(layer_id, score_head)
+            )
+        else:
+            bbox_head = heads[layer_id]
+            bbox_layers = getattr(bbox_head, "layers", None)
+
+            if bbox_layers is None:
+                raise TypeError(
+                    "Expected every bbox head to expose its linear layers "
+                    f"through '.layers', got {type(bbox_head).__name__} at "
+                    f"decoder layer {layer_id}"
+                )
+
+            num_bbox_layers = len(bbox_layers)
+            if not -num_bbox_layers <= bbox_head_layer < num_bbox_layers:
+                raise IndexError(
+                    f"Invalid bbox head layer {bbox_head_layer} for decoder "
+                    f"layer {layer_id}; expected an index in "
+                    f"[-{num_bbox_layers}, {num_bbox_layers - 1}]"
+                )
+
+            bbox_layer_id = bbox_head_layer % num_bbox_layers
+            bbox_linear = bbox_layers[bbox_layer_id]
+
+            if not isinstance(bbox_linear, nn.Linear):
+                raise TypeError(
+                    "Expected the selected bbox head layer to be nn.Linear, "
+                    f"got {type(bbox_linear).__name__} at decoder layer "
+                    f"{layer_id}, bbox head layer {bbox_layer_id}"
+                )
+
+            score_head = transformer.dec_score_head[layer_id]
+            if not isinstance(score_head, nn.Linear):
+                raise TypeError(
+                    "Expected every score head to be nn.Linear, "
+                    f"got {type(score_head).__name__} at decoder layer "
+                    f"{layer_id}"
+                )
+
+            def make_bbox_score_hook(
+                index: int,
+                head: nn.Linear,
+            ):
+                def hook(
+                    module: nn.Module,
+                    inputs: tuple[Tensor, ...],
+                    output: Tensor,
+                ) -> None:
+                    captures.setdefault(index, {})["logits"] = F.linear(
+                        output.detach(),
+                        head.weight.detach(),
+                        (
+                            head.bias.detach()
+                            if head.bias is not None
+                            else None
+                        ),
+                    ).detach()
+
+                return hook
+
+            # Preserve class conditioning without treating the four bbox
+            # coordinates as class logits.
+            score_handle = decoder.layers[layer_id].register_forward_hook(
+                make_bbox_score_hook(layer_id, score_head)
+            )
+            handles.append(score_handle)
+
+            def make_bbox_hook(index: int):
+                def hook(
+                    module: nn.Module,
+                    inputs: tuple[Tensor, ...],
+                    output: Tensor,
+                ) -> None:
+                    if not inputs or not isinstance(inputs[0], Tensor):
+                        raise TypeError(
+                            "Expected the bbox linear layer's first input "
+                            "to be a Tensor"
+                        )
+
+                    captures.setdefault(index, {}).update(
+                        input=inputs[0].detach(),
+                        weight=module.weight.detach(),
+                        output=output.detach(),
+                    )
+
+                return hook
+
+            # Unlike intermediate score heads, bbox heads really execute at
+            # evaluation time, so capture the selected MLP layer directly.
+            handle = bbox_linear.register_forward_hook(
+                make_bbox_hook(layer_id)
+            )
 
         handles.append(handle)
 

@@ -1,12 +1,12 @@
 __include__: [
-  '../dataset/coco_detection_home.yml',
+  '../dataset/construction_detection_home.yml',
   '../runtime.yml',
   './include/dataloader.yml',
   './include/optimizer.yml',
   './include/rtdetrv2_r50vd.yml',
 ]
 
-task: detection
+task: tu_estimation
 model: TUERTDETR
 
 # tu_estimation (TUESolver.fit) collects persistence diagrams to build
@@ -20,6 +20,14 @@ RTDETR:
 
 output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue
 
+TUERTDETR:
+  backbone: PResNet
+  encoder: HybridEncoder
+  decoder: TUERTDETRTransformerv2
+  frechet_means: output/construction_uncertainty/frechet_means.pth # output/rtdetrv2_r18vd_120e_coco_tue/frechet_means.pth
+  decoder_layers: null
+  tue_confidence_threshold: 0.15
+  tue_topk: 1
 
 PResNet:
   depth: 18

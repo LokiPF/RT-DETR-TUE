@@ -36,25 +36,85 @@ from ..misc.tue_utils import (
 )
 from ..misc import MetricLogger, SmoothedValue
 
+def _update_buckets(diagrams, captures, matched_labels, buckets):
+    for layer_id, batch_diagrams in diagrams.items():
+        layer_classes = captures[layer_id][
+            "logits"
+        ].argmax(dim=-1)
+
+        for batch_id, query_diagrams in enumerate(
+                batch_diagrams
+        ):
+            for query_id, diagram in query_diagrams.items():
+                gt_label = int(
+                    matched_labels[batch_id, query_id].item()
+                )
+
+                # Skip queries the matcher did not assign to any
+                # ground-truth object -- a confident but unmatched
+                # query is likely a false positive/duplicate.
+                if gt_label < 0:
+                    continue
+
+                class_id = int(
+                    layer_classes[
+                        batch_id,
+                        query_id,
+                    ].item()
+                )
+
+                # Skip queries whose predicted class at this layer
+                # disagrees with the matched ground truth -- a
+                # confidently wrong prediction should not
+                # contribute to that class's Frechet mean.
+                if class_id != gt_label:
+                    continue
+
+                # start_time = time.perf_counter()
+                buckets.update(
+                    diagram=diagram,
+                    layer_id=layer_id,
+                    class_id=class_id,
+                )
+                # end_time = time.perf_counter()
+                # elapsed_times = np.append(elapsed_times, end_time-start_time)
+
 @torch.inference_mode()
 def collect_persistence_one_epoch(
     model: nn.Module,
+    matcher: nn.Module,
     data_loader: Iterable,
     device: torch.device,
     epoch: int,
     confidence_threshold: float = 0.8,
     decoder_layers: int | Iterable[int] | None = None,
     print_freq: int = 10,
-) -> tuple[LayerClassBuckets, dict]:
+    data_fraction: float = 1.0,
+) -> tuple[LayerClassBuckets, dict, dict]:
     """
     Collect persistence diagrams for one pass over a dataset.
 
     This is an analysis function; it does not train the model.
+
+    A query only contributes to a class's Frechet mean if it both passes
+    the confidence threshold AND is matched to a ground-truth object of
+    that class by ``matcher`` (the same Hungarian matcher used for the
+    detection loss). Confidence alone does not imply correctness, so
+    unmatched or misclassified queries -- however confident -- are
+    excluded to avoid contaminating the reference diagrams.
     """
     if not 0.0 <= confidence_threshold <= 1.0:
         raise ValueError(
             "confidence_threshold must be between zero and one"
         )
+
+    if not 0.0 < data_fraction <= 1.0:
+        raise ValueError("data_fraction must be in the interval (0, 1]")
+
+    num_batches = max(
+        1,
+        math.ceil(len(data_loader) * data_fraction),
+    )
 
     metric_logger = MetricLogger(delimiter="  ")
     metric_logger.add_meter(
@@ -66,15 +126,40 @@ def collect_persistence_one_epoch(
 
     transformer = model.decoder
 
-    buckets = LayerClassBuckets(
+    buckets_score = LayerClassBuckets(
         num_layers=len(transformer.dec_score_head),
         num_classes=transformer.num_classes,
     )
 
-    captures, handles, selected_layers = hook_decoder_layers(
+    num_bbox_layers = len(transformer.dec_bbox_head[0].layers)
+
+    buckets_bbox = {
+        bbox_layer_id: LayerClassBuckets(
+            num_layers=len(transformer.dec_bbox_head),
+            num_classes=transformer.num_classes,
+        )
+        for bbox_layer_id in range(num_bbox_layers)
+    }
+    captures_score, handles_score, selected_layers_score = hook_decoder_layers(
         transformer=transformer,
         decoder_layers=decoder_layers,
+        head_task='score'
     )
+
+    captures_bbox = {}
+    selected_layers_bbox = {}
+    handles_bbox = []
+
+    for bbox_layer_id in range(num_bbox_layers):
+        captures, handles, selected = hook_decoder_layers(
+            transformer=transformer,
+            decoder_layers=decoder_layers,
+            head_task="bbox",
+            bbox_head_layer=bbox_layer_id,
+        )
+        captures_bbox[bbox_layer_id] = captures
+        selected_layers_bbox[bbox_layer_id] = selected
+        handles_bbox.extend(handles)
 
     previous_training_mode = model.training
     model.eval()
@@ -88,17 +173,27 @@ def collect_persistence_one_epoch(
     elapsed_times = np.array([])
 
     try:
-        for step, (samples, _) in enumerate(
+        for step, (samples, targets) in enumerate(
             metric_logger.log_every(
                 data_loader,
                 print_freq,
                 header,
             )
         ):
-            captures.clear()
-            samples = samples.to(device)
+            if step >= num_batches:
+                break
 
-            outputs = model(samples, build_frechet_mean=True)
+            captures_score.clear()
+            for captures in captures_bbox.values():
+                captures.clear()
+            samples = samples.to(device)
+            targets = [
+                {k: v.to(device) for k, v in t.items()}
+                for t in targets
+            ]
+
+
+            outputs = model(samples)
 
             # [B, num_queries, num_classes]
             probabilities = outputs["pred_logits"].sigmoid()
@@ -107,6 +202,25 @@ def collect_persistence_one_epoch(
             confidence, _ = probabilities.max(dim=-1)
 
             confidence_mask = confidence > confidence_threshold
+
+            # Ground-truth label matched to each query by the Hungarian
+            # matcher, or -1 if the query was not matched to any object.
+            batch_size, num_queries = confidence.shape
+            matched_labels = torch.full(
+                (batch_size, num_queries),
+                fill_value=-1,
+                dtype=torch.long,
+                device=device,
+            )
+
+            match_indices = matcher(outputs, targets)["indices"]
+
+            for batch_id, (query_idx, target_idx) in enumerate(
+                match_indices
+            ):
+                matched_labels[batch_id, query_idx] = targets[
+                    batch_id
+                ]["labels"][target_idx]
 
             query_indices = [
                 torch.where(confidence_mask[batch_id])[0]
@@ -123,43 +237,47 @@ def collect_persistence_one_epoch(
                 / confidence.shape[0]
             )
 
-            missing_layers = set(selected_layers) - set(captures)
-
-            if missing_layers:
-                raise RuntimeError(
-                    "The following decoder layers did not execute: "
-                    f"{sorted(missing_layers)}. Check decoder.eval_idx."
+            missing_score = set(selected_layers_score) - set(captures_score)
+            missing_bbox = {
+                bbox_layer_id: sorted(
+                    set(selected_layers_bbox[bbox_layer_id])
+                    - set(captures_bbox[bbox_layer_id])
                 )
+                for bbox_layer_id in range(num_bbox_layers)
+            }
 
-            diagrams = get_captured_persistence_diagrams(
-                captures=captures,
+            missing_bbox = {
+                bbox_layer_id: missing
+                for bbox_layer_id, missing in missing_bbox.items()
+                if missing
+            }
+
+            if missing_score or missing_bbox:
+                raise RuntimeError(
+                    f"Missing score layers: {sorted(missing_score)}; "
+                    f"missing bbox layers: {missing_bbox}"
+                )
+            diagrams_score = get_captured_persistence_diagrams(
+                captures=captures_score,
                 query_indices=query_indices,
-                decoder_layer_indices=selected_layers,
+                decoder_layer_indices=selected_layers_score,
             )
 
-            for layer_id, batch_diagrams in diagrams.items():
-                layer_classes = captures[layer_id][
-                    "logits"
-                ].argmax(dim=-1)
+            _update_buckets(diagrams_score, captures_score, matched_labels, buckets_score)
 
-                for batch_id, query_diagrams in enumerate(
-                    batch_diagrams
-                ):
-                    for query_id, diagram in query_diagrams.items():
-                        class_id = int(
-                            layer_classes[
-                                batch_id,
-                                query_id,
-                            ].item()
-                        )
-                        #start_time = time.perf_counter()
-                        buckets.update(
-                            diagram=diagram,
-                            layer_id=layer_id,
-                            class_id=class_id,
-                        )
-                        # end_time = time.perf_counter()
-                        #elapsed_times = np.append(elapsed_times, end_time-start_time)
+            for bbox_layer_id in range(num_bbox_layers):
+                diagrams_bbox = get_captured_persistence_diagrams(
+                    captures=captures_bbox[bbox_layer_id],
+                    query_indices=query_indices,
+                    decoder_layer_indices=selected_layers_bbox[bbox_layer_id],
+                )
+
+                _update_buckets(
+                    diagrams_bbox,
+                    captures_bbox[bbox_layer_id],
+                    matched_labels,
+                    buckets_bbox[bbox_layer_id],
+                )
 
             global_step = epoch * len(data_loader) + step
 
@@ -171,12 +289,12 @@ def collect_persistence_one_epoch(
             }
 
     finally:
-        for handle in handles:
+        for handle in handles_score + handles_bbox:
             handle.remove()
 
         model.train(previous_training_mode)
 
-    return buckets, metas
+    return buckets_score, buckets_bbox, metas
 
 
 @torch.no_grad()

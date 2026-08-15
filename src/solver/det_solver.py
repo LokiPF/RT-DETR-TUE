@@ -22,10 +22,10 @@ class DetSolver(BaseSolver):
         self.train()
         args = self.cfg
 
-        print("Freezing RT-DETR weights. Only training UncTemp head")
-        for name, param in self.model.named_parameters():
-            if 'unc_temp' not in name:
-                param.requires_grad = False
+        # print("Freezing RT-DETR weights. Only training UncTemp head")
+        # for name, param in self.model.named_parameters():
+        #     if 'unc_temp' not in name:
+        #         param.requires_grad = False
 
         n_parameters = sum([p.numel() for p in self.model.parameters() if p.requires_grad])
         print(f'number of trainable parameters: {n_parameters}')
@@ -148,7 +148,8 @@ class DetSolver(BaseSolver):
         return
 
     def _strip_state_dict(self, state_dict):
-        if not self.cfg.yaml_cfg['save_optimizer'] and "optimizer" in state_dict:
-            state_dict.pop("optimizer")
-        if not self.cfg.yaml_cfg['save_ema'] and "ema" in state_dict:
-            state_dict.pop("model")  # keep ema as a model
+        pass
+        # if not self.cfg.yaml_cfg['save_optimizer'] and "optimizer" in state_dict:
+        #     state_dict.pop("optimizer")
+        # if not self.cfg.yaml_cfg['save_ema'] and "ema" in state_dict:
+        #     state_dict.pop("model")  # keep ema as a model

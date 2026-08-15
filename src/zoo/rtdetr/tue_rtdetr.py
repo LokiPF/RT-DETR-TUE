@@ -99,9 +99,18 @@ class TUERTDETR(nn.Module):
             "frechet_means_bbox",
             persistence_state,
         )
-        self.frechet_means_score = self._pack_references(frechet_means_score)
-        self.frechet_means_bbox = self._pack_references(frechet_means_bbox)
-        self._reference_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+
+        self.frechet_means_score = self._pack_references(
+            frechet_means_score
+        )
+
+        self.frechet_means_bbox = {
+            int(bbox_layer_id): self._pack_references(decoder_means)
+            for bbox_layer_id, decoder_means
+            in frechet_means_bbox.items()
+        }
+
+        self._reference_device = torch.device("cpu")
 
     @staticmethod
     def _pack_references(
@@ -144,7 +153,11 @@ class TUERTDETR(nn.Module):
             }
 
         self.frechet_means_score = move(self.frechet_means_score)
-        self.frechet_means_bbox = move(self.frechet_means_bbox)
+        self.frechet_means_bbox = {
+            bbox_layer_id: move(decoder_references)
+            for bbox_layer_id, decoder_references
+            in self.frechet_means_bbox.items()
+        }
         self._reference_device = device
 
     @torch.no_grad()
@@ -242,11 +255,22 @@ class TUERTDETR(nn.Module):
             head_task='score'
         )
 
-        captures_bbox, handles_bbox, selected_layers_bbox = hook_decoder_layers(
-            transformer=self.decoder,
-            decoder_layers=self.decoder_layers,
-            head_task='bbox'
-        )
+        num_bbox_layers = len(self.decoder.dec_bbox_head[0].layers)
+
+        bbox_captures = {}
+        bbox_selected_layers = {}
+        handles_bbox = []
+
+        for bbox_layer_id in range(num_bbox_layers):
+            captures, handles, selected = hook_decoder_layers(
+                transformer=self.decoder,
+                decoder_layers=self.decoder_layers,
+                head_task="bbox",
+                bbox_head_layer=bbox_layer_id,
+            )
+            bbox_captures[bbox_layer_id] = captures
+            bbox_selected_layers[bbox_layer_id] = selected
+            handles_bbox.extend(handles)
 
         try:
             outputs = self.decoder(features, targets)
@@ -274,11 +298,14 @@ class TUERTDETR(nn.Module):
             decoder_layer_indices=selected_layers_score,
         )
 
-        diagrams_bbox = get_captured_persistence_diagrams(
-            captures=captures_bbox,
-            query_indices=query_indices,
-            decoder_layer_indices=selected_layers_bbox,
-        )
+        diagrams_bbox = {
+            bbox_layer_id: get_captured_persistence_diagrams(
+                captures=bbox_captures[bbox_layer_id],
+                query_indices=query_indices,
+                decoder_layer_indices=bbox_selected_layers[bbox_layer_id],
+            )
+            for bbox_layer_id in range(num_bbox_layers)
+        }
 
         distances_score = self._get_distances(
             confidence,
@@ -288,17 +315,28 @@ class TUERTDETR(nn.Module):
             self.frechet_means_score
         )
 
-        distances_bbox = self._get_distances(
-            confidence,
-            selected_layers_bbox,
-            diagrams_bbox,
-            captures_bbox,
-            self.frechet_means_bbox
+        distances_bbox = torch.stack(
+            [
+                self._get_distances(
+                    confidence,
+                    bbox_selected_layers[bbox_layer_id],
+                    diagrams_bbox[bbox_layer_id],
+                    bbox_captures[bbox_layer_id],
+                    self.frechet_means_bbox[bbox_layer_id],
+                )
+                for bbox_layer_id in range(num_bbox_layers)
+            ],
+            dim=-1,
         )
 
         outputs.update(
             tue_uncertainty_score=torch.nanmean(distances_score, dim=-1),
-            tue_uncertainty_bbox=torch.nanmean(distances_bbox, dim=-1),
+            tue_uncertainty_bbox=torch.nanmean(
+                distances_bbox,
+                dim=(-2, -1),
+            ),
+            tue_confidence=confidence,
+            tue_distances=distances_score,
         )
 
         # ranked_logits = self.rerank_head(outputs["pred_logits"], outputs["tue_uncertainty"])

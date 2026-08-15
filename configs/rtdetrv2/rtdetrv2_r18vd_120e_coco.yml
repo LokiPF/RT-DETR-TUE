@@ -1,5 +1,5 @@
 __include__: [
-  '../dataset/coco_detection.yml',
+  '../dataset/construction_detection_home.yml',
   '../runtime.yml',
   './include/dataloader.yml',
   './include/optimizer.yml',
@@ -8,6 +8,7 @@ __include__: [
 
 
 output_dir: ./output/rtdetrv2_r18vd_120e_coco
+task: tu_estimation
 
 
 PResNet:
@@ -27,12 +28,12 @@ RTDETRTransformerv2:
   num_layers: 3
 
 
-epoches: 120 
+epoches: 50
 
 optimizer:
   type: AdamW
   params:
-    - 
+    -
       params: '^(?=.*(?:norm|bn)).*$'
       weight_decay: 0.
 
@@ -44,3 +45,7 @@ train_dataloader:
         epoch: 117
   collate_fn:
     scales: ~
+  total_batch_size: 4
+
+val_dataloader:
+  total_batch_size: 4

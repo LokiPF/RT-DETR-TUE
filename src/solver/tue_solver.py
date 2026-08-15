@@ -17,10 +17,30 @@ from supervisely.nn.training import train_logger
 
 class TUESolver(BaseSolver):
 
+    def _create_frechet_mean(self, buckets):
+        # Store means only for nonempty layer/class buckets.
+        frechet_means = {}
+
+        for layer_id in range(buckets.num_layers):
+            layer_means = {}
+
+            for class_id in range(buckets.num_classes):
+                if buckets.count(layer_id, class_id) == 0:
+                    continue
+
+                layer_means[class_id] = buckets.frechet_mean(
+                    layer_id=layer_id,
+                    class_id=class_id,
+                )
+
+            frechet_means[layer_id] = layer_means
+
+        return frechet_means
+
     def fit(self):
         print("Starting persistence analysis")
         self.train() # this is necessary to load the train dataloader
-        self.eval()
+        # self.eval() Not required because reinits the model
 
         args = self.cfg
         start_time = time.time()
@@ -45,7 +65,7 @@ class TUESolver(BaseSolver):
         if hasattr(model, "module"):
             model = model.module
 
-        buckets, persistence_stats = collect_persistence_one_epoch(
+        buckets_score, buckets_bbox, persistence_stats = collect_persistence_one_epoch(
             model=model,
             matcher=self.criterion.matcher,
             data_loader=data_loader,
@@ -54,36 +74,36 @@ class TUESolver(BaseSolver):
             confidence_threshold=getattr(
                 args,
                 "persistence_confidence_threshold",
-                0.8,
+                0.5,
             ),
             decoder_layers=getattr(
                 args,
                 "persistence_decoder_layers",
                 None,
             ),
-            print_freq=getattr(args, "print_freq", 10),
+            print_freq=getattr(args, "print_freq", 10,),
+            data_fraction=1.0
         )
 
-        # Store means only for nonempty layer/class buckets.
-        frechet_means = {}
+        frechet_means_score = self._create_frechet_mean(
+            buckets_score
+        )
 
-        for layer_id in range(buckets.num_layers):
-            layer_means = {}
-
-            for class_id in range(buckets.num_classes):
-                if buckets.count(layer_id, class_id) == 0:
-                    continue
-
-                layer_means[class_id] = buckets.frechet_mean(
-                    layer_id=layer_id,
-                    class_id=class_id,
-                )
-
-            frechet_means[layer_id] = layer_means
+        frechet_means_bbox = {
+            bbox_layer_id: self._create_frechet_mean(bucket)
+            for bbox_layer_id, bucket in buckets_bbox.items()
+        }
 
         persistence_state = {
-            "frechet_means": frechet_means,
-            "counts": buckets.counts,
+            "frechet_means_score": frechet_means_score,
+            "frechet_means_bbox": frechet_means_bbox,
+            "counts": {
+                "score": buckets_score.counts,
+                "bbox": {
+                    bbox_layer_id: bucket.counts
+                    for bbox_layer_id, bucket in buckets_bbox.items()
+                },
+            },
             "metadata": persistence_stats,
             "confidence_threshold": getattr(
                 args,
@@ -95,6 +115,7 @@ class TUESolver(BaseSolver):
                 "persistence_decoder_layers",
                 None,
             ),
+            "bbox_head_layers": sorted(buckets_bbox),
         }
 
         if self.output_dir and dist_utils.is_main_process():
