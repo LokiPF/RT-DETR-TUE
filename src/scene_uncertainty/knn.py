@@ -56,13 +56,28 @@ def fit_clean_distance_scale(
 ) -> dict[str, Tensor]:
     """Robust centre and spread of the clean mean-kNN distance, for standardising scores.
 
-    Sampled rows are scored against the bank they belong to, so their own zero-distance
-    self match is dropped by taking neighbours `1..k`. The inter-quartile spread is
-    floored, because a bank whose clean distances are all equal would otherwise hand
-    every caller a division by zero.
+    Sampled rows are scored against the bank they belong to, so column zero is that row's own
+    zero-distance self match and is dropped by averaging neighbours `1..k`.
+
+    That drop is *positional, not by identity*: it removes one near-zero distance, which is the
+    self match only when the sampled row is unique in the bank. A row that has a near-duplicate
+    twin elsewhere in the bank keeps the twin's near-zero distance in its average, which pulls
+    `center` down and inflates `scale`. Measured on a 2000x64 bank with 20% of rows duplicated,
+    `center` fell 4.6% while `scale` grew 2.4x -- and `scale` is the divisor every downstream
+    scene score is standardised by, so the distortion is silent and plausible-looking. Whether
+    near-duplicate bank rows belong in a clean-distance fit is a question about what `scale` is
+    meant to measure, so this function does not decide it; it reports `min_neighbor_distance`,
+    the smallest post-self distance any sampled row saw, so the assumption is visible in the
+    artifacts. A value far below `center` means the bank holds near-duplicates and the fit should
+    be revisited -- offline, from this same state, without re-extracting anything.
+
+    The inter-quartile spread is floored, because a bank whose clean distances are all equal
+    would otherwise hand every caller a division by zero.
     """
     if bank.shape[0] <= k:
         raise ValueError("Bank must contain more than k vectors for leave-self-out scaling")
+    if max_samples <= 0:
+        raise ValueError(f"max_samples must be positive, got {max_samples}")
     generator = torch.Generator().manual_seed(seed)
     indices = torch.randperm(bank.shape[0], generator=generator)[:max_samples]
     sample = bank.index_select(0, indices.to(bank.device))
@@ -72,4 +87,9 @@ def fit_clean_distance_scale(
     scale = (
         torch.quantile(clean_scores, 0.75) - torch.quantile(clean_scores, 0.25)
     ).clamp_min(1e-6)
-    return {"center": center, "scale": scale, "sample_count": torch.tensor(len(clean_scores))}
+    return {
+        "center": center,
+        "scale": scale,
+        "sample_count": torch.tensor(len(clean_scores)),
+        "min_neighbor_distance": neighbors[:, 1].min().cpu(),
+    }

@@ -100,10 +100,23 @@ def test_mean_knn_distance_averages_the_k_nearest_neighbours():
 
 
 def test_near_duplicate_vectors_never_produce_nan_or_negative_distances():
-    """The squared-norm expansion cancels catastrophically here and can go negative before the clamp."""
+    """The squared-norm expansion cancels catastrophically here; the clamp is what stops the NaN.
+
+    The unclamped expansion is recomputed inline at the same chunk width the kernel uses, so the
+    test asserts its own relevance: `isfinite` and `>= 0` would both pass vacuously if a torch or
+    BLAS change moved this fixture out of the regime where cancellation goes negative.
+    """
     generator = torch.Generator().manual_seed(23)
     bank = torch.randn(64, 335, generator=generator) * 50.0
     queries = bank[:8] + torch.randn(8, 335, generator=generator) * 1e-5
+    raw = torch.cat([
+        queries.square().sum(dim=1, keepdim=True)
+        + chunk.square().sum(dim=1).unsqueeze(0)
+        - 2.0 * queries @ chunk.T
+        for chunk in bank.split(16, dim=0)
+    ], dim=1)
+    assert (raw < 0).any(), "fixture no longer reaches the cancellation the clamp exists for"
+    assert torch.isnan(raw.sqrt()).any()
     distances = chunked_knn_distances(queries, bank, k=3, bank_chunk_size=16)
     assert torch.isfinite(distances).all()
     assert (distances >= 0).all()
@@ -135,6 +148,32 @@ def test_clean_distance_scale_rejects_a_bank_no_larger_than_k():
         fit_clean_distance_scale(bank, k=3)
 
 
+def test_clean_distance_scale_rejects_a_non_positive_max_samples():
+    """`-1` is a natural "use everything" sentinel, and `randperm(n)[:-1]` would quietly honour it
+    as "all but the last row" -- a fit over 39 of 40 rows that looks entirely plausible."""
+    generator = torch.Generator().manual_seed(47)
+    bank = torch.randn(40, 5, generator=generator)
+    for max_samples in (0, -1, -3):
+        with pytest.raises(ValueError, match="max_samples"):
+            fit_clean_distance_scale(bank, k=3, max_samples=max_samples)
+
+
+def test_clean_distance_scale_reports_the_nearest_non_self_distance():
+    """The dropped-self-match assumption holds only for rows unique in the bank, so expose it.
+
+    A sampled row with a twin keeps the twin's near-zero distance in its mean, biasing `center`
+    down and `scale` up with nothing in the artifacts to show it happened. `min_neighbor_distance`
+    collapsing towards zero is that signal.
+    """
+    generator = torch.Generator().manual_seed(53)
+    bank = torch.randn(48, 6, generator=generator)
+    clean = fit_clean_distance_scale(bank, k=3, max_samples=48, seed=1)
+    twinned = fit_clean_distance_scale(torch.cat((bank, bank[:24])), k=3, max_samples=48, seed=1)
+    nearest_non_self = chunked_knn_distances(bank, bank, k=2)[:, 1].min()
+    assert clean["min_neighbor_distance"] == pytest.approx(float(nearest_non_self), abs=1e-6)
+    assert twinned["min_neighbor_distance"] < 1e-3 < clean["min_neighbor_distance"]
+
+
 def test_clean_distance_scale_floors_a_degenerate_spread():
     """Every clean score is identical here, so an unfloored inter-quartile range would be zero."""
     bank = torch.eye(8) * 2.0
@@ -161,7 +200,7 @@ def test_clean_distance_scale_is_deterministic_and_chunk_invariant():
     reseeded = fit_clean_distance_scale(bank, k=4, max_samples=25, seed=9)
     assert not torch.equal(first["center"], reseeded["center"])
     rechunked = fit_clean_distance_scale(bank, k=4, max_samples=25, seed=8, bank_chunk_size=9)
-    for key in ("center", "scale", "sample_count"):
+    for key in ("center", "scale", "sample_count", "min_neighbor_distance"):
         assert torch.equal(first[key], repeat[key])
         assert torch.allclose(first[key].float(), rechunked[key].float(), rtol=0.0, atol=1e-5)
     assert int(first["sample_count"]) == 25
