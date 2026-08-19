@@ -9,6 +9,25 @@ import torch.nn.functional as F
 # The graph structure is identical for every query with the same dimensions.
 _EDGE_INDEX_CACHE: dict[tuple[int, int], Tensor] = {}
 
+
+def empirical_cdf(sorted_distances: torch.Tensor, measured) -> torch.Tensor:
+    total = sorted_distances.numel()
+    measured = torch.as_tensor(measured, dtype=sorted_distances.dtype, device=sorted_distances.device)
+    if total == 0:
+        return torch.full_like(measured, float("nan"), dtype=torch.float32)
+    count_le = torch.searchsorted(sorted_distances, measured, right=True).to(torch.float32)
+    return count_le / total
+
+
+def conformal_pvalue(sorted_distances: torch.Tensor, measured) -> torch.Tensor:
+    total = sorted_distances.numel()
+    measured = torch.as_tensor(measured, dtype=sorted_distances.dtype, device=sorted_distances.device)
+    if total == 0:
+        return torch.full_like(measured, float("nan"), dtype=torch.float32)
+    count_lt = torch.searchsorted(sorted_distances, measured, right=False).to(torch.float32)
+    count_ge = total - count_lt
+    return (1.0 + count_ge) / (total + 1.0)
+
 def hook_decoder_layers(
     transformer: nn.Module,
     decoder_layers: int | Iterable[int] | None = None,
@@ -19,41 +38,6 @@ def hook_decoder_layers(
     list[torch.utils.hooks.RemovableHandle],
     list[int],
 ]:
-    """
-    Capture a linear prediction layer for each selected decoder layer.
-
-    For the score task, decoder-layer outputs are captured and the
-    corresponding score projection is reconstructed because intermediate
-    score heads are not normally executed during evaluation.
-
-    For the bbox task, the selected linear layer inside each bbox MLP is
-    hooked directly. Bbox heads are executed during evaluation because their
-    predictions refine the reference points used by the next decoder layer.
-    The corresponding score logits are also reconstructed so bbox diagrams
-    can still be compared with class-conditioned reference means.
-
-    Args:
-        transformer:
-            RT-DETR transformer containing ``decoder``, ``dec_score_head``,
-            and ``dec_bbox_head``.
-
-        decoder_layers:
-            Decoder layers to capture. Negative indices are supported.
-
-        head_task:
-            Either ``"score"`` or ``"bbox"``.
-
-        bbox_head_layer:
-            Linear layer within each bbox MLP to capture. Negative indices
-            are supported. The default, ``-1``, captures the final layer that
-            produces the four box deltas. This argument is used only when
-            ``head_task="bbox"``.
-
-    Notes:
-        The persistence-diagram utilities operate on one linear layer at a
-        time. To analyse multiple bbox MLP layers, call this function once per
-        ``bbox_head_layer`` and keep separate reference means for each layer.
-    """
     decoder = transformer.decoder
     if head_task == "score":
         heads = transformer.dec_score_head
@@ -227,7 +211,6 @@ def hook_decoder_layers(
     return captures, handles, normalized_layers
 
 def diagram_distance(diagram: Tensor, reference: Tensor) -> Tensor:
-    """Compute the paper's distance between two 1-D diagrams."""
     diagram = torch.sort(
         diagram.detach().cpu().float().flatten(),
         descending=True,
@@ -268,29 +251,6 @@ def get_activation_weights(
     weight_matrix: Tensor,
     layer_input: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    """
-    Construct the weighted bipartite graph for one linear layer input.
-
-    The edge between input j and output i has weight
-
-        a_ij = abs(W_ij * x_j)
-
-    Args:
-        weight_matrix:
-            Linear-layer weight matrix with shape
-            [num_outputs, num_inputs].
-
-        layer_input:
-            Input activation vector with shape [num_inputs].
-
-    Returns:
-        edge_index:
-            Graph edges with shape [2, num_outputs * num_inputs].
-
-        edge_weight:
-            Flattened activation weights with shape
-            [num_outputs * num_inputs].
-    """
     weight_matrix = weight_matrix.detach().cpu()
     layer_input = layer_input.detach().cpu()
 

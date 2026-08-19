@@ -65,23 +65,20 @@ class TUESolver(BaseSolver):
         if hasattr(model, "module"):
             model = model.module
 
+        confidence_threshold = args.yaml_cfg.get(
+            "persistence_confidence_threshold", 0.5
+        )
+        decoder_layers = args.yaml_cfg.get("persistence_decoder_layers", None)
+
         buckets_score, buckets_bbox, persistence_stats = collect_persistence_one_epoch(
             model=model,
             matcher=self.criterion.matcher,
             data_loader=data_loader,
             device=self.device,
             epoch=0,
-            confidence_threshold=getattr(
-                args,
-                "persistence_confidence_threshold",
-                0.5,
-            ),
-            decoder_layers=getattr(
-                args,
-                "persistence_decoder_layers",
-                None,
-            ),
-            print_freq=getattr(args, "print_freq", 10,),
+            confidence_threshold=confidence_threshold,
+            decoder_layers=decoder_layers,
+            print_freq=args.yaml_cfg.get("print_freq", 10),
             data_fraction=1.0
         )
 
@@ -105,16 +102,8 @@ class TUESolver(BaseSolver):
                 },
             },
             "metadata": persistence_stats,
-            "confidence_threshold": getattr(
-                args,
-                "persistence_confidence_threshold",
-                0.8,
-            ),
-            "decoder_layers": getattr(
-                args,
-                "persistence_decoder_layers",
-                None,
-            ),
+            "confidence_threshold": confidence_threshold,
+            "decoder_layers": decoder_layers,
             "bbox_head_layers": sorted(buckets_bbox),
         }
 
