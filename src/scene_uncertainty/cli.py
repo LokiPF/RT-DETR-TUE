@@ -43,6 +43,15 @@ before it extracts anything new. The scan reports its own wall time on stderr.
 Resume requires the same git commit, checkpoint, config, annotation file and image list
 as the interrupted run: the features in one artifact must come from one version of the
 extraction code. A mismatch is reported by name and nothing is written.
+
+The commit is read from `git rev-parse HEAD`, or from SCENE_UNCERTAINTY_GIT_COMMIT when
+that is set, and is recorded as `unknown` (with a warning) when neither works -- which is
+the normal state on a host running from an rsync'd tree. Because the commit is part of
+what resume compares, setting SCENE_UNCERTAINTY_GIT_COMMIT for a run and forgetting it on
+the restart strands the partial artifact: export the same value both times, or neither.
+
+Wall time and peak memory are written to `<output>/run_stats.json`, deliberately not into
+`manifest.json`, so that two identical extractions keep one content address.
 """
 
 _BUILD_BANK_EPILOG = """\

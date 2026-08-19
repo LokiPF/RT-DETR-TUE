@@ -151,13 +151,47 @@ def test_tools_entry_point_runs_the_cli():
 def test_peak_memory_instrumentation_survives_being_the_first_cuda_call():
     """`reset_peak_memory_stats` raises on a process that has not initialised CUDA yet.
 
-    Only a fresh process proves that (`pytest -k peak_memory`); once anything else in the
-    session has touched CUDA the context already exists and the raw call would pass too.
+    Run in a subprocess, because that is the only place the claim can be tested: once anything
+    else in the session has touched CUDA the context already exists and the unfixed call would
+    pass too, which would make this test quietly vacuous inside the full suite.
     """
-    device = torch.device("cuda:0")
-    pipeline._reset_peak_memory(device)
-    assert pipeline._peak_memory_bytes(device) >= 0
-    assert pipeline._peak_memory_bytes(torch.device("cpu")) == 0
+    program = (
+        "import torch;"
+        "from src.scene_uncertainty import pipeline;"
+        "pipeline._reset_peak_memory(torch.device('cuda:0'));"
+        "assert pipeline._peak_memory_bytes(torch.device('cuda:0')) >= 0;"
+        "assert pipeline._peak_memory_bytes(torch.device('cpu')) == 0;"
+        "print('cuda_ok')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", program],
+        cwd=REPOSITORY_ROOT,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONPATH": str(REPOSITORY_ROOT)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "cuda_ok" in result.stdout
+
+
+def test_an_unavailable_git_commit_is_announced_and_names_the_override(monkeypatch, capsys):
+    def unavailable(*args, **kwargs):
+        raise OSError("no git here")
+
+    monkeypatch.delenv("SCENE_UNCERTAINTY_GIT_COMMIT", raising=False)
+    monkeypatch.setattr(pipeline.subprocess, "check_output", unavailable)
+    assert pipeline._git_commit() == "unknown"
+    warning = capsys.readouterr().err
+    assert "WARNING" in warning
+    assert "git_commit=unknown" in warning
+    assert "SCENE_UNCERTAINTY_GIT_COMMIT" in warning
+    assert "resum" in warning
+
+
+def test_an_overridden_git_commit_is_recorded_without_a_warning(monkeypatch, capsys):
+    monkeypatch.setenv("SCENE_UNCERTAINTY_GIT_COMMIT", "  abc123\n")
+    assert pipeline._git_commit() == "abc123"
+    assert capsys.readouterr().err == ""
 
 
 # --------------------------------------------------------------------------------------
@@ -395,8 +429,37 @@ def test_extraction_metadata_pins_everything_needed_to_reproduce_it(tmp_path: Pa
     assert manifest["persistence_dim"] == PERSISTENCE_DIM
     assert manifest["query_count"] == QUERY_COUNT
     assert isinstance(manifest["git_commit"], str)
-    assert manifest["run_stats"]["wall_seconds"] >= 0.0
+    assert "run_stats" not in manifest
     assert len(manifest["artifact_id"]) == 64
+
+
+def test_an_identical_re_extraction_has_an_identical_artifact_id(tmp_path: Path, monkeypatch):
+    """The one property a content address exists for: same inputs, same id.
+
+    Wall time and peak memory are per-run facts, so folding them into the hashed manifest
+    would break this -- and `source_cache_id` / `feature_cache_id` carry that id downstream.
+    """
+    selection = {"tuning_pilot_ids": [1], "test_pilot_ids": [2]}
+    ids = []
+    for name in ("first", "second"):
+        _install_fake_detector(monkeypatch)
+        args = _extract_args(tmp_path, "extract-blur", selection, output=tmp_path / name)
+        pipeline.command_extract_blur(args)
+        ids.append(load_manifest(args.output)["artifact_id"])
+    assert ids[0] == ids[1]
+
+
+def test_extraction_timings_are_written_beside_the_manifest(tmp_path: Path, monkeypatch):
+    _install_fake_detector(monkeypatch)
+    args = _extract_args(tmp_path, "extract-blur", {"tuning_pilot_ids": [1], "test_pilot_ids": [2]})
+    pipeline.command_extract_blur(args)
+    stats = json.loads((Path(args.output) / "run_stats.json").read_text())
+    assert stats["wall_seconds"] >= 0.0
+    assert stats["peak_cuda_memory_bytes"] == 0
+    assert stats["record_count"] == 12
+    assert stats["records_written_this_segment"] == 12
+    assert stats["records_recovered_on_resume"] == 0
+    assert stats["covers_whole_extraction"] is True
 
 
 def test_extraction_rejects_an_unexpected_persistence_shape(tmp_path: Path, monkeypatch):
@@ -427,6 +490,10 @@ def test_interrupted_extraction_resumes_without_redoing_completed_shards(tmp_pat
     assert len(records) == 12
     assert len({(record["image_id"], record["severity"]) for record in records}) == 12
     assert load_manifest(args.output)["record_count"] == 12
+    stats = json.loads((Path(args.output) / "run_stats.json").read_text())
+    assert stats["records_recovered_on_resume"] == 4
+    assert stats["records_written_this_segment"] == 8
+    assert stats["covers_whole_extraction"] is False
     assert "resume" in capsys.readouterr().err.lower()
 
 
@@ -848,6 +915,29 @@ def test_evaluate_accepts_a_comma_separated_string_of_names(tmp_path: Path):
 # --------------------------------------------------------------------------------------
 # report
 # --------------------------------------------------------------------------------------
+
+
+def test_a_crash_after_the_csv_leaves_no_manifest_to_mislabel_it(tmp_path: Path, monkeypatch):
+    first = _scored(tmp_path, policies="all", aggregations="mean")
+    manifest_path = Path(first.output).with_suffix(".manifest.json")
+    assert json.loads(manifest_path.read_text())["policies"] == ["all"]
+
+    def explode(value, path):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(pipeline, "_atomic_torch_save", explode)
+    second = _evaluate_args(
+        tmp_path, first.cache, first.bank, policies="all,top10", aggregations="median",
+    )
+    with pytest.raises(RuntimeError, match="disk full"):
+        pipeline.command_evaluate_knn(second)
+    assert not manifest_path.exists()
+
+    report = build_parser().parse_args([
+        "report", "--results", str(first.output), "--output", str(tmp_path / "report"),
+    ])
+    with pytest.raises(PipelineError, match="No result manifest"):
+        pipeline.command_report(report)
 
 
 def test_report_summarizes_the_scored_rows_with_the_run_metadata(tmp_path: Path):

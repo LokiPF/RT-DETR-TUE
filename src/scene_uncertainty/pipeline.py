@@ -90,6 +90,20 @@ def _write_json(path: Path, value: dict) -> None:
     os.replace(temporary, path)
 
 
+def _artifact_run_stats(directory: Path, manifest: dict) -> dict:
+    """This artifact's timings, from wherever that artifact keeps them.
+
+    Feature caches keep them in a `run_stats.json` sidecar so the manifest stays a content
+    address (see `_extract`); banks and result sets keep them in the manifest, which excludes
+    them from its own address. Both are read here so the provenance rollup is complete either
+    way, including for a cache written before the sidecar existed.
+    """
+    sidecar = Path(directory) / "run_stats.json"
+    if sidecar.exists():
+        return json.loads(sidecar.read_text(encoding="utf-8"))
+    return manifest.get("run_stats", {})
+
+
 def _content_address(manifest: dict) -> str:
     return manifest_id({
         key: value for key, value in manifest.items() if key not in NON_IDENTIFYING_KEYS
@@ -168,6 +182,11 @@ def _git_commit() -> str:
     The extraction hosts run from an rsync'd tree with no usable git metadata, so this must not
     be able to fail a six-hour extraction before it starts. `SCENE_UNCERTAINTY_GIT_COMMIT` is
     read first so such a host can be told the answer it cannot work out for itself.
+
+    Falling back is announced rather than silent: these artifacts exist to be reproducible, and
+    an artifact that cannot say which code produced it should say *that* out loud, once, where
+    the operator can still do something about it. The warning names the variable because the
+    docstring nobody reads is not where that belongs.
     """
     override = os.environ.get("SCENE_UNCERTAINTY_GIT_COMMIT")
     if override:
@@ -177,6 +196,11 @@ def _git_commit() -> str:
             ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
         ).strip()
     except (OSError, subprocess.CalledProcessError):
+        _report(
+            "WARNING no git commit available, recording git_commit=unknown; set "
+            "SCENE_UNCERTAINTY_GIT_COMMIT=<sha> to record it, and set the same value when "
+            "resuming this artifact -- resume compares git_commit and refuses a mismatch"
+        )
         return "unknown"
 
 
@@ -355,10 +379,20 @@ def _extract(args, reference: bool) -> None:
                         record["source_partition"] = "reference" if reference else groups[record["image_id"]]
                         record["reference_group"] = groups[record["image_id"]] if reference else None
                         writer.add(record)
-        writer.metadata["run_stats"] = {
-            "wall_seconds": time.perf_counter() - started,
-            "peak_cuda_memory_bytes": _peak_memory_bytes(device),
-        }
+    # Timings go *beside* the manifest, never into it. `ShardWriter.close` hashes every metadata
+    # key into `artifact_id`, so a wall time recorded there would give two bit-identical
+    # extractions two different content addresses -- and that id is what `source_cache_id` and
+    # `feature_cache_id` carry downstream, so the whole chain would lose the one property a
+    # content address exists for. The sidecar is also the honest place for the number: on a
+    # resumed run it measures only the final segment, which `covers_whole_extraction` says.
+    _write_json(output / "run_stats.json", {
+        "wall_seconds": time.perf_counter() - started,
+        "peak_cuda_memory_bytes": _peak_memory_bytes(device),
+        "records_recovered_on_resume": len(completed),
+        "records_written_this_segment": writer.record_count - len(completed),
+        "record_count": writer.record_count,
+        "covers_whole_extraction": not completed,
+    })
     _report(f"extract: wrote {load_manifest(output)['record_count']} records to {output}")
 
 
@@ -602,6 +636,13 @@ def command_evaluate_knn(args) -> None:
         raise PipelineError(f"Nothing to score in {cache} for --partition {args.partition}")
 
     output = Path(args.output)
+    manifest_path = output.with_suffix(".manifest.json")
+    # Four files are written in sequence and only the last one is the manifest, so a crash in
+    # between would leave the new CSV beside the *previous* run's manifest -- and `report` reads
+    # that manifest for its metadata without cross-checking, so it would publish this run's
+    # numbers labelled with the last run's `k`, `normalization` and `policies`. Dropping the old
+    # manifest first turns that silent mislabelling into a loud failure at `report`.
+    manifest_path.unlink(missing_ok=True)
     write_result_csv(rows, output)
     query_distance_path = output.with_suffix(".query_distances.pt")
     _atomic_torch_save(query_distance_rows, query_distance_path)
@@ -633,12 +674,12 @@ def command_evaluate_knn(args) -> None:
             # the answer. Recorded for provenance, excluded from the artifact id, and never
             # compared when deciding whether two result sets are interchangeable.
             "bank_chunk_size": args.bank_chunk_size,
-            "feature_cache": cache_manifest.get("run_stats", {}),
+            "feature_cache": _artifact_run_stats(cache, cache_manifest),
             "bank": bank_manifest.get("run_stats", {}),
         },
     }
     result_manifest["artifact_id"] = _content_address(result_manifest)
-    _write_json(output.with_suffix(".manifest.json"), result_manifest)
+    _write_json(manifest_path, result_manifest)
     _report(f"evaluate-knn: scored {len(rows)} rows from {len(query_distance_rows)} scenes into {output}")
 
 
