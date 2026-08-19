@@ -45,6 +45,29 @@ def test_undefined_when_fewer_than_two_finite_scores():
         assert math.isnan(result["adjacent_monotonicity"])
         assert math.isnan(result["violation_magnitude"])
         assert result["endpoint_increase"] is False
+    # The counts are reported on the undefined path too, so a consumer never has to
+    # branch on whether the keys are present before reading them.
+    assert (none_finite["finite_count"], none_finite["total_count"]) == (0, 3)
+    assert (one_finite["finite_count"], one_finite["total_count"]) == (1, 2)
+
+
+def test_collapsed_curve_is_distinguishable_from_a_genuinely_rising_one():
+    rising = monotonicity_metrics([0, 1, 2, 3, 4, 5], [1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    collapsed = monotonicity_metrics(
+        [0, 1, 2, 3, 4, 5], [1.0, 2.0, 3.0, float("nan"), float("nan"), float("nan")]
+    )
+    # A policy whose query selection goes empty under blur scores `nan` at the severities
+    # where it collapsed, and the trend statistics then describe only the severities that
+    # survived -- so a collapsed run is byte-identical to a run that really did rise all
+    # the way. Every statistic agrees here:
+    assert collapsed["spearman"] == rising["spearman"] == 1.0
+    assert collapsed["adjacent_monotonicity"] == rising["adjacent_monotonicity"] == 1.0
+    assert collapsed["violation_magnitude"] == rising["violation_magnitude"] == 0.0
+    assert collapsed["endpoint_increase"] is rising["endpoint_increase"] is True
+    # The counts are the only thing that separates them.
+    assert rising["finite_count"] == 6
+    assert collapsed["finite_count"] == 3
+    assert rising["total_count"] == collapsed["total_count"] == 6
 
 
 def test_non_finite_scores_are_dropped_before_the_trend_is_measured():
