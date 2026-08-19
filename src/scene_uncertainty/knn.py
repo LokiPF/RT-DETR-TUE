@@ -62,14 +62,39 @@ def fit_clean_distance_scale(
     That drop is *positional, not by identity*: it removes one near-zero distance, which is the
     self match only when the sampled row is unique in the bank. A row that has a near-duplicate
     twin elsewhere in the bank keeps the twin's near-zero distance in its average, which pulls
-    `center` down and inflates `scale`. Measured on a 2000x64 bank with 20% of rows duplicated,
-    `center` fell 4.6% while `scale` grew 2.4x -- and `scale` is the divisor every downstream
-    scene score is standardised by, so the distortion is silent and plausible-looking. Whether
-    near-duplicate bank rows belong in a clean-distance fit is a question about what `scale` is
-    meant to measure, so this function does not decide it; it reports `min_neighbor_distance`,
-    the smallest post-self distance any sampled row saw, so the assumption is visible in the
-    artifacts. A value far below `center` means the bank holds near-duplicates and the fit should
-    be revisited -- offline, from this same state, without re-extracting anything.
+    `center` down and inflates `scale`. On a 2400x64 standard-normal bank (k=5, 500 sampled,
+    seed 7) with 400 rows replaced by exact twins, `scale` grew roughly 2.8x; three independent
+    fixtures put the effect at 2.4x-2.8x, so read the magnitude as approximate and the direction
+    as reliable. `scale` is the divisor every downstream scene score is standardised by, so the
+    distortion is silent and plausible-looking. Whether near-duplicate bank rows belong in a
+    clean-distance fit is a question about what `scale` is meant to measure, and this function
+    does not decide it. It reports two numbers instead, so the assumption is visible in the
+    artifacts and the fit can be judged -- and refitted -- offline from this same state:
+
+    `min_neighbor_distance` -- the smallest post-self distance any sampled row saw. It grades
+    *how close* the worst contaminant is, and on that axis it is the sharper of the two: holding
+    the contaminated fraction fixed and spreading the twins apart, it rises smoothly (0.00, 0.08,
+    0.23, 0.37 as a fraction of `center`) in step with `scale` relaxing back (2.8x, 2.5x, 1.9x,
+    1.4x). It says nothing about *how many* rows are affected: one exact twin and four hundred
+    both read exactly zero.
+
+    `near_duplicate_fraction` -- the fraction of sampled rows whose nearest post-self neighbour
+    is closer than half of `center`. It grades *how much* of the fit is contaminated, which is
+    the axis `min_neighbor_distance` is blind to, and it is the one to look at first, because
+    `scale` is an inter-quartile range and so moves with the share of rows pulled low rather than
+    with the single worst of them. On the fixture above it runs 0.000, 0.004, 0.050, 0.158, 0.362
+    for 0, 5, 50, 200, 400 twins while `scale` moves 1.0x, 1.0x, 1.1x, 1.4x, 2.8x. As a reading
+    guide: below ~0.01 `scale` is untouched, ~0.05 costs about 10%, ~0.15 about 40%, and beyond
+    ~0.25 `scale` can multiply. The half-of-`center` threshold is the loosest one that still reads
+    exactly 0.000 on every clean bank tested from 16 dimensions up -- gaussian at 16/32/64/335
+    dimensions and 240/600/2400 rows, unit-normalised, heavy-tailed, and twenty tight clusters --
+    so on a bank of this pipeline's shape a nonzero value is a real finding, not natural spread.
+    It is a claim about high-dimensional banks specifically: a 4- or 8-dimensional gaussian cloud
+    reads 0.16 or 0.03 clean, because in that few dimensions genuinely close pairs are ordinary.
+    At 335 dimensions the closest clean row still sits at 0.91 of `center`, well clear of 0.5.
+
+    Both describe the sample this fit was computed from, not the whole bank: a twin that was never
+    sampled reads clean because it never entered `center` or `scale` either.
 
     The inter-quartile spread is floored, because a bank whose clean distances are all equal
     would otherwise hand every caller a division by zero.
@@ -87,9 +112,11 @@ def fit_clean_distance_scale(
     scale = (
         torch.quantile(clean_scores, 0.75) - torch.quantile(clean_scores, 0.25)
     ).clamp_min(1e-6)
+    nearest_non_self = neighbors[:, 1].cpu()
     return {
         "center": center,
         "scale": scale,
         "sample_count": torch.tensor(len(clean_scores)),
-        "min_neighbor_distance": neighbors[:, 1].min().cpu(),
+        "min_neighbor_distance": nearest_non_self.min(),
+        "near_duplicate_fraction": (nearest_non_self < 0.5 * center).float().mean(),
     }

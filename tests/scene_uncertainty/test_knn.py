@@ -102,10 +102,13 @@ def test_mean_knn_distance_averages_the_k_nearest_neighbours():
 def test_near_duplicate_vectors_never_produce_nan_or_negative_distances():
     """The squared-norm expansion cancels catastrophically here; the clamp is what stops the NaN.
 
-    The unclamped expansion is recomputed inline at the same chunk width the kernel uses, so the
-    test asserts its own relevance: `isfinite` and `>= 0` would both pass vacuously if a torch or
-    BLAS change moved this fixture out of the regime where cancellation goes negative.
+    The unclamped expansion is recomputed inline at the same chunk width the kernel uses -- one
+    shared `chunk_size`, because the width changes the GEMM accumulation and so changes the sign
+    pattern (measured: full-bank 1 negative, width 1 gives 3, width 4 reaches -0.250). The test
+    therefore asserts its own relevance: `isfinite` and `>= 0` would both pass vacuously if a
+    torch or BLAS change moved this fixture out of the regime where cancellation goes negative.
     """
+    chunk_size = 16
     generator = torch.Generator().manual_seed(23)
     bank = torch.randn(64, 335, generator=generator) * 50.0
     queries = bank[:8] + torch.randn(8, 335, generator=generator) * 1e-5
@@ -113,11 +116,11 @@ def test_near_duplicate_vectors_never_produce_nan_or_negative_distances():
         queries.square().sum(dim=1, keepdim=True)
         + chunk.square().sum(dim=1).unsqueeze(0)
         - 2.0 * queries @ chunk.T
-        for chunk in bank.split(16, dim=0)
+        for chunk in bank.split(chunk_size, dim=0)
     ], dim=1)
     assert (raw < 0).any(), "fixture no longer reaches the cancellation the clamp exists for"
     assert torch.isnan(raw.sqrt()).any()
-    distances = chunked_knn_distances(queries, bank, k=3, bank_chunk_size=16)
+    distances = chunked_knn_distances(queries, bank, k=3, bank_chunk_size=chunk_size)
     assert torch.isfinite(distances).all()
     assert (distances >= 0).all()
 
@@ -174,6 +177,49 @@ def test_clean_distance_scale_reports_the_nearest_non_self_distance():
     assert twinned["min_neighbor_distance"] < 1e-3 < clean["min_neighbor_distance"]
 
 
+def test_clean_distance_scale_grades_contamination_by_closeness_and_by_extent():
+    """The two diagnostics cover each other's blind spot, so both are asserted on both axes.
+
+    `min_neighbor_distance` is flat at zero once any sampled row has an exact twin, however many
+    there are; `near_duplicate_fraction` is flat while the twins stay closer than the threshold,
+    however close they get. Neither is monotone in both, which is why the state reports both.
+    """
+    generator = torch.Generator().manual_seed(59)
+    base = torch.randn(240, 16, generator=generator)
+    offset = torch.zeros(16)
+    offset[0] = 1.0
+
+    def twinned(count, separation):
+        bank = base.clone()
+        bank[240 - count:] = base[:count] + separation * offset
+        return fit_clean_distance_scale(bank, k=5, max_samples=240, seed=4)
+
+    clean = twinned(0, 0.0)
+    assert float(clean["near_duplicate_fraction"]) == 0.0
+
+    closeness = [float(twinned(40, gap)["min_neighbor_distance"]) for gap in (0.0, 0.05, 0.2, 0.6)]
+    assert closeness == sorted(closeness), closeness
+    assert closeness[0] == 0.0
+    assert closeness[1] == pytest.approx(0.05, abs=5e-3)
+
+    # Each twinned pair contaminates both rows, so `count` twins contaminate `2 * count` of 240.
+    extent = [float(twinned(count, 0.05)["near_duplicate_fraction"]) for count in (0, 10, 40, 90)]
+    assert extent == sorted(extent), extent
+    assert extent == pytest.approx([0.0, 20 / 240, 80 / 240, 180 / 240], abs=1e-6)
+
+
+def test_near_duplicate_fraction_stays_silent_on_uncontaminated_banks():
+    """A threshold that false-positives on clean data would make the number unreadable."""
+    generator = torch.Generator().manual_seed(61)
+    clustered = (torch.randn(20, 16, generator=generator).repeat_interleave(30, dim=0) * 3.0
+                 + torch.randn(600, 16, generator=generator) * 0.3)
+    for bank in (torch.randn(600, 16, generator=generator),
+                 torch.nn.functional.normalize(torch.randn(600, 64, generator=generator), dim=1),
+                 clustered):
+        state = fit_clean_distance_scale(bank, k=5, max_samples=300, seed=6)
+        assert float(state["near_duplicate_fraction"]) == 0.0
+
+
 def test_clean_distance_scale_floors_a_degenerate_spread():
     """Every clean score is identical here, so an unfloored inter-quartile range would be zero."""
     bank = torch.eye(8) * 2.0
@@ -200,7 +246,8 @@ def test_clean_distance_scale_is_deterministic_and_chunk_invariant():
     reseeded = fit_clean_distance_scale(bank, k=4, max_samples=25, seed=9)
     assert not torch.equal(first["center"], reseeded["center"])
     rechunked = fit_clean_distance_scale(bank, k=4, max_samples=25, seed=8, bank_chunk_size=9)
-    for key in ("center", "scale", "sample_count", "min_neighbor_distance"):
+    for key in ("center", "scale", "sample_count",
+                "min_neighbor_distance", "near_duplicate_fraction"):
         assert torch.equal(first[key], repeat[key])
         assert torch.allclose(first[key].float(), rechunked[key].float(), rtol=0.0, atol=1e-5)
     assert int(first["sample_count"]) == 25
