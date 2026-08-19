@@ -1,33 +1,41 @@
 __include__: [
-  '../dataset/construction_detection_home.yml',
+  '../dataset/coco_detection_home.yml',
   '../runtime.yml',
   './include/dataloader.yml',
   './include/optimizer.yml',
   './include/rtdetrv2_r50vd.yml',
 ]
 
-task: tu_estimation
+task: tue_calibration
 model: TUERTDETR
 
-# tu_estimation (TUESolver.fit) collects persistence diagrams to build
-# frechet_means.pth in the first place, so it must run the plain RTDETR
-# model here -- TUERTDETR requires an already-built frechet_means.pth to
-# even construct, which does not exist yet at this stage. Point a
-# separate config at TUERTDETR (see include/rtdetrv2_r50vd.yml) once
-# frechet_means.pth has been produced by this run.
+# Calibration hooks the detector heads directly, so use plain RTDETR here.
+# TUERTDETR is reserved for the separate inference config after both artifacts
+# have been produced; this avoids loading and recomputing stale TUE references.
 RTDETR:
   decoder: TUERTDETRTransformerv2
 
-output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue
+output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue_majority_t05
 
 TUERTDETR:
   backbone: PResNet
   encoder: HybridEncoder
   decoder: TUERTDETRTransformerv2
-  frechet_means: output/construction_uncertainty/frechet_means.pth # output/rtdetrv2_r18vd_120e_coco_tue/frechet_means.pth
+  frechet_means: output/rtdetrv2_r18vd_120e_coco_tue_majority_t05/frechet_means.pth
+  conformal_distances: output/rtdetrv2_r18vd_120e_coco_tue_majority_t05/conformal_distances.pth
   decoder_layers: null
-  tue_confidence_threshold: 0.15
+  tue_confidence_threshold: 0.5
   tue_topk: 1
+
+train_calibration_split_path: /home/philip/datasets/coco/annotations/instances_train_calibration_split.json
+conformal_calibration_population: predicted
+persistence_confidence_threshold: 0.5
+conformal_confidence_threshold: 0.5
+frechet_means_path: output/rtdetrv2_r18vd_120e_coco_tue_majority_t05/frechet_means.pth
+# Majority-class proof of concept: person, car, bottle, chair (COCO labels).
+# These classes have enough fitted/calibration detections to avoid the very
+# coarse p-values produced by rare classes.
+calibration_class_ids: [0, 2, 39, 56]
 
 PResNet:
   depth: 18
@@ -69,8 +77,15 @@ optimizer:
 train_dataloader: 
   dataset: 
     transforms:
+      # Calibration must match deterministic inference preprocessing. Keep the
+      # box conversion because Fréchet fitting still uses the matcher.
+      ops:
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
       policy:
-        epoch: 117
+        name: default
   collate_fn:
     scales: ~
   total_batch_size: 16
