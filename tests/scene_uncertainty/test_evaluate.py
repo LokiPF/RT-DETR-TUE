@@ -156,6 +156,7 @@ def test_deployable_policies_score_a_record_that_carries_no_oracle_fields(policy
     result = score_cached_record(record, THREE_LAYER_BANKS, policy, "mean", k=1)
     assert result["policy"] == policy
     assert result["valid"] is True
+    assert result["aggregation"] == ("weighted_mean" if policy.startswith("smooth_") else "mean")
 
 
 def test_a_deployable_score_does_not_move_with_the_ground_truth_labels():
@@ -221,3 +222,67 @@ def test_a_smoothed_policy_reports_the_weighted_mean_it_actually_computed():
     assert as_quantile == as_mean
     assert math.isclose(as_mean["layer_scores"][0], expected, rel_tol=1e-6)
     assert not math.isclose(expected, float(distances[0].mean()), rel_tol=1e-6)
+
+
+SEPARABLE_QUERIES = torch.tensor([[0.0, 0.0], [3.0, 3.0], [9.0, 9.0]])
+ORIGIN_BANK = {0: torch.tensor([[0.0, 0.0]])}
+
+
+def expected_aggregate(distances, aggregation):
+    """The four aggregations computed from first principles, without the module under test."""
+    ordered = sorted(float(value) for value in distances)
+    if aggregation == "mean":
+        return sum(ordered) / len(ordered)
+    if aggregation == "median":
+        return ordered[1]
+    if aggregation == "q90":
+        return ordered[1] + 0.8 * (ordered[2] - ordered[1])
+    if aggregation == "top20_mean":
+        return ordered[2]
+    raise AssertionError(f"untested aggregation: {aggregation}")
+
+
+@pytest.mark.parametrize("aggregation", ("mean", "median", "q90", "top20_mean"))
+def test_a_deployable_policy_runs_and_labels_the_aggregation_that_was_asked_for(aggregation):
+    """Three separably distant queries, so each aggregation lands on a different number.
+
+    Every deployable policy hands back uniform weights, so on equidistant queries a mean and a
+    weighted mean agree bit for bit and a suite built on them cannot see an aggregation being
+    swapped underneath the label.
+    """
+    record = make_layered_record(layers={0: SEPARABLE_QUERIES})
+    distances = compute_query_distances(record, ORIGIN_BANK, k=1)
+    result = score_cached_record(record, ORIGIN_BANK, "top20", aggregation, k=1)
+    assert result["aggregation"] == aggregation
+    assert math.isclose(
+        result["layer_scores"][0], expected_aggregate(distances[0], aggregation), rel_tol=1e-6
+    )
+    if aggregation != "mean":
+        assert not math.isclose(
+            result["layer_scores"][0], expected_aggregate(distances[0], "mean"), rel_tol=1e-6
+        )
+
+
+@pytest.mark.parametrize(
+    "policy, is_matched, is_correct",
+    (
+        ("oracle_matched", [False, False, False], [False, False, False]),
+        ("oracle_background", [True, True, True], [True, True, True]),
+        ("oracle_correct", [True, False, True], [False, False, False]),
+        ("oracle_incorrect", [True, False, True], [True, False, True]),
+    ),
+)
+def test_an_oracle_policy_with_nothing_to_select_reports_a_missing_score(policy, is_matched, is_correct):
+    """A scene with no matched object -- or none incorrect -- is an ordinary pilot condition."""
+    record = make_layered_record(
+        is_matched=torch.tensor(is_matched),
+        is_correct=torch.tensor(is_correct),
+    )
+    result = score_cached_record(record, THREE_LAYER_BANKS, policy, "mean", k=1)
+    assert result["policy"] == policy
+    assert result["valid"] is False
+    assert result["selected_count"] == 0
+    assert result["selected_query_ids"] == []
+    assert math.isnan(result["raw_score"])
+    assert result["layer_scores"] == {}
+    assert result["clean_scaled_layer_scores"] == {}
