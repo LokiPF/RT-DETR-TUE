@@ -12,15 +12,18 @@ from src.data.transforms import Compose, ConvertBoxes, ConvertPILImage, Resize, 
 from .blur import FixedGaussianBlur
 
 
-def _labels_and_annotation_ids(sample):
+def _per_annotation_tensors(sample):
     """Every tensor returned here is filtered by `SanitizeBoundingBoxes`' box mask.
 
-    Its default heuristic only finds `labels`, which would leave `annotation_ids`
-    misaligned with `boxes` whenever a box is dropped. Defined at module level rather
-    than as a lambda so the loader stays picklable for worker processes.
+    Its default heuristic only finds `labels`, which would leave the other
+    per-annotation tensors misaligned with `boxes` whenever a box is dropped. They must
+    all be listed so the target dict has no mix of aligned and stale keys. Returns the
+    tensors themselves, not copies: the sanitizer matches them by object identity.
+    Defined at module level rather than as a lambda so the loader stays picklable for
+    worker processes.
     """
     target = sample[1]
-    return target["labels"], target["annotation_ids"]
+    return target["labels"], target["annotation_ids"], target["area"], target["iscrowd"]
 
 
 def make_coco_loader(
@@ -35,7 +38,7 @@ def make_coco_loader(
         [
             Resize(size=[640, 640]),
             FixedGaussianBlur(blur_radius),
-            SanitizeBoundingBoxes(min_size=1, labels_getter=_labels_and_annotation_ids),
+            SanitizeBoundingBoxes(min_size=1, labels_getter=_per_annotation_tensors),
             ConvertPILImage(dtype="float32", scale=True),
             ConvertBoxes(fmt="cxcywh", normalize=True),
         ]

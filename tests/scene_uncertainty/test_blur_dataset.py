@@ -49,12 +49,12 @@ def _write_coco(root, image_ids, annotations):
 
 
 def _write_mini_coco(root):
-    """Three 8x8 images, one full-size box each."""
-    image_ids = (1, 2, 3)
+    """Four 8x8 images: three with one full-size box each, and image 4 with none."""
+    annotated_ids = (1, 2, 3)
     return _write_coco(
         root,
-        image_ids,
-        [_annotation(100 + image_id, image_id, [1, 1, 4, 4]) for image_id in image_ids],
+        (*annotated_ids, 4),
+        [_annotation(100 + image_id, image_id, [1, 1, 4, 4]) for image_id in annotated_ids],
     )
 
 
@@ -155,3 +155,22 @@ def test_sanitizer_drops_annotation_ids_together_with_their_boxes(tmp_path):
     # the upper box (normalised cy 0.375) and 203 the lower one (cy 0.75).
     assert target["boxes"][:, 1].tolist() == pytest.approx([0.375, 0.75])
     assert target["labels"].tolist() == [0, 2]
+    # `area` and `iscrowd` live in the same dict and must be filtered in lockstep too.
+    # The three areas are distinct (16, 0.004, 8), so this pins each surviving entry to
+    # its own annotation rather than merely counting them.
+    assert target["area"].tolist() == pytest.approx([16.0, 8.0])
+    # The converter drops every `iscrowd=1` annotation before this point, so a survivor
+    # can only ever be 0; length is all `iscrowd` can be pinned on.
+    assert target["iscrowd"].tolist() == [0, 0]
+
+
+def test_annotation_free_image_survives_the_loader(tmp_path):
+    # val2017 contains images with no annotations, and Task 5 extracts over a split
+    # drawn from it, so the empty-target path is reached for real.
+    image_dir, annotation_file = _write_mini_coco(tmp_path)
+    loader = make_coco_loader(image_dir, annotation_file, [4], 0.0, 1, 0)
+    images, (target,) = next(iter(loader))
+    assert images.shape == (1, 3, 640, 640)
+    for key in ("boxes", "labels", "annotation_ids", "area", "iscrowd"):
+        assert target[key].shape[0] == 0, key
+    assert int(target["image_id"]) == 4
