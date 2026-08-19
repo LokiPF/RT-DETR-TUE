@@ -10,39 +10,52 @@ from src.scene_uncertainty.blur import FixedGaussianBlur
 from src.scene_uncertainty.dataset import make_coco_loader
 
 
-def _write_mini_coco(root):
-    """Three 8x8 images, black left half / white right half, one box each."""
+_CATEGORIES = [
+    {"id": 1, "name": "person"},
+    {"id": 2, "name": "bicycle"},
+    {"id": 3, "name": "car"},
+]
+
+
+def _annotation(annotation_id, image_id, bbox, category_id=1):
+    return {
+        "id": annotation_id,
+        "image_id": image_id,
+        "category_id": category_id,
+        "bbox": bbox,
+        "area": bbox[2] * bbox[3],
+        "iscrowd": 0,
+    }
+
+
+def _write_coco(root, image_ids, annotations):
+    """8x8 images, black left half / white right half, plus the given annotations."""
     image_dir = root / "images"
     image_dir.mkdir()
     array = np.zeros((8, 8, 3), dtype=np.uint8)
     array[:, 4:] = 255
     images = []
-    annotations = []
-    for image_id in (1, 2, 3):
+    for image_id in image_ids:
         file_name = f"{image_id:012d}.png"
         Image.fromarray(array).save(image_dir / file_name)
         images.append({"id": image_id, "file_name": file_name, "width": 8, "height": 8})
-        annotations.append(
-            {
-                "id": 100 + image_id,
-                "image_id": image_id,
-                "category_id": 1,
-                "bbox": [1, 1, 4, 4],
-                "area": 16,
-                "iscrowd": 0,
-            }
-        )
     annotation_file = root / "instances.json"
     annotation_file.write_text(
         json.dumps(
-            {
-                "images": images,
-                "annotations": annotations,
-                "categories": [{"id": 1, "name": "person"}],
-            }
+            {"images": images, "annotations": annotations, "categories": _CATEGORIES}
         )
     )
     return image_dir, annotation_file
+
+
+def _write_mini_coco(root):
+    """Three 8x8 images, one full-size box each."""
+    image_ids = (1, 2, 3)
+    return _write_coco(
+        root,
+        image_ids,
+        [_annotation(100 + image_id, image_id, [1, 1, 4, 4]) for image_id in image_ids],
+    )
 
 
 def test_converter_preserves_filtered_annotation_ids():
@@ -120,3 +133,25 @@ def test_blur_is_applied_after_resize(tmp_path):
     # than the fixed radius.
     assert torch.equal(blurred[0, :, 0, 0], torch.zeros(3))
     assert torch.equal(blurred[0, :, 0, -1], torch.ones(3))
+
+
+def test_sanitizer_drops_annotation_ids_together_with_their_boxes(tmp_path):
+    # The middle box is 0.001px wide in an 8x8 source, so it survives the converter's
+    # `keep` mask but is 0.08px wide after the 80x resize and SanitizeBoundingBoxes
+    # drops it. The ids must lose the same entry, not merely the right count of them.
+    image_dir, annotation_file = _write_coco(
+        tmp_path,
+        (1,),
+        [
+            _annotation(201, 1, [1, 1, 4, 4], category_id=1),
+            _annotation(202, 1, [5, 1, 0.001, 4], category_id=2),
+            _annotation(203, 1, [1, 5, 4, 2], category_id=3),
+        ],
+    )
+    loader = make_coco_loader(image_dir, annotation_file, [1], 0.0, 1, 0)
+    _, (target,) = next(iter(loader))
+    assert target["annotation_ids"].tolist() == [201, 203]
+    # Pair each surviving id with its own box rather than trusting the count: 201 is
+    # the upper box (normalised cy 0.375) and 203 the lower one (cy 0.75).
+    assert target["boxes"][:, 1].tolist() == pytest.approx([0.375, 0.75])
+    assert target["labels"].tolist() == [0, 2]
