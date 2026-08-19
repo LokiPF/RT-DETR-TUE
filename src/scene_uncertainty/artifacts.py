@@ -12,10 +12,33 @@ import torch
 SCHEMA_VERSION = 1
 
 
+def _dumps(value) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def _canonical(value) -> str:
+    """Canonical JSON text for `value`, invariant under a manifest round trip.
+
+    Manifests are persisted as JSON, which rewrites int keys as strings and tuples
+    as lists, so a live metadata value and the copy reloaded from disk are only
+    comparable once both have been through the same normalisation. Dumping twice is
+    what makes that normalisation idempotent: the first dump applies JSON's key
+    coercion and the second sorts the coerced keys, so `{0: ..., 10: ...}` and
+    `{"0": ..., "10": ...}` agree on order instead of one side sorting int keys
+    numerically (9, 10) while the other sorts their strings lexicographically
+    ("10", "9").
+
+    Deliberately no `default=` fallback: metadata that JSON cannot encode cannot be
+    persisted either, so raising here fails the run at writer construction instead
+    of at the end of a multi-hour extraction, and stringifying such values would let
+    two different ones (two large tensors print identically) pass as compatible.
+    """
+    return _dumps(json.loads(_dumps(value)))
+
+
 def manifest_id(manifest: Mapping) -> str:
     payload = {key: value for key, value in manifest.items() if key != "artifact_id"}
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(encoded).hexdigest()
+    return hashlib.sha256(_canonical(payload).encode("utf-8")).hexdigest()
 
 
 def _atomic_torch_save(value, path: Path) -> None:
@@ -97,7 +120,7 @@ class ShardWriter:
         }
         manifest["artifact_id"] = manifest_id(manifest)
         _atomic_json_save(manifest, self.final_manifest)
-        self.partial_manifest.unlink()
+        self.partial_manifest.unlink(missing_ok=True)
 
     def __exit__(self, exc_type, exc_value, traceback) -> None:
         if exc_type is None:
@@ -117,7 +140,7 @@ def iter_records(directory: str | Path) -> Iterator[dict]:
 
 def assert_compatible(actual: Mapping, expected: Mapping, keys: Iterable[str]) -> None:
     for key in keys:
-        if actual.get(key) != expected.get(key):
+        if _canonical(actual.get(key)) != _canonical(expected.get(key)):
             raise ValueError(
                 f"Artifact mismatch for {key}: actual={actual.get(key)!r}, expected={expected.get(key)!r}"
             )

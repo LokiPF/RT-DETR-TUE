@@ -127,3 +127,54 @@ def test_compatibility_reports_a_key_the_artifact_never_recorded():
             {"checkpoint_sha256": "a", "query_count": 300},
             keys=("checkpoint_sha256", "query_count"),
         )
+
+
+def test_resume_accepts_metadata_that_json_rewrites(tmp_path: Path):
+    # Task 12 writes `corruption.radii` keyed by int severity and passes tuples
+    # for list-valued settings. JSON persists int keys as strings and tuples as
+    # lists, so a partial manifest never compares equal to the live metadata it
+    # was written from unless both sides are canonicalised first -- and the
+    # failure looks exactly like the checkpoint-mismatch guard firing correctly.
+    metadata = {
+        "checkpoint_sha256": "abc",
+        "decoder_layers": (0, 1, 2),
+        "corruption": {
+            "type": "gaussian_blur",
+            "radii": {severity: float(severity) for severity in range(6)},
+        },
+    }
+    interrupted = ShardWriter(tmp_path, metadata, shard_size=2)
+    interrupted.add({"image_id": 1})
+    interrupted.add({"image_id": 2})
+    resumed = ShardWriter(tmp_path, metadata, shard_size=2)
+    assert resumed.existing_record_keys() == {(1, 0), (2, 0)}
+    resumed.add({"image_id": 3})
+    resumed.close()
+    assert [record["image_id"] for record in iter_records(tmp_path)] == [1, 2, 3]
+
+
+def test_canonicalisation_holds_past_the_single_digit_key_boundary(tmp_path: Path):
+    # `sort_keys` orders int keys numerically (..., 9, 10, 11) but orders the
+    # strings JSON rewrites them to lexicographically ("1", "10", "11", ..., "9"),
+    # so a single canonical dump of each side only agrees while every key is one
+    # digit long. Both the resume comparison and the content-addressed id have to
+    # survive the eleventh key.
+    metadata = {
+        "checkpoint_sha256": "abc",
+        "radii": {severity: float(severity) for severity in range(12)},
+    }
+    interrupted = ShardWriter(tmp_path, metadata, shard_size=2)
+    interrupted.add({"image_id": 1})
+    interrupted.add({"image_id": 2})
+    resumed = ShardWriter(tmp_path, metadata, shard_size=2)
+    resumed.close()
+    manifest = load_manifest(tmp_path)
+    assert manifest_id(manifest) == manifest["artifact_id"]
+
+
+def test_close_is_idempotent(tmp_path: Path):
+    writer = ShardWriter(tmp_path, {"checkpoint_sha256": "abc"}, shard_size=2)
+    writer.add({"image_id": 1})
+    writer.close()
+    writer.close()
+    assert [record["image_id"] for record in iter_records(tmp_path)] == [1]
