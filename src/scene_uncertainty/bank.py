@@ -23,13 +23,12 @@ def deterministic_reservoir(vectors: Iterable[Tensor], capacity: int, seed: int)
     rng = np.random.default_rng(seed)
     reservoir: list[Tensor] = []
     for seen, vector in enumerate(vectors, start=1):
-        value = _stored_vector(vector)
         if len(reservoir) < capacity:
-            reservoir.append(value)
+            reservoir.append(_stored_vector(vector))
             continue
         replacement = int(rng.integers(0, seen))
         if replacement < capacity:
-            reservoir[replacement] = value
+            reservoir[replacement] = _stored_vector(vector)
     if not reservoir:
         raise ValueError("Cannot build a bank from zero vectors")
     return torch.stack(reservoir)

@@ -1,3 +1,4 @@
+import math
 import weakref
 
 import numpy as np
@@ -200,8 +201,9 @@ def test_coverage_bank_returns_the_rows_its_indices_name_exactly_once():
 def test_normalizer_state_is_fitted_on_the_bank_and_never_refitted():
     bank = torch.tensor([[1.0, 0.0], [2.0, 2.0], [4.0, 1.0], [8.0, 3.0]])
     evaluation = torch.tensor([[100.0, 50.0], [-100.0, -50.0]])
+    # every feature here spreads, so no floor applies and the raw spread is the scale
     center = bank.median(dim=0).values
-    scale = (torch.quantile(bank, 0.75, dim=0) - torch.quantile(bank, 0.25, dim=0)).clamp_min(1e-6)
+    scale = torch.quantile(bank, 0.75, dim=0) - torch.quantile(bank, 0.25, dim=0)
     state = fit_normalizer(bank, "robust_z")
     assert torch.allclose(transform_vectors(evaluation, state), (evaluation - center) / scale)
     assert not torch.allclose(
@@ -212,7 +214,7 @@ def test_normalizer_state_is_fitted_on_the_bank_and_never_refitted():
     magnitude_center = magnitudes.median(dim=0).values
     magnitude_scale = (
         torch.quantile(magnitudes, 0.75, dim=0) - torch.quantile(magnitudes, 0.25, dim=0)
-    ).clamp_min(1e-6)
+    )
     shape_state = fit_normalizer(bank, "shape_scale")
     expected = (evaluation.norm(dim=1, keepdim=True).log1p() - magnitude_center) / magnitude_scale
     assert torch.allclose(transform_vectors(evaluation, shape_state)[:, 2:], expected)
@@ -247,3 +249,38 @@ def test_unknown_normalization_mode_raises(mode):
         fit_normalizer(bank, mode)
     with pytest.raises(ValueError, match="Unknown normalization mode"):
         transform_vectors(bank, {"mode": mode})
+
+
+def test_robust_z_bounds_a_bank_constant_feature_instead_of_exploding_it():
+    """Feature 1 never moves in the bank, so its spread carries no scale of its own.
+
+    The floor it falls back to must be relative to how much the other features move,
+    or an evaluation-time movement in it swamps every informative coordinate.
+    """
+    bank = torch.stack([torch.tensor([float(index), 0.0]) for index in range(1000)])
+    state = fit_normalizer(bank, "robust_z")
+    assert state["scale"][1].item() == pytest.approx(1e-3 * state["scale"][0].item(), rel=1e-5)
+    assert state["zero_spread"].tolist() == [False, True]
+    assert state["zero_spread_count"] == 1
+    output = transform_vectors(torch.tensor([[500.0, 0.3]]), state)
+    assert torch.isfinite(output).all()
+    assert abs(output[0, 1].item()) < 1.0
+
+
+def test_shape_scale_bounds_the_magnitude_coordinate_on_an_equal_norm_bank():
+    bank = torch.tensor([[3.0, 4.0], [4.0, 3.0], [0.0, 5.0], [5.0, 0.0]])
+    state = fit_normalizer(bank, "shape_scale")
+    assert state["magnitude_zero_spread"].tolist() == [True]
+    assert state["magnitude_zero_spread_count"] == 1
+    assert state["magnitude_scale"].item() == pytest.approx(1e-3 * math.log1p(5.0), rel=1e-5)
+    output = transform_vectors(torch.tensor([[6.0, 8.0]]), state)
+    assert torch.isfinite(output).all()
+    assert abs(output[0, 2].item()) < 1000.0
+
+
+def test_robust_z_stays_finite_when_the_whole_bank_is_one_point():
+    bank = torch.zeros(4, 2)
+    state = fit_normalizer(bank, "robust_z")
+    assert state["zero_spread"].tolist() == [True, True]
+    assert state["zero_spread_count"] == 2
+    assert torch.isfinite(transform_vectors(torch.tensor([[1.0, -2.0]]), state)).all()
