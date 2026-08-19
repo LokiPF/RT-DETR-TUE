@@ -134,7 +134,8 @@ def build_parser() -> argparse.ArgumentParser:
     select.add_argument("--train-ann", required=True, help="COCO train2017 instances JSON")
     select.add_argument("--val-ann", required=True, help="COCO val2017 instances JSON")
     select.add_argument("--output", required=True, help="directory for the two selection files")
-    select.add_argument("--seed", type=int, default=42)
+    select.add_argument("--seed", type=_non_negative_int, default=42,
+                        help="numpy seed; the selection files record it for the extractors")
     select.add_argument("--natural-count", type=_positive_int, default=4000,
                         help="uniformly drawn reference images")
     select.add_argument("--augmentation-budget", type=_positive_int, default=1000,
@@ -173,7 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
     build_bank.add_argument("--population", choices=("natural", "coverage"), required=True)
     build_bank.add_argument("--capacity", type=_positive_int, required=True,
                             help="vectors per decoder layer")
-    build_bank.add_argument("--seed", type=int, default=42)
+    build_bank.add_argument("--seed", type=_non_negative_int, default=42,
+                            help="offset by the layer id, so each layer bank draws independently")
 
     evaluate = add("evaluate-knn", "Score cached scenes against the bank.", _EVALUATE_EPILOG)
     evaluate.add_argument("--cache", required=True, help="evaluation feature cache directory")

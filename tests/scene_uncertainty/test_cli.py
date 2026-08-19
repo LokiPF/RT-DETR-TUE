@@ -117,6 +117,16 @@ def test_non_positive_extraction_sizes_are_refused(argument, value):
         ])
 
 
+@pytest.mark.parametrize("command,arguments", [
+    ("select", ["--train-ann", "t", "--val-ann", "v", "--output", "o"]),
+    ("build-bank", ["--cache", "c", "--output", "o", "--population", "natural", "--capacity", "8"]),
+])
+def test_a_negative_seed_is_refused(command, arguments):
+    """numpy's default_rng rejects it, several layers down, after the annotations are loaded."""
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([command, *arguments, "--seed", "-1"])
+
+
 def test_zero_workers_is_accepted():
     args = build_parser().parse_args([
         "extract-blur", "--config", "c", "--checkpoint", "k", "--images", "i",
