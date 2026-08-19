@@ -5,6 +5,16 @@ from scipy.stats import spearmanr
 
 
 def jaccard_overlap(first, second) -> float:
+    """Overlap between two query selections, as intersection over union.
+
+    Two empty selections score 1.0. That is set-theoretically right -- they really are the
+    same selection -- but in a report it reads as "selection was perfectly stable across this
+    severity step" when what happened is "the policy selected nothing at either severity, and
+    neither scene has a score at all". Returning 0.0 or `nan` for that case instead would be
+    no better, since 0.0 reads as "the selection changed completely"; the caller is the only
+    one that can separate the two, from the `selected_count` and `valid` that
+    `score_cached_record` reports alongside each selection.
+    """
     first_set = set(int(value) for value in first)
     second_set = set(int(value) for value in second)
     union = first_set | second_set
@@ -62,5 +72,20 @@ def monotonicity_metrics(severities, scores) -> dict:
 
 
 def has_class_switch(first: dict[int, int], second: dict[int, int]) -> bool:
+    """Report whether an annotation matched at both severities changed its predicted class.
+
+    This does not detect detection collapse. Only annotations present in both mappings are
+    compared, so a scene that matched ten objects at severity 0 and matched *none* at
+    severity 5 returns `False` -- the same value as a scene that was perfectly stable. Read
+    `False` strictly as "no annotation that was still detected changed its predicted class",
+    never as "the detector was unaffected". Match loss is the dominant effect of blur and
+    this function is blind to it by construction.
+
+    Widening the comparison to the union, with a sentinel standing in for "unmatched", is the
+    wrong fix: it would push detection loss and misclassification through one flag that cannot
+    say which of them happened. What is missing is a sibling metric, and `matched_predictions`
+    already carries what such a metric needs -- its key set shrinks as annotations go
+    unmatched.
+    """
     shared = set(first) & set(second)
     return any(int(first[annotation_id]) != int(second[annotation_id]) for annotation_id in shared)
