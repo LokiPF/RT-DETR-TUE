@@ -69,6 +69,7 @@ def test_all_policy_keeps_every_query_with_uniform_weight():
     assert selection["valid"] is True
     assert selection["indices"].tolist() == [0, 1, 2, 3]
     assert torch.allclose(selection["weights"], torch.full((4,), 0.25))
+    assert select_queries(torch.empty(0, 2), "all")["valid"] is False
 
 
 def test_topk_breaks_confidence_ties_by_ascending_query_index():
@@ -88,6 +89,8 @@ def test_topk_uses_locked_budgets_and_clamps_to_the_available_queries():
     assert fifty["indices"].tolist() == list(range(11, -1, -1))
     assert torch.allclose(fifty["weights"], torch.full((12,), 1.0 / 12))
     assert select_queries(logits, "top20", topk_override=0)["valid"] is False
+    with pytest.raises(ValueError, match="must not be negative: -1"):
+        select_queries(logits, "top20", topk_override=-1)
 
 
 def test_threshold_boundary_excludes_queries_at_the_locked_thresholds():

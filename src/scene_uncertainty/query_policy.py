@@ -57,6 +57,8 @@ def select_queries(
     if policy == "all":
         return _uniform_selection(torch.arange(query_count))
     if policy in TOPK:
+        if topk_override is not None and topk_override < 0:
+            raise ValueError(f"top-K query budget must not be negative: {topk_override}")
         count = TOPK[policy] if topk_override is None else topk_override
         order = torch.argsort(confidence, descending=True, stable=True).cpu()
         return _uniform_selection(order[:count])
