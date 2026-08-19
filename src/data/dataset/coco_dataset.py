@@ -145,9 +145,15 @@ class ConvertCocoPolysToMask(object):
             if num_keypoints:
                 keypoints = keypoints.view(num_keypoints, -1, 3)
 
+        annotation_ids = torch.tensor(
+            [int(obj["id"]) for obj in anno],
+            dtype=torch.int64,
+        )
+
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
         labels = labels[keep]
+        annotation_ids = annotation_ids[keep]
         if self.return_masks:
             masks = masks[keep]
         if keypoints is not None:
@@ -156,6 +162,7 @@ class ConvertCocoPolysToMask(object):
         target = {}
         target["boxes"] = boxes
         target["labels"] = labels
+        target["annotation_ids"] = annotation_ids
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id
