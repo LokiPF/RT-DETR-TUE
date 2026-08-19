@@ -111,7 +111,10 @@ def test_csv_round_trip_preserves_row_order_columns_and_unscored_rows(tmp_path: 
         {
             "image_id": 4,
             "severity": 5,
-            "raw_score": 5.5,
+            # Not exactly representable: pandas' default float converter reads this back
+            # as 0.3, and every published statistic in Task 12 is derived from what this
+            # reader returns rather than from what the scorer produced.
+            "raw_score": 0.1 + 0.2,
             "layer_scores": {0: 1.5},
             "clean_scaled_layer_scores": {0: -1.25},
             "valid": True,
@@ -143,7 +146,7 @@ def test_csv_round_trip_preserves_row_order_columns_and_unscored_rows(tmp_path: 
 
     assert [row["severity"] for row in loaded] == [5, 0]
     assert set(loaded[0]) == set(rows[0])
-    assert loaded[0]["raw_score"] == 5.5
+    assert loaded[0]["raw_score"] == 0.1 + 0.2
     assert loaded[0]["valid"] is True
     assert loaded[0]["clean_scaled_layer_scores"] == {"0": -1.25}
     assert math.isnan(loaded[1]["raw_score"])
@@ -195,8 +198,17 @@ def test_undefined_statistics_are_written_as_null_not_nan(tmp_path: Path):
     assert "NaN" not in text
     group = json.loads(text)["groups"][0]
     assert group["median_spearman"] is None
+    assert group["mean_adjacent_monotonicity"] is None
+    assert group["mean_violation_magnitude"] is None
+    # `monotonicity_metrics` reports `endpoint_increase: False` -- not `nan` -- when fewer
+    # than two severities survived, so this is the one trend statistic a plain mean cannot
+    # drop. Averaged over the images that were actually measured, it goes null with the
+    # other three instead of publishing "no image rose" about zero measurements.
+    assert group["endpoint_increase_rate"] is None
     assert group["mean_adjacent_query_overlap"] is None
     assert group["class_switch_monotonicity"] is None
+    assert group["image_count"] == 1
+    assert group["scored_image_count"] == 0
     assert group["empty_selection_frequency"] == 1.0
     assert group["scored_severity_count"] == 0
     assert group["total_severity_count"] == 6
@@ -210,6 +222,32 @@ def test_a_single_severity_produces_no_adjacent_steps(tmp_path: Path):
     assert group["median_spearman"] is None
     assert group["scored_severity_count"] == 1
     assert group["total_severity_count"] == 1
+
+
+def test_trend_statistics_report_the_images_they_were_measured_over(tmp_path: Path):
+    """One image rose across the whole sweep; three collapsed after severity 0.
+
+    Every trend statistic here is an n=1 result. `image_count` says 4 because four images
+    were swept, so `scored_image_count` has to say 1, or a reader takes the median and the
+    endpoint rate for a four-image finding.
+    """
+    rows = list(make_trend_rows("all", [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+    for image_id, collapsed in enumerate(
+        [[1.0] + [float("nan")] * 5] * 3, start=2
+    ):
+        for row in make_trend_rows("all", collapsed):
+            rows.append({**row, "image_id": image_id})
+    write_report(rows, tmp_path)
+    group = next(
+        group for group in json.loads((tmp_path / "summary.json").read_text())["groups"]
+        if group["score_scope"] == "combined"
+    )
+    assert group["image_count"] == 4
+    assert group["scored_image_count"] == 1
+    assert group["median_spearman"] == 1.0
+    # Not 0.25: the three collapsed images never produced an endpoint to compare.
+    assert group["endpoint_increase_rate"] == 1.0
+    assert group["images_with_unscored_severities"] == 3
 
 
 def test_empty_input_round_trips_as_no_rows_and_is_refused_by_write_report(tmp_path: Path):

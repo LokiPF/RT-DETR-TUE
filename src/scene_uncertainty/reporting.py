@@ -68,9 +68,17 @@ def write_result_csv(rows: list[dict], path: str | Path) -> None:
 
 
 def read_result_csv(path: str | Path) -> list[dict]:
-    """Read back what `write_result_csv` wrote, decoding the nested columns."""
+    """Read back what `write_result_csv` wrote, decoding the nested columns.
+
+    `float_precision="round_trip"` is not optional. Pandas' default float converter is
+    fast rather than exact, so a score written as `0.30000000000000004` comes back as
+    `0.3`; it is intermittent, and most values survive it, which is exactly what makes it
+    dangerous. The whole summary is computed from what this function returns, and
+    `adjacent_monotonicity` and `endpoint_increase` are strict comparisons that a
+    one-ULP shift can flip on a near-tie.
+    """
     try:
-        frame = pd.read_csv(path)
+        frame = pd.read_csv(path, float_precision="round_trip")
     except pd.errors.EmptyDataError:
         # `write_result_csv([])` has no columns to declare, so the file holds a bare
         # header line. Reading it back as no rows keeps the round trip total.
@@ -154,6 +162,12 @@ def write_report(rows: list[dict], output_dir: str | Path, run_metadata: dict | 
     that rose only over the severities it survived -- those two publish identical
     `median_spearman` and `endpoint_increase_rate`, so without the counts the second one
     can outrank the first.
+
+    `image_count` is every image the config swept; `scored_image_count` is the subset with
+    two or more surviving severities, which is the denominator all four trend statistics
+    are actually computed over. Both are published because they diverge exactly when the
+    trend statistics get thin: a median over one surviving image out of four reads as a
+    four-image finding without the second number next to it.
     """
     if not rows:
         raise ValueError("write_report needs at least one scored row")
@@ -185,6 +199,13 @@ def write_report(rows: list[dict], output_dir: str | Path, run_metadata: dict | 
             monotonicity_metrics(image_group["severity"], image_group["score"])
             for _, image_group in all_group.groupby("image_id", sort=True)
         ]
+        # An image with fewer than two surviving severities has no trend to describe.
+        # `monotonicity_metrics` says so with `nan` for three of the four statistics, but
+        # `endpoint_increase` comes back a definite `False` there, which a plain mean
+        # would happily average in and publish as "this image did not rise". Selecting
+        # the measured images once gives all four statistics the same denominator, so
+        # they go null together and `scored_image_count` reports what that denominator is.
+        scored_metrics = [value for value in image_metrics if value["finite_count"] >= 2]
         adjacent = []
         for _, image_group in group.groupby("image_id", sort=True):
             adjacent.extend(_adjacent_diagnostics(image_group))
@@ -196,6 +217,7 @@ def write_report(rows: list[dict], output_dir: str | Path, run_metadata: dict | 
             "aggregation": keys[2],
             "score_scope": keys[3],
             "image_count": len(image_metrics),
+            "scored_image_count": len(scored_metrics),
             "scored_severity_count": sum(value["finite_count"] for value in image_metrics),
             "total_severity_count": sum(value["total_count"] for value in image_metrics),
             "images_with_unscored_severities": sum(
@@ -203,10 +225,10 @@ def write_report(rows: list[dict], output_dir: str | Path, run_metadata: dict | 
             ),
             "empty_selection_frequency": float((~all_group["valid"]).mean()),
             "mean_adjacent_query_overlap": _safe_mean(step["query_overlap"] for step in adjacent),
-            "median_spearman": _safe_median(value["spearman"] for value in image_metrics),
-            "mean_adjacent_monotonicity": _safe_mean(value["adjacent_monotonicity"] for value in image_metrics),
-            "mean_violation_magnitude": _safe_mean(value["violation_magnitude"] for value in image_metrics),
-            "endpoint_increase_rate": _safe_mean(value["endpoint_increase"] for value in image_metrics),
+            "median_spearman": _safe_median(value["spearman"] for value in scored_metrics),
+            "mean_adjacent_monotonicity": _safe_mean(value["adjacent_monotonicity"] for value in scored_metrics),
+            "mean_violation_magnitude": _safe_mean(value["violation_magnitude"] for value in scored_metrics),
+            "endpoint_increase_rate": _safe_mean(value["endpoint_increase"] for value in scored_metrics),
             "class_switch_step_count": len(switched),
             "class_switch_monotonicity": _safe_mean(step["nondecreasing"] for step in switched),
             "class_switch_violation_magnitude": _safe_mean(step["normalized_downward_change"] for step in switched),
