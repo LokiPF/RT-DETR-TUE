@@ -36,6 +36,15 @@ def score_cached_record(
         selection = select_oracle_queries(record, policy)
     else:
         selection = select_queries(record["logits"].float(), policy, uniform_floor=uniform_floor)
+    if policy.startswith("smooth_"):
+        # A smoothed policy keeps every query and carries its whole signal in the per-query
+        # weights, so a plain mean -- or worse a quantile -- would aggregate that signal away.
+        # The aggregation is forced to the weighted mean, and the row is then relabelled with
+        # the aggregation that actually ran: the results table groups on this label, so a
+        # weighted mean filed under `q90` would publish a q90 curve no q90 ever produced, and
+        # sweeping `mean` and `q90` over one smoothed policy would file a single number under
+        # two contradictory names instead of collapsing onto one.
+        aggregation = "weighted_mean"
     matched_predictions = {
         int(annotation_id): int(predicted_class)
         for annotation_id, predicted_class in zip(
@@ -68,8 +77,7 @@ def score_cached_record(
     layer_scores: dict[int, float] = {}
     for layer_id in sorted(query_distances):
         selected_scores = query_distances[layer_id].index_select(0, selection["indices"])
-        method = "weighted_mean" if policy.startswith("smooth_") else aggregation
-        score = aggregate_scores(selected_scores, method, selection["weights"])
+        score = aggregate_scores(selected_scores, aggregation, selection["weights"])
         layer_scores[layer_id] = float(score.item())
     if layer_score_scales is None:
         layer_score_scales = {
