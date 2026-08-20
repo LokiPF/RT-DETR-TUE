@@ -1913,3 +1913,193 @@ def test_the_confidence_panel_is_not_captioned_with_a_persistence_scope(tmp_path
     persistence, confidence = figure.axes
     assert PRIMARY_SCORE_SCOPE in persistence.get_title()
     assert PRIMARY_SCORE_SCOPE not in confidence.get_title()
+
+
+# --- review round 1: a table that is silently sliced ------------------------------------------
+
+
+def sparse_rows():
+    """The grid cut to three decile bins, plus both benchmarks -- a genuinely sparse table.
+
+    This is the case the shown-absence mechanism replaced brief:82's unimplementable assertion
+    for, so it is the case its behaviour has to be checked in.
+    """
+    kept = {"decile_00_10", "decile_50_60", "decile_90_100", ALL_VALID_BENCHMARK[1]}
+    return [row for row in full_grid_rows() if row["confidence_bin"] in kept]
+
+
+def table_rows(text: str) -> list[list[str]]:
+    return [
+        [cell.strip() for cell in line.strip().strip("|").split("|")]
+        for line in text.splitlines()
+        if line.startswith("|") and "---" not in line
+    ]
+
+
+def test_the_confidence_table_contains_the_winners_own_row(tmp_path):
+    """The paragraph above this table quotes the winner; the table must hold the row it quotes.
+
+    Slicing the table at one scene summary while the headline candidate sits at another puts
+    two different numbers for one selection on one page -- `+0.6286 / 176-9-65` in the sentence
+    and `+0.6000 / 179-6-65` in the table beneath it -- with nothing saying they are different
+    summaries. Both correct, and together misleading. This kills the slice.
+    """
+    summary = grid_summary()
+    winner = summary[RANKED_GROUPS_KEY][0]
+    section_text = section((written(tmp_path) / "easy-report.md").read_text(),
+                           "Persistence versus confidence alone")
+    matched = [
+        cells for cells in table_rows(section_text)
+        if cells[1] == f"`{winner['confidence_bin']}`"
+        and cells[2] == f"`{winner['aggregation']}`"
+        and cells[0].startswith(f"`{winner['membership_mode']}`")
+    ]
+    assert len(matched) == 1, matched
+    assert matched[0][3] == f"{winner['median_spearman']:+.4f}"
+
+
+@pytest.mark.parametrize(("heading", "column"), [
+    ("Persistence versus confidence alone", 2),
+    ("Dynamic versus frozen queries", 1),
+    ("Effect of padded queries", 3),
+])
+def test_every_report_table_names_the_scene_summary_of_each_row(tmp_path, heading, column):
+    """Kills the hidden slice in all three tables at once.
+
+    Each carries a `summary` column and rows at more than one summary, so a reader can never
+    take a number out of one of them without knowing which summary it belongs to.
+    """
+    section_text = section((written(tmp_path) / "easy-report.md").read_text(), heading)
+    rows = table_rows(section_text)
+    assert rows and rows[0][column] == "summary"
+    present = {cells[column].strip("`") for cells in rows[1:]}
+    assert present <= set(DECILE_AGGREGATIONS)
+    assert len(present) > 1, present
+
+
+def test_a_table_says_which_slice_is_still_fixed(tmp_path):
+    """The figures carry their slice on their own titles; the tables now do the same."""
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    for heading in ("Persistence versus confidence alone", "Dynamic versus frozen queries"):
+        assert "Slice:" in section(report, heading)
+        assert PRIMARY_SCORE_SCOPE in section(report, heading)
+    assert "the confidence control has no decoder-layer scope" in section(
+        report, "Effect of padded queries"
+    )
+
+
+def test_the_absent_pair_message_names_the_slice_it_looked_in(tmp_path):
+    """"No matched pair was scored in this table" is false whenever pairs exist at another
+    summary or another scope. The message has to say where it looked."""
+    summary = grid_summary()
+    summary["comparisons"] = []
+    lines = reporting_module._confidence_section(summary, None)
+    # Asserted on the message line itself. The slice caption above the table also names the
+    # scope and the padding rule, so a check over the whole section passes on the generic
+    # message and proves nothing -- which is how the first version of this test survived.
+    message = [line for line in lines if line.startswith("No matched")]
+    assert len(message) == 1
+    assert PRIMARY_SCORE_SCOPE in message[0]
+    assert "padding union removed" in message[0]
+
+
+@pytest.mark.parametrize(("heading", "column"), [
+    ("Persistence versus confidence alone", 0),
+    ("Effect of padded queries", 1),
+])
+def test_a_frozen_row_is_labelled_diagnostic_in_every_table_it_appears_in(
+    tmp_path, heading, column
+):
+    """Spec:230. The frozen bottom bin publishes the strongest pair of numbers in the report,
+    so an unlabelled `frozen` in a membership column beside dynamic rows reads as the best
+    method on offer rather than as something that needs a paired clean image."""
+    rows = table_rows(section((written(tmp_path) / "easy-report.md").read_text(), heading))
+    assert rows[0][column] == "membership"
+    frozen = [cells for cells in rows[1:] if cells[column].startswith("`frozen`")]
+    assert frozen
+    for cells in frozen:
+        assert "(diagnostic)" in cells[column]
+
+
+# --- review round 1: two captions that stated something untrue ---------------------------------
+
+
+def test_the_dynamic_frozen_panel_title_does_not_claim_a_single_membership(tmp_path):
+    """The panel draws dynamic *and* frozen bars; a caption reading "dynamic membership" over
+    them says the frozen bars are dynamic."""
+    figure = reporting_module._dynamic_frozen_figure(grid_summary())
+    axis = figure.axes[0]
+    title = axis.get_title()
+    assert [container.get_label() for container in axis.containers] == ["dynamic", "frozen"]
+    assert f"{reporting_module.DYNAMIC_MEMBERSHIP_MODE} membership" not in title
+    assert reporting_module.FIGURE_SLICE not in title
+    assert PRIMARY_SCORE_SCOPE in title
+
+
+def test_the_padding_title_does_not_give_the_confidence_control_a_decoder_scope(tmp_path):
+    """Spec:125 -- two of the four bar groups are the confidence control, which has no decoder
+    scope, so a blanket "(q90, persistence at layer_2)" over all four is untrue of half."""
+    figure = reporting_module._padding_sensitivity_figure(grid_summary())
+    axis = figure.axes[0]
+    title = axis.get_title()
+    assert any("confidence" in label.get_text() for label in axis.get_xticklabels())
+    assert f"persistence at {PRIMARY_SCORE_SCOPE})" not in title
+    assert "the confidence control has no decoder-layer scope" in title
+    assert SENSITIVITY_BIN in title
+
+
+# --- review round 1: the sparse-table message that could not be read ----------------------------
+
+
+def test_the_sparse_blur_curve_title_counts_the_missing_bins_rather_than_listing_them(tmp_path):
+    """On a three-bin table the list of seven absent names overflows the panel it captions --
+    clipped at the left, off the canvas at the right -- in exactly the case the message exists
+    for. A count fits; `summary.json` holds which."""
+    figure = reporting_module._blur_curve_figure(summary_frame(sparse_rows()))
+    for axis in figure.axes:
+        title = axis.get_title()
+        assert f"7 of {len(DECILE_NAMES)} bins have no row here" in title
+        assert "decile_10_20" not in title
+        assert max(len(line) for line in title.splitlines()) < 80
+
+
+def test_a_complete_table_leaves_the_missing_bin_note_off(tmp_path):
+    figure = reporting_module._blur_curve_figure(summary_frame(full_grid_rows()))
+    assert all("no row here" not in axis.get_title() for axis in figure.axes)
+
+
+def test_a_sparse_table_still_writes_every_declared_artifact(tmp_path):
+    output = written(tmp_path, rows=sparse_rows())
+    assert {path.name for path in output.iterdir()} == {
+        "per_scene.csv", "summary.json", "confidence_decile_heatmap.png", "blur_curves.png",
+        "dynamic_vs_frozen.png", "padding_sensitivity.png", "easy-report.md",
+    }
+
+
+# --- review round 1: an unpaired median difference is not a null --------------------------------
+
+
+def test_a_frozen_gap_the_metric_cannot_resolve_is_not_read_as_no_effect(tmp_path):
+    """Two marginal medians one grid step apart do not establish that bin movement costs
+    nothing -- this same report explains that a median difference of exactly zero coexists with
+    122 images against 92. No paired dynamic-versus-frozen statistic exists to support the
+    stronger claim, so the generator must not make it."""
+    reading = reporting_module._freezing_reading(0.6286, 0.6000)
+    assert "does not destroy the trend" in reading
+    assert "not a paired comparison" in reading
+    assert "costs nothing" in reading and "does not establish" in reading
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    assert "is not costing it anything" not in report
+
+
+@pytest.mark.parametrize(("dynamic", "frozen"), [(0.1, 0.9), (0.9, 0.1)])
+def test_even_a_large_frozen_gap_is_marked_unpaired(dynamic, frozen):
+    reading = reporting_module._freezing_reading(dynamic, frozen)
+    assert "not a paired comparison" in reading
+
+
+def test_the_short_answer_carries_the_selection_caveat_beside_the_claim(tmp_path):
+    """The consequence of selecting on the reported images belonged beside the strongest claim,
+    not seven sections below it."""
+    short = section((written(tmp_path) / "easy-report.md").read_text(), "Short answer")
+    assert "not a hypothesis test" in short

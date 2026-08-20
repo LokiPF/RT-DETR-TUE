@@ -965,16 +965,25 @@ FROZEN_MEMBERSHIP_MODE = "frozen"
 PERSISTENCE_PANEL_LABEL = f"persistence ({PRIMARY_SCORE_SCOPE})"
 CONFIDENCE_PANEL_LABEL = "confidence control (1 - confidence)"
 
-FIGURE_SLICE = (
-    f"{DYNAMIC_MEMBERSHIP_MODE} membership, {FILTERED_PADDING_MODE} queries, "
-    f"{BENCHMARK_AGGREGATION} scene summary"
+FIGURE_SLICE_WITHOUT_MEMBERSHIP = (
+    f"{FILTERED_PADDING_MODE} queries, {BENCHMARK_AGGREGATION} scene summary"
 )
+FIGURE_SLICE = f"{DYNAMIC_MEMBERSHIP_MODE} membership, {FIGURE_SLICE_WITHOUT_MEMBERSHIP}"
 FIGURE_SLICE_NOTE = f"{FIGURE_SLICE}, persistence at {PRIMARY_SCORE_SCOPE}"
-"""What every figure is a slice of, printed on the figure.
+FIGURE_SLICE_BOTH_MEMBERSHIPS = (
+    f"{FIGURE_SLICE_WITHOUT_MEMBERSHIP}, persistence at {PRIMARY_SCORE_SCOPE}"
+)
+"""What each figure is a slice of, printed on the figure -- in four forms, not one.
 
-Two forms, because the scope clause is a lie on a confidence panel: the confidence control has
-no decoder-layer scope at all (spec:125), and a panel captioned "persistence at layer_2" over
-`1 - confidence` values tells the reader something untrue about what they are looking at.
+A caption is a claim about what is drawn, and a slice clause that is true of one figure is
+false on the next. Two of these forms exist because the general one was wrong somewhere:
+
+* the **membership** clause is false on `dynamic_vs_frozen.png`, whose entire subject is both
+  memberships side by side. A top panel captioned "dynamic membership" over a pair of dynamic
+  and frozen bars says the frozen bars are dynamic;
+* the **scope** clause is false on any confidence panel or bar. The confidence control has no
+  decoder-layer scope at all (spec:125), and `1 - confidence` values captioned "persistence at
+  layer_2" tell the reader something untrue about the numbers in front of them.
 
 All four fix the scene summary at `q90` because that is the only summary the published
 all-300-query benchmark exists at (spec:131), so it is the only one in which a figure and the
@@ -1005,12 +1014,13 @@ def _lookup(entries, **match) -> dict | None:
 
 
 def _decile_group(summary: dict, membership: str, confidence_bin: str,
-                  signal: str = "persistence", scope: str | None = None) -> dict | None:
+                  signal: str = "persistence", scope: str | None = None,
+                  aggregation: str = BENCHMARK_AGGREGATION) -> dict | None:
     return _lookup(
         summary["groups"], signal=signal,
         score_scope=PRIMARY_SCORE_SCOPE if scope is None else scope,
         membership_mode=membership, confidence_bin=confidence_bin,
-        aggregation=BENCHMARK_AGGREGATION, padding_mode=FILTERED_PADDING_MODE,
+        aggregation=aggregation, padding_mode=FILTERED_PADDING_MODE,
     )
 
 
@@ -1100,6 +1110,44 @@ def _outcome(entry: dict | None, prefix: str, total_key: str = "paired_image_cou
         f"it wins {win}, ties {tie} and loses {loss} of the {total} images both sides "
         f"measured -- a win rate of {_plain(entry.get(f'{prefix}_win_rate'))} over all "
         f"{total}, {tail}"
+    )
+
+
+def _membership_cell(membership: str) -> str:
+    """A membership label that carries its own status (spec:230).
+
+    `frozen` prints as a diagnostic wherever it appears in a table, and not only in the table
+    named after it. On the pilot the frozen bottom bin publishes the single most impressive
+    pair of numbers in the whole report -- a difference of +1.2571 at a 0.916 win rate -- and
+    an unlabelled `frozen` in a membership column beside dynamic rows reads as the best
+    available method rather than as a measurement that needs a paired clean image.
+    """
+    if membership == FROZEN_MEMBERSHIP_MODE:
+        return f"`{membership}` (diagnostic)"
+    return f"`{membership}`"
+
+
+def _slice_caption(scoped: bool, summaries: str) -> str:
+    """What a table is a slice of, said above the table.
+
+    The figures each carry their slice on their own title, deliberately, because a PNG gets
+    pasted into a write-up on its own. A markdown table has exactly the same problem and had
+    none of the protection: three tables here were silently cut to one scene summary while the
+    headline sentence directly above one of them quoted a different one, so the same selection
+    appeared twice on one page with two different numbers and nothing said why.
+
+    Two remedies, applied together. The tables now carry every scene summary rather than one,
+    so the row the headline quotes is in the table a reader is invited to check it against;
+    and this caption says which slice is still fixed.
+    """
+    scope = (
+        f"persistence at `{PRIMARY_SCORE_SCOPE}` against its matched control"
+        if scoped else f"persistence at `{PRIMARY_SCORE_SCOPE}`"
+    )
+    return (
+        f"Slice: {scope}, with the padding union removed, at {summaries} scene summary. "
+        "Rows that differ only in the summary are views of one selection on the same images, "
+        "not independent measurements of it."
     )
 
 
@@ -1272,11 +1320,19 @@ def _blur_curve_figure(frame: pd.DataFrame):
                 [int(value) for value in series.index], series.to_numpy(dtype=np.float64),
                 marker="o", markersize=3, color=colour, label=name,
             )
+        # Counted, not listed. Naming the absent bins is unreadable in exactly the case the
+        # message exists for: on a three-bin table the list is seven names long, and it
+        # overflows the panel it is meant to caption -- clipped on the left, off the canvas on
+        # the right. The count fits, and `summary.json` holds which.
         missing = [name for name in DECILE_NAMES if name not in curves]
         axis.set_title(
             f"{signal}\n"
             + (FIGURE_SLICE_NOTE if signal == "persistence" else FIGURE_SLICE)
-            + (f"\nmissing from this table: {', '.join(missing)}" if missing else ""),
+            + (
+                f"\n{len(missing)} of {len(DECILE_NAMES)} bins have no row here -- "
+                "see summary.json"
+                if missing else ""
+            ),
             fontsize=7,
         )
         axis.axhline(0.0, color="0.6", linewidth=0.8, linestyle=":")
@@ -1319,7 +1375,7 @@ def _dynamic_frozen_figure(summary: dict):
     trend.legend(fontsize=8)
     trend.set_title(
         "Persistence trend by confidence bin under two memberships -- two answers, never one"
-        f"\n{FIGURE_SLICE_NOTE}"
+        f"\n{FIGURE_SLICE_BOTH_MEMBERSHIPS}"
         "\nFrozen is a diagnostic: it needs a paired clean image, which a naturally corrupted "
         "one does not have.",
         fontsize=8,
@@ -1371,9 +1427,10 @@ def _padding_sensitivity_figure(summary: dict):
     )
     figure, axis = plt.subplots(figsize=(9, 4.6))
     axis.set_title(
-        f"Padding sensitivity, {SENSITIVITY_BIN} only ({BENCHMARK_AGGREGATION}, "
-        f"persistence at {PRIMARY_SCORE_SCOPE}).\nUnfiltered keeps the repeated decoder "
-        "placeholders the primary analysis removes.",
+        f"Padding sensitivity, {SENSITIVITY_BIN} only, {BENCHMARK_AGGREGATION} scene summary."
+        f"\nThe persistence bars are at {PRIMARY_SCORE_SCOPE}; the confidence control has no "
+        "decoder-layer scope."
+        "\nUnfiltered keeps the repeated decoder placeholders the primary analysis removes.",
         fontsize=8,
     )
     axis.set_ylabel("median per-image Spearman", fontsize=8)
@@ -1469,7 +1526,9 @@ def _winner_sentence(ranked: list[dict], winner: dict | None, group_count: int) 
         f"{_plain(winner['endpoint_increase_rate'])}, and it scored "
         f"{winner['scored_severity_count']} of the {winner['expected_severity_count']} "
         f"image-severity pairs it swept. It came first of {len(ranked)} candidates that "
-        "cleared the deployable gate."
+        "cleared the deployable gate -- which also means it was chosen on the same images "
+        "every number in this report is measured over, so what follows is a selection and not "
+        "a hypothesis test of anything."
     )
 
 
@@ -1549,29 +1608,46 @@ def _benchmark_sentence(summary: dict, winner: dict | None) -> str:
 
 
 def _freezing_reading(dynamic_median, frozen_median) -> str:
-    """What the frozen twin's number says about bin movement, decided by the numbers.
+    """What the frozen twin's number says about bin movement -- and what it cannot say.
 
-    Freezing the membership at severity zero removes the movement and leaves the fingerprint
-    motion, so the *sign* of the gap is the answer to spec:172's fourth question for this bin.
-    A gap smaller than one grid step is not a gap at all: the metric cannot resolve it.
+    Freezing the membership at severity zero removes the query movement and leaves the
+    fingerprint motion, so the gap between the two medians bears on spec:172's fourth question.
+    It bears on it in **one direction only**, and the asymmetry is the whole point of this
+    function.
+
+    A large gap is evidence: the trend measurably changes when the movement is removed. A small
+    gap is *not* evidence of no effect, and an earlier version of this sentence said it was.
+    These are two marginal medians on a metric whose own resolution is `1/35`, and this report
+    spends a section explaining that a median difference of exactly zero coexists with 122
+    images against 92 on the same pair -- so the same argument applies here and forbids the
+    stronger reading. No paired dynamic-versus-frozen statistic exists in the summary: the
+    comparison families are persistence-versus-control, candidate-versus-benchmark and
+    filtered-versus-unfiltered, and none of them pairs a bin against its own frozen twin. Until
+    one does, the most this may say is that freezing did not destroy the trend.
     """
     if dynamic_median is None or frozen_median is None:
         return "one of the two was not measured, so the comparison cannot be made"
     gap = float(frozen_median) - float(dynamic_median)
+    unpaired = (
+        "these are two medians and not a paired comparison, and no paired dynamic-versus-frozen "
+        "statistic is computed here"
+    )
     if abs(gap) * SPEARMAN_STEP_DENOMINATOR < 1.5:
         return (
-            "a gap of at most one step of the metric's own grid, so on this run the movement "
-            "of queries between bins is not what produces the trend and is not costing it "
-            "anything either"
+            "a gap the primary metric cannot resolve, so freezing the membership does not "
+            f"destroy the trend. That is as far as it goes: {unpaired}, so this does not "
+            "establish that the movement costs nothing"
         )
     if gap > 0:
         return (
-            "higher with the membership held still, so on this run the movement of queries "
-            "between bins is costing this selection some of its trend"
+            "higher with the membership held still, which on this run points at the movement "
+            f"of queries between bins costing this selection some of its trend -- though "
+            f"{unpaired}"
         )
     return (
         "lower with the membership held still, so on this run the trend does not survive "
-        "freezing the membership and rebuilding the bins is part of what produces it"
+        f"freezing the membership and rebuilding the bins is part of what produces it -- though "
+        f"{unpaired}"
     )
 
 
@@ -1886,38 +1962,43 @@ def _confidence_section(summary: dict, winner: dict | None) -> list[str]:
                 "control that moves the wrong way.",
                 "",
             ])
+    lines.extend([_slice_caption(scoped=True, summaries="every"), ""])
     body = []
     for name in [*DECILE_NAMES, ALL_VALID_BENCHMARK[1]]:
         for membership in (DYNAMIC_MEMBERSHIP_MODE, FROZEN_MEMBERSHIP_MODE,
                            ALL_VALID_BENCHMARK[0]):
-            entry = _lookup(
-                summary["comparisons"], membership_mode=membership, confidence_bin=name,
-                aggregation=BENCHMARK_AGGREGATION, score_scope=PRIMARY_SCORE_SCOPE,
-                padding_mode=FILTERED_PADDING_MODE,
-            )
-            if entry is None:
-                continue
-            total = entry["paired_image_count"]
-            body.append([
-                f"`{membership}`", f"`{name}`",
-                _signed(entry["persistence_median_spearman"]),
-                _signed(entry["confidence_median_spearman"]),
-                _signed(entry["persistence_minus_confidence_spearman"]),
-                f"{_whole(entry['persistence_image_win_rate'], total)}/"
-                f"{_whole(entry['persistence_image_tie_rate'], total)}/"
-                f"{_whole(entry['persistence_image_loss_rate'], total)}",
-                _plain(entry["persistence_image_win_rate"]),
-                f"{_plain(entry['persistence_image_decided_win_rate'])} "
-                f"({entry['persistence_image_decided_image_count']})",
-            ])
+            for aggregation in DECILE_AGGREGATIONS:
+                entry = _lookup(
+                    summary["comparisons"], membership_mode=membership, confidence_bin=name,
+                    aggregation=aggregation, score_scope=PRIMARY_SCORE_SCOPE,
+                    padding_mode=FILTERED_PADDING_MODE,
+                )
+                if entry is None:
+                    continue
+                total = entry["paired_image_count"]
+                body.append([
+                    _membership_cell(membership), f"`{name}`", f"`{aggregation}`",
+                    _signed(entry["persistence_median_spearman"]),
+                    _signed(entry["confidence_median_spearman"]),
+                    _signed(entry["persistence_minus_confidence_spearman"]),
+                    f"{_whole(entry['persistence_image_win_rate'], total)}/"
+                    f"{_whole(entry['persistence_image_tie_rate'], total)}/"
+                    f"{_whole(entry['persistence_image_loss_rate'], total)}",
+                    _plain(entry["persistence_image_win_rate"]),
+                    f"{_plain(entry['persistence_image_decided_win_rate'])} "
+                    f"({entry['persistence_image_decided_image_count']})",
+                ])
     if body:
         lines.extend(_table(
-            ["membership", "bin", "persistence", "confidence", "difference",
+            ["membership", "bin", "summary", "persistence", "confidence", "difference",
              "W/T/L", "win rate, all paired", "decided, over N"],
             body,
         ))
     else:
-        lines.append("No matched persistence/confidence pair was scored in this table.")
+        lines.append(
+            f"No matched persistence/confidence pair was scored at `{PRIMARY_SCORE_SCOPE}` "
+            "with the padding union removed in this table."
+        )
     lines.append("")
     return lines
 
@@ -1933,22 +2014,27 @@ def _dynamic_frozen_section(summary: dict) -> list[str]:
         "are never combined into one score."
     )
     lines.append("")
+    lines.extend([_slice_caption(scoped=False, summaries="every"), ""])
     body = []
     for name in DECILE_NAMES:
-        dynamic = _decile_group(summary, DYNAMIC_MEMBERSHIP_MODE, name)
-        frozen = _decile_group(summary, FROZEN_MEMBERSHIP_MODE, name)
-        if dynamic is None and frozen is None:
-            continue
-        body.append([
-            f"`{name}`",
-            _UNMEASURED if dynamic is None else _signed(dynamic["median_spearman"]),
-            _UNMEASURED if frozen is None else _signed(frozen["median_spearman"]),
-            _UNMEASURED if dynamic is None
-            else _plain(dynamic["mean_clean_overlap_from_severity_1"], 4),
-        ])
+        for aggregation in DECILE_AGGREGATIONS:
+            dynamic = _decile_group(summary, DYNAMIC_MEMBERSHIP_MODE, name,
+                                    aggregation=aggregation)
+            frozen = _decile_group(summary, FROZEN_MEMBERSHIP_MODE, name,
+                                   aggregation=aggregation)
+            if dynamic is None and frozen is None:
+                continue
+            body.append([
+                f"`{name}`", f"`{aggregation}`",
+                _UNMEASURED if dynamic is None else _signed(dynamic["median_spearman"]),
+                _UNMEASURED if frozen is None else _signed(frozen["median_spearman"]),
+                _UNMEASURED if dynamic is None
+                else _plain(dynamic["mean_clean_overlap_from_severity_1"], 4),
+            ])
     if body:
         lines.extend(_table(
-            ["bin", "dynamic", "frozen (diagnostic)", "dynamic overlap vs severity 0"], body
+            ["bin", "summary", "dynamic", "frozen (diagnostic)",
+             "dynamic overlap vs severity 0"], body
         ))
         lines.append("")
     lines.append(
@@ -1983,19 +2069,24 @@ def _padding_section(summary: dict) -> list[str]:
     entries = sorted(
         (
             entry for entry in summary["padding_sensitivity"]
-            if entry["aggregation"] == BENCHMARK_AGGREGATION
-            and entry["score_scope"] in (PRIMARY_SCORE_SCOPE, CONFIDENCE_SCOPE)
+            if entry["score_scope"] in (PRIMARY_SCORE_SCOPE, CONFIDENCE_SCOPE)
         ),
-        key=lambda entry: (entry["confidence_bin"], entry["membership_mode"], entry["signal"]),
+        key=lambda entry: (entry["confidence_bin"], entry["membership_mode"], entry["signal"],
+                           entry["aggregation"]),
     )
     if entries:
+        lines.append(
+            f"Every scene summary the control was scored at. Persistence rows are at "
+            f"`{PRIMARY_SCORE_SCOPE}`; the confidence control has no decoder-layer scope."
+        )
+        lines.append("")
         lines.extend(_table(
-            ["bin", "membership", "signal", "filtered", "unfiltered", "difference",
+            ["bin", "membership", "signal", "summary", "filtered", "unfiltered", "difference",
              "score changed on", "decided win rate on those, over N"],
             [
                 [
-                    f"`{entry['confidence_bin']}`", f"`{entry['membership_mode']}`",
-                    f"`{entry['signal']}`",
+                    f"`{entry['confidence_bin']}`", _membership_cell(entry["membership_mode"]),
+                    f"`{entry['signal']}`", f"`{entry['aggregation']}`",
                     _signed(entry["filtered_median_spearman"]),
                     _signed(entry["unfiltered_median_spearman"]),
                     _signed(entry["unfiltered_minus_filtered_spearman"]),
