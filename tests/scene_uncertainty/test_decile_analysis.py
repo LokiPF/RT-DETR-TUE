@@ -13,9 +13,11 @@ from src.scene_uncertainty.confidence_deciles import (
     union_query_ids,
 )
 from src.scene_uncertainty.decile_analysis import (
+    RESULT_NON_IDENTIFYING_KEYS,
     SLIM_RECORD_KEYS,
     DecileAnalysisError,
     load_decile_inputs,
+    result_content_address,
 )
 from tests.scene_uncertainty.decile_test_utils import (
     QUERY_COUNT,
@@ -86,12 +88,14 @@ def test_load_inputs_rejects_misalignment(decile_artifacts, mutation, message):
     # "artifact provenance does not match"
     ("missing_result_manifest", "missing result manifest"),
     ("missing_cache_manifest", "missing feature-cache manifest"),
-    ("drop_layer_score_scales", "missing"),
-    ("drop_result_cache_id", "feature_cache_id"),
-    ("drop_result_k", "missing"),
-    ("wrong_result_artifact_type", "artifact_type"),
+    ("drop_layer_score_scales", r"normalizer artifact .* is missing \['layer_score_scales'\]"),
+    ("drop_result_cache_id", r"result manifest .* is missing \['feature_cache_id'\]"),
+    ("drop_result_k", r"result manifest .* is missing \['k'\]"),
+    ("wrong_result_artifact_type", "has artifact_type 'scene_uncertainty_results'"),
+    ("forged_result_manifest", "does not match its own content address"),
+    ("cache_field_lengths_disagree", r"11, 0, 'tuning'\) is internally inconsistent"),
     ("cache_source_kind", "source_kind"),
-    ("cache_manifest_forged", "content address"),
+    ("cache_manifest_forged", "feature-cache manifest .* does not match its own content address"),
     ("missing_distance_file", "missing query-distance artifact"),
     ("missing_normalizer_file", "missing clean-distance"),
     # "a record key is duplicated or missing from either input"
@@ -126,7 +130,7 @@ def test_a_null_result_manifest_field_is_missing_data(decile_artifacts, field):
     manifest = json.loads(path.read_text())
     manifest[field] = None
     path.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(DecileAnalysisError, match="missing"):
+    with pytest.raises(DecileAnalysisError, match=rf"result manifest .* is missing \['{field}'\]"):
         load(decile_artifacts)
 
 
@@ -136,19 +140,75 @@ def test_a_null_cache_manifest_field_is_missing_data(decile_artifacts, field):
     manifest = json.loads(path.read_text(encoding="utf-8"))
     manifest[field] = None
     path.write_text(json.dumps(manifest), encoding="utf-8")
-    with pytest.raises(DecileAnalysisError, match="missing"):
+    with pytest.raises(
+        DecileAnalysisError, match=rf"feature-cache manifest .* is missing \['{field}'\]"
+    ):
         load(decile_artifacts)
 
 
 def test_a_missing_cache_id_on_both_sides_is_not_a_match(decile_artifacts):
-    """`result.get(...) == cache.get(...)` is True when both are absent, and means nothing."""
+    """`result.get(...) == cache.get(...)` is True when both are absent, and means nothing.
+
+    The cache manifest is read first, so its own missing id is what gets named; the regex says
+    so rather than accepting any message containing "missing", which is the weakness that let
+    a filtered-instead-of-refused mutant survive earlier in this task.
+    """
     manifest_path = decile_artifacts["cache"] / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     manifest.pop("artifact_id")
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
     mutate_decile_artifacts(decile_artifacts, "drop_result_cache_id")
-    with pytest.raises(DecileAnalysisError, match="missing"):
+    with pytest.raises(
+        DecileAnalysisError, match=r"feature-cache manifest .* is missing \['artifact_id'\]"
+    ):
         load(decile_artifacts)
+
+
+def test_a_forged_result_manifest_pointing_at_other_distances_is_refused(decile_artifacts):
+    """The reviewer's pilot forgery: same feature_cache_id, another run's distances, new labels.
+
+    Every field this loader *compares* still agrees after the edit -- which is the point. What
+    catches it is the manifest hashing its own `query_distance_path`, `k` and `normalization`.
+    """
+    results = decile_artifacts["results"]
+    mutate_decile_artifacts(decile_artifacts, "forged_result_manifest")
+    manifest = json.loads(results.with_suffix(".manifest.json").read_text())
+    assert (manifest["k"], manifest["normalization"]) == (99, "hand_edited")
+    honest = torch.load(
+        results.with_suffix(".query_distances.pt"), map_location="cpu", weights_only=True
+    )
+    forged = torch.load(
+        results.parent / manifest["query_distance_path"], map_location="cpu", weights_only=True
+    )
+    assert not torch.equal(
+        honest[0]["query_scores_by_layer"][2], forged[0]["query_scores_by_layer"][2]
+    )
+    with pytest.raises(DecileAnalysisError, match="does not match its own content address"):
+        load(decile_artifacts)
+
+
+def test_the_result_address_exclusion_matches_the_writer():
+    """One rule, two copies, and a test that fails when they drift.
+
+    `decile_analysis` may not import `pipeline` -- that is what
+    `test_the_loader_cannot_reach_a_knn_or_extraction_path` enforces -- so the exclusion list
+    is restated in the loader. A test carries no such restriction, so the drift is caught here
+    instead of by a result manifest that silently stops verifying.
+    """
+    from src.scene_uncertainty.pipeline import NON_IDENTIFYING_KEYS
+
+    assert set(RESULT_NON_IDENTIFYING_KEYS) == set(NON_IDENTIFYING_KEYS), (
+        "pipeline._content_address and decile_analysis.result_content_address must exclude the "
+        "same keys, or a manifest the writer sealed will not verify (or worse, will verify "
+        "while hiding an edited field)"
+    )
+
+
+def test_the_synthetic_result_manifest_is_sealed_like_a_real_one(decile_artifacts):
+    """A fixture with a literal id cannot exercise the check it is supposed to exercise."""
+    manifest = json.loads(decile_artifacts["results"].with_suffix(".manifest.json").read_text())
+    assert manifest["artifact_id"] == result_content_address(manifest)
+    assert manifest["artifact_id"] != "synthetic-results"
 
 
 # --- the slim record -------------------------------------------------------------------
@@ -217,7 +277,11 @@ def test_run_metadata_carries_the_provenance_of_both_inputs(decile_artifacts):
     metadata = loaded.run_metadata
     assert metadata["artifact_type"] == "confidence_decile_scene_uncertainty"
     assert metadata["feature_cache_id"] == load_manifest(decile_artifacts["cache"])["artifact_id"]
-    assert metadata["source_result_id"] == "synthetic-results"
+    result_manifest = json.loads(
+        decile_artifacts["results"].with_suffix(".manifest.json").read_text()
+    )
+    assert metadata["source_result_id"] == result_manifest["artifact_id"]
+    assert metadata["source_result_id"] == result_content_address(result_manifest)
     assert metadata["source_partition"] == "tuning"
     assert metadata["normalization"] == "raw"
     assert metadata["k"] == 5

@@ -7,10 +7,13 @@ real content address. Everything here goes through `ShardWriter`, so the cache s
 written by the same code that wrote the pilot's, and its `artifact_id` is a real content
 address rather than a literal.
 
-`write_decile_artifacts` is reproduced from the plan unchanged. `mutate_decile_artifacts`
-keeps the plan's four mutations byte-identical and adds more, one per validation rule the
-design names, so a rule that stops being enforced fails a test instead of quietly widening
-what the loader accepts.
+`write_decile_artifacts` is the plan's builder with one change: the result manifest is sealed
+with its real content address instead of the literal `"synthetic-results"`. A fixture carrying
+a made-up id would be a fixture that cannot exercise the check which makes `source_result_id`
+mean anything, and a validation rule the fixtures bypass is a validation rule that is not
+tested. `mutate_decile_artifacts` keeps the plan's four mutations byte-identical and adds
+more, one per validation rule the design names, so a rule that stops being enforced fails a
+test instead of quietly widening what the loader accepts.
 """
 
 from __future__ import annotations
@@ -21,6 +24,7 @@ from pathlib import Path
 import torch
 
 from src.scene_uncertainty.artifacts import ShardWriter, load_manifest, manifest_id
+from src.scene_uncertainty.decile_analysis import result_content_address
 
 
 LAYERS = (0, 1, 2)
@@ -84,12 +88,13 @@ def write_decile_artifacts(root: Path, severities=range(6)) -> dict[str, Path]:
         }
     }, normalizer_path)
     manifest = {
-        "artifact_id": "synthetic-results", "artifact_type": "knn_scene_uncertainty_results",
+        "artifact_type": "knn_scene_uncertainty_results",
         "feature_cache_id": load_manifest(cache)["artifact_id"],
         "source_partition": "tuning", "normalization": "raw", "k": 5,
         "query_distance_path": distance_path.name,
         "normalizer_path": normalizer_path.name,
     }
+    manifest["artifact_id"] = result_content_address(manifest)
     results.with_suffix(".manifest.json").write_text(
         json.dumps(manifest), encoding="utf-8"
     )
@@ -232,6 +237,33 @@ def mutate_decile_artifacts(artifacts: dict[str, Path], mutation: str) -> None:
         _edit_result_manifest(
             results, lambda manifest: manifest.update({"artifact_type": "scene_uncertainty_results"})
         )
+    elif mutation == "forged_result_manifest":
+        # The reviewer's pilot forgery in miniature: repoint `query_distance_path` at another
+        # run's distances -- same `feature_cache_id`, different numbers -- and relabel `k` and
+        # `normalization`. Every field the loader *compares* still agrees, so without the
+        # result manifest's own content address this loads cleanly and mislabels every row.
+        other_path = results.with_suffix(".other_distances.pt")
+        torch.save(
+            [
+                {
+                    **row,
+                    "query_scores_by_layer": {
+                        layer: values * 2.0
+                        for layer, values in row["query_scores_by_layer"].items()
+                    },
+                }
+                for row in rows
+            ],
+            other_path,
+        )
+        _edit_result_manifest(results, lambda manifest: manifest.update({
+            "query_distance_path": other_path.name, "k": 99, "normalization": "hand_edited",
+        }))
+    elif mutation == "cache_field_lengths_disagree":
+        def truncate_boxes(records):
+            records[0]["boxes"] = records[0]["boxes"][:-1]
+            return records
+        _edit_cache_records(cache, truncate_boxes)
     elif mutation == "cache_source_kind":
         _edit_cache_manifest(cache, {"source_kind": "reference"}, reseal=True)
     elif mutation == "cache_manifest_forged":

@@ -5,8 +5,8 @@ are a multi-gigabyte cache of 3,000 records and a 4 MB table of saved kNN distan
 nothing downstream can tell a wrong join from a right one: a bin built from the wrong
 severity, a record scored against another image's distances, or a held-out test scene
 quietly included would all produce a full results table and a confident median Spearman.
-So the rule here is that a join is either proved -- by content address, by key, by layer
-set, by query count -- or it stops the run.
+So the rule here is that a join is either proved -- by content address on *both* manifests,
+by key, by layer set, by query count -- or it stops the run.
 
 Three properties are load-bearing and easy to lose:
 
@@ -70,6 +70,33 @@ REQUIRED_CACHE_MANIFEST_KEYS = ("artifact_id", "source_kind", "decoder_layers", 
 REQUIRED_DISTANCE_ROW_KEYS = ("image_id", "severity", "source_partition", "query_scores_by_layer")
 REQUIRED_CACHE_RECORD_KEYS = ("image_id", "severity", "source_partition", "boxes", "logits", "layers")
 
+RESULT_NON_IDENTIFYING_KEYS = ("artifact_id", "run_stats", "clean_distance_fit")
+"""The keys `pipeline._content_address` leaves out of a result manifest's own address.
+
+Re-stated here rather than imported: this module must not import `pipeline`, which reaches
+the kNN and extraction paths the design lists as non-goals, and
+`test_the_loader_cannot_reach_a_knn_or_extraction_path` enforces that. A second copy of a
+rule is a second thing that can drift, so
+`test_the_result_address_exclusion_matches_the_writer` imports `pipeline` -- a test may --
+and fails loudly if the writer's list and this one stop agreeing. `run_stats` and
+`clean_distance_fit` are excluded because they move with wall time and with the chunk width
+of an algebraically exact kNN, so hashing them would give two interchangeable runs two
+identities.
+"""
+
+
+def result_content_address(manifest: dict) -> str:
+    """The address a result manifest should carry, recomputed from the manifest itself.
+
+    Exported because the fixtures that stand in for `evaluate-knn` have to seal their
+    manifests the same way the real writer does; a fixture carrying a literal id would
+    bypass the one check that makes `source_result_id` mean anything.
+    """
+    return manifest_id({
+        key: value for key, value in manifest.items() if key not in RESULT_NON_IDENTIFYING_KEYS
+    })
+
+
 SLIM_RECORD_KEYS = frozenset({
     "image_id", "severity", "source_partition",
     "query_confidence", "padded_query_ids", "query_count",
@@ -123,10 +150,14 @@ def _load_cache_manifest(cache: Path) -> dict:
 
     The content address is recomputed rather than trusted. Without it, matching the result
     artifact's `feature_cache_id` against this manifest's `artifact_id` compares two strings,
-    and a one-line edit to either file makes an unrelated cache and result set look like a
-    matched pair -- which is precisely the mistake that produces a complete, plausible, wrong
-    results table. `manifest_id` hashes every field except the id itself, so a manifest whose
+    and a one-line edit here makes an unrelated cache and result set look like a matched pair
+    -- which is precisely the mistake that produces a complete, plausible, wrong results
+    table. `manifest_id` hashes every field except the id itself, so a manifest whose
     `query_count`, `decoder_layers` or checkpoint hash was edited no longer addresses itself.
+
+    This covers the cache side only. `_load_result_manifest` does the same for the result
+    side, and it has to: the two checks together are what closes the forgery, because either
+    one alone leaves a whole file editable.
     """
     path = cache / "manifest.json"
     if not path.exists():
@@ -149,15 +180,31 @@ def _load_cache_manifest(cache: Path) -> dict:
     return manifest
 
 
-def _load_result_manifest(results: Path) -> dict:
-    """The raw-kNN result manifest, with the two refusals that gate the whole experiment.
+def _load_result_manifest(results: Path, cache_manifest: dict) -> dict:
+    """The raw-kNN result manifest, proved against the cache and against its own contents.
 
     `artifact_type` is checked because the `--results` argument is a path to a CSV whose
-    siblings are read by name; pointed at a different run's CSV it would happily read that
-    run's distances. `source_partition` is checked because the design forbids scoring the
-    held-out test partition in this experiment, and a result artifact built with
-    `--partition all` or `--partition test` is the way that would happen -- so `"all"` is
-    refused too, not merely `"test"`.
+    siblings are read *by name out of this manifest*; pointed at a different run's CSV it
+    would happily read that run's distances. `source_partition` is checked because the design
+    forbids scoring the held-out test partition in this experiment, and a result artifact
+    built with `--partition all` or `--partition test` is the way that would happen -- so
+    `"all"` is refused too, not merely `"test"`.
+
+    The content address is the check that makes the other two mean something, and the
+    concrete forgery it stops was demonstrated on the pilot: copy `raw_k5.manifest.json`,
+    repoint `query_distance_path` at `raw_k5_bank50k.query_distances.pt` -- a *different clean
+    bank*, same `feature_cache_id` -- and set `k: 99`, `normalization: "hand_edited"`. Every
+    field this loader compares still agrees, the join still succeeds for all 250 images, and
+    the run produces a complete results table of distances from one bank labelled with
+    another bank's configuration. Nothing downstream could detect that; `manifest_id` over the
+    manifest's own contents does, because `query_distance_path`, `k` and `normalization` are
+    all inside the address.
+
+    Order matters and is chosen for the message, not the strength. The address check is a
+    catch-all: it fires for *any* edit, so running it first would answer "your manifest was
+    edited" to a question like "why won't it take my test-partition results?". The three
+    checks that identify which experiment this is run first and keep their own messages; the
+    address closes everything they do not name.
     """
     path = results.with_suffix(".manifest.json")
     if not path.exists():
@@ -174,6 +221,19 @@ def _load_result_manifest(results: Path) -> dict:
             f"result manifest {path} was built for the {manifest['source_partition']!r} "
             f"partition; the confidence-decile experiment accepts {TUNING_PARTITION!r} results "
             f"only and must not score the held-out test partition"
+        )
+    if manifest["feature_cache_id"] != cache_manifest["artifact_id"]:
+        raise DecileAnalysisError(
+            f"result feature_cache_id does not match the cache: {path} claims "
+            f"{manifest['feature_cache_id']} and the cache is {cache_manifest['artifact_id']}"
+        )
+    recomputed = result_content_address(manifest)
+    if recomputed != manifest["artifact_id"]:
+        raise DecileAnalysisError(
+            f"result manifest {path} does not match its own content address: it claims "
+            f"{manifest['artifact_id']} and hashes to {recomputed}, so the k, normalization, "
+            f"bank and distance-file name it reports are not the ones this artifact was "
+            f"written with and every row scored from it would be mislabelled"
         )
     return manifest
 
@@ -311,13 +371,7 @@ def load_decile_inputs(cache_value: str | Path, results_value: str | Path) -> De
     """
     cache, results = Path(cache_value), Path(results_value)
     cache_manifest = _load_cache_manifest(cache)
-    result_manifest = _load_result_manifest(results)
-    if result_manifest["feature_cache_id"] != cache_manifest["artifact_id"]:
-        raise DecileAnalysisError(
-            f"result feature_cache_id does not match the cache: the results claim "
-            f"{result_manifest['feature_cache_id']} and {cache} is "
-            f"{cache_manifest['artifact_id']}"
-        )
+    result_manifest = _load_result_manifest(results, cache_manifest)
 
     query_count = int(cache_manifest["query_count"])
     decoder_layers = [int(layer_id) for layer_id in cache_manifest["decoder_layers"]]
@@ -356,7 +410,16 @@ def load_decile_inputs(cache_value: str | Path, results_value: str | Path) -> De
             )
         if key not in distances:
             raise DecileAnalysisError(f"missing query-distance record for {key}")
-        records_by_image.setdefault(key[0], {})[key[1]] = _slim_record(record, key, query_count)
+        try:
+            slim = _slim_record(record, key, query_count)
+        except ValueError as error:
+            # `detect_padded_tail` and `confidence_from_logits` raise a bare `ValueError` that
+            # names a shape and no record -- "query-count mismatch inside record: [19, 20]" is
+            # unactionable against 3,000 of them. The key is in hand here, so it goes in.
+            raise DecileAnalysisError(
+                f"feature-cache record {key} is internally inconsistent: {error}"
+            ) from error
+        records_by_image.setdefault(key[0], {})[key[1]] = slim
 
     if not records_by_image:
         raise DecileAnalysisError(
