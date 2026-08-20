@@ -5,6 +5,8 @@ from collections.abc import Iterable
 import torch
 from torch import Tensor
 
+from .metrics import jaccard_overlap
+
 
 DECILE_NAMES = tuple(f"decile_{lower:02d}_{lower + 10:02d}" for lower in range(0, 100, 10))
 
@@ -78,6 +80,27 @@ def detect_padded_tail(record: dict) -> Tensor:
     return torch.arange(start, query_count, dtype=torch.long)
 
 
+def _require_index_dtype(values: Tensor, what: str) -> None:
+    """Refuse a tensor whose dtype makes a `(query,)` selection mask look like a list of IDs.
+
+    A boolean keep/drop mask casts to a tensor of zeros and ones, which is a perfectly
+    valid-looking pair of query IDs 0 and 1 and completely wrong; `uint8` is the same mask one
+    `.to()` further on and fails identically. Floating point is refused for the other half of
+    the same failure -- `.long()` truncates rather than rejects, so a vector of confidences
+    handed in where IDs belong becomes a list of zeros instead of an error.
+
+    Empty tensors pass. They carry no ID to misread, and the plainest way to write "nothing
+    here" is a bare `[]`, which torch reads as float32.
+    """
+    misreadable = (
+        values.dtype in (torch.bool, torch.uint8)
+        or values.is_floating_point()
+        or values.is_complex()
+    )
+    if values.numel() and misreadable:
+        raise ValueError(f"{what} must hold integer query IDs, got dtype {values.dtype}")
+
+
 def union_query_ids(id_tensors: Iterable[Tensor]) -> Tensor:
     """Merge query-ID masks into one sorted, de-duplicated index tensor.
 
@@ -103,18 +126,15 @@ def union_query_ids(id_tensors: Iterable[Tensor]) -> Tensor:
     Masks that are *all* empty return empty, which is the ordinary case rather than an error:
     184 of the pilot's 250 tuning images have no padding at any severity.
 
-    Boolean input raises. A `(query,)` selection mask of `True`/`False` casts to a tensor of
-    zeros and ones, which is a perfectly valid-looking pair of query IDs and completely wrong.
-    Empty masks skip that check, because they carry no ID to misread and because the plainest
-    way to say "nothing padded here" -- a bare `[]` -- is float64 before it is anything else.
+    Selection-mask dtypes raise; see `_require_index_dtype`. Empty masks skip that check,
+    because they carry no ID to misread and because the plainest way to say "nothing padded
+    here" -- a bare `[]` -- is float32 before it is anything else.
     """
     masks = [torch.as_tensor(ids).reshape(-1) for ids in id_tensors]
     if not masks:
         raise ValueError("cannot build a query-ID union from zero masks")
     for mask in masks:
-        misreadable = mask.dtype is torch.bool or mask.is_floating_point() or mask.is_complex()
-        if mask.numel() and misreadable:
-            raise ValueError(f"masks must hold integer query IDs, got dtype {mask.dtype}")
+        _require_index_dtype(mask, "masks")
     return torch.cat([mask.long().cpu() for mask in masks]).unique()
 
 
@@ -123,12 +143,12 @@ def union_padded_query_ids(records: Iterable[dict]) -> Tensor:
 
     The tail is not stable under blur: across the pilot's 250 tuning images, 66 carry padding
     and *all 66* detect a different tail at different severities. Nor does it simply grow --
-    one image runs 159, 165, 170, 63, 8, 79 padded queries across severities 0 to 5 -- so
-    per-severity masking would not merely shrink the valid set with blur, it would let the
-    population wander in both directions. That matters because placeholder queries are close
-    to zero confidence (mean 0.0045 against 0.0395 for valid queries, and 99 percent of them
-    below the valid median), so they land in the lowest decile and would drag the bottom
-    bin's membership around for a reason that has nothing to do with any signal. Unioning
+    `union_query_ids` records the counts of the image that wanders furthest -- so per-severity
+    masking would not merely shrink the valid set with blur, it would let the population wander
+    in both directions. That matters because placeholder queries are close to zero confidence
+    (mean 0.0045 against 0.0395 for valid queries, and 99 percent of them below the valid
+    median), so they land in the lowest decile and would drag the bottom bin's membership
+    around for a reason that has nothing to do with any signal. Unioning
     first fixes the mask once per image, so severity moves the features and never the
     population.
 
@@ -152,3 +172,195 @@ def union_padded_query_ids(records: Iterable[dict]) -> Tensor:
     if len(counts) != 1:
         raise ValueError(f"query-count mismatch across severities: {sorted(counts)}")
     return union_query_ids([detect_padded_tail(record) for record in records])
+
+
+def confidence_from_logits(logits: Tensor) -> Tensor:
+    """Each query's largest sigmoid class score, recomputed rather than read from the cache.
+
+    Blur records carry a `confidence` field beside their logits, and it is not this number.
+    That field was reduced from the full-precision logits *before* those logits were cast to
+    float16, so it cannot be recovered from what the cache actually stores. Over the pilot's
+    450,000 tuning queries the two disagree by up to 1.020e-04, median 1.86e-05, and agree
+    exactly for 0.03 percent of queries. A threshold policy would never notice. Deciles are
+    ranks, so they do: with roughly 300 queries in bins of roughly 30, and a median gap of
+    3.7e-04 between adjacent ranked confidences, a 1e-4 shift is enough to swap near-tied
+    queries across a bin edge -- and it does, changing the membership of 535 of the 1,500
+    tuning records. `query_policy.select_queries` recomputes the same way, which is also what
+    keeps decile results comparable with the existing all-query benchmark. Read the stored
+    field only to audit that gap, never to build a bin.
+
+    `float()` before `sigmoid()` is not cosmetic either. Float16 spacing at 0.5 is about
+    4.9e-04, so reducing in half precision quantises the scores far more coarsely than the
+    logits themselves are quantised, manufacturing ties that the recorded logits do not
+    contain. Sigmoid is monotone, so this never changes *which* class wins -- only how many
+    queries the ranking can still tell apart.
+
+    The two-dimension requirement is a real check rather than a formality: a `(query,)` input
+    would reduce to a scalar under `amax(dim=-1)` and hand back one confidence for the whole
+    image, and a `(batch, query, class)` input would silently bin one record's queries using
+    another's scores.
+    """
+    if logits.ndim != 2:
+        raise ValueError(f"logits must have shape (query, class), got {tuple(logits.shape)}")
+    return logits.float().sigmoid().amax(dim=-1).cpu()
+
+
+def confidence_deciles(confidence: Tensor, valid_indices: Tensor, label: str = "") -> dict[str, Tensor]:
+    """Split the valid queries into ten equal-count confidence bins, lowest first.
+
+    Ties are the reason this is written with a stable sort over an already-sorted index
+    tensor rather than a plain `argsort`. Confidence comes from float16 logits, so exact ties
+    are ordinary rather than exotic: every one of the pilot's 1,500 tuning records has some,
+    a median of 55 of its 300 queries share a confidence with another query, and the largest
+    tie group runs to 257. A decile edge therefore falls inside a tie block routinely, and an
+    unstable sort would return different bins for the same record on different runs. Sorting
+    `valid_indices` first and then sorting *stably* by confidence makes ascending query ID the
+    tie-break the design asks for, and makes the result reproducible.
+
+    Bin sizes differ by at most one when the count is not divisible by ten; the remainder goes
+    to the lowest bins, which is `tensor_split`'s rule and is arbitrary but fixed. Every valid
+    query lands in exactly one bin, so concatenating the ten bins reproduces `valid_indices`.
+
+    Each bin is returned in ascending *confidence* order, not ascending query ID. Membership
+    is what the analysis consumes, so the order is incidental there, but it is stable and it
+    means `bins[name][0]` is the least confident query of that bin.
+
+    Fewer than ten valid queries raises rather than returning short or empty bins, because a
+    record that cannot fill its bins is an invalid record and its score would silently mean
+    something different from every other record's. `label` names that record in the message;
+    `memberships_by_severity` fills it in, and a direct caller that leaves it empty gets the
+    same check with a less useful message.
+
+    Two inputs that look right and are not: a `(query, class)` logit tensor, which would rank
+    rows instead of queries, and a boolean keep-mask where the index tensor belongs. Both
+    raise. Non-finite confidence raises too -- `argsort` sorts `nan` to the end, which would
+    quietly place a broken query in the top decile.
+    """
+    scores = confidence.float().cpu()
+    if scores.ndim != 1:
+        raise ValueError(
+            f"confidence must be one score per query, got shape {tuple(confidence.shape)}"
+        )
+    _require_index_dtype(valid_indices, "valid query indices")
+    valid = torch.sort(valid_indices.reshape(-1).long().cpu()).values
+    named = f" for {label}" if label else ""
+    if valid.numel() < len(DECILE_NAMES):
+        raise ValueError(
+            f"confidence deciles need at least ten valid queries, got {valid.numel()}{named}"
+        )
+    if valid.unique().numel() != valid.numel():
+        raise ValueError(f"valid query indices must be unique{named}")
+    if int(valid.min()) < 0 or int(valid.max()) >= scores.numel():
+        raise ValueError(f"valid query index lies outside the confidence vector{named}")
+    selected = scores.index_select(0, valid)
+    if not bool(torch.isfinite(selected).all()):
+        raise ValueError(f"confidence must be finite to rank queries{named}")
+    order = torch.argsort(selected, stable=True)
+    chunks = torch.tensor_split(valid.index_select(0, order), len(DECILE_NAMES))
+    return {name: chunk for name, chunk in zip(DECILE_NAMES, chunks)}
+
+
+def bin_overlap(bins: dict[str, Tensor], reference: dict[str, Tensor]) -> dict[str, float]:
+    """Jaccard overlap of each bin against the bin of the same name in `reference`.
+
+    This is the design's "dynamic-bin overlap with the clean bin", and it is a diagnostic
+    rather than a score: it says how much of a severity's result comes from the queries
+    moving between bins instead of the fingerprints moving inside them. At severity zero it
+    is 1.0 for every bin by construction, so a value below 1.0 there means the two sides were
+    not built from the same ordering.
+
+    Comparing bin *names* rather than positions is deliberate. Two bin sets that disagree on
+    names are not two views of the same partition, and quietly intersecting whichever names
+    happened to match would report a high overlap for a comparison that never took place.
+    """
+    if set(bins) != set(reference):
+        raise ValueError(
+            f"cannot overlap bin sets that do not name the same bins: "
+            f"{sorted(bins)} against {sorted(reference)}"
+        )
+    return {name: jaccard_overlap(values, reference[name]) for name, values in bins.items()}
+
+
+def _severity_confidence(record: dict) -> Tensor:
+    """The confidence vector of one severity record, from its logits whenever it still has them.
+
+    Records reach this function in two shapes. A raw cache record carries `logits` *and* a
+    stored `confidence` that disagrees with them; logits win, always, for the reason
+    `confidence_from_logits` documents. A record that has already been streamed down to
+    metadata carries only `confidence`, which the loader is required to have produced with
+    `confidence_from_logits` -- the design asks it to retain the confidence vector and discard
+    the fingerprints, so the logits are genuinely gone by then and there is nothing left to
+    recompute from. Preferring logits means the trap can only be sprung by a caller that
+    deletes the logits and keeps the stale field, which no loader in this package does.
+    """
+    if "logits" in record:
+        return confidence_from_logits(record["logits"])
+    if "confidence" not in record:
+        raise ValueError("a severity record must carry logits or a confidence vector")
+    return record["confidence"].float().cpu()
+
+
+def _record_label(record: dict, severity: int) -> str:
+    image_id = record.get("image_id")
+    if image_id is None:
+        return f"severity {severity}"
+    return f"image {int(image_id)} severity {severity}"
+
+
+def memberships_by_severity(records_by_severity: dict[int, dict], padded: Tensor) -> dict[int, dict]:
+    """Dynamic and clean-frozen decile memberships for one image, at every cached severity.
+
+    `dynamic` re-sorts and rebuilds all ten bins at each severity: a policy that a single
+    image could actually run, whose membership moves as confidence moves. `frozen` is severity
+    zero's membership reused unchanged everywhere: a diagnostic, since a naturally corrupted
+    image has no paired clean version, whose point is to hold the queries still so that any
+    change in score comes from the fingerprints. The two answer different questions and the
+    design forbids combining them into one number. `dynamic_overlap` is what separates them --
+    Jaccard of each dynamic bin against its severity-zero self, 1.0 everywhere at severity
+    zero and falling as queries change rank.
+
+    `padded` is the *image-level union* of padded query IDs, not one severity's tail, and this
+    function takes it as a single argument precisely so it cannot be anything else. The tail
+    wanders with severity rather than growing, so per-severity masking would change the valid
+    population between severities and move bin membership for a reason that has nothing to do
+    with blur; `union_padded_query_ids` is what produces the argument this wants.
+
+    `all_valid` is that same union-masked set, and it is the direct comparison with the
+    existing all-query method -- every non-padded query, not all 300 and not a re-derivation
+    from the ten bins.
+
+    Severity zero must be present, since there is nothing to freeze without it, and every
+    severity must report the same query count, since one valid mask is applied to all of them.
+    Neither check knows that six severities were expected: whether a severity is missing or
+    was never requested is a question only the loader that assembled this mapping can answer.
+    """
+    if 0 not in records_by_severity:
+        raise ValueError("clean-frozen bins require severity zero")
+    ordered = sorted(records_by_severity.items())
+    confidence = {severity: _severity_confidence(record) for severity, record in ordered}
+    counts = {int(values.numel()) for values in confidence.values()}
+    if len(counts) != 1:
+        raise ValueError(f"query-count mismatch across severities: {sorted(counts)}")
+    query_count = counts.pop()
+    _require_index_dtype(padded, "padded query IDs")
+    padded = padded.reshape(-1).long().cpu()
+    if padded.numel() and (int(padded.min()) < 0 or int(padded.max()) >= query_count):
+        raise ValueError(f"padded query ID lies outside the {query_count}-query record")
+    keep = torch.ones(query_count, dtype=torch.bool)
+    keep[padded] = False
+    valid = torch.where(keep)[0]
+    frozen = confidence_deciles(
+        confidence[0], valid, label=_record_label(records_by_severity[0], 0)
+    )
+    memberships = {}
+    for severity, record in ordered:
+        dynamic = confidence_deciles(
+            confidence[severity], valid, label=_record_label(record, severity)
+        )
+        memberships[severity] = {
+            "dynamic": dynamic,
+            "frozen": {name: indices.clone() for name, indices in frozen.items()},
+            "all_valid": valid.clone(),
+            "dynamic_overlap": bin_overlap(dynamic, frozen),
+        }
+    return memberships

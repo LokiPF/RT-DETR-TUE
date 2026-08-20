@@ -1,10 +1,14 @@
 import pytest
 import torch
 
-from src.scene_uncertainty import confidence_deciles
+from src.scene_uncertainty import confidence_deciles as decile_module
 from src.scene_uncertainty.confidence_deciles import (
     DECILE_NAMES,
+    bin_overlap,
+    confidence_deciles,
+    confidence_from_logits,
     detect_padded_tail,
+    memberships_by_severity,
     union_padded_query_ids,
     union_query_ids,
 )
@@ -297,9 +301,327 @@ def test_the_record_entry_point_delegates_to_the_id_primitive(monkeypatch):
         seen.append([mask.tolist() for mask in id_tensors])
         return torch.tensor([7], dtype=torch.long)
 
-    monkeypatch.setattr(confidence_deciles, "union_query_ids", spy)
+    monkeypatch.setattr(decile_module, "union_query_ids", spy)
     result = union_padded_query_ids([
         padded_record(10, 2, severity=0), padded_record(10, 5, severity=1)
     ])
     assert result.tolist() == [7]
     assert seen == [[[8, 9], [5, 6, 7, 8, 9]]]
+
+
+def confidence_record(confidence, image_id=None, **extra):
+    """A slim severity record of the shape the analysis loader keeps: confidence, no fingerprints."""
+    item = {"confidence": torch.as_tensor(confidence, dtype=torch.float32), **extra}
+    if image_id is not None:
+        item["image_id"] = image_id
+    return item
+
+
+NO_PADDING = torch.empty(0, dtype=torch.long)
+
+
+def as_lists(bins):
+    return {name: values.tolist() for name, values in bins.items()}
+
+
+# --- the brief's tests -------------------------------------------------------------------
+
+
+def test_confidence_is_largest_sigmoid_class_score():
+    actual = confidence_from_logits(torch.tensor([[0.0, 2.0], [-2.0, -1.0]]))
+    assert torch.allclose(actual, torch.tensor([2.0, -1.0]).sigmoid())
+
+
+def test_equal_confidence_ties_follow_query_id():
+    bins = confidence_deciles(torch.tensor([0.5] * 20), torch.arange(20))
+    assert [values.tolist() for values in bins.values()] == [
+        [0, 1], [2, 3], [4, 5], [6, 7], [8, 9],
+        [10, 11], [12, 13], [14, 15], [16, 17], [18, 19],
+    ]
+
+
+def test_non_divisible_count_differs_by_at_most_one():
+    bins = confidence_deciles(torch.arange(23, dtype=torch.float32), torch.arange(23))
+    sizes = [len(values) for values in bins.values()]
+    assert sum(sizes) == 23
+    assert max(sizes) - min(sizes) == 1
+
+
+def test_frozen_ids_stay_clean_while_dynamic_ids_move():
+    records = {
+        0: {"confidence": torch.arange(20, dtype=torch.float32)},
+        1: {"confidence": torch.arange(19, -1, -1, dtype=torch.float32)},
+    }
+    result = memberships_by_severity(records, torch.empty(0, dtype=torch.long))
+    assert result[1]["frozen"]["decile_00_10"].tolist() == [0, 1]
+    assert result[1]["dynamic"]["decile_00_10"].tolist() == [19, 18]
+    assert result[0]["all_valid"].tolist() == list(range(20))
+
+
+def test_fewer_than_ten_valid_queries_is_rejected():
+    with pytest.raises(ValueError, match="at least ten"):
+        confidence_deciles(torch.arange(9, dtype=torch.float32), torch.arange(9))
+
+
+# --- confidence_from_logits --------------------------------------------------------------
+
+
+def test_confidence_from_logits_reduces_in_float32_not_float16():
+    """The cast the plan writes as `.float()` is what keeps near-tied queries distinguishable."""
+    logits = torch.tensor([[-3.191, -8.0], [-3.193, -8.0]], dtype=torch.float16)
+    actual = confidence_from_logits(logits)
+    assert actual.dtype == torch.float32
+    assert torch.equal(actual, logits.float().sigmoid().amax(dim=-1))
+    assert not torch.equal(actual, logits.sigmoid().amax(dim=-1).float())
+
+
+def test_confidence_from_logits_needs_a_class_dimension():
+    with pytest.raises(ValueError, match="query, class"):
+        confidence_from_logits(torch.zeros(4))
+    with pytest.raises(ValueError, match="query, class"):
+        confidence_from_logits(torch.zeros(2, 4, 80))
+
+
+def test_confidence_from_logits_reduces_over_classes_not_over_queries():
+    actual = confidence_from_logits(torch.tensor([[-5.0, 1.0, -5.0], [2.0, -5.0, -5.0]]))
+    assert actual.tolist() == pytest.approx(torch.tensor([1.0, 2.0]).sigmoid().tolist())
+
+
+# --- confidence_deciles ------------------------------------------------------------------
+
+
+def test_bins_run_from_lowest_confidence_to_highest():
+    bins = confidence_deciles(torch.arange(30, dtype=torch.float32) / 30, torch.arange(30))
+    assert bins["decile_00_10"].tolist() == [0, 1, 2]
+    assert bins["decile_90_100"].tolist() == [27, 28, 29]
+
+
+def test_bins_partition_the_valid_queries_with_no_gap_and_no_repeat():
+    generator = torch.Generator().manual_seed(3)
+    confidence = torch.rand(300, generator=generator)
+    valid = torch.arange(300)[torch.arange(300) % 7 != 0]
+    bins = confidence_deciles(confidence, valid)
+    assigned = torch.cat(list(bins.values()))
+    assert assigned.numel() == valid.numel() == 257
+    assert assigned.sort().values.tolist() == valid.tolist()
+    sizes = [len(values) for values in bins.values()]
+    assert max(sizes) - min(sizes) == 1
+
+
+def test_bins_never_hold_a_query_outside_the_valid_set():
+    valid = torch.arange(0, 40, 2)
+    bins = confidence_deciles(torch.arange(40, dtype=torch.float32).flip(0), valid)
+    assert set(torch.cat(list(bins.values())).tolist()) == set(valid.tolist())
+
+
+def test_exactly_ten_valid_queries_gives_ten_bins_of_one():
+    bins = confidence_deciles(torch.arange(10, dtype=torch.float32), torch.arange(10))
+    assert [values.tolist() for values in bins.values()] == [[index] for index in range(10)]
+
+
+def test_ties_that_straddle_a_bin_edge_split_by_ascending_query_id():
+    """Half the queries share one confidence, so only the tie-break decides five bin edges."""
+    confidence = torch.cat([torch.full((15,), 0.25), torch.full((15,), 0.75)])
+    bins = confidence_deciles(confidence, torch.arange(30))
+    assert bins["decile_40_50"].tolist() == [12, 13, 14]
+    assert bins["decile_50_60"].tolist() == [15, 16, 17]
+
+
+def test_unsorted_valid_indices_bin_identically_to_sorted_ones():
+    confidence = torch.tensor([0.5] * 12 + [0.9] * 8)
+    shuffled = torch.tensor([13, 2, 19, 0, 7, 15, 4, 11, 1, 18, 6, 9, 3, 16, 12, 5, 17, 8, 14, 10])
+    assert as_lists(confidence_deciles(confidence, shuffled)) == as_lists(
+        confidence_deciles(confidence, torch.arange(20))
+    )
+
+
+def test_repeated_calls_return_the_same_bins():
+    generator = torch.Generator().manual_seed(5)
+    confidence = (torch.rand(120, generator=generator) * 8).round() / 8
+    valid = torch.arange(120)
+    assert as_lists(confidence_deciles(confidence, valid)) == as_lists(
+        confidence_deciles(confidence, valid)
+    )
+
+
+def test_duplicate_valid_indices_are_rejected():
+    with pytest.raises(ValueError, match="must be unique"):
+        confidence_deciles(torch.arange(20, dtype=torch.float32), torch.tensor([0] + list(range(11))))
+
+
+def test_a_valid_index_outside_the_confidence_vector_is_rejected():
+    confidence = torch.arange(20, dtype=torch.float32)
+    with pytest.raises(ValueError, match="outside the confidence vector"):
+        confidence_deciles(confidence, torch.arange(15, 35))
+    with pytest.raises(ValueError, match="outside the confidence vector"):
+        confidence_deciles(confidence, torch.arange(-5, 10))
+
+
+def test_confidence_deciles_refuses_a_boolean_selection_mask():
+    """`torch.where(keep)[0]` is the intended input; `keep` itself is zeros and ones."""
+    with pytest.raises(ValueError, match="integer query IDs"):
+        confidence_deciles(torch.arange(20, dtype=torch.float32), torch.ones(20, dtype=torch.bool))
+
+
+def test_confidence_deciles_refuses_float_query_indices():
+    with pytest.raises(ValueError, match="integer query IDs"):
+        confidence_deciles(torch.arange(20, dtype=torch.float32), torch.arange(12, dtype=torch.float32))
+
+
+def test_confidence_deciles_needs_one_confidence_score_per_query():
+    with pytest.raises(ValueError, match="one score per query"):
+        confidence_deciles(torch.rand(20, 80), torch.arange(20))
+
+
+def test_confidence_deciles_refuses_to_rank_a_non_finite_confidence():
+    confidence = torch.arange(20, dtype=torch.float32)
+    confidence[4] = float("nan")
+    with pytest.raises(ValueError, match="finite"):
+        confidence_deciles(confidence, torch.arange(20))
+
+
+def test_the_shortfall_error_names_the_record_it_rejected():
+    records = {0: confidence_record(torch.arange(9, dtype=torch.float32), image_id=7888)}
+    with pytest.raises(ValueError, match="image 7888 severity 0"):
+        memberships_by_severity(records, NO_PADDING)
+
+
+# --- bin_overlap -------------------------------------------------------------------------
+
+
+def test_bin_overlap_is_jaccard_per_bin():
+    overlap = bin_overlap(
+        {"decile_00_10": torch.tensor([1, 2, 3]), "decile_10_20": torch.tensor([4, 5])},
+        {"decile_00_10": torch.tensor([3, 2, 9]), "decile_10_20": torch.tensor([5, 4])},
+    )
+    assert overlap == {"decile_00_10": pytest.approx(0.5), "decile_10_20": 1.0}
+
+
+def test_bin_overlap_refuses_two_different_bin_sets():
+    with pytest.raises(ValueError, match="same bins"):
+        bin_overlap({"decile_00_10": torch.tensor([1])}, {"decile_10_20": torch.tensor([1])})
+
+
+# --- memberships_by_severity -------------------------------------------------------------
+
+
+def test_membership_recomputes_confidence_and_ignores_the_stored_field():
+    """Blur records carry a `confidence` reduced before the fp16 cast; only logits are the source."""
+    rising = torch.linspace(-4.0, 4.0, 20).reshape(-1, 1)
+    records = {
+        0: {"logits": rising, "confidence": rising.flip(0).reshape(-1).sigmoid()},
+    }
+    result = memberships_by_severity(records, NO_PADDING)
+    assert result[0]["dynamic"]["decile_00_10"].tolist() == [0, 1]
+    assert result[0]["dynamic"]["decile_90_100"].tolist() == [18, 19]
+
+
+def test_frozen_membership_is_the_severity_zero_membership_at_every_severity():
+    generator = torch.Generator().manual_seed(11)
+    records = {
+        severity: confidence_record(torch.rand(64, generator=generator))
+        for severity in range(6)
+    }
+    result = memberships_by_severity(records, NO_PADDING)
+    clean = as_lists(result[0]["dynamic"])
+    for severity in range(6):
+        assert as_lists(result[severity]["frozen"]) == clean
+    assert any(
+        as_lists(result[severity]["dynamic"]) != clean for severity in range(1, 6)
+    )
+
+
+def test_dynamic_overlap_is_one_at_severity_zero_and_falls_only_where_queries_moved():
+    rising = torch.arange(20, dtype=torch.float32)
+    swapped = rising.clone()
+    swapped[1], swapped[2] = rising[2], rising[1]
+    records = {0: confidence_record(rising), 1: confidence_record(swapped)}
+    result = memberships_by_severity(records, NO_PADDING)
+    assert result[0]["dynamic_overlap"] == {name: 1.0 for name in DECILE_NAMES}
+    assert result[1]["dynamic"]["decile_00_10"].tolist() == [0, 2]
+    assert result[1]["dynamic_overlap"]["decile_00_10"] == pytest.approx(1 / 3)
+    assert result[1]["dynamic_overlap"]["decile_10_20"] == pytest.approx(1 / 3)
+    assert result[1]["dynamic_overlap"]["decile_90_100"] == 1.0
+
+
+def test_dynamic_overlap_is_zero_where_a_reversed_rank_empties_every_bin():
+    records = {
+        0: confidence_record(torch.arange(20, dtype=torch.float32)),
+        1: confidence_record(torch.arange(19, -1, -1, dtype=torch.float32)),
+    }
+    result = memberships_by_severity(records, NO_PADDING)
+    assert set(result[1]["dynamic_overlap"].values()) == {0.0}
+
+
+def test_all_valid_is_exactly_the_union_masked_set():
+    padded = torch.tensor([3, 17, 18, 19])
+    records = {
+        severity: confidence_record(torch.arange(20, dtype=torch.float32))
+        for severity in range(2)
+    }
+    result = memberships_by_severity(records, padded)
+    expected = [index for index in range(20) if index not in {3, 17, 18, 19}]
+    assert result[0]["all_valid"].tolist() == expected
+    assert result[1]["all_valid"].tolist() == expected
+    assert sorted(torch.cat(list(result[1]["dynamic"].values())).tolist()) == expected
+
+
+def test_each_severity_holds_its_own_frozen_and_all_valid_tensors():
+    records = {
+        severity: confidence_record(torch.arange(20, dtype=torch.float32))
+        for severity in range(2)
+    }
+    result = memberships_by_severity(records, NO_PADDING)
+    result[0]["frozen"]["decile_00_10"][0] = 99
+    result[0]["all_valid"][0] = 99
+    assert result[1]["frozen"]["decile_00_10"][0] == 0
+    assert result[1]["all_valid"][0] == 0
+
+
+def test_memberships_require_severity_zero():
+    records = {
+        severity: confidence_record(torch.arange(20, dtype=torch.float32))
+        for severity in range(1, 6)
+    }
+    with pytest.raises(ValueError, match="severity zero"):
+        memberships_by_severity(records, NO_PADDING)
+
+
+def test_memberships_reject_a_query_count_mismatch_across_severities():
+    records = {
+        0: confidence_record(torch.arange(20, dtype=torch.float32)),
+        1: confidence_record(torch.arange(19, dtype=torch.float32)),
+    }
+    with pytest.raises(ValueError, match="query-count mismatch across severities"):
+        memberships_by_severity(records, NO_PADDING)
+
+
+def test_memberships_reject_a_padded_id_outside_the_record():
+    records = {0: confidence_record(torch.arange(20, dtype=torch.float32))}
+    with pytest.raises(ValueError, match="outside the 20-query record"):
+        memberships_by_severity(records, torch.tensor([19, 20]))
+
+
+def test_memberships_refuse_a_boolean_padding_mask():
+    records = {0: confidence_record(torch.arange(20, dtype=torch.float32))}
+    with pytest.raises(ValueError, match="integer query IDs"):
+        memberships_by_severity(records, torch.zeros(20, dtype=torch.bool))
+
+
+def test_padding_that_leaves_fewer_than_ten_queries_is_rejected():
+    records = {0: confidence_record(torch.arange(20, dtype=torch.float32), image_id=42)}
+    with pytest.raises(ValueError, match="at least ten valid queries, got 9"):
+        memberships_by_severity(records, torch.arange(9, 20))
+
+
+# --- directed extra: the index-dtype guard -----------------------------------------------
+
+
+def test_union_query_ids_refuses_a_uint8_selection_mask():
+    with pytest.raises(ValueError, match="integer query IDs"):
+        union_query_ids([torch.tensor([0, 1, 1], dtype=torch.uint8)])
+
+
+def test_a_record_with_neither_logits_nor_confidence_is_rejected():
+    with pytest.raises(ValueError, match="logits or a confidence vector"):
+        memberships_by_severity({0: {"image_id": 3}}, NO_PADDING)
