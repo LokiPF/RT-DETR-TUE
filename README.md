@@ -17,6 +17,11 @@ The following is the corresponding `torch` and `torchvision` versions.
 | `-` | `2.1` | `0.16` |
 | `-` | `2.0` | `0.15` |
 
+Those rows are the **detector-only** combinations. The scene-uncertainty pipeline needs
+`torchvision >= 0.18` (torch `2.3`), because its blur loader passes a tuple-returning
+`labels_getter` to `SanitizeBoundingBoxes` and earlier versions accept only a single
+tensor. `requirements.txt` declares that floor.
+
 </details>
 
 <details open>
