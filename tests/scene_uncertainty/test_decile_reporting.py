@@ -40,6 +40,7 @@ from src.scene_uncertainty.decile_analysis import (
 )
 from src.scene_uncertainty.decile_reporting import (
     BENCHMARK_SELECTION,
+    FILTERED_PADDING_MODE,
     EASY_REPORT_FINAL_SENTENCE,
     GROUP_KEYS,
     RANDOM_BIN_OVERLAP,
@@ -2250,6 +2251,18 @@ def test_the_membership_comparison_reads_both_medians_off_its_own_two_groups():
         )
 
 
+MEMBERSHIP_COMPARISON_KEYS = {
+    "signal", "confidence_bin", "aggregation", "score_scope", "padding_mode",
+    "dynamic_median_spearman", "frozen_median_spearman", "dynamic_minus_frozen_spearman",
+    "dynamic_image_win_rate", "dynamic_image_tie_rate", "dynamic_image_loss_rate",
+    "dynamic_image_decided_image_count", "dynamic_image_decided_win_rate",
+    "paired_image_count", "dynamic_mean_clean_overlap_from_severity_1",
+}
+"""Exactly what a `membership_comparisons` row publishes. Two separate medians, their
+difference, one paired triple with both denominators, and the movement the comparison is about
+-- and nothing on the score's own scale that covers both memberships (spec:230)."""
+
+
 def test_the_membership_family_compares_and_never_combines(tmp_path):
     """Spec:230 -- the family may not publish anything on the score's own scale that covers
     both memberships, and it may not open a route into the deployable ranking.
@@ -2262,14 +2275,13 @@ def test_the_membership_family_compares_and_never_combines(tmp_path):
     assert all(
         group["membership_mode"] != "frozen" for group in summary[RANKED_GROUPS_KEY]
     )
+    # Asserted on the published schema, not on the values. "No number equals (d + f) / 2" is
+    # not an invariant at all: it is false by arithmetic coincidence whenever `d == 3f`, since
+    # then `d - f == (d + f) / 2`, and the real 165-row family contains such rows. It passed
+    # here only because `grid_summary()` happens to hold none. An exact key set is the thing
+    # that actually forbids a combined score being added, and it cannot be satisfied by luck.
     for entry in summary["membership_comparisons"]:
-        dynamic, frozen = entry["dynamic_median_spearman"], entry["frozen_median_spearman"]
-        if dynamic is None or frozen is None:
-            continue
-        combined = (dynamic + frozen) / 2
-        for key, value in entry.items():
-            if isinstance(value, float) and key.endswith("spearman"):
-                assert value != pytest.approx(combined) or dynamic == frozen, key
+        assert set(entry) == MEMBERSHIP_COMPARISON_KEYS
     report = (written(tmp_path) / "easy-report.md").read_text()
     assert "never a combination" in report
 
@@ -2393,10 +2405,247 @@ def test_the_report_demonstrates_the_median_blindness_from_its_own_rows(tmp_path
 
 
 def test_the_median_blindness_note_stays_silent_when_the_run_cannot_show_it(tmp_path):
-    """No exact median tie, or every tie pointing the same way, means no demonstration."""
+    """No exact median tie at all means no demonstration."""
     summary = grid_summary()
     summary["membership_comparisons"] = [
         entry for entry in summary["membership_comparisons"]
         if entry["dynamic_minus_frozen_spearman"] != 0.0
     ]
     assert reporting_module._median_blindness_note(summary) == []
+
+
+@pytest.mark.parametrize(("low_rate", "high_rate"), [
+    (0.523, 0.540),   # both above even -- they differ, they do not disagree
+    (0.410, 0.449),   # both below even
+    (0.500, 0.600),   # one exactly even, which is not the opposite side of anything
+])
+def test_the_median_blindness_note_stays_silent_when_the_ties_agree(low_rate, high_rate):
+    """Two tied rows that merely *differ* show the paired statistic has more resolution than
+    the median, which is arithmetic. Only rows that land on opposite sides of even show the
+    median could have been read either way, which is the whole claim.
+
+    The overstatement this kills printed "far apart ... different answers image by image" over
+    two rates on the same side of even -- contradicted by the two numbers in its own sentence.
+    """
+    summary = {"membership_comparisons": [
+        {**reporting_module.MEMBERSHIP_COMPARISON_SLICE,
+         "confidence_bin": name, "aggregation": "q90",
+         "dynamic_minus_frozen_spearman": 0.0, "paired_image_count": 1000,
+         "dynamic_image_decided_image_count": 1000,
+         "dynamic_image_decided_win_rate": rate,
+         "dynamic_image_win_rate": rate, "dynamic_image_tie_rate": 0.0,
+         "dynamic_image_loss_rate": 1.0 - rate}
+        for name, rate in (("decile_00_10", low_rate), ("decile_10_20", high_rate))
+    ]}
+    assert reporting_module._median_blindness_note(summary) == []
+
+
+def test_an_exactly_even_paired_row_is_not_described_as_one_side_being_ahead():
+    """`win >= loss` printed "has dynamic ahead 107 images to 107", and `decile_40_50` at `q90`
+    is 107/36/107 on the real run -- so the false sentence was reachable."""
+    phrase = reporting_module._membership_outcome_phrase({
+        "confidence_bin": "decile_40_50", "aggregation": "q90",
+        "paired_image_count": 250, "dynamic_image_win_rate": 107 / 250,
+        "dynamic_image_tie_rate": 36 / 250, "dynamic_image_loss_rate": 107 / 250,
+        "dynamic_image_decided_image_count": 214, "dynamic_image_decided_win_rate": 0.5,
+    })
+    assert "splits evenly, 107 images each" in phrase
+    assert "ahead" not in phrase
+
+
+# --- review round 3: the fallback branch nothing reached -------------------------------------
+
+
+@pytest.mark.parametrize(("dynamic", "frozen", "expected", "forbidden"), [
+    (0.1, 0.9, "higher", "lower"),
+    (0.9, 0.1, "lower", "higher"),
+])
+def test_the_unpaired_fallback_states_only_the_direction_of_the_gap(
+    dynamic, frozen, expected, forbidden
+):
+    """The large-gap branch of the `paired is None` fallback, which had no coverage at all.
+
+    Round 1 forbade this branch from claiming the movement costs anything or nothing -- it has
+    two marginal medians and no paired statistic. The round-1 test that covered it was replaced
+    when the paired family arrived, and its replacement only reaches the small-gap branch. A
+    mutation that reverses the direction *and* asserts "the movement costs nothing" passed all
+    177 tests. This asserts the direction against the sign, and that no verdict is offered.
+    """
+    reading = reporting_module._freezing_reading(dynamic, frozen, None)
+    assert f"{expected} with the membership held still" in reading
+    assert forbidden not in reading
+    assert "not a paired comparison" in reading
+    assert "no frozen twin was scored" in reading
+    # No claim in either direction about what the movement costs.
+    assert "costs nothing" not in reading
+    assert "costing" not in reading
+
+
+def test_the_unpaired_fallback_is_only_reached_without_a_frozen_twin(tmp_path):
+    """And on a table that has one, the fallback's language must not appear at all."""
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    assert "no frozen twin was scored" not in report
+    assert "with the membership held still" not in report
+
+
+# --- review round 3: the ten-bin reading, derived -------------------------------------------
+
+
+def profile_rows(rates: list[float], frozen: list[float], aggregation: str = "q90") -> dict:
+    """A `membership_comparisons` slice with a chosen decided-rate profile and frozen column.
+
+    Built directly rather than from scored rows because the note is a function of these numbers
+    and nothing else, and because `full_grid_rows` cannot be bent into a profile that peaks at
+    its own winning bin without moving figures a dozen other tests pin.
+    """
+    return {
+        "membership_comparisons": [
+            {
+                "signal": "persistence", "score_scope": PRIMARY_SCORE_SCOPE,
+                "padding_mode": FILTERED_PADDING_MODE, "confidence_bin": name,
+                "aggregation": aggregation,
+                "dynamic_median_spearman": 0.6, "frozen_median_spearman": frozen[index],
+                "dynamic_minus_frozen_spearman": 0.6 - frozen[index],
+                "paired_image_count": 250,
+                "dynamic_image_win_rate": rates[index] * 0.9,
+                "dynamic_image_tie_rate": 0.1,
+                "dynamic_image_loss_rate": 0.9 - rates[index] * 0.9,
+                "dynamic_image_decided_image_count": 225,
+                "dynamic_image_decided_win_rate": rates[index],
+                "dynamic_mean_clean_overlap_from_severity_1": 0.06,
+            }
+            for index, name in enumerate(DECILE_NAMES)
+        ]
+    }
+
+
+def profile_ranked(bin_name: str, medians: list[float], aggregation: str = "q90") -> list[dict]:
+    return [
+        {"membership_mode": "dynamic", "confidence_bin": bin_name if index == 0 else name,
+         "aggregation": aggregation, "score_scope": PRIMARY_SCORE_SCOPE,
+         "padding_mode": FILTERED_PADDING_MODE, "median_spearman": median}
+        for index, (name, median) in enumerate(zip(DECILE_NAMES, medians))
+    ]
+
+
+UNIMODAL = [0.20, 0.31, 0.39, 0.46, 0.52, 0.60, 0.49, 0.43, 0.28, 0.22]
+FLAT_FROZEN = [0.5429, 0.6, 0.6, 0.6, 0.6, 0.6, 0.6, 0.5429, 0.4857, -0.5429]
+
+
+def test_the_movement_profile_is_derived_from_the_paired_rows():
+    """Every number in the note comes back out of `membership_comparisons`.
+
+    Kills prose naming a bin, a rate or a direction as a literal: move the peak and the
+    sentence has to move with it.
+    """
+    summary = profile_rows(UNIMODAL, FLAT_FROZEN)
+    ranked = profile_ranked("decile_50_60", [0.6286] * 10)
+    note = "\n".join(reporting_module._movement_profile_note(summary, ranked))
+    assert "runs from 0.200 at `decile_00_10` to 0.600 at `decile_50_60`" in note
+    assert "back to 0.220 at `decile_90_100`" in note
+    assert "one peak with no second rise" in note
+    assert "The peak is the bin the ranking selected." in note
+
+    shifted = list(UNIMODAL)
+    shifted[2], shifted[5] = shifted[5], shifted[2]
+    moved = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(shifted, FLAT_FROZEN), ranked
+    ))
+    assert "0.600 at `decile_20_30`" in moved
+    assert "The peak is not the selected bin `decile_50_60`" in moved
+    assert "it is not single-peaked" in moved
+
+
+def test_the_movement_profile_names_the_peaks_neighbours_rather_than_calling_it_the_only_bin():
+    """"The only bin" is the wrong shape for a single-peaked curve whose neighbours straddle
+    even; the note names them with their rates so a reader sees the plateau."""
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, FLAT_FROZEN), profile_ranked("decile_50_60", [0.6286] * 10)
+    ))
+    assert "Its neighbours -- `decile_40_50` at 0.520 and `decile_60_70` at 0.490 --" in note
+    assert "straddle even" in note
+    assert "the only bin" not in note
+    assert "2 of the 10 bins are above even at this summary." in note
+    # "the ten bins" was a literal, and a sparse table has three. Both the heading and the
+    # verb have to follow the data.
+    assert "across the 10 bins" in note
+    thin = "\n".join(reporting_module._movement_profile_note(
+        {"membership_comparisons": profile_rows(UNIMODAL, FLAT_FROZEN)[
+            "membership_comparisons"][5:8]},
+        profile_ranked("decile_50_60", [22 / 35] * 10),
+    ))
+    assert "across the 3 bins" in thin
+    assert "1 of the 3 bins is above even" in thin
+
+
+def test_the_movement_profile_publishes_both_denominators():
+    """The decided rate alone overstates; the all-paired rate alone understates. Both counts,
+    over the same rows, or the sentence is quoting the flattering half."""
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, FLAT_FROZEN), profile_ranked("decile_50_60", [0.6286] * 10)
+    ))
+    # Two rows clear 0.5 on the decided denominator and one does over every paired image,
+    # because the fixture's all-paired rate is 0.9 x the decided one -- the same direction the
+    # real run shows, where it is 7 of 30 against 1 of 30.
+    assert "10 rows of this slice, 2 clear 0.5 on the images the comparison decided" in note
+    assert "1 clear it over every paired image" in note
+
+
+def test_the_movement_profile_lets_the_flat_frozen_medians_carry_the_selection_argument():
+    """The selection reading comes from the frozen column and the ranked field -- not from an
+    inference about why the paired peak falls where it does."""
+    # Exact grid values, not rounded ones: 22/35 and 21/35 are one step apart, whereas
+    # 0.6286 and 0.6 are 0.0286 apart, which is *wider* than 1/35 and would fall outside the
+    # band. The real medians are always exact grid values; a fixture that rounds them makes
+    # this note look broken when it is not.
+    top, step_below = 22 / 35, 21 / 35
+    ranked = profile_ranked(
+        "decile_50_60", [top, top, step_below, step_below, step_below, 0.5, 0.4, 0.3, 0.2, 0.1]
+    )
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, FLAT_FROZEN), ranked
+    ))
+    assert "identical at +0.6000 across 6 neighbouring bins" in note
+    assert "`decile_10_20` through `decile_60_70`" in note
+    assert "5 of the 10 ranked candidates sit within one 1/35 = 0.0286 step of the top" in note
+    assert "2 share the top median exactly" in note
+
+
+def test_the_movement_profile_omits_the_frozen_argument_when_nothing_is_flat():
+    """A frozen column with no run of three is no evidence of "any middle bin scores about X",
+    and the paragraph that says so must not appear."""
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, [0.1 * index for index in range(10)]),
+        profile_ranked("decile_50_60", [0.6286] * 10),
+    ))
+    assert "The shape of that column" in note
+    assert "The frozen medians are identical" not in note
+
+
+def test_the_movement_profile_says_nothing_without_a_ranking():
+    assert reporting_module._movement_profile_note(grid_summary(), []) == []
+
+
+def test_the_movement_profile_survives_the_full_fixture(tmp_path):
+    """And on the shared fixture -- whose peak is *not* its winning bin -- it says so rather
+    than reporting a peak that is not there."""
+    summary = grid_summary()
+    note = "\n".join(
+        reporting_module._movement_profile_note(summary, summary[RANKED_GROUPS_KEY])
+    )
+    assert "The peak is not the selected bin" in note
+    assert note in (written(tmp_path) / "easy-report.md").read_text()
+
+
+@pytest.mark.parametrize(("run", "expected"), [
+    ([1.0, 1.0, 0.5, 1.0, 1.0, 1.0], (3, 3, 5)),
+    ([0.5, 0.5, 0.5], (3, 0, 2)),
+    ([None, 1.0, 1.0], (2, 1, 2)),
+    ([None, None], (0, 0, 0)),
+    ([0.1, 0.2, 0.3], (1, 0, 0)),
+])
+def test_the_longest_equal_run_finds_the_longest_and_skips_the_absent(run, expected):
+    """The frozen-medians run is what carries the selection argument, so a helper that
+    returned the *first* run rather than the longest, or that counted a run of `None`s as
+    flatness, would publish a claim about a stretch of bins that is not flat."""
+    assert reporting_module._longest_equal_run(run) == expected

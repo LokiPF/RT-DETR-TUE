@@ -2178,6 +2178,7 @@ def _dynamic_frozen_section(summary: dict) -> list[str]:
         )
         lines.append("")
     lines.extend(_median_blindness_note(summary))
+    lines.extend(_movement_profile_note(summary, list(summary.get(RANKED_GROUPS_KEY) or [])))
     lines.append(
         f"Two unrelated decile memberships would overlap at {RANDOM_BIN_OVERLAP:.4f}, so a bin "
         "sitting close to that line is being rebuilt almost from scratch at every severity. A "
@@ -2189,24 +2190,56 @@ def _dynamic_frozen_section(summary: dict) -> list[str]:
     return lines
 
 
+MEMBERSHIP_COMPARISON_SLICE = {
+    "signal": "persistence",
+    "score_scope": PRIMARY_SCORE_SCOPE,
+    "padding_mode": FILTERED_PADDING_MODE,
+}
+"""The slice of `membership_comparisons` the report reads. Stated once so the two notes below
+and the table they sit under cannot drift onto different populations."""
+
+
+def _membership_outcome_phrase(entry: dict) -> str:
+    """One paired dynamic-versus-frozen row in words, including the case where it is even.
+
+    `win >= loss` printed "has dynamic ahead 107 images to 107" on an exactly even row, and
+    `decile_40_50` at `q90` is 107/36/107 on the real run -- so the sentence was reachable and
+    false. Even is its own outcome here, not a tie broken toward whichever side the comparison
+    is named after.
+    """
+    total = entry["paired_image_count"]
+    win = _whole(entry["dynamic_image_win_rate"], total)
+    loss = _whole(entry["dynamic_image_loss_rate"], total)
+    where = f"`{entry['confidence_bin']}` at `{entry['aggregation']}`"
+    decided = (
+        f"a decided rate of {_plain(entry['dynamic_image_decided_win_rate'])} over the "
+        f"{entry['dynamic_image_decided_image_count']} it decided"
+    )
+    if win == loss:
+        return f"{where} splits evenly, {win} images each, {decided}"
+    ahead = DYNAMIC_MEMBERSHIP_MODE if win > loss else FROZEN_MEMBERSHIP_MODE
+    return f"{where} has {ahead} ahead {max(win, loss)} images to {min(win, loss)}, {decided}"
+
+
 def _median_blindness_note(summary: dict) -> list[str]:
     """Show, from this run's own rows, that the difference of medians could not have answered.
 
     The paired family exists because a difference of two medians is blind at the primary
     metric's resolution. That is an argument; this turns it into a measurement. It collects the
     rows whose median difference is **exactly zero** -- a dead heat by the design's primary
-    metric -- and reports how far apart the paired comparison puts them. When two such rows land
-    on opposite sides of even, the primary metric demonstrably could not have told them apart,
-    and no reader has to take the claim on trust.
+    metric -- and reports where the paired comparison puts them.
 
-    Emitted only when the run actually contains the demonstration. A table with fewer than two
-    exact median ties says nothing here rather than reaching for a weaker version of it.
+    **The demonstration requires the two extremes to fall on opposite sides of even, and there
+    is no weaker version of it.** Two tied rows at 0.540 and 0.523 differ, and an earlier
+    version of this called that "far apart ... different answers image by image" -- contradicted
+    by the two numbers printed in the same sentence. Rows that merely differ show that the
+    paired statistic has more resolution than the median, which is arithmetic; rows that
+    *disagree* show the median could have been read either way, which is the point. So the note
+    is silent unless one extreme is strictly below even and the other strictly above.
     """
     tied = [
         entry for entry in summary["membership_comparisons"]
-        if entry["signal"] == "persistence"
-        and entry["score_scope"] == PRIMARY_SCORE_SCOPE
-        and entry["padding_mode"] == FILTERED_PADDING_MODE
+        if all(entry[field] == value for field, value in MEMBERSHIP_COMPARISON_SLICE.items())
         and entry["dynamic_minus_frozen_spearman"] == 0.0
         and entry["dynamic_image_decided_win_rate"] is not None
     ]
@@ -2217,35 +2250,158 @@ def _median_blindness_note(summary: dict) -> list[str]:
                                  entry["confidence_bin"], entry["aggregation"])
     )
     low, high = ordered[0], ordered[-1]
-    if low["dynamic_image_decided_win_rate"] == high["dynamic_image_decided_win_rate"]:
+    # Strictly, on both sides. A row at exactly 0.5 is even, and even is not the opposite side
+    # of anything -- it is also what makes `_membership_outcome_phrase`'s even branch
+    # unreachable from here, which is why that branch is tested directly instead.
+    if not (low["dynamic_image_decided_win_rate"] < 0.5
+            < high["dynamic_image_decided_win_rate"]):
         return []
-
-    def described(entry: dict) -> str:
-        total = entry["paired_image_count"]
-        win = _whole(entry["dynamic_image_win_rate"], total)
-        loss = _whole(entry["dynamic_image_loss_rate"], total)
-        ahead = "dynamic" if win >= loss else "frozen"
-        return (
-            f"`{entry['confidence_bin']}` at `{entry['aggregation']}` has {ahead} ahead "
-            f"{max(win, loss)} images to {min(win, loss)}, a decided rate of "
-            f"{_plain(entry['dynamic_image_decided_win_rate'])} over the "
-            f"{entry['dynamic_image_decided_image_count']} it decided"
-        )
-
-    opposed = (
-        low["dynamic_image_decided_win_rate"] < 0.5 <= high["dynamic_image_decided_win_rate"]
-    )
     return [
         f"**Why the paired column and not the gap between the medians.** {len(tied)} of the "
-        f"rows above have two medians that are *exactly equal* -- a dead heat on the statistic "
-        "the design ranks by. The per-image comparison puts them "
-        + ("on opposite sides of even" if opposed else "far apart")
-        + f": {described(high)}, while {described(low)}. Identical on the primary metric, "
-        + ("opposite answers" if opposed else "different answers")
-        + " image by image -- which is what a difference of two medians on a 36-valued "
-        "statistic cannot see.",
+        "rows above have two medians that are *exactly equal* -- a dead heat on the statistic "
+        "the design ranks by -- and the per-image comparison puts them on opposite sides of "
+        f"even: {_membership_outcome_phrase(high)}, while "
+        f"{_membership_outcome_phrase(low)}. Identical on the primary metric, opposite answers "
+        "image by image, which is what a difference of two medians on a 36-valued statistic "
+        "cannot see.",
         "",
     ]
+
+
+def _longest_equal_run(values: list) -> tuple[int, int, int]:
+    """`(length, start, stop)` of the longest run of equal, non-`None` neighbouring values."""
+    best = (0, 0, 0)
+    index = 0
+    while index < len(values):
+        stop = index
+        while (stop + 1 < len(values) and values[stop + 1] is not None
+               and values[stop + 1] == values[index]):
+            stop += 1
+        if values[index] is not None and stop - index + 1 > best[0]:
+            best = (stop - index + 1, index, stop)
+        index = stop + 1
+    return best
+
+
+def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
+    """The shape of the paired column across the ten bins, derived rather than written down.
+
+    The 30-row table above already contains this; leaving the reading out does not withhold it,
+    it leaves a reader to derive it unaided with no caution attached. So it is stated -- and
+    stated the way the numbers support, which is not the way it first looks.
+
+    Three things this is careful about, each because a shorter version of it was wrong:
+
+    * **"the only bin" is the wrong shape.** The decided rate is a single-peaked curve in
+      confidence, and the peak's neighbours straddle even. A plateau reads very differently from
+      an outlier, and the difference is visible in the same column.
+    * **the denominator changes the strength.** Far more rows clear even on the decided
+      denominator than over every paired image. Both counts are published, because quoting the
+      decided one alone overstates and quoting the all-paired one alone understates.
+    * **the frozen column is the cleaner evidence about the peak.** Frozen medians that are flat
+      across a run of middle bins, a ranked field whose top places sit inside one `1/35` step,
+      and a winner sharing its median with others together say that a middle bin of any kind
+      scores about the same here and the ranking picked the one that landed a step above. That
+      is a statement about the selection, and it needs no inference about why the paired peak
+      falls where it does.
+
+    Everything is computed from `membership_comparisons` and the ranking, so it describes
+    whatever run it is handed rather than this one.
+    """
+    if not ranked:
+        return []
+    winner = ranked[0]
+    slice_rows = [
+        entry for entry in summary["membership_comparisons"]
+        if all(entry[field] == value for field, value in MEMBERSHIP_COMPARISON_SLICE.items())
+    ]
+    at_summary = {
+        entry["confidence_bin"]: entry
+        for entry in slice_rows if entry["aggregation"] == winner["aggregation"]
+    }
+    profile = [(name, at_summary[name]) for name in DECILE_NAMES if name in at_summary]
+    rates = [entry["dynamic_image_decided_win_rate"] for _, entry in profile]
+    if len(profile) < 3 or any(rate is None for rate in rates):
+        return []
+
+    peak = max(range(len(profile)), key=lambda index: rates[index])
+    single_peaked = (
+        all(rates[index] <= rates[index + 1] for index in range(peak))
+        and all(rates[index] >= rates[index + 1] for index in range(peak, len(rates) - 1))
+    )
+    neighbours = [
+        f"`{profile[index][0]}` at {_plain(rates[index])}"
+        for index in (peak - 1, peak + 1) if 0 <= index < len(profile)
+    ]
+    straddling = [rates[index] for index in (peak - 1, peak + 1) if 0 <= index < len(profile)]
+    above_even = sum(1 for rate in rates if rate > 0.5)
+    decided_above = sum(
+        1 for entry in slice_rows
+        if entry["dynamic_image_decided_win_rate"] is not None
+        and entry["dynamic_image_decided_win_rate"] > 0.5
+    )
+    paired_above = sum(
+        1 for entry in slice_rows
+        if entry["dynamic_image_win_rate"] is not None
+        and entry["dynamic_image_win_rate"] > 0.5
+    )
+
+    frozen = [entry["frozen_median_spearman"] for _, entry in profile]
+    length, start, stop = _longest_equal_run(frozen)
+    step = 1 / SPEARMAN_STEP_DENOMINATOR
+    top = winner["median_spearman"]
+    within_step = [
+        group for group in ranked
+        if group["median_spearman"] is not None and top is not None
+        and top - float(group["median_spearman"]) <= step + 1e-9
+    ]
+    sharing = [group for group in ranked if group["median_spearman"] == top]
+
+    bins_word = "bin" if len(profile) == 1 else "bins"
+    shape = [
+        f"**The shape of that column across the {len(profile)} {bins_word}.** At "
+        f"`{winner['aggregation']}` the decided rate runs from {_plain(rates[0])} at "
+        f"`{profile[0][0]}` to {_plain(rates[peak])} at `{profile[peak][0]}` and back to "
+        f"{_plain(rates[-1])} at `{profile[-1][0]}`"
+        + (", one peak with no second rise" if single_peaked
+           else ", and it is not single-peaked")
+        + (
+            f". The peak is the bin the ranking selected. Its neighbours -- "
+            f"{' and '.join(neighbours)} -- "
+            + (
+                "straddle even, so this is a short plateau of near-even bins and not one bin "
+                "standing apart"
+                if straddling and min(straddling) < 0.5 <= max(straddling)
+                else "sit below it on both sides"
+            )
+            if profile[peak][0] == winner["confidence_bin"]
+            else f". The peak is not the selected bin `{winner['confidence_bin']}`, which sits "
+                 f"at {_plain(at_summary[winner['confidence_bin']]['dynamic_image_decided_win_rate'])}"
+        )
+        + f". {above_even} of the {len(profile)} {bins_word} "
+        + ("is" if above_even == 1 else "are")
+        + " above even at this summary.",
+        "",
+        "**And how much of that survives the other denominator.** Over the "
+        f"{len(slice_rows)} rows of this slice, {decided_above} clear 0.5 on the images the "
+        f"comparison decided and {paired_above} clear it over every paired image. Quoting the "
+        "first alone overstates the effect and quoting the second alone understates it, which "
+        "is why both are here.",
+        "",
+    ]
+    if length >= 3 and top is not None:
+        shape.extend([
+            "**What the frozen column says to read into the peak.** The frozen medians are "
+            f"identical at {_signed(frozen[start])} across {length} neighbouring bins, "
+            f"`{profile[start][0]}` through `{profile[stop][0]}`; {len(within_step)} of the "
+            f"{len(ranked)} ranked candidates sit within one 1/{SPEARMAN_STEP_DENOMINATOR} = "
+            f"{step:.4f} step of the top; and {len(sharing)} share the top median exactly. A "
+            f"middle bin of almost any kind scores about {_signed(frozen[start])} here, and "
+            "what the ranking selected is the one that landed a step above -- which is a fact "
+            "about the selection and needs no explanation of where the paired peak falls.",
+            "",
+        ])
+    return shape
 
 
 def _padding_section(summary: dict) -> list[str]:
