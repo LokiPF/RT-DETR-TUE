@@ -160,6 +160,28 @@ which is arithmetic. Three of the pilot's 33 ranked candidates are `shared`, and
 FILTERED_PADDING_MODE = "filtered"
 UNFILTERED_PADDING_MODE = "unfiltered"
 
+MEMBERSHIP_COMPARISON_PAIR = ("dynamic", "frozen")
+"""The two memberships `membership_comparisons` pairs, and why that is a comparison and not the
+combination spec:230 forbids.
+
+Spec:230 says dynamic and frozen "must not be combined into one score". Nothing here combines
+them: no sum, no mean, no difference of raw scores, no single ranked figure covering both. What
+this family publishes is the same shape the design already asks for between persistence and its
+confidence control (spec:157) -- two separate medians and a per-image win/tie/loss triple over
+the images both measured -- and a triple is a statement about *how often one exceeds the other*,
+which cannot be a combined score because it is not on the score's scale at all. The frozen group
+stays out of the deployable ranking exactly as before, and this family adds no way into it.
+
+Why it has to exist. Spec:172 makes the easy report answer whether bin movement explains the
+result, and freezing the membership at severity zero is the only manipulation in the design that
+removes movement while leaving everything else. Before this family, that question was answered
+by subtracting two medians -- on the pilot +0.6286 against +0.6000, one step of the metric's
+`1/35` grid. This plan has already shown that comparison to be blind at that resolution: the
+leading candidate's median difference against the all-query benchmark is exactly 0.000 at `q90`
+while the paired comparison runs 122 to 92. So the fourth question was being answered by the one
+statistic the other three had stopped trusting.
+"""
+
 BENCHMARK_AGGREGATION = "q90"
 """The scene summary the figures slice on, and the one the published benchmark exists at.
 
@@ -696,6 +718,14 @@ def summarize_decile_rows(
       unrestricted rate counts every such image as a non-win. That count is a *lower bound* on
       the images the mask reached and varies with the scene summary; `_score_changed_images`
       says why, and why buying the exact set back is the wrong trade.
+    * `membership_comparisons` -- each dynamic selection against its own frozen twin, paired
+      per image (spec:172's fourth question). Freezing the membership at severity zero is the
+      only manipulation in the design that removes query movement and leaves everything else,
+      so the paired outcome between the two is what says whether the movement explains a
+      result. Two medians one grid step apart cannot say it: this plan has a candidate whose
+      median difference against the benchmark is exactly 0.000 while the paired comparison runs
+      122 to 92. Nothing here combines the two into one score -- see
+      `MEMBERSHIP_COMPARISON_PAIR`.
     * `benchmark_comparisons` -- every ranked candidate against the published all-300-query
       result (spec:229), paired per image. The spec asks only whether a candidate beats the
       benchmark; a difference of two medians answers that with a number whose resolution is
@@ -904,6 +934,49 @@ def summarize_decile_rows(
         entry["aggregation"], entry["score_scope"],
     ))
 
+    # Each dynamic selection against its own frozen twin, paired per image. Same bin, same
+    # summary, same scope, same padding rule -- the only thing that differs is whether the ten
+    # bins were rebuilt at this severity or reused from severity zero, which is what makes the
+    # comparison a measurement of query movement and nothing else. See
+    # `MEMBERSHIP_COMPARISON_PAIR` for why this is a comparison and not the combination
+    # spec:230 forbids.
+    dynamic_mode, frozen_mode = MEMBERSHIP_COMPARISON_PAIR
+    membership_comparisons = []
+    for key, group in by_key.items():
+        signal, membership, confidence_bin, aggregation, scope, padding = key
+        if membership != dynamic_mode:
+            continue
+        frozen_key = (signal, frozen_mode, confidence_bin, aggregation, scope, padding)
+        frozen = by_key.get(frozen_key)
+        if frozen is None:
+            continue
+        dynamic_spearman = spearman_by_group[key]
+        frozen_spearman = spearman_by_group[frozen_key]
+        paired = _paired(dynamic_spearman, frozen_spearman)
+        membership_comparisons.append({
+            "signal": signal,
+            "confidence_bin": confidence_bin,
+            "aggregation": aggregation,
+            "score_scope": scope,
+            "padding_mode": padding,
+            "dynamic_median_spearman": group["median_spearman"],
+            "frozen_median_spearman": frozen["median_spearman"],
+            "dynamic_minus_frozen_spearman": _difference(
+                group["median_spearman"], frozen["median_spearman"]
+            ),
+            **_outcome_rates("dynamic_image", dynamic_spearman, frozen_spearman, paired),
+            "paired_image_count": len(paired),
+            # The movement the comparison is about, carried on the row rather than left to be
+            # joined from `groups`: a reader of this table needs to know whether the dynamic
+            # bin moved at all before a win or a loss over the frozen one means anything.
+            "dynamic_mean_clean_overlap_from_severity_1":
+                group["mean_clean_overlap_from_severity_1"],
+        })
+    membership_comparisons.sort(key=lambda entry: (
+        entry["signal"], entry["confidence_bin"], entry["aggregation"],
+        entry["score_scope"], entry["padding_mode"],
+    ))
+
     ranked = rank_deployable_groups(groups)
     benchmark_comparisons = []
     for candidate in ranked:
@@ -947,12 +1020,14 @@ def summarize_decile_rows(
             "comparison_count": len(comparisons),
             "persistence_groups_without_confidence_control": without_control,
             "padding_sensitivity_count": len(sensitivity),
+            "membership_comparison_count": len(membership_comparisons),
             "benchmark_comparison_count": len(benchmark_comparisons),
         },
         "padding": _padding_rollup(diagnostics),
         "groups": groups,
         "comparisons": comparisons,
         "padding_sensitivity": sensitivity,
+        "membership_comparisons": membership_comparisons,
         "benchmark_comparisons": benchmark_comparisons,
         RANKED_GROUPS_KEY: ranked,
     }
@@ -1243,8 +1318,11 @@ def _heatmap_figure(summary: dict):
                 color="white" if not math.isfinite(value) else "black",
             )
     figure.colorbar(drawn, ax=axis, label="median per-image Spearman")
+    # `FIGURE_SLICE` and not `FIGURE_SLICE_NOTE`: the second row of this figure is the
+    # confidence control, which has no decoder-layer scope (spec:125). Each row carries its own
+    # scope in its label, so the title states only what is true of both.
     axis.set_title(
-        f"Median per-image Spearman by confidence bin and signal\n{FIGURE_SLICE_NOTE}"
+        f"Median per-image Spearman by confidence bin and signal\n{FIGURE_SLICE}"
         "; grey `n/a` = no row in this table",
         fontsize=8,
     )
@@ -1430,7 +1508,8 @@ def _padding_sensitivity_figure(summary: dict):
         f"Padding sensitivity, {SENSITIVITY_BIN} only, {BENCHMARK_AGGREGATION} scene summary."
         f"\nThe persistence bars are at {PRIMARY_SCORE_SCOPE}; the confidence control has no "
         "decoder-layer scope."
-        "\nUnfiltered keeps the repeated decoder placeholders the primary analysis removes.",
+        "\nUnfiltered keeps the repeated decoder placeholders the primary analysis removes; "
+        "frozen is a diagnostic and not a deployable result.",
         fontsize=8,
     )
     axis.set_ylabel("median per-image Spearman", fontsize=8)
@@ -1462,9 +1541,18 @@ def _padding_sensitivity_figure(summary: dict):
     # Headroom for the annotations, which are anchored to the top of the axis.
     bottom, top = axis.get_ylim()
     axis.set_ylim(bottom, top + 0.22 * (top - bottom))
+    # Spec:230 on a figure that gets read on its own. The frozen bars are the tallest on this
+    # axis -- +0.4857 and +0.5429 against a dynamic persistence bar at -0.0286 -- so a reader
+    # skimming the figures meets the most impressive result in the set with nothing saying it
+    # needs a paired clean image and cannot be run on one.
     axis.set_xticks(
         positions,
-        [f"{entry['membership_mode']}\n{entry['signal']}" for entry in entries],
+        [
+            f"{entry['membership_mode']}"
+            + (" (diagnostic)" if entry["membership_mode"] == FROZEN_MEMBERSHIP_MODE else "")
+            + f"\n{entry['signal']}"
+            for entry in entries
+        ],
         fontsize=8,
     )
     axis.legend(fontsize=8)
@@ -1607,47 +1695,68 @@ def _benchmark_sentence(summary: dict, winner: dict | None) -> str:
     )
 
 
-def _freezing_reading(dynamic_median, frozen_median) -> str:
-    """What the frozen twin's number says about bin movement -- and what it cannot say.
+def _freezing_reading(dynamic_median, frozen_median, paired: dict | None) -> str:
+    """What the frozen twin says about bin movement -- from the paired outcome, not two medians.
 
     Freezing the membership at severity zero removes the query movement and leaves the
-    fingerprint motion, so the gap between the two medians bears on spec:172's fourth question.
-    It bears on it in **one direction only**, and the asymmetry is the whole point of this
-    function.
+    fingerprint motion, so the comparison between a bin and its frozen twin is the design's only
+    direct handle on spec:172's fourth question. It used to be answered here by subtracting two
+    marginal medians, and that is the one comparison this plan has already proved blind at this
+    resolution: the leading candidate's median difference against the all-query benchmark is
+    exactly 0.000 while the same pair runs 122 images to 92. A gap of one `1/35` step and a gap
+    of nothing are adjacent states of a 36-valued statistic, so either verdict was reachable
+    from data that could not distinguish them.
 
-    A large gap is evidence: the trend measurably changes when the movement is removed. A small
-    gap is *not* evidence of no effect, and an earlier version of this sentence said it was.
-    These are two marginal medians on a metric whose own resolution is `1/35`, and this report
-    spends a section explaining that a median difference of exactly zero coexists with 122
-    images against 92 on the same pair -- so the same argument applies here and forbids the
-    stronger reading. No paired dynamic-versus-frozen statistic exists in the summary: the
-    comparison families are persistence-versus-control, candidate-versus-benchmark and
-    filtered-versus-unfiltered, and none of them pairs a bin against its own frozen twin. Until
-    one does, the most this may say is that freezing did not destroy the trend.
+    `paired` is the `membership_comparisons` row for this selection. With it, the verdict comes
+    from the win and loss counts through `_verdict`, exactly as every other comparison in this
+    report does, and both denominators travel with it. Without it -- a table that never scored
+    the frozen twin -- the sentence falls back to saying what two medians can and cannot
+    support, which is what this function said before the family existed.
     """
     if dynamic_median is None or frozen_median is None:
         return "one of the two was not measured, so the comparison cannot be made"
     gap = float(frozen_median) - float(dynamic_median)
-    unpaired = (
-        "these are two medians and not a paired comparison, and no paired dynamic-versus-frozen "
-        "statistic is computed here"
-    )
-    if abs(gap) * SPEARMAN_STEP_DENOMINATOR < 1.5:
-        return (
-            "a gap the primary metric cannot resolve, so freezing the membership does not "
-            f"destroy the trend. That is as far as it goes: {unpaired}, so this does not "
-            "establish that the movement costs nothing"
+    if paired is None:
+        unpaired = (
+            "these are two medians and not a paired comparison, and no frozen twin was scored "
+            "for this selection"
         )
-    if gap > 0:
+        if abs(gap) * SPEARMAN_STEP_DENOMINATOR < 1.5:
+            return (
+                "a gap the primary metric cannot resolve, so freezing the membership does not "
+                f"destroy the trend. That is as far as it goes: {unpaired}, so this does not "
+                "establish that the movement costs nothing"
+            )
         return (
-            "higher with the membership held still, which on this run points at the movement "
-            f"of queries between bins costing this selection some of its trend -- though "
-            f"{unpaired}"
+            ("higher" if gap > 0 else "lower")
+            + f" with the membership held still -- though {unpaired}"
+        )
+    total = paired["paired_image_count"]
+    win = _whole(paired.get("dynamic_image_win_rate"), total)
+    loss = _whole(paired.get("dynamic_image_loss_rate"), total)
+    _, sentence = _outcome(paired, "dynamic_image")
+    if win is None or loss is None:
+        reading = "the two could not be compared image by image"
+    elif win > loss:
+        reading = (
+            "rebuilding the bins at every severity does better than freezing them image by "
+            "image, so on these images the movement is not costing this selection its trend"
+        )
+    elif win < loss:
+        reading = (
+            "freezing the membership does better image by image, so on these images the "
+            "movement of queries between bins is costing this selection some of its trend"
+        )
+    else:
+        reading = (
+            "the paired comparison splits evenly, so it separates the two no better than the "
+            "medians do"
         )
     return (
-        "lower with the membership held still, so on this run the trend does not survive "
-        f"freezing the membership and rebuilding the bins is part of what produces it -- though "
-        f"{unpaired}"
+        f"a difference of {_signed(_difference(dynamic_median, frozen_median))}, which the "
+        f"primary metric resolves to within {1 / SPEARMAN_STEP_DENOMINATOR:.4f} at best. Paired "
+        f"image by image the same selection against its own frozen twin: {sentence} -- "
+        f"{reading}"
     )
 
 
@@ -1683,12 +1792,17 @@ def _movement_sentence(summary: dict, winner: dict | None) -> str:
         aggregation=winner["aggregation"], padding_mode=winner["padding_mode"],
     )
     if twin is not None:
+        against_twin = _lookup(
+            summary["membership_comparisons"], signal="persistence",
+            confidence_bin=winner["confidence_bin"], aggregation=winner["aggregation"],
+            score_scope=winner["score_scope"], padding_mode=winner["padding_mode"],
+        )
         parts.append(
             f"Holding that bin's membership fixed at severity zero scores "
             f"{_signed(twin['median_spearman'])} instead of "
             f"{_signed(winner['median_spearman'])} -- "
-            f"{_freezing_reading(winner['median_spearman'], twin['median_spearman'])}. That "
-            "frozen number is a diagnostic and not an alternative method, and the two are "
+            f"{_freezing_reading(winner['median_spearman'], twin['median_spearman'], against_twin)}. "
+            "That frozen number is a diagnostic and not an alternative method, and the two are "
             "never combined into one score."
         )
     sensitivity = _lookup(
@@ -2024,19 +2138,46 @@ def _dynamic_frozen_section(summary: dict) -> list[str]:
                                    aggregation=aggregation)
             if dynamic is None and frozen is None:
                 continue
+            entry = _lookup(
+                summary["membership_comparisons"], signal="persistence",
+                confidence_bin=name, aggregation=aggregation,
+                score_scope=PRIMARY_SCORE_SCOPE, padding_mode=FILTERED_PADDING_MODE,
+            )
+            total = None if entry is None else entry["paired_image_count"]
             body.append([
                 f"`{name}`", f"`{aggregation}`",
                 _UNMEASURED if dynamic is None else _signed(dynamic["median_spearman"]),
                 _UNMEASURED if frozen is None else _signed(frozen["median_spearman"]),
+                _UNMEASURED if entry is None else (
+                    f"{_whole(entry['dynamic_image_win_rate'], total)}/"
+                    f"{_whole(entry['dynamic_image_tie_rate'], total)}/"
+                    f"{_whole(entry['dynamic_image_loss_rate'], total)}"
+                ),
+                _UNMEASURED if entry is None else (
+                    f"{_plain(entry['dynamic_image_decided_win_rate'])} "
+                    f"({entry['dynamic_image_decided_image_count']})"
+                ),
                 _UNMEASURED if dynamic is None
                 else _plain(dynamic["mean_clean_overlap_from_severity_1"], 4),
             ])
     if body:
         lines.extend(_table(
-            ["bin", "summary", "dynamic", "frozen (diagnostic)",
-             "dynamic overlap vs severity 0"], body
+            ["bin", "summary", "dynamic", "frozen (diagnostic)", "dynamic W/T/L vs frozen",
+             "decided win rate, over N", "dynamic overlap vs severity 0"], body
         ))
         lines.append("")
+        lines.append(
+            "The `W/T/L` column is the paired comparison the difference of medians cannot "
+            "make: one selection against its own frozen twin, image by image, over the images "
+            "both measured. Freezing the membership at severity zero is the only manipulation "
+            "in this design that removes the movement of queries between bins and leaves "
+            "everything else, so this column -- and not the gap between the two medians -- is "
+            "what says whether that movement explains a bin's trend. It is a comparison and "
+            "never a combination: neither column is added to, averaged with, or subtracted "
+            "from the other in anything this report ranks."
+        )
+        lines.append("")
+    lines.extend(_median_blindness_note(summary))
     lines.append(
         f"Two unrelated decile memberships would overlap at {RANDOM_BIN_OVERLAP:.4f}, so a bin "
         "sitting close to that line is being rebuilt almost from scratch at every severity. A "
@@ -2046,6 +2187,65 @@ def _dynamic_frozen_section(summary: dict) -> list[str]:
     )
     lines.append("")
     return lines
+
+
+def _median_blindness_note(summary: dict) -> list[str]:
+    """Show, from this run's own rows, that the difference of medians could not have answered.
+
+    The paired family exists because a difference of two medians is blind at the primary
+    metric's resolution. That is an argument; this turns it into a measurement. It collects the
+    rows whose median difference is **exactly zero** -- a dead heat by the design's primary
+    metric -- and reports how far apart the paired comparison puts them. When two such rows land
+    on opposite sides of even, the primary metric demonstrably could not have told them apart,
+    and no reader has to take the claim on trust.
+
+    Emitted only when the run actually contains the demonstration. A table with fewer than two
+    exact median ties says nothing here rather than reaching for a weaker version of it.
+    """
+    tied = [
+        entry for entry in summary["membership_comparisons"]
+        if entry["signal"] == "persistence"
+        and entry["score_scope"] == PRIMARY_SCORE_SCOPE
+        and entry["padding_mode"] == FILTERED_PADDING_MODE
+        and entry["dynamic_minus_frozen_spearman"] == 0.0
+        and entry["dynamic_image_decided_win_rate"] is not None
+    ]
+    if len(tied) < 2:
+        return []
+    ordered = sorted(
+        tied, key=lambda entry: (entry["dynamic_image_decided_win_rate"],
+                                 entry["confidence_bin"], entry["aggregation"])
+    )
+    low, high = ordered[0], ordered[-1]
+    if low["dynamic_image_decided_win_rate"] == high["dynamic_image_decided_win_rate"]:
+        return []
+
+    def described(entry: dict) -> str:
+        total = entry["paired_image_count"]
+        win = _whole(entry["dynamic_image_win_rate"], total)
+        loss = _whole(entry["dynamic_image_loss_rate"], total)
+        ahead = "dynamic" if win >= loss else "frozen"
+        return (
+            f"`{entry['confidence_bin']}` at `{entry['aggregation']}` has {ahead} ahead "
+            f"{max(win, loss)} images to {min(win, loss)}, a decided rate of "
+            f"{_plain(entry['dynamic_image_decided_win_rate'])} over the "
+            f"{entry['dynamic_image_decided_image_count']} it decided"
+        )
+
+    opposed = (
+        low["dynamic_image_decided_win_rate"] < 0.5 <= high["dynamic_image_decided_win_rate"]
+    )
+    return [
+        f"**Why the paired column and not the gap between the medians.** {len(tied)} of the "
+        f"rows above have two medians that are *exactly equal* -- a dead heat on the statistic "
+        "the design ranks by. The per-image comparison puts them "
+        + ("on opposite sides of even" if opposed else "far apart")
+        + f": {described(high)}, while {described(low)}. Identical on the primary metric, "
+        + ("opposite answers" if opposed else "different answers")
+        + " image by image -- which is what a difference of two medians on a 36-valued "
+        "statistic cannot see.",
+        "",
+    ]
 
 
 def _padding_section(summary: dict) -> list[str]:

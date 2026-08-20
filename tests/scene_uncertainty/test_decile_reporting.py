@@ -1055,7 +1055,9 @@ def test_a_paired_rate_states_both_denominators_because_ties_invert_it():
     assert comparison["candidate_image_decided_win_rate"] == pytest.approx(2 / 3)
 
 
-@pytest.mark.parametrize("family", ["comparisons", "padding_sensitivity", "benchmark_comparisons"])
+@pytest.mark.parametrize("family", [
+    "comparisons", "padding_sensitivity", "benchmark_comparisons", "membership_comparisons",
+])
 def test_every_paired_rate_publishes_its_decided_denominator(family):
     """One helper serves all three comparison families, so none of them can lose the second
     denominator on its own."""
@@ -1069,11 +1071,17 @@ def test_every_paired_rate_publishes_its_decided_denominator(family):
                 image_id, severity, "persistence", PRIMARY_SCORE_SCOPE, float(severity),
                 padding_mode="unfiltered",
             ))
+            # ... and the frozen twin, which completes the fourth family.
+            rows.append(row(
+                image_id, severity, "persistence", PRIMARY_SCORE_SCOPE,
+                DIPPING_CURVE[severity], membership_mode="frozen",
+            ))
     summary = summarize_decile_rows(rows, {})
     prefixes = {
         "comparisons": "persistence_image",
         "padding_sensitivity": "unfiltered_image",
         "benchmark_comparisons": "candidate_image",
+        "membership_comparisons": "dynamic_image",
     }
     prefix = prefixes[family]
     assert summary[family]
@@ -1978,14 +1986,29 @@ def test_every_report_table_names_the_scene_summary_of_each_row(tmp_path, headin
 
 
 def test_a_table_says_which_slice_is_still_fixed(tmp_path):
-    """The figures carry their slice on their own titles; the tables now do the same."""
+    """The figures carry their slice on their own titles; the tables now do the same.
+
+    Asserted on the caption **line**, not on the section. The first version of this test looked
+    for the two claims anywhere in the section, which the surrounding prose already satisfies --
+    so dropping either half of the caption survived it. Same defect as the MH mutant, and the
+    same fix.
+    """
     report = (written(tmp_path) / "easy-report.md").read_text()
     for heading in ("Persistence versus confidence alone", "Dynamic versus frozen queries"):
-        assert "Slice:" in section(report, heading)
-        assert PRIMARY_SCORE_SCOPE in section(report, heading)
-    assert "the confidence control has no decoder-layer scope" in section(
-        report, "Effect of padded queries"
-    )
+        caption = [
+            line for line in section(report, heading).splitlines() if line.startswith("Slice:")
+        ]
+        assert len(caption) == 1, heading
+        assert PRIMARY_SCORE_SCOPE in caption[0]
+        assert "padding union removed" in caption[0]
+        assert "every scene summary" in caption[0]
+    padding = [
+        line for line in section(report, "Effect of padded queries").splitlines()
+        if line.startswith("Every scene summary the control was scored at.")
+    ]
+    assert len(padding) == 1
+    assert PRIMARY_SCORE_SCOPE in padding[0]
+    assert "the confidence control has no decoder-layer scope" in padding[0]
 
 
 def test_the_absent_pair_message_names_the_slice_it_looked_in(tmp_path):
@@ -2079,27 +2102,301 @@ def test_a_sparse_table_still_writes_every_declared_artifact(tmp_path):
 # --- review round 1: an unpaired median difference is not a null --------------------------------
 
 
-def test_a_frozen_gap_the_metric_cannot_resolve_is_not_read_as_no_effect(tmp_path):
-    """Two marginal medians one grid step apart do not establish that bin movement costs
-    nothing -- this same report explains that a median difference of exactly zero coexists with
-    122 images against 92. No paired dynamic-versus-frozen statistic exists to support the
-    stronger claim, so the generator must not make it."""
-    reading = reporting_module._freezing_reading(0.6286, 0.6000)
-    assert "does not destroy the trend" in reading
-    assert "not a paired comparison" in reading
-    assert "costs nothing" in reading and "does not establish" in reading
-    report = (written(tmp_path) / "easy-report.md").read_text()
-    assert "is not costing it anything" not in report
+def membership_entry(win: int, tie: int, loss: int) -> dict:
+    """A `membership_comparisons` row with the outcome block `_outcome_rates` would produce."""
+    total, decided = win + tie + loss, win + loss
+    return {
+        "paired_image_count": total,
+        "dynamic_image_win_rate": win / total,
+        "dynamic_image_tie_rate": tie / total,
+        "dynamic_image_loss_rate": loss / total,
+        "dynamic_image_decided_image_count": decided,
+        "dynamic_image_decided_win_rate": (win / decided) if decided else None,
+    }
 
 
-@pytest.mark.parametrize(("dynamic", "frozen"), [(0.1, 0.9), (0.9, 0.1)])
-def test_even_a_large_frozen_gap_is_marked_unpaired(dynamic, frozen):
-    reading = reporting_module._freezing_reading(dynamic, frozen)
-    assert "not a paired comparison" in reading
+def test_the_frozen_reading_comes_from_the_paired_outcome_and_not_the_two_medians():
+    """Spec:172's fourth question must not rest on a difference of two medians.
+
+    The two medians here are one `1/35` step apart with the dynamic side *higher*, which is the
+    real pilot's configuration. The paired outcome says the opposite -- 40 wins against 200
+    losses -- and the verdict has to follow the counts. A generator that reads the medians says
+    "the movement is not costing anything"; that is the mutation this kills, and it is
+    reachable from data the primary metric cannot distinguish from a tie.
+    """
+    reading = reporting_module._freezing_reading(
+        0.6285714, 0.6, membership_entry(win=40, tie=10, loss=200)
+    )
+    assert "costing this selection some of its trend" in reading
+    assert "it wins 40, ties 10 and loses 200 of the 250" in reading
+    assert "0.167 over the 240 it decided" in reading
+
+
+def test_the_frozen_reading_reverses_when_the_paired_outcome_reverses():
+    """Identical medians, opposite counts, opposite verdict -- so the counts are load-bearing."""
+    reading = reporting_module._freezing_reading(
+        0.6285714, 0.6, membership_entry(win=200, tie=10, loss=40)
+    )
+    assert "the movement is not costing this selection its trend" in reading
+    assert "costing this selection some of its trend" not in reading
+
+
+def test_an_even_paired_outcome_is_not_read_as_a_result():
+    reading = reporting_module._freezing_reading(0.6, 0.6, membership_entry(50, 150, 50))
+    assert "splits evenly" in reading
+
+
+def test_a_selection_with_no_frozen_twin_falls_back_and_still_claims_nothing():
+    """The fallback is the pre-family sentence, and it must keep its own limit on it."""
+    reading = reporting_module._freezing_reading(0.6285714, 0.6, None)
+    assert "no frozen twin was scored" in reading
+    assert "does not establish that the movement costs nothing" in reading
+
+
+def test_the_report_uses_the_paired_family_for_the_bin_movement_question(tmp_path):
+    """The real answer to spec:172's fourth question is now a paired one, in the lead."""
+    summary = grid_summary()
+    winner = summary[RANKED_GROUPS_KEY][0]
+    entry = next(
+        candidate for candidate in summary["membership_comparisons"]
+        if candidate["signal"] == "persistence"
+        and candidate["confidence_bin"] == winner["confidence_bin"]
+        and candidate["aggregation"] == winner["aggregation"]
+        and candidate["score_scope"] == winner["score_scope"]
+        and candidate["padding_mode"] == winner["padding_mode"]
+    )
+    movement = section(
+        (written(tmp_path) / "easy-report.md").read_text(), "Short answer"
+    ).split("Does padding")[1]
+    assert "Paired image by image the same selection against its own frozen twin" in movement
+    assert f"of the {entry['paired_image_count']} images both sides measured" in movement
+    assert "no frozen twin was scored" not in movement
 
 
 def test_the_short_answer_carries_the_selection_caveat_beside_the_claim(tmp_path):
-    """The consequence of selecting on the reported images belonged beside the strongest claim,
-    not seven sections below it."""
+    """The consequence of selecting on the reported images belongs beside the strongest claim.
+
+    Asserted on the **line that makes the claim** -- the one naming the winner and its median --
+    and not on the section. A caveat anywhere in `Short answer` satisfies "it is present"; only
+    a caveat in the winner's own sentence satisfies "beside the claim it qualifies", which is
+    what the docstring says and what the review asked for. Moving the sentence into the
+    neighbouring answer survives the section-wide form.
+    """
+    summary = grid_summary()
+    winner = summary[RANKED_GROUPS_KEY][0]
     short = section((written(tmp_path) / "easy-report.md").read_text(), "Short answer")
-    assert "not a hypothesis test" in short
+    claim = [
+        line for line in short.splitlines()
+        if f"{winner['median_spearman']:+.4f}" in line and "came first of" in line
+    ]
+    assert len(claim) == 1
+    assert "not a hypothesis test" in claim[0]
+    assert "chosen on the same images" in claim[0]
+
+
+# --- review round 2: the fourth comparison family ------------------------------------------------
+
+
+def test_every_dynamic_selection_is_paired_against_its_own_frozen_twin():
+    """One entry per dynamic selection that has a frozen twin -- no more, no fewer.
+
+    Kills a family that pairs only the ranked candidates (which would omit every bin the
+    ranking dropped, and spec:172's question is about the winner's bin whether or not it wins)
+    and one that pairs across confidence bins.
+    """
+    summary = grid_summary()
+    expected = {
+        (group["signal"], group["confidence_bin"], group["aggregation"],
+         group["score_scope"], group["padding_mode"])
+        for group in summary["groups"] if group["membership_mode"] == "dynamic"
+    } & {
+        (group["signal"], group["confidence_bin"], group["aggregation"],
+         group["score_scope"], group["padding_mode"])
+        for group in summary["groups"] if group["membership_mode"] == "frozen"
+    }
+    published = {
+        (entry["signal"], entry["confidence_bin"], entry["aggregation"],
+         entry["score_scope"], entry["padding_mode"])
+        for entry in summary["membership_comparisons"]
+    }
+    assert published == expected
+    assert summary["diagnostics"]["membership_comparison_count"] == len(published)
+
+
+def test_the_membership_comparison_reads_both_medians_off_its_own_two_groups():
+    """Kills a pair matched on the wrong bin, scope or padding rule.
+
+    Not on the wrong *summary*: `full_grid_rows` scores all three summaries of one selection
+    identically, so a pair matched across summaries is invisible to it. That mutation survived
+    this test and is killed by
+    `test_the_membership_comparison_never_pairs_across_scene_summaries`, which builds a table
+    where the frozen twin differs by summary and nothing else.
+    """
+    summary = grid_summary()
+    by_key = {
+        (group["signal"], group["membership_mode"], group["confidence_bin"],
+         group["aggregation"], group["score_scope"], group["padding_mode"]): group
+        for group in summary["groups"]
+    }
+    for entry in summary["membership_comparisons"]:
+        base = (entry["signal"], entry["confidence_bin"], entry["aggregation"],
+                entry["score_scope"], entry["padding_mode"])
+        dynamic = by_key[(base[0], "dynamic", *base[1:])]
+        frozen = by_key[(base[0], "frozen", *base[1:])]
+        assert entry["dynamic_median_spearman"] == dynamic["median_spearman"]
+        assert entry["frozen_median_spearman"] == frozen["median_spearman"]
+        assert entry["dynamic_mean_clean_overlap_from_severity_1"] == (
+            dynamic["mean_clean_overlap_from_severity_1"]
+        )
+
+
+def test_the_membership_family_compares_and_never_combines(tmp_path):
+    """Spec:230 -- the family may not publish anything on the score's own scale that covers
+    both memberships, and it may not open a route into the deployable ranking.
+
+    The mutation is a `combined_median_spearman` of `(dynamic + frozen) / 2`: a number that
+    would rank the frozen bottom bin's +0.4857 into the dynamic bottom bin's -0.0286 and
+    publish +0.2286, which describes neither.
+    """
+    summary = grid_summary()
+    assert all(
+        group["membership_mode"] != "frozen" for group in summary[RANKED_GROUPS_KEY]
+    )
+    for entry in summary["membership_comparisons"]:
+        dynamic, frozen = entry["dynamic_median_spearman"], entry["frozen_median_spearman"]
+        if dynamic is None or frozen is None:
+            continue
+        combined = (dynamic + frozen) / 2
+        for key, value in entry.items():
+            if isinstance(value, float) and key.endswith("spearman"):
+                assert value != pytest.approx(combined) or dynamic == frozen, key
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    assert "never a combination" in report
+
+
+def test_the_dynamic_frozen_table_carries_the_paired_columns(tmp_path):
+    """The table beside the two medians must show the comparison that can separate them."""
+    rows = table_rows(section(
+        (written(tmp_path) / "easy-report.md").read_text(), "Dynamic versus frozen queries"
+    ))
+    assert rows[0][4] == "dynamic W/T/L vs frozen"
+    assert rows[0][5] == "decided win rate, over N"
+    assert all(re.fullmatch(r"\d+/\d+/\d+", cells[4]) for cells in rows[1:])
+
+
+# --- review round 2: the third instance of the caption class -------------------------------------
+
+
+def test_the_heatmap_title_does_not_scope_the_confidence_row(tmp_path):
+    """Spec:125 again, on the figure whose second row is the confidence control.
+
+    Weaker than the other two -- each row carries its own scope label -- but the same defect:
+    a title clause true of one row and false of the other.
+    """
+    figure = reporting_module._heatmap_figure(grid_summary())
+    axis = figure.axes[0]
+    title = axis.get_title()
+    labels = [text.get_text() for text in axis.get_yticklabels()]
+    assert any("confidence" in label for label in labels)
+    assert f"persistence at {PRIMARY_SCORE_SCOPE}" not in title
+    assert reporting_module.FIGURE_SLICE in title
+    # The scope is still stated -- once per row, where it is true.
+    assert any(PRIMARY_SCORE_SCOPE in label for label in labels)
+
+
+def test_the_padding_figure_marks_its_frozen_bars_diagnostic(tmp_path):
+    """Spec:230 on a figure read on its own: the frozen bars are the tallest in the set."""
+    figure = reporting_module._padding_sensitivity_figure(grid_summary())
+    axis = figure.axes[0]
+    labels = [text.get_text() for text in axis.get_xticklabels()]
+    frozen = [label for label in labels if label.startswith("frozen")]
+    assert frozen
+    for label in frozen:
+        assert "(diagnostic)" in label
+    assert all("(diagnostic)" not in label for label in labels if label.startswith("dynamic"))
+    assert "frozen is a diagnostic" in axis.get_title()
+
+
+def test_the_membership_comparison_never_pairs_across_scene_summaries():
+    """One bin, one scope, one padding rule; the frozen twin differs by scene summary alone.
+
+    `full_grid_rows` cannot see this: it scores every summary of a selection identically, which
+    is why the mutation that fetches the frozen twin at a fixed summary survived the test above.
+    Here the frozen twin rises perfectly at `mean` and falls at `q90`, so a pair matched on the
+    wrong summary reports the wrong median *and* the wrong per-image outcome.
+    """
+    distances = {
+        ("dynamic", "mean"): 0, ("dynamic", "q90"): 0,
+        ("frozen", "mean"): 0, ("frozen", "q90"): 5,
+    }
+    rows = [
+        row(
+            image_id, severity, "persistence", PRIMARY_SCORE_SCOPE,
+            swap_curve(distance)[severity],
+            membership_mode=membership, aggregation=aggregation,
+        )
+        for image_id in (1, 2)
+        for severity in range(6)
+        for (membership, aggregation), distance in distances.items()
+    ]
+    entries = {
+        entry["aggregation"]: entry
+        for entry in summarize_decile_rows(rows, {})["membership_comparisons"]
+    }
+    assert set(entries) == {"mean", "q90"}
+    assert entries["mean"]["frozen_median_spearman"] == pytest.approx(1.0)
+    assert entries["q90"]["frozen_median_spearman"] == pytest.approx(
+        SPEARMAN_FOR_DISTANCE[5]
+    )
+    # The per-image outcome has to move with the median, or only the label was matched.
+    assert entries["mean"]["dynamic_image_tie_rate"] == pytest.approx(1.0)
+    assert entries["q90"]["dynamic_image_win_rate"] == pytest.approx(1.0)
+
+
+def test_the_report_demonstrates_the_median_blindness_from_its_own_rows(tmp_path):
+    """The argument for the paired family is turned into a measurement, or it is not made.
+
+    Both bins below are built so the two medians are *exactly* equal while the per-image
+    comparison is 3-0-1 one way and 1-0-3 the other. That is only constructible because the
+    median of four values depends on the multiset and the pairing depends on the assignment:
+    each membership holds four per-image Spearmans whose middle two are the same pair, dealt to
+    different images. A note that read the extremes off the medians would find nothing to say
+    here, which is the mutation this kills.
+    """
+    plans = {
+        "decile_00_10": ([1, 2, 3, 4], [2, 3, 5, 0]),
+        "decile_10_20": ([2, 3, 5, 0], [1, 2, 3, 4]),
+    }
+    rows = [
+        row(image_id, severity, "persistence", PRIMARY_SCORE_SCOPE,
+            swap_curve(distances[image_id - 1])[severity],
+            confidence_bin=name, membership_mode=membership)
+        for name, pair in plans.items()
+        for membership, distances in zip(("dynamic", "frozen"), pair)
+        for image_id in (1, 2, 3, 4)
+        for severity in range(6)
+    ]
+    summary = summarize_decile_rows(rows, {})
+    tied = [
+        entry for entry in summary["membership_comparisons"]
+        if entry["dynamic_minus_frozen_spearman"] == 0.0
+    ]
+    assert len(tied) == 2, [
+        (entry["confidence_bin"], entry["dynamic_median_spearman"],
+         entry["frozen_median_spearman"]) for entry in summary["membership_comparisons"]
+    ]
+    note = "\n".join(reporting_module._median_blindness_note(summary))
+    assert "exactly equal" in note
+    assert "on opposite sides of even" in note
+    assert "`decile_00_10` at `q90` has dynamic ahead 3 images to 1" in note
+    assert "`decile_10_20` at `q90` has frozen ahead 3 images to 1" in note
+
+
+def test_the_median_blindness_note_stays_silent_when_the_run_cannot_show_it(tmp_path):
+    """No exact median tie, or every tie pointing the same way, means no demonstration."""
+    summary = grid_summary()
+    summary["membership_comparisons"] = [
+        entry for entry in summary["membership_comparisons"]
+        if entry["dynamic_minus_frozen_spearman"] != 0.0
+    ]
+    assert reporting_module._median_blindness_note(summary) == []
