@@ -1778,10 +1778,101 @@ def _freezing_reading(dynamic_median, frozen_median, paired: dict | None) -> str
     )
 
 
+def _padding_finding(sensitivity: dict | None) -> str:
+    """`untested` / `unmoved` / `moved` -- whether padding moves *this* selection's score.
+
+    "Not tested on this selection" and "tested and found nothing" are different facts and the
+    verdict has to keep them apart: the padding control is scoped to `SENSITIVITY_BIN` alone, so
+    on the real run the winning bin has no sensitivity row at all, and a verdict that reported
+    that as "padding is not shown to explain it" would be claiming a measurement nobody made.
+
+    Both columns are read. The median can sit still while the per-image score moves, and "does
+    not move this selection's score" would be false of the score, which is what the sentence is
+    about.
+    """
+    if sensitivity is None:
+        return "untested"
+    difference = sensitivity.get("unfiltered_minus_filtered_spearman")
+    changed = sensitivity.get("score_changed_image_count") or 0
+    moved = (difference is not None and float(difference) != 0.0) or changed > 0
+    return "moved" if moved else "unmoved"
+
+
+def _membership_finding(winner: dict, paired: dict | None) -> str:
+    """`none` / `unmeasured` / `survives` / `reselected` / `reselected_frozen_ahead`.
+
+    Read from the two things that measure bin movement: how much of the severity-zero membership
+    survives blur, and what happens per image when the movement is removed. The second matters
+    because a verdict of "bin movement is not shown to explain it" printed directly above "the
+    frozen twin does better image by image" is a contradiction a reader can see -- removing the
+    movement changed the answer, so the movement is doing something to the result.
+    """
+    if winner.get("clean_overlap_is_definitional"):
+        return "none"
+    overlap = winner.get("mean_clean_overlap_from_severity_1")
+    if overlap is None:
+        return "unmeasured"
+    if float(overlap) > 2 * RANDOM_BIN_OVERLAP:
+        return "survives"
+    decided = None if paired is None else paired.get("dynamic_image_decided_win_rate")
+    if decided is not None and float(decided) < 0.5:
+        return "reselected_frozen_ahead"
+    return "reselected"
+
+
+PADDING_VERDICTS = {
+    "untested": "Padding is not tested on this selection",
+    "unmoved": "Padding does not move this selection's score",
+    "moved": "Padding does move this selection's score",
+}
+
+MEMBERSHIP_VERDICTS = {
+    "none": "bin movement cannot be explaining it, because this selection has none",
+    "unmeasured": "membership stability was not measured for it",
+    "survives": "bin movement is part of what this selection is measuring",
+    "reselected": "bin movement is not shown to explain it",
+    "reselected_frozen_ahead": (
+        "bin movement is not what carries the trend, though removing it scores better image by "
+        "image"
+    ),
+}
+
+
+def _explanation_verdict(padding: str, movement: str) -> str:
+    """Spec:172's fourth answer, composed from the two findings the paragraph goes on to state.
+
+    `parts = ["Neither is shown to."]` was a literal, emitted before a number was consulted.
+    Three reachable branches contradicted it in the next breath: a frozen twin that wins the
+    paired comparison, an overlap high enough that "a substantial part of its membership
+    survives blur, and the trend is partly a property of the queries themselves", and -- on the
+    published run itself -- a padding control that was never run on this selection at all.
+    """
+    return f"{PADDING_VERDICTS[padding]}, and {MEMBERSHIP_VERDICTS[movement]}."
+
+
 def _movement_sentence(summary: dict, winner: dict | None) -> str:
     if winner is None:
         return "No candidate was selected, so there is no result for either to explain."
-    parts = ["Neither is shown to."]
+    twin = _lookup(
+        summary["groups"], signal="persistence", score_scope=winner["score_scope"],
+        membership_mode=FROZEN_MEMBERSHIP_MODE, confidence_bin=winner["confidence_bin"],
+        aggregation=winner["aggregation"], padding_mode=winner["padding_mode"],
+    )
+    against_twin = _lookup(
+        summary["membership_comparisons"], signal="persistence",
+        confidence_bin=winner["confidence_bin"], aggregation=winner["aggregation"],
+        score_scope=winner["score_scope"], padding_mode=winner["padding_mode"],
+    )
+    sensitivity = _lookup(
+        summary["padding_sensitivity"], signal="persistence",
+        membership_mode=winner["membership_mode"], confidence_bin=winner["confidence_bin"],
+        aggregation=winner["aggregation"], score_scope=winner["score_scope"],
+    )
+    # Every lookup first, then the verdict, then the sentences it was read from. The verdict
+    # used to be the first thing written and the last thing checked.
+    parts = [_explanation_verdict(
+        _padding_finding(sensitivity), _membership_finding(winner, against_twin)
+    )]
     overlap = winner.get("mean_clean_overlap_from_severity_1")
     if winner.get("clean_overlap_is_definitional"):
         parts.append(
@@ -1804,17 +1895,7 @@ def _movement_sentence(summary: dict, winner: dict | None) -> str:
             f"membership from severity 1 onward, against {RANDOM_BIN_OVERLAP:.4f} for two "
             f"unrelated memberships -- {settled}."
         )
-    twin = _lookup(
-        summary["groups"], signal="persistence", score_scope=winner["score_scope"],
-        membership_mode=FROZEN_MEMBERSHIP_MODE, confidence_bin=winner["confidence_bin"],
-        aggregation=winner["aggregation"], padding_mode=winner["padding_mode"],
-    )
     if twin is not None:
-        against_twin = _lookup(
-            summary["membership_comparisons"], signal="persistence",
-            confidence_bin=winner["confidence_bin"], aggregation=winner["aggregation"],
-            score_scope=winner["score_scope"], padding_mode=winner["padding_mode"],
-        )
         parts.append(
             f"Holding that bin's membership fixed at severity zero scores "
             f"{_signed(twin['median_spearman'])} instead of "
@@ -1823,11 +1904,6 @@ def _movement_sentence(summary: dict, winner: dict | None) -> str:
             "That frozen number is a diagnostic and not an alternative method, and the two are "
             "never combined into one score."
         )
-    sensitivity = _lookup(
-        summary["padding_sensitivity"], signal="persistence",
-        membership_mode=winner["membership_mode"], confidence_bin=winner["confidence_bin"],
-        aggregation=winner["aggregation"], score_scope=winner["score_scope"],
-    )
     if sensitivity is not None:
         parts.append(
             f"Keeping the padded queries instead of removing them moves this selection from "
@@ -1847,12 +1923,25 @@ def _movement_sentence(summary: dict, winner: dict | None) -> str:
             aggregation=BENCHMARK_AGGREGATION, score_scope=PRIMARY_SCORE_SCOPE,
         )
         if every_query is not None:
+            unfiltered = every_query["unfiltered_median_spearman"]
+            filtered = every_query["filtered_median_spearman"]
+            # The direction of this clause is the *sign* of a difference the same sentence
+            # prints. It used to be a literal, so it read "the placeholders were adding to the
+            # old benchmark" whichever way the two numbers ran.
+            if unfiltered is None or filtered is None:
+                direction = "one of the two medians is missing, so nothing follows about them"
+            elif float(filtered) < float(unfiltered):
+                direction = (
+                    "the placeholders were adding to the old benchmark rather than to this bin"
+                )
+            elif float(filtered) > float(unfiltered):
+                direction = "the placeholders were holding the old benchmark down, not lifting it"
+            else:
+                direction = "the placeholders made no difference to the old benchmark's median"
             parts.append(
                 f"Where padding can be measured -- the every-query selection -- removing the "
-                f"repeated decoder placeholders moves the trend from "
-                f"{_signed(every_query['unfiltered_median_spearman'])} to "
-                f"{_signed(every_query['filtered_median_spearman'])}, so on this run the "
-                f"placeholders were adding to the old benchmark rather than to this bin. "
+                f"repeated decoder placeholders moves the trend from {_signed(unfiltered)} to "
+                f"{_signed(filtered)}, so on this run {direction}. "
                 f"{padding.get('images_with_padding', 0)} of "
                 f"{padding.get('image_count', 0)} images carried any padding at all."
             )
@@ -1995,14 +2084,28 @@ def _ranked_section(summary: dict, ranked: list[dict], winner: dict | None) -> l
         f"(`{winner['membership_mode']}`, `{winner['aggregation']}`) first at "
         f"{_signed(winner['median_spearman'])}."
     )
-    if len(tied) > 1:
-        others = len(tied) - 1
+    # Selections, not rows. Counting rows called the winner's own `mean` summary "1 other
+    # candidate of the 33 ranked" twelve lines into the published report, while the note a
+    # hundred and sixty lines below it said "no other selection matches the top median
+    # exactly". Both were reading the same two rows. `SELECTION_KEYS` is the rule every table
+    # caption here states, and this is the sentence a reader hits first.
+    others = _selection_count(tied) - 1
+    if others > 0:
         lines.append(
-            f"It shares that median with {others} other candidate"
-            f"{'' if others == 1 else 's'} of the {len(ranked)} ranked, and the order among "
-            "them is settled by the adjacent non-decrease rate and then by the violation "
-            "magnitude -- both far finer than the metric they are breaking a tie in, so the "
-            "first place is not a gap over the second."
+            f"It shares that median with {others} other selection"
+            f"{'' if others == 1 else 's'} of the {_selection_count(ranked)} ranked "
+            f"({len(tied)} of the {len(ranked)} ranked rows hold it, counting each selection "
+            "once per scene summary), and the order among them is settled by the adjacent "
+            "non-decrease rate and then by the violation magnitude -- both far finer than the "
+            "metric they are breaking a tie in, so the first place is not a gap over the "
+            "second."
+        )
+    elif len(tied) > 1:
+        lines.append(
+            f"No other selection matches that median: the {len(tied)} ranked rows that hold it "
+            f"are this same selection at {len(tied)} scene summaries, which the caption on "
+            "every table here calls views of one selection rather than independent "
+            "measurements of it."
         )
     same_bin = [
         group for group in ranked
@@ -2514,6 +2617,15 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
       `_winner_standing` derives the second and it is printed beside the first. Neither is
       allowed to imply the other away: the ranking is determined, not discretionary, so the note
       states the margin rather than calling the field interchangeable.
+    * **each paragraph is gated on what it is read from and on nothing else.** One early return
+      guarded all four: a profile of fewer than three paired bins, or a single bin whose decided
+      rate was `None`, deleted the near-equals count, the margin and the standing along with the
+      column reading -- and a dynamic bin that matches its frozen twin exactly ties on every
+      image, so `None` there is reachable rather than hypothetical. The ranked-field paragraph
+      is read from the ranking, the denominator paragraph from the slice, the frozen paragraph
+      from the frozen column, and none of them is conditional on either of the others. When the
+      column cannot be read the note says which bins it is missing and why, rather than going
+      quiet.
 
     Everything is computed from `membership_comparisons` and the ranking, so it describes
     whatever run it is handed rather than this one.
@@ -2531,9 +2643,81 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
     }
     profile = [(name, at_summary[name]) for name in DECILE_NAMES if name in at_summary]
     rates = [entry["dynamic_image_decided_win_rate"] for _, entry in profile]
-    if len(profile) < 3 or any(rate is None for rate in rates):
-        return []
+    blank = [name for name, rate in zip([name for name, _ in profile], rates) if rate is None]
 
+    note: list[str] = []
+    if len(profile) < 3 or blank:
+        # The column cannot be read, and that is a fact about the column -- not a reason to
+        # withhold the two paragraphs below, which are read from the ranking and never touch it.
+        # One early return over all four deleted the near-equals count, the margin and the
+        # standing whenever a single dynamic bin matched its frozen twin exactly, because a bin
+        # that ties on every image has no decided rate at all.
+        reason = (
+            f"Only {len(profile)} of the {len(DECILE_NAMES)} confidence bins have a "
+            f"dynamic-versus-frozen pair at `{winner['aggregation']}`, so there is no column to "
+            "read across them."
+            if len(profile) < 3 else
+            f"The decided rate is missing for {_and_list([f'`{name}`' for name in blank])} at "
+            f"`{winner['aggregation']}` -- every paired image tied "
+            + ("there" if len(blank) == 1 else "in those bins")
+            + " -- so the shape of this column is not read."
+        )
+        note.extend([f"**The shape of that column.** {reason}", ""])
+    else:
+        note.extend(_profile_shape_paragraph(profile, rates, winner))
+
+    if slice_rows:
+        decided_above = sum(
+            1 for entry in slice_rows
+            if entry["dynamic_image_decided_win_rate"] is not None
+            and entry["dynamic_image_decided_win_rate"] > 0.5
+        )
+        paired_above = sum(
+            1 for entry in slice_rows
+            if entry["dynamic_image_win_rate"] is not None
+            and entry["dynamic_image_win_rate"] > 0.5
+        )
+        note.extend([
+            "**And how much of that survives the other denominator.** Over the "
+            f"{len(slice_rows)} rows of this slice, {decided_above} clear 0.5 on the images the "
+            f"comparison decided and {paired_above} clear it over every paired image. Quoting "
+            "the first alone overstates the effect and quoting the second alone understates it, "
+            "which is why both are here.",
+            "",
+        ])
+
+    frozen = [entry["frozen_median_spearman"] for _, entry in profile]
+    length, start, stop = _longest_equal_run(frozen)
+    if length >= 3:
+        reach = (
+            "a run that spans the whole confidence range, so the frozen column separates no "
+            "bin from any other"
+            if start == 0 and stop == len(profile) - 1 else
+            "a run that reaches the bottom of the confidence range, so it is a flat stretch "
+            "of that end and not a statement about middle bins"
+            if start == 0 else
+            "a run that reaches the top of the confidence range, so it is a flat stretch of "
+            "that end and not a statement about middle bins"
+            if stop == len(profile) - 1 else
+            "a run that touches neither end of the confidence range, so a middle bin of "
+            f"almost any kind scores about {_signed(frozen[start])} here once the membership "
+            "is held still"
+        )
+        note.extend([
+            "**What the frozen column says about the field the ranking chose from.** The "
+            f"frozen medians are identical at {_signed(frozen[start])} across {length} "
+            f"neighbouring bins, `{profile[start][0]}` through `{profile[stop][0]}` -- "
+            f"{reach}.",
+            "",
+        ])
+
+    note.extend(_ranked_field_paragraph(ranked, winner))
+    return note
+
+
+def _profile_shape_paragraph(profile: list[tuple], rates: list[float],
+                             winner: dict) -> list[str]:
+    """The shape of the paired column, and where the selected bin sits in it."""
     shape = _column_shape(rates)
     first, last = _peak_span(rates)
     tops = _top_indices(rates)
@@ -2608,61 +2792,28 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
         )
 
     above_even = sum(1 for rate in rates if rate > 0.5)
-    decided_above = sum(
-        1 for entry in slice_rows
-        if entry["dynamic_image_decided_win_rate"] is not None
-        and entry["dynamic_image_decided_win_rate"] > 0.5
-    )
-    paired_above = sum(
-        1 for entry in slice_rows
-        if entry["dynamic_image_win_rate"] is not None
-        and entry["dynamic_image_win_rate"] > 0.5
-    )
-
-    note = [
+    return [
         f"**The shape of that column across the {len(profile)} {bins_word}.** At "
         f"`{winner['aggregation']}` {opening}. {selection}{neighbourhood} {above_even} of the "
         f"{len(profile)} {bins_word} "
         + ("is" if above_even == 1 else "are")
         + " above even at this summary.",
         "",
-        "**And how much of that survives the other denominator.** Over the "
-        f"{len(slice_rows)} rows of this slice, {decided_above} clear 0.5 on the images the "
-        f"comparison decided and {paired_above} clear it over every paired image. Quoting the "
-        "first alone overstates the effect and quoting the second alone understates it, which "
-        "is why both are here.",
-        "",
     ]
 
-    frozen = [entry["frozen_median_spearman"] for _, entry in profile]
-    length, start, stop = _longest_equal_run(frozen)
-    if length >= 3:
-        reach = (
-            "a run that spans the whole confidence range, so the frozen column separates no "
-            "bin from any other"
-            if start == 0 and stop == len(profile) - 1 else
-            "a run that reaches the bottom of the confidence range, so it is a flat stretch "
-            "of that end and not a statement about middle bins"
-            if start == 0 else
-            "a run that reaches the top of the confidence range, so it is a flat stretch of "
-            "that end and not a statement about middle bins"
-            if stop == len(profile) - 1 else
-            "a run that touches neither end of the confidence range, so a middle bin of "
-            f"almost any kind scores about {_signed(frozen[start])} here once the membership "
-            "is held still"
-        )
-        note.extend([
-            "**What the frozen column says about the field the ranking chose from.** The "
-            f"frozen medians are identical at {_signed(frozen[start])} across {length} "
-            f"neighbouring bins, `{profile[start][0]}` through `{profile[stop][0]}` -- "
-            f"{reach}.",
-            "",
-        ])
 
+def _ranked_field_paragraph(ranked: list[dict], winner: dict) -> list[str]:
+    """What the ranking says about the selection: the near-equals field, the margin, the standing.
+
+    Read from the ranking and from nothing else. It used to be gated on the frozen column having
+    a run of three or more equal bins, and before that on the paired column being readable at
+    all -- two conditions with nothing to do with the ranking, either of which could delete the
+    standing that the whole paragraph exists to publish.
+    """
     step = 1 / SPEARMAN_STEP_DENOMINATOR
     top = winner["median_spearman"]
     if top is None:
-        return note
+        return []
     within_step = [
         group for group in ranked
         if group["median_spearman"] is not None
@@ -2677,7 +2828,7 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
     near, selections = _selection_count(within_step), _selection_count(ranked)
     # The winner's own selection is always in `sharing`, because `top` is its median.
     matched = _selection_count(sharing) - 1
-    ranked_field = (
+    paragraph = (
         "**What the ranked field says about the selection.** The ranking is choosing among "
         f"near-equals: {near} of the {selections} ranked selections "
         + ("sits" if near == 1 else "sit")
@@ -2701,15 +2852,13 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
         + "."
     )
     if rivals and matched == 0:
-        ranked_field += (
+        paragraph += (
             f" The margin over the best of the others is {_grid_steps(top - max(rivals))}."
         )
     standing = _standing_sentence(_winner_standing(ranked, winner))
     if standing:
-        ranked_field += f" {standing}"
-    note.extend([ranked_field, ""])
-    return note
-
+        paragraph += f" {standing}"
+    return [paragraph, ""]
 
 
 def _padding_section(summary: dict) -> list[str]:

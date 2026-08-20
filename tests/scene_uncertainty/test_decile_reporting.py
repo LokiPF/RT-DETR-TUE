@@ -3295,3 +3295,217 @@ def test_the_standing_sentence_never_leans_on_a_clause_that_is_not_there(standin
     clause that names the top median to have been printed first.
     """
     assert reporting_module._standing_sentence(standing) == expected
+
+
+# --- adjudication wave: the sentences the numbers were never allowed to reach ------------------
+
+
+def tied_top_rows():
+    """The grid table with a *second* selection tied at the top median.
+
+    `decile_40_50` gets `decile_50_60`'s perfect curve, so two distinct bins hold +1.0000 at all
+    three scene summaries -- six ranked rows, two selections. The grid fixture on its own has
+    three rows at the top and only one selection in them, which is the case that made "1 other
+    candidate" wrong; both cases have to be in the file for the count to mean anything.
+    """
+    rows = []
+    for scored in full_grid_rows():
+        scored = dict(scored)
+        if (scored["signal"] == "persistence" and scored["membership_mode"] == "dynamic"
+                and scored["confidence_bin"] == "decile_40_50"
+                and scored["padding_mode"] == FILTERED_PADDING_MODE
+                and scored["score_scope"] == PRIMARY_SCORE_SCOPE):
+            scored["score"] = swap_curve(0)[scored["severity"]]
+        rows.append(scored)
+    return rows
+
+
+def test_the_headline_section_counts_selections_rather_than_rows_at_the_top_median(tmp_path):
+    """The shipped report contradicted itself between its twelfth line and its 181st.
+
+        line 12:  "It shares that median with 1 other candidate of the 33 ranked..."
+        line 181: "no other selection matches the top median exactly -- the 2 ranked rows that
+                   hold it are the winner's own scene summaries."
+
+    The "1 other candidate" *was* the winner's own `mean` summary. Round 4 fixed the count in the
+    note and left the headline section counting rows, and the headline section is what a reader
+    hits first -- the only finding in the review a reader of the published document could hit.
+    """
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    best = section(report, "Best confidence range")
+    assert ("No other selection matches that median: the 3 ranked rows that hold it are this "
+            "same selection at 3 scene summaries") in best
+    assert "other candidate" not in best
+    # And it has to agree with the note eighty lines below it.
+    assert "no other selection matches the top median exactly" in report
+
+
+def test_the_headline_section_still_names_a_real_tie_as_a_tie(tmp_path):
+    """The other side of the same branch: two *different* selections at the top median is a real
+    tie, the tie-break sentence applies to it, and both counts are published."""
+    report = (written(tmp_path, rows=tied_top_rows()) / "easy-report.md").read_text()
+    best = section(report, "Best confidence range")
+    assert ("It shares that median with 1 other selection of the 11 ranked (6 of the 33 ranked "
+            "rows hold it, counting each selection once per scene summary), and the order "
+            "among them is settled by") in best
+    assert "the first place is not a gap over the second" in best
+
+
+# --- adjudication wave: the verdict emitted before the numbers ---------------------------------
+
+
+@pytest.mark.parametrize(("sensitivity", "expected"), [
+    (None, "untested"),
+    ({"unfiltered_minus_filtered_spearman": 0.0, "score_changed_image_count": 0}, "unmoved"),
+    ({"unfiltered_minus_filtered_spearman": 0.2, "score_changed_image_count": 0}, "moved"),
+    # The median can sit still while the per-image score moves; "does not move it" would be
+    # false of the score, which is what the sentence is about.
+    ({"unfiltered_minus_filtered_spearman": 0.0, "score_changed_image_count": 12}, "moved"),
+    ({"unfiltered_minus_filtered_spearman": None, "score_changed_image_count": 0}, "unmoved"),
+])
+def test_the_padding_finding_reads_both_the_median_and_the_per_image_count(sensitivity,
+                                                                          expected):
+    assert reporting_module._padding_finding(sensitivity) == expected
+
+
+@pytest.mark.parametrize(("winner", "paired", "expected"), [
+    ({"clean_overlap_is_definitional": True, "mean_clean_overlap_from_severity_1": 1.0},
+     None, "none"),
+    ({"clean_overlap_is_definitional": False, "mean_clean_overlap_from_severity_1": None},
+     None, "unmeasured"),
+    ({"clean_overlap_is_definitional": False, "mean_clean_overlap_from_severity_1": 0.40},
+     None, "survives"),
+    ({"clean_overlap_is_definitional": False, "mean_clean_overlap_from_severity_1": 0.06},
+     None, "reselected"),
+    ({"clean_overlap_is_definitional": False, "mean_clean_overlap_from_severity_1": 0.06},
+     {"dynamic_image_decided_win_rate": 0.577}, "reselected"),
+    ({"clean_overlap_is_definitional": False, "mean_clean_overlap_from_severity_1": 0.06},
+     {"dynamic_image_decided_win_rate": 0.5}, "reselected"),
+    # Freezing the membership wins the paired comparison: the movement is doing something to
+    # the result, and a verdict that says otherwise is contradicted in the next breath.
+    ({"clean_overlap_is_definitional": False, "mean_clean_overlap_from_severity_1": 0.06},
+     {"dynamic_image_decided_win_rate": 0.42}, "reselected_frozen_ahead"),
+])
+def test_the_membership_finding_reads_the_overlap_and_the_paired_twin(winner, paired, expected):
+    assert reporting_module._membership_finding(winner, paired) == expected
+
+
+@pytest.mark.parametrize(("padding", "movement", "expected"), [
+    ("untested", "reselected",
+     "Padding is not tested on this selection, and bin movement is not shown to explain it."),
+    ("unmoved", "reselected",
+     "Padding does not move this selection's score, and bin movement is not shown to explain "
+     "it."),
+    ("moved", "survives",
+     "Padding does move this selection's score, and bin movement is part of what this "
+     "selection is measuring."),
+    ("unmoved", "none",
+     "Padding does not move this selection's score, and bin movement cannot be explaining it, "
+     "because this selection has none."),
+    ("untested", "unmeasured",
+     "Padding is not tested on this selection, and membership stability was not measured for "
+     "it."),
+    ("unmoved", "reselected_frozen_ahead",
+     "Padding does not move this selection's score, and bin movement is not what carries the "
+     "trend, though removing it scores better image by image."),
+])
+def test_the_explanation_verdict_is_composed_from_the_two_findings(padding, movement, expected):
+    """`parts = ["Neither is shown to."]` was a literal emitted before a number was consulted,
+    and three reachable branches contradicted it in the next breath. `grep "Neither is shown to"`
+    over this file returned nothing before this test existed."""
+    assert reporting_module._explanation_verdict(padding, movement) == expected
+
+
+@pytest.mark.parametrize(("overlap", "expected", "forbidden"), [
+    (0.06, "bin movement is not shown to explain it", "part of what this selection is measuring"),
+    (0.40, "bin movement is part of what this selection is measuring", "not shown to explain it"),
+])
+def test_the_fourth_short_answer_leads_with_what_its_own_numbers_say(overlap, expected,
+                                                                    forbidden):
+    """End to end: the same summary, one field moved, and the opening verdict moves with it."""
+    summary = grid_summary()
+    winner = {**summary[RANKED_GROUPS_KEY][0],
+              "mean_clean_overlap_from_severity_1": overlap}
+    answer = reporting_module._movement_sentence(summary, winner)
+    assert answer.startswith("Padding is not tested on this selection, and ")
+    assert expected in answer
+    assert forbidden not in answer
+    assert "Neither is shown to." not in answer
+
+
+@pytest.mark.parametrize(("unfiltered", "filtered", "expected"), [
+    (0.6, 0.5429, "the placeholders were adding to the old benchmark rather than to this bin"),
+    (0.5429, 0.6, "the placeholders were holding the old benchmark down, not lifting it"),
+    (0.6, 0.6, "the placeholders made no difference to the old benchmark's median"),
+])
+def test_the_every_query_padding_reading_follows_the_sign_it_quotes(unfiltered, filtered,
+                                                                   expected):
+    """"Removing the repeated decoder placeholders moves the trend from A to B, so on this run
+    the placeholders were adding to the old benchmark" -- asserted whichever way A and B ran."""
+    summary = grid_summary()
+    row = reporting_module._lookup(
+        summary["padding_sensitivity"], signal="persistence",
+        membership_mode=ALL_VALID_BENCHMARK[0], confidence_bin=ALL_VALID_BENCHMARK[1],
+        aggregation="q90", score_scope=PRIMARY_SCORE_SCOPE,
+    )
+    assert row is not None
+    row["unfiltered_median_spearman"] = unfiltered
+    row["filtered_median_spearman"] = filtered
+    answer = reporting_module._movement_sentence(summary, summary[RANKED_GROUPS_KEY][0])
+    assert expected in answer
+
+
+# --- adjudication wave: the paragraphs a column with nothing to do with them could delete ------
+
+
+def test_the_ranked_field_paragraph_does_not_depend_on_the_frozen_column(tmp_path):
+    """Round 5 ungated it; nothing pinned the ungating, because every frozen fixture in this
+    file has a run of three or more equal bins. Re-gating it on `length >= 3` restores the
+    round-4 bug -- the near-equals count, the margin and the standing all disappearing with a
+    column that has nothing to do with the ranking -- and 252 tests passed."""
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, [0.1 * index for index in range(10)]),
+        profile_ranked("decile_50_60", [22 / 35, *[0.1] * 9]),
+    ))
+    assert "The frozen medians are identical" not in note
+    assert "**What the ranked field says about the selection.**" in note
+    assert "step of the top median" in note
+    assert "At the ranking's one scene summary" in note
+
+
+@pytest.mark.parametrize(("drop", "blank", "expected"), [
+    (None, "decile_50_60",
+     "The decided rate is missing for `decile_50_60` at `q90` -- every paired image tied "
+     "there -- so the shape of this column is not read."),
+    (("decile_00_10", "decile_10_20", "decile_20_30", "decile_30_40", "decile_40_50",
+      "decile_60_70", "decile_70_80", "decile_80_90"), None,
+     "Only 2 of the 10 confidence bins have a dynamic-versus-frozen pair at `q90`, so there is "
+     "no column to read across them."),
+])
+def test_a_column_that_cannot_be_read_does_not_delete_the_ranking_paragraphs(drop, blank,
+                                                                             expected):
+    """A single tied bin removed the *entire* note -- near-equals, margin and the standing that
+    Ruling 33 ordered published -- because one early return guarded four paragraphs.
+
+    The test file's own round-4 comment records that this state is reachable: a dynamic bin that
+    matches its frozen twin exactly ties on every image, and the decided rate is then `None`.
+    """
+    rows = profile_rows(UNIMODAL, FLAT_FROZEN)
+    if drop is not None:
+        rows["membership_comparisons"] = [
+            entry for entry in rows["membership_comparisons"]
+            if entry["confidence_bin"] not in drop
+        ]
+    if blank is not None:
+        for entry in rows["membership_comparisons"]:
+            if entry["confidence_bin"] == blank:
+                entry["dynamic_image_decided_win_rate"] = None
+    note = "\n".join(reporting_module._movement_profile_note(
+        rows, profile_ranked("decile_50_60", [22 / 35, *[0.1] * 9])
+    ))
+    assert expected in note
+    assert "**What the ranked field says about the selection.**" in note
+    assert "1 of the 10 ranked selections sits within one 1/35 = 0.0286 step" in note
+    assert "At the ranking's one scene summary the same selection holds the top median" in note
+    # The shape claim itself is withheld, because the column it is about is incomplete.
+    assert "one peak with no second rise" not in note
