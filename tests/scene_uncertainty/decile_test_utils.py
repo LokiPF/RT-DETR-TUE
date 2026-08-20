@@ -31,8 +31,48 @@ LAYERS = (0, 1, 2)
 QUERY_COUNT = 20
 PERSISTENCE_DIM = 4
 
+SYNTHETIC_BANK_ID = "b" * 64
+"""The clean bank the synthetic distances pretend to come from.
 
-def write_decile_artifacts(root: Path, severities=range(6)) -> dict[str, Path]:
+A literal is honest here, unlike the result manifest's own `artifact_id`: there is no bank
+artifact in this fixture for the loader to check it against, and the loader does not check it
+-- it *carries* it. What makes carrying it matter is that the pilot ships two sanctioned
+result sets, `raw_k5` (bank 353a5992...) and `raw_k5_bank50k` (bank 5dfd6e50...), built from
+the *same* feature cache against *different* clean banks. Without `bank_id` on the way through,
+two runs whose distances came from different banks produce indistinguishable provenance.
+"""
+
+
+def write_decile_artifacts(
+    root: Path,
+    severities=range(6),
+    padded_tails: dict | None = None,
+    rotate_confidence: int = 0,
+) -> dict[str, Path]:
+    """The plan's synthetic pair, with two knobs the cross-severity tests need.
+
+    `padded_tails` maps severity to the length of that severity's identical suffix (default 2
+    everywhere, which is what every pre-existing test asserts). It exists because the real
+    padded tail *wanders* with severity rather than growing -- 66 of the pilot's 250 tuning
+    images carry padding and the tail differs across severities in all 66 -- and a fixture
+    that pads the same two queries at every severity cannot tell an image-level union apart
+    from a per-severity mask, nor a computed `tail_identical_across_severities` from a
+    hard-coded `True`.
+
+    `rotate_confidence` rotates the confidence vector by `severity * rotate_confidence`
+    queries, so the confidence *ranking* moves with severity. The default fixture subtracts a
+    constant from every query, which is rank-preserving, so dynamic membership equals frozen
+    membership at every severity and the whole dynamic/frozen distinction -- and every
+    `clean_overlap` below 1.0 -- is invisible to it.
+
+    A tail of 1 is not padding (`detect_padded_tail` refuses a suffix shorter than two), and a
+    tail of 0 would silently mean "the whole tensor" through the negative-slice arithmetic
+    below, so both are refused here rather than producing a fixture that means something else.
+    """
+    tails = {int(severity): 2 for severity in severities}
+    tails.update({int(key): int(value) for key, value in (padded_tails or {}).items()})
+    if any(length < 2 for length in tails.values()):
+        raise ValueError(f"a padded tail needs at least two queries, got {tails}")
     cache = root / "cache"
     metadata = {
         "source_kind": "evaluation", "image_ids": [11],
@@ -41,13 +81,16 @@ def write_decile_artifacts(root: Path, severities=range(6)) -> dict[str, Path]:
     }
     with ShardWriter(cache, metadata, shard_size=20) as writer:
         for severity in severities:
+            tail = tails[int(severity)]
             confidence = torch.linspace(0.05, 0.95, QUERY_COUNT).sub(severity * 0.005).clamp(0.002, 0.998)
+            if rotate_confidence:
+                confidence = confidence.roll(int(severity) * int(rotate_confidence))
             logits = torch.full((QUERY_COUNT, 80), -20.0)
             logits[:, 0] = torch.logit(confidence)
-            logits[-2:, 0] = torch.logit(torch.tensor(0.002))
+            logits[-tail:, 0] = torch.logit(torch.tensor(0.002))
             boxes = torch.arange(QUERY_COUNT * 4, dtype=torch.float32).reshape(QUERY_COUNT, 4) / 100
-            boxes[-1] = boxes[-2]
-            logits[-1] = logits[-2]
+            boxes[-(tail - 1):] = boxes[-tail]
+            logits[-(tail - 1):] = logits[-tail]
             layers = {
                 layer_id: (
                     torch.arange(QUERY_COUNT * PERSISTENCE_DIM, dtype=torch.float32)
@@ -57,7 +100,7 @@ def write_decile_artifacts(root: Path, severities=range(6)) -> dict[str, Path]:
                 for layer_id in LAYERS
             }
             for values in layers.values():
-                values[-1] = values[-2]
+                values[-(tail - 1):] = values[-tail]
             writer.add({
                 "image_id": 11, "severity": int(severity), "source_partition": "tuning",
                 "boxes": boxes, "logits": logits.to(torch.float16),
@@ -90,6 +133,7 @@ def write_decile_artifacts(root: Path, severities=range(6)) -> dict[str, Path]:
     manifest = {
         "artifact_type": "knn_scene_uncertainty_results",
         "feature_cache_id": load_manifest(cache)["artifact_id"],
+        "bank_id": SYNTHETIC_BANK_ID,
         "source_partition": "tuning", "normalization": "raw", "k": 5,
         "query_distance_path": distance_path.name,
         "normalizer_path": normalizer_path.name,
@@ -233,6 +277,8 @@ def mutate_decile_artifacts(artifacts: dict[str, Path], mutation: str) -> None:
         _edit_result_manifest(results, lambda manifest: manifest.pop("feature_cache_id"))
     elif mutation == "drop_result_k":
         _edit_result_manifest(results, lambda manifest: manifest.pop("k"))
+    elif mutation == "drop_result_bank_id":
+        _edit_result_manifest(results, lambda manifest: manifest.pop("bank_id"))
     elif mutation == "wrong_result_artifact_type":
         _edit_result_manifest(
             results, lambda manifest: manifest.update({"artifact_type": "scene_uncertainty_results"})

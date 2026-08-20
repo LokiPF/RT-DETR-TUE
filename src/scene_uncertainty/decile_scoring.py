@@ -22,7 +22,17 @@ PRIMARY_SCORE_SCOPE = "layer_2"
 scope. Layers 0 and 1 and `combined` are secondary diagnostics; naming the primary once here
 keeps a later ranking step from quietly promoting whichever scope happens to win."""
 
-MEMBERSHIP_MODES = ("dynamic", "frozen")
+MEMBERSHIP_MODES = ("dynamic", "frozen", "shared")
+"""How a selection's membership was chosen -- the design's two, plus the one it implies.
+
+`dynamic` re-sorts and rebuilds the bins at every severity; `frozen` reuses severity zero's.
+`shared` is neither: it is a selection that no confidence ranking produced and that is the same
+query set at every severity -- `all_valid`, and the all-300-query benchmark. Calling those
+`dynamic` would drop a fixed selection into the group that measures how much membership moves,
+and calling them `frozen` would claim they were copied from severity zero. The design forbids
+combining dynamic and frozen into one score, and a third label is what keeps a selection that
+is neither from having to borrow one of their names."""
+
 PADDING_MODES = ("filtered", "unfiltered")
 CONFIDENCE_BINS = DECILE_NAMES + ("all_valid",)
 

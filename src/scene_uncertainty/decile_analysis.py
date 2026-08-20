@@ -45,10 +45,14 @@ import torch
 from .artifacts import iter_records, load_manifest, manifest_id
 from .confidence_deciles import (
     DECILE_NAMES,
+    bin_overlap,
+    confidence_deciles,
     confidence_from_logits,
     detect_padded_tail,
+    memberships_by_severity,
     union_query_ids,
 )
+from .decile_scoring import score_selection
 
 
 EXPECTED_SEVERITIES = frozenset(range(6))
@@ -63,9 +67,18 @@ image at a time deep inside the scoring loop; catching it here fails the run bef
 first row is written, and names the image rather than the bin."""
 
 REQUIRED_RESULT_MANIFEST_KEYS = (
-    "artifact_id", "artifact_type", "feature_cache_id", "source_partition",
+    "artifact_id", "artifact_type", "feature_cache_id", "bank_id", "source_partition",
     "normalization", "k", "query_distance_path", "normalizer_path",
 )
+"""`bank_id` is required rather than optional, and it is carried into `run_metadata`.
+
+Nothing here can check it -- no bank artifact is passed to this command -- but it is the only
+field that separates the two sanctioned pilot result sets. `raw_k5` and `raw_k5_bank50k` were
+built from the *same* feature cache (df79fddf...) against *different* clean banks (353a5992...
+and 5dfd6e50...), so every other provenance field this analysis records is identical between
+them. Without `bank_id` on the way through, the analysis directory cannot say which clean bank
+its distances were measured against, and two runs that are not comparable produce provenance
+that says they are. `pipeline` has always written it."""
 REQUIRED_CACHE_MANIFEST_KEYS = ("artifact_id", "source_kind", "decoder_layers", "query_count")
 REQUIRED_DISTANCE_ROW_KEYS = ("image_id", "severity", "source_partition", "query_scores_by_layer")
 REQUIRED_CACHE_RECORD_KEYS = ("image_id", "severity", "source_partition", "boxes", "logits", "layers")
@@ -96,6 +109,56 @@ def result_content_address(manifest: dict) -> str:
         key: value for key, value in manifest.items() if key not in RESULT_NON_IDENTIFYING_KEYS
     })
 
+
+ALL_VALID_BENCHMARK = ("shared", "all_valid", "filtered")
+"""Spec benchmarks 2 and 3: every non-padded query, persistence and its confidence control.
+
+`shared` because this selection is not built from a confidence ranking and is the identical
+query set at every severity; `filtered` because the image-level padding union is removed."""
+
+ALL_QUERY_BENCHMARK = ("shared", "all_valid", "unfiltered")
+"""Spec benchmark 1 -- the existing all-300-query result -- written down, because it has no
+label of its own and would otherwise be rediscovered by whoever reads the CSV next.
+
+The spec names five report rows and this is the first: "the existing all-300-query persistence
+benchmark: q90, layer 2, median Spearman 0.600". It is *not* `all_valid` in the strict sense --
+it deliberately keeps the padded decoder placeholders, which is the whole point of comparing it
+against benchmark 2 -- but the closed vocabulary in `decile_scoring` has no `all_300` bin and
+should not grow one, because the label that actually distinguishes the two benchmarks is the
+padding mode. So the pair reads: the same every-query selection, once with the padding union
+removed (`ALL_VALID_BENCHMARK`) and once without (`ALL_QUERY_BENCHMARK`). The difference between
+their scores is the effect of padding on the existing benchmark, which is what the spec asks the
+report to show.
+
+Two consequences worth stating rather than deducing. The selection is `arange(query_count)`, so
+`selected_count` is 300 and not the valid count -- that is how a reader tells the two apart in
+the CSV without recomputing anything. And it is scored for `q90` alone and with no confidence
+control: it exists to reproduce one published number, and a `1 - confidence` summary over a
+population that includes near-zero-confidence placeholders would describe the placeholders
+rather than the scene."""
+
+SENSITIVITY_BIN = DECILE_NAMES[0]
+"""The one bin the padding sensitivity control repeats unfiltered (spec 69).
+
+"A sensitivity control repeats only the lowest-confidence-bin analysis without filtering" --
+only. Widening it to the other nine deciles would double the decile grid and publish nine
+padding measurements the design never asked for, and it would do so silently, because every
+extra row would be a perfectly well-formed row."""
+
+ROW_KEYS_EXCLUDED_FROM_CSV = ("selected_query_ids",)
+"""Row keys that stay in memory and must not be written to `per_scene.csv`.
+
+The full tuning grid is 250 images x 6 severities x 349 rows = 523,500 rows, and each row
+carries the IDs of its own selection -- 30 for a decile, 300 for the all-query benchmark. In the
+CSV that is on the order of 100 MB of quoted integer lists, in a file whose purpose is one score
+per row; loaded back with `read_csv` every one of them is a string that has to be parsed before
+it means anything.
+
+They stay on the in-memory rows because they are the only per-row evidence that the persistence
+score and the confidence score summarised the *same* queries, which is the fairness claim the
+whole experiment rests on, and because every control in this module is verified through them.
+The writer drops the column; this constant names it so the drop is by contract rather than by a
+literal in a plotting module."""
 
 SLIM_RECORD_KEYS = frozenset({
     "image_id", "severity", "source_partition",
@@ -459,6 +522,7 @@ def load_decile_inputs(cache_value: str | Path, results_value: str | Path) -> De
             "artifact_type": ANALYSIS_ARTIFACT_TYPE,
             "feature_cache_id": cache_manifest["artifact_id"],
             "source_result_id": result_manifest["artifact_id"],
+            "bank_id": result_manifest["bank_id"],
             "normalization": result_manifest["normalization"],
             "k": result_manifest["k"],
             "source_partition": TUNING_PARTITION,
@@ -469,3 +533,172 @@ def load_decile_inputs(cache_value: str | Path, results_value: str | Path) -> De
             "record_count": len(seen),
         },
     )
+
+
+def _padding_diagnostics(records: dict[int, dict], padded: torch.Tensor) -> dict:
+    """What the design requires be *recorded* about one image's padding, not merely applied.
+
+    Spec 67: "Record the padded count by image and severity, the image-level union count, and
+    whether the detected tail was identical at all severities." Task 1 built the detector and
+    the union; without this block the analysis would apply a mask that nothing in the output
+    describes, and a reader of `summary.json` could not tell an image that lost 170 queries
+    from one that lost none.
+
+    The third fact is the one that looks redundant and is not. Padding *wanders* with severity
+    rather than growing: on the pilot, 66 of 250 tuning images carry padding and the detected
+    tail differs across severities in all 66, and the image that moves furthest runs 159, 165,
+    170, 63, 8, 79 padded queries across the six levels. So `union_padded_count` is routinely
+    larger than any single severity's count, `tail_identical_across_severities` is routinely
+    `False`, and the two together are what tell a later reader that the union in
+    `union_padded_query_ids` was a decision rather than a formality -- masking per severity
+    would have swung that image's valid population between 141 and 292.
+
+    Keys are strings and values are plain lists, ints and bools, because this dictionary is
+    written into `summary.json`; an int-keyed severity would come back from JSON as a string
+    and stop matching whatever compared against it.
+    """
+    tails = {
+        str(severity): record["padded_query_ids"].tolist()
+        for severity, record in sorted(records.items())
+    }
+    return {
+        "union_padded_query_ids": padded.tolist(),
+        "union_padded_count": int(padded.numel()),
+        "padded_query_ids_by_severity": tails,
+        "padded_count_by_severity": {key: len(value) for key, value in tails.items()},
+        "tail_identical_across_severities": len({tuple(value) for value in tails.values()}) == 1,
+    }
+
+
+def analyze_deciles(inputs: DecileInputs) -> tuple[list[dict], dict]:
+    """Every experiment and control row the design asks for, plus the padding bookkeeping.
+
+    This is the only place in the analysis that holds more than one severity of an image at
+    once, and that is the whole reason it exists as a separate function: the padding union, the
+    frozen membership and every `clean_overlap` are cross-severity facts, and computing any of
+    them one record at a time gives a different -- and wrong -- answer.
+
+    The fairness rule `score_selection` cannot enforce for itself is enforced here. That
+    function guarantees the two signals share one selection and one summary *within* a call; it
+    cannot tell whether the confidence vector it is scoring is the vector that built the bins it
+    is scoring. So each severity reads `record["query_confidence"]` exactly once, into `common`,
+    and that one tensor is what `confidence_deciles`/`memberships_by_severity` ranked and what
+    every row of that severity is scored against. Handing severity zero's vector to the scorer
+    while binning severity five's would produce a complete, plausible table with no error in it.
+    The key is `query_confidence` and never `confidence`: the cache's own field was reduced
+    before the float16 cast and moves decile membership on 535 of the pilot's 1,500 records, so
+    reaching for it here is a `KeyError` rather than a slightly different result.
+
+    Four kinds of selection per severity -- 23 in all, 349 rows -- covering the design's five
+    benchmark rows (spec 127-138):
+
+    * the ten `dynamic` bins and the ten `frozen` bins, filtered -- the experiment, and
+      benchmark 4's matched confidence control comes free with each of them;
+    * `ALL_VALID_BENCHMARK`, every non-padded query -- benchmarks 2 and 3;
+    * the lowest bin repeated `unfiltered` under both membership modes -- benchmark 5, the
+      padding sensitivity control, scoped to `SENSITIVITY_BIN` and nothing else;
+    * `ALL_QUERY_BENCHMARK`, all 300 queries at q90 with no confidence control -- benchmark 1,
+      the existing published number, reproduced from the artifacts rather than asserted.
+
+    None of those five collide: the row key carries `membership_mode`, `confidence_bin` and
+    `padding_mode`, and each selection differs from the others in at least one of them. Dynamic
+    and frozen stay separable for the same reason, which is the design's rule that they answer
+    different questions and must not be combined into one score.
+
+    `clean_overlap` is measured through `bin_overlap` for all four decile selections rather than
+    asserted, including the frozen ones. Frozen membership is severity zero's by construction so
+    its overlap is 1.0, but writing the constant would make a broken freeze look healthy in the
+    one column that exists to detect movement; measuring it costs ten set intersections and
+    turns that into a failing number.
+
+    Two things this deliberately does not do. It does not re-check the loader's guarantees --
+    six severities, ten valid queries, a distance row per key -- because `load_decile_inputs`
+    fails on all of them before the first row is built, and a second copy would drift. And it
+    does not reject duplicate output keys: it cannot produce one, and the check the design asks
+    for belongs where rows arrive from anywhere, which is the summariser.
+
+    Note for a reader of the padding-sensitivity plot: on an image with no padding at all --
+    184 of the pilot's 250 -- the filtered and unfiltered bottom bins are the same queries and
+    the control is a no-op by construction, not a null result. The effect lives entirely in the
+    66 padded images and is diluted accordingly across a 250-image median.
+    """
+    rows: list[dict] = []
+    images: dict[str, dict] = {}
+    for image_id, records in sorted(inputs.records_by_image.items()):
+        # One union mask per image, through the primitive that owns the rule. Building it
+        # inline would also accept zero masks and boolean selection masks, which
+        # `union_query_ids` refuses -- a boolean mask casts to the plausible query IDs 0 and 1.
+        padded = union_query_ids(
+            [record["padded_query_ids"] for _, record in sorted(records.items())]
+        )
+        images[str(image_id)] = _padding_diagnostics(records, padded)
+
+        query_count = int(records[0]["query_count"])
+        all_indices = torch.arange(query_count, dtype=torch.long)
+        memberships = memberships_by_severity(records, padded)
+        # Severity zero's *dynamic* bins, which is the reference spec 97 names literally: "the
+        # Jaccard overlap between each dynamic bin and its severity-zero membership". Reusing
+        # the `dynamic_overlap` that `memberships_by_severity` already computed would take the
+        # reference from whatever that function chose to freeze instead, so the number recorded
+        # here stays correct even if the frozen construction changes.
+        clean_filtered = memberships[0]["dynamic"]
+        # The unfiltered control needs its own severity-zero reference: bins built over all 300
+        # queries, not the union-masked ten. Overlapping an unfiltered bin against a filtered
+        # one would report movement that is really the padding mask.
+        clean_unfiltered = confidence_deciles(
+            records[0]["query_confidence"], all_indices,
+            label=f"image {image_id} severity 0, unfiltered",
+        )
+
+        for severity, record in sorted(records.items()):
+            partition = record["source_partition"]
+            common = {
+                "image_id": image_id,
+                "severity": severity,
+                "source_partition": partition,
+                "query_confidence": record["query_confidence"],
+                "query_scores_by_layer": inputs.distances[(image_id, severity, partition)],
+                "layer_score_scales": inputs.layer_score_scales,
+            }
+            for mode in ("dynamic", "frozen"):
+                bins = memberships[severity][mode]
+                overlap = bin_overlap(bins, clean_filtered)
+                for name in DECILE_NAMES:
+                    rows.extend(score_selection(
+                        **common, membership_mode=mode, confidence_bin=name,
+                        padding_mode="filtered", indices=bins[name],
+                        clean_overlap=overlap[name],
+                    ))
+            rows.extend(score_selection(
+                **common,
+                membership_mode=ALL_VALID_BENCHMARK[0],
+                confidence_bin=ALL_VALID_BENCHMARK[1],
+                padding_mode=ALL_VALID_BENCHMARK[2],
+                indices=memberships[severity]["all_valid"],
+                # The union mask is one set for the whole image, so this selection is the same
+                # queries at every severity and its overlap with severity zero is 1.0 by the
+                # construction of the mask rather than by anything measured here.
+                clean_overlap=1.0,
+            ))
+            unfiltered = {
+                "dynamic": confidence_deciles(
+                    record["query_confidence"], all_indices,
+                    label=f"image {image_id} severity {severity}, unfiltered",
+                ),
+                "frozen": clean_unfiltered,
+            }
+            for mode, bins in unfiltered.items():
+                rows.extend(score_selection(
+                    **common, membership_mode=mode, confidence_bin=SENSITIVITY_BIN,
+                    padding_mode="unfiltered", indices=bins[SENSITIVITY_BIN],
+                    clean_overlap=bin_overlap(bins, clean_unfiltered)[SENSITIVITY_BIN],
+                ))
+            rows.extend(score_selection(
+                **common,
+                membership_mode=ALL_QUERY_BENCHMARK[0],
+                confidence_bin=ALL_QUERY_BENCHMARK[1],
+                padding_mode=ALL_QUERY_BENCHMARK[2],
+                indices=all_indices, clean_overlap=1.0,
+                aggregations=("q90",), include_confidence=False,
+            ))
+    return rows, {"images": images}

@@ -7,6 +7,7 @@ import torch
 from src.scene_uncertainty import decile_scoring as scoring_module
 from src.scene_uncertainty.decile_scoring import (
     DECILE_AGGREGATIONS,
+    MEMBERSHIP_MODES,
     PRIMARY_SCORE_SCOPE,
     score_selection,
 )
@@ -384,3 +385,17 @@ def test_the_all_valid_selection_is_a_recognised_bin():
     rows = call(confidence_bin="all_valid", padding_mode="unfiltered", membership_mode="frozen")
     assert {row["confidence_bin"] for row in rows} == {"all_valid"}
     assert {row["padding_mode"] for row in rows} == {"unfiltered"}
+
+
+def test_the_shared_membership_mode_is_recognised():
+    """`all_valid` and the all-300 benchmark are neither dynamic nor frozen.
+
+    Their membership is not built from a confidence ranking at all -- it is the same query set
+    at every severity -- so filing them under `dynamic` would put a fixed selection into the
+    group that measures how much membership moves, and under `frozen` would claim they were
+    copied from severity zero. `shared` is the third answer, and Task 6 ranks it alongside
+    `dynamic` as deployable.
+    """
+    rows = call(membership_mode="shared", confidence_bin="all_valid")
+    assert {row["membership_mode"] for row in rows} == {"shared"}
+    assert set(MEMBERSHIP_MODES) == {"dynamic", "frozen", "shared"}
