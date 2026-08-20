@@ -30,6 +30,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from src.scene_uncertainty import pipeline
 from src.scene_uncertainty.cli import build_parser, main
 from src.scene_uncertainty.decile_analysis import ALL_QUERY_BENCHMARK
 
@@ -122,6 +123,46 @@ def test_the_command_publishes_every_confidence_decile_artifact(tmp_path: Path, 
     assert _stderr_line(capsys) == (
         f"analyze-confidence-deciles: summarized {scored_rows} score rows into {output}"
     )
+
+
+# Everything in `pipeline` that needs a GPU, a checkpoint, a COCO tree or a bank. The list is
+# the module's own expensive surface rather than a guess: if a name is added to it that this
+# command legitimately needs, the failure names which one and why.
+EXPENSIVE_PIPELINE_NAMES = (
+    "load_frozen_detector", "make_coco_loader", "streaming_coverage_bank",
+    "deterministic_reservoir", "compute_query_distances", "score_cached_record",
+    "fit_clean_distance_scale", "fit_normalizer", "_device",
+)
+
+
+def test_the_command_reaches_for_no_detector_and_no_knn(tmp_path: Path, monkeypatch):
+    """The help's central claim, checked instead of only written down.
+
+    "Runs no detector forward pass and no kNN search" is why this command is worth having:
+    it is minutes on a CPU against artifacts someone else spent GPU hours producing, and it
+    can be rerun against a second result set over the same cache. A rewrite that recomputed
+    the distances rather than reading the saved ones would still publish seven plausible
+    files, and every other assertion in this module would still hold.
+
+    Scoped honestly: the detonators are installed in `pipeline`'s namespace, so what this
+    proves is that `command_analyze_confidence_deciles` reaches for none of them -- not that
+    `decile_analysis` contains no arithmetic of its own, which it does.
+    """
+    def detonator(name):
+        def explode(*args, **kwargs):
+            raise AssertionError(f"analyze-confidence-deciles called {name}")
+        return explode
+
+    for name in EXPENSIVE_PIPELINE_NAMES:
+        assert hasattr(pipeline, name), name
+        monkeypatch.setattr(pipeline, name, detonator(name))
+
+    artifacts = write_decile_artifacts(tmp_path)
+    output = tmp_path / "report"
+
+    assert _analyze(artifacts, output) == 0
+
+    assert sorted(path.name for path in output.iterdir()) == list(DECILE_REPORT_FILES)
 
 
 def test_an_unfinished_output_directory_is_completed_rather_than_refused(tmp_path: Path):
