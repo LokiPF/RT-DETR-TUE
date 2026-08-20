@@ -1,6 +1,6 @@
 """Turn scored scene rows into the study's CSV, summary, and trend plots.
 
-Three things in here are easy to get subtly wrong, so they are stated once, up front:
+Four things in here are easy to get subtly wrong, so they are stated once, up front:
 
 * **The per-image trend statistics are computed over the unfiltered rows.** A severity
   where the query policy selected nothing has no score, and `monotonicity_metrics` drops
@@ -17,6 +17,11 @@ Three things in here are easy to get subtly wrong, so they are stated once, up f
   annotations matched at *both* severities, so `no_switch_step_count` means "no annotation
   that was still detected changed its predicted class" and never "the detector was
   unaffected". Blur mostly makes detections disappear, and that does not show up here.
+* **The trend plots put two units on one axis.** The `layer_*` curves are the *unscaled*
+  per-layer kNN distances; `combined` is the mean of those same per-layer scores *after*
+  each has been centred and divided by its own clean-distance scale. A `layer_2` value is
+  therefore not comparable with a `combined` one, and the plots say so on the axis. See
+  `_expanded_frame` for why they are labelled rather than re-united.
 """
 
 from __future__ import annotations
@@ -40,6 +45,21 @@ from .metrics import has_class_switch, jaccard_overlap, monotonicity_metrics
 
 
 STRUCTURED_COLUMNS = ("layer_scores", "clean_scaled_layer_scores", "selected_query_ids", "matched_predictions")
+
+# `clean_scaled_layer_scores` is written to every results CSV and, as of this commit, read
+# by nothing: the report's `layer_*` scopes come from the unscaled `layer_scores` and
+# `combined` comes from `raw_score`, which is already their scaled mean. It is kept because
+# it is the only per-row record of the standardisation that produced `raw_score`.
+
+# What the two trend plots put on their y axis. Stated as constants because the mixed unit
+# is the whole point of the label: a plot that says only "Raw scene uncertainty" invites
+# the reader to compare a `layer_*` curve with the `combined` one.
+MIXED_UNIT_NOTE = (
+    "layer_* curves are unscaled per-layer kNN distances; `combined` is the mean of the "
+    "clean-standardised per-layer scores -- one axis, two units"
+)
+RAW_TREND_YLABEL = "Raw scene uncertainty (mixed units)"
+RELATIVE_TREND_YLABEL = "Clean-relative scene uncertainty (mixed units)"
 
 # One scored row per key. `evaluate-knn` produces exactly one, but `report --results`
 # accepts any CSV, and concatenating two result files is an obvious operator move.
@@ -121,6 +141,21 @@ def read_result_csv(path: str | Path) -> list[dict]:
 
 
 def _expanded_frame(rows: list[dict]) -> pd.DataFrame:
+    """One row per (scored row, score scope) -- and the scopes are in two different units.
+
+    `combined` carries `raw_score`, which `score_cached_record` computes as the mean of the
+    per-layer scores *after* each has been centred and divided by its clean-distance scale.
+    The `layer_*` scopes carry `layer_scores`, the same per-layer numbers *before* that
+    standardisation. Nothing here re-units them, so `raw_trend.png` draws four curves on
+    one axis in two units; `MIXED_UNIT_NOTE` is what tells the reader.
+
+    They are labelled rather than re-united on purpose. Every statistic this module
+    publishes over the trend -- Spearman, adjacent monotonicity, endpoint increase, and the
+    range-normalised violation magnitude -- is invariant under a positive affine map, which
+    is exactly what the standardisation is, so re-uniting the layer scopes would move no
+    reported number while invalidating the already-published pilot figures. The scaled
+    per-layer values are in every CSV as `clean_scaled_layer_scores`; nothing reads them.
+    """
     layer_ids = sorted({str(layer_id) for row in rows for layer_id in row["layer_scores"]})
     expanded = []
     for row in rows:
@@ -165,6 +200,9 @@ def _safe_median(values) -> float | None:
 
 def _plot_trend(valid: pd.DataFrame, column: str, ylabel: str, path: Path) -> None:
     figure, axis = plt.subplots(figsize=(8, 4.5))
+    # The unit warning rides on the figure itself, not just in the docs: these PNGs get
+    # pasted into write-ups on their own.
+    axis.set_title(MIXED_UNIT_NOTE, fontsize=6)
     for keys, group in valid.groupby(["source_partition", "policy", "aggregation", "score_scope"], sort=True):
         severity = group.groupby("severity")[column]
         median, q25, q75 = severity.median(), severity.quantile(0.25), severity.quantile(0.75)
@@ -197,6 +235,11 @@ def write_report(rows: list[dict], output_dir: str | Path, run_metadata: dict | 
     are actually computed over. Both are published because they diverge exactly when the
     trend statistics get thin: a median over one surviving image out of four reads as a
     four-image finding without the second number next to it.
+
+    Both trend plots carry `MIXED_UNIT_NOTE`, because their `layer_*` and `combined`
+    curves are in different units. `summary.json` is unaffected -- every statistic in it
+    is computed within one `score_scope` and is invariant under the positive affine map
+    that separates the two units. See `_expanded_frame`.
     """
     if not rows:
         raise ValueError("write_report needs at least one scored row")
@@ -305,8 +348,8 @@ def write_report(rows: list[dict], output_dir: str | Path, run_metadata: dict | 
     temporary = metadata_path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(run_metadata or {}, indent=2, sort_keys=True), encoding="utf-8")
     os.replace(temporary, metadata_path)
-    _plot_trend(valid, "score", "Raw scene uncertainty", output / "raw_trend.png")
-    _plot_trend(valid, "clean_relative_score", "Clean-relative scene uncertainty", output / "relative_trend.png")
+    _plot_trend(valid, "score", RAW_TREND_YLABEL, output / "raw_trend.png")
+    _plot_trend(valid, "clean_relative_score", RELATIVE_TREND_YLABEL, output / "relative_trend.png")
 
     combined = pd.DataFrame([group for group in groups if group["score_scope"] == "combined"])
     figure, axis = plt.subplots(figsize=(8, 4.5))

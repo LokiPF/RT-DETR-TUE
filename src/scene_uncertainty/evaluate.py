@@ -89,6 +89,10 @@ def score_cached_record(
         / float(layer_score_scales[layer_id]["scale"])
         for layer_id, score in layer_scores.items()
     }
+    # `raw_score` is the mean of the *scaled* per-layer scores; `layer_scores` keeps the
+    # unscaled ones because they are what the per-layer trend curves are drawn from.
+    # `clean_scaled_layer_scores` is the per-row record of the standardisation and is
+    # currently read by nothing downstream -- see `reporting._expanded_frame`.
     raw_score = sum(clean_scaled_layers.values()) / len(clean_scaled_layers)
     return {
         **base,

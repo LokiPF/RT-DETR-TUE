@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from src.scene_uncertainty import reporting
 from src.scene_uncertainty.reporting import (
     find_duplicate_result_key,
     read_result_csv,
@@ -292,3 +293,33 @@ def test_rows_that_differ_in_any_key_column_are_not_duplicates():
     """The key is all five columns; two policies over one image are a normal report."""
     rows = make_rows() + [{**row, "policy": "top10"} for row in make_rows()]
     assert find_duplicate_result_key(rows) is None
+
+
+def test_the_trend_plots_say_that_their_curves_are_in_two_units(tmp_path: Path, monkeypatch):
+    """`raw_trend.png` draws `layer_*` and `combined` on one axis in two different units.
+
+    `combined` is `raw_score`, the mean of the per-layer scores after each was centred and
+    divided by its clean-distance scale; the `layer_*` curves are the same scores before
+    that standardisation. The statistics in `summary.json` are unaffected -- they are all
+    invariant under a positive affine map -- but a reader comparing two curves by eye is
+    not, and these PNGs travel on their own. The label is the fix, so it is asserted.
+    """
+    drawn = []
+    real_close = reporting.plt.close
+
+    def spy(figure):
+        axis = figure.axes[0]
+        drawn.append((axis.get_ylabel(), axis.get_title()))
+        real_close(figure)
+
+    monkeypatch.setattr(reporting.plt, "close", spy)
+    write_report(make_rows(), tmp_path)
+
+    raw_label, raw_note = drawn[0]
+    relative_label, relative_note = drawn[1]
+    assert "mixed units" in raw_label.lower()
+    assert "mixed units" in relative_label.lower()
+    for note in (raw_note, relative_note):
+        assert "unscaled" in note.lower()
+        assert "standardised" in note.lower()
+        assert "layer_" in note and "combined" in note
