@@ -187,7 +187,7 @@ OUT=output/scene_uncertainty/pilot
 # rsync'd tree -- provenance then degrades to "unknown" with a warning -- so take the sha
 # from wherever the code was edited and pass it in. The value is compared when an
 # interrupted extraction is resumed: export it for every command of a run, or for none.
-export SCENE_UNCERTAINTY_GIT_COMMIT=<sha>
+export SCENE_UNCERTAINTY_GIT_COMMIT=9184adb65864b802378ad3e261b7ea62be5a3b98  # <- your sha
 
 $UE_PY tools/scene_uncertainty.py select \
   --train-ann $COCO/annotations/instances_train2017.json \
@@ -251,8 +251,14 @@ $UE_PY tools/scene_uncertainty.py report \
 * **`near_duplicate_fraction`, in `<results>.manifest.json` under `clean_distance_fit`.**
   The share of sampled bank rows whose nearest other row is closer than half the typical
   clean distance. Every score is divided by the `scale` fitted beside it, and near-duplicate
-  rows inflate that `scale` -- 20% twins inflated it about 2.8x on a synthetic bank -- so a
-  high value flattens every curve in the report. Above 1% the run says so on stderr.
+  rows inflate that `scale` -- 20% twins inflated it about 2.8x on a synthetic bank. Above 1%
+  the run says so on stderr, and **the commands above do print that warning for all three
+  layers**: the 25,000-vector coverage bank in this repository reads 0.023-0.034 (0.043-0.047
+  at 50,000), because the detector emits bit-identical outputs for several query slots at
+  once, so ~1.6% of bank rows are exact duplicates of another row. That is expected here, not
+  a misconfiguration. What an inflated `scale` changes is the *amplitude* of every curve --
+  the score axis is compressed -- and not the rank statistics the report leads with
+  (`median_spearman`, `mean_adjacent_monotonicity`), which a positive rescale cannot move.
 * **`scored_image_count` and `scored_severity_count`, in `summary.json`.** A policy that
   stops selecting queries under blur produces no score at those severities, and the trend
   statistics are computed over what survived. A curve truncated at severity 2 and a curve
@@ -277,6 +283,12 @@ under two minutes for the bank, the 69,000 scored rows and the report.
 `top20/mean` reached a median Spearman of -0.89 across the 250 tuning images, and the whole
 top-K, threshold and smoothed family sat between -0.6 and -0.9. Only the upper-quantile
 aggregation over all queries rose at all (`all/q90`, +0.43), and it dips before it rises.
-The measured part is the direction; the likeliest reading of it is that blur removes the
-confident detections and the queries that replace them sit *closer* to the reference bank,
-not further from it. Read `summary.json` before assuming a rising curve.
+Roughly half of that drop is not about *which* queries get selected. Freezing each image's
+severity-0 top-20 query ids and re-scoring that same frozen set at every severity still gives
+a median per-image Spearman of **-0.771** (medians +0.175, +0.142, +0.091, +0.039, -0.107,
+-0.161): the surviving queries themselves move *toward* the reference bank as the image is
+blurred, because the persistence vector shrinks toward the origin, into the dense
+low-magnitude region of a bank that is 54% background. Selection churn supplies the rest --
+median Jaccard against the severity-0 selection has already collapsed to 0.29 by severity 1 --
+taking -0.771 to -0.886. Read `summary.json` before assuming a rising curve, and note that
+`raw` is the one normalization that keeps the magnitude this trend rides on.
