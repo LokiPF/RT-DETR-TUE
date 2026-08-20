@@ -15,10 +15,14 @@ internally consistent, and describes a population nobody chose.
   Spearman over the severities they survived. Spec:159 makes full coverage a *requirement* for
   a candidate to be ranked deployable, so `rank_deployable_groups` drops it from the list
   instead of writing a flag beside it.
-* A **paired statistic computed over marginal populations** is the failure spec:157 guards
-  against: the fraction of images where persistence beats its confidence control is only
-  meaningful over images both signals scored. `paired_image_count` is published next to the
-  win rate so a reader can see the denominator.
+* A **paired statistic whose denominator is not stated** is the failure spec:157 guards
+  against, and it has two halves. The fraction of images where persistence beats its
+  confidence control is only meaningful over images both signals scored, so
+  `paired_image_count` is published next to it. And a per-image Spearman over six severities
+  takes only 35 distinct values, so exact ties are common and a rate that counts them as
+  non-wins reads as a defeat: every paired rate here is published as a win/tie/loss triple
+  over the full population *and* again over the decided images alone, because either
+  denominator on its own inverts the sentence a reader writes.
 * A **raw score magnitude leaking into a comparison** (spec:157 again). Persistence distances
   and `1 - confidence` are in unrelated units; the only fair comparison is between their
   *trends*. Every number this module publishes about a score is invariant under
@@ -101,6 +105,18 @@ RANKED_GROUPS_KEY = f"ranked_{PRIMARY_SCORE_SCOPE}_persistence"
 """The summary key holding the deployable ranking, named after the primary scope rather than
 spelling `layer_2` twice. Layer 2 is the design's primary persistence scope; layers 0 and 1 and
 `combined` are secondary diagnostics and are summarised but never ranked."""
+
+DEFINITIONAL_OVERLAP_MODES = ("frozen", "shared")
+"""The membership modes whose clean-bin overlap is 1.0 by construction at every severity.
+
+`frozen` reuses severity zero's query IDs, and `shared` is a selection no confidence ranking
+produced and that is the same query set at every severity -- so neither's overlap is a
+measurement. `clean_overlap` is still *recorded* for them rather than asserted, because
+writing the constant would make a broken freeze look healthy in the one column that exists to
+detect movement; but a reader of the ranked table needs to know which 1.000 is evidence and
+which is arithmetic. Three of the pilot's 33 ranked candidates are `shared`, and they print
+1.000 beside dynamic bins at 0.059 in the same table.
+"""
 
 FILTERED_PADDING_MODE = "filtered"
 UNFILTERED_PADDING_MODE = "unfiltered"
@@ -414,8 +430,32 @@ def _rate(left, right, images: list[int], compare) -> float | None:
     return float(np.mean([compare(left[image], right[image]) for image in images]))
 
 
-def _win_rate(left: dict[int, float], right: dict[int, float], images: list[int]) -> float | None:
-    return _rate(left, right, images, operator.gt)
+def _outcome_rates(prefix: str, left, right, images: list[int]) -> dict:
+    """Win, tie and loss over `images`, and the win rate again over the *decided* ones only.
+
+    Both denominators, always, because either one alone inverts the reading. A per-image
+    Spearman over six severities takes 35 distinct values, so exact ties are common -- 15.6
+    percent of images on the pilot's leading candidate against the all-query benchmark. The
+    rate over all paired images counts every tie as a non-win, which pushes a candidate that
+    wins 122 images and loses 88 below 0.5 and invites the sentence "it loses the per-image
+    majority", which is false. The rate over decided images alone hides how much of the
+    population the comparison could not separate at all.
+
+    So five numbers rather than one, and the three rates over `images` sum to 1.0. Nothing
+    here is a significance test: a sign test over these counts is available to a reader, but
+    it would be selection-conditioned for whichever candidate the ranking put first -- that
+    candidate was chosen best-of-33 on the same tuning data -- and publishing a bare p-value
+    next to a ranked row would invite exactly the reading spec:224-225 reserves for the
+    held-out run.
+    """
+    decided = [image for image in images if left[image] != right[image]]
+    return {
+        f"{prefix}_win_rate": _rate(left, right, images, operator.gt),
+        f"{prefix}_tie_rate": _rate(left, right, images, operator.eq),
+        f"{prefix}_loss_rate": _rate(left, right, images, operator.lt),
+        f"{prefix}_decided_image_count": len(decided),
+        f"{prefix}_decided_win_rate": _rate(left, right, decided, operator.gt),
+    }
 
 
 def _score_index(arrays) -> dict[tuple[int, int], float]:
@@ -434,23 +474,32 @@ def _same_score(left: float | None, right: float | None) -> bool:
     return left == right
 
 
-def _moved_images(left_arrays, right_arrays) -> set[int]:
-    """The images whose scene scores differ between two padding modes -- the ones the mask
-    actually reached.
+def _score_changed_images(left_arrays, right_arrays) -> set[int]:
+    """The images whose scene *score* differs between two padding modes.
 
-    Score equality, not Spearman equality, and the difference is not academic. The filtered
-    and unfiltered selections differ on every image that carries a padded tail -- 66 of the
-    pilot's 250 -- but a per-image Spearman takes only 35 distinct values over six severities,
-    so on many of those images the scores all move and the rank correlation lands on the same
-    value it had before. Reading the moved set off the Spearman counts those images as
-    untouched: on the pilot it reports 50 to 56 of 250 where the score-derived answer is 64 to
-    66, and a rate restricted to it is a tie-excluding sign test wearing the label "the images
-    the control could reach". The `all_valid` pair is the case with no room for judgement --
-    its two selections are every valid query against every query, so they differ on exactly the
-    66 images that carry a padded tail, and that is what this returns.
+    **This is a lower bound on the set of images the padding mask actually reached, and it is
+    named for what it measures rather than for what a reader would like it to mean.** The mask
+    reaches an image whenever it changes that image's *selection*, and a changed selection can
+    still produce a bit-identical scene score at every severity -- a summary is a many-to-one
+    map. The proof needs no per-image detail: on the pilot the dynamic bottom-bin pair at layer 2
+    reports 66 changed images under `mean`, 64 under `q90` and 65 under `top20_mean`, and a set
+    of "images the mask reached" cannot depend on the summary applied afterwards.
 
-    An image scored on one side and absent from the other counts as moved, and two `nan`
-    scores count as unmoved -- both severities were unscored under either rule, which is the
+    Measured against the selection-derived truth -- 66 for the dynamic bottom bin and for
+    `all_valid`, and 65 for the frozen bottom bin, whose selection genuinely coincides under both
+    padding rules on one image -- 27 of the 34 sensitivity rows recover it exactly and 7
+    understate it by one or two. The error is bounded and one-directional: this can never
+    overstate the reached set, because a changed score requires a changed selection.
+
+    The exact set would need `selected_query_ids`, the ~280 MB column `summary_frame` drops
+    before the DataFrame conversion, and buying exactness back at that price is the wrong
+    trade for a diagnostic. What this rules out is the far larger error it replaced: reading
+    the set off the per-image *Spearman*, which takes only 35 distinct values over six
+    severities and reported 50 to 56 of 250 -- a tie-excluding sign test wearing the label
+    "the images the control could reach".
+
+    An image scored on one side and absent from the other counts as changed, and two `nan`
+    scores count as unchanged -- both severities were unscored under either rule, which is the
     mask making no difference rather than making one nobody can measure.
     """
     left = _score_index(left_arrays)
@@ -541,15 +590,19 @@ def summarize_decile_rows(
       therefore a marginal statistic; `paired_image_count` sits beside it so a reader can see
       whether the two medians rest on the same images. The win fraction is the paired one.
     * `padding_sensitivity` -- the same selection with and without the padding union (spec:155),
-      including `moved_image_count` and a win rate restricted to those images, because the
-      control is a no-op on any image that had no padding to remove and the unrestricted rate
-      counts every such image as a loss.
+      including `score_changed_image_count` and the outcomes restricted to those images,
+      because the control is a no-op on any image that had no padding to remove and the
+      unrestricted rate counts every such image as a non-win. That count is a *lower bound* on
+      the images the mask reached and varies with the scene summary; `_score_changed_images`
+      says why, and why buying the exact set back is the wrong trade.
     * `benchmark_comparisons` -- every ranked candidate against the published all-300-query
       result (spec:229), paired per image. The spec asks only whether a candidate beats the
       benchmark; a difference of two medians answers that with a number whose resolution is
       1/35, because a Spearman over six severities takes 35 distinct values. The win, tie and
       loss rates say how many of the images the difference actually rests on, which is what
-      makes a margin of one such step falsifiable rather than merely reportable.
+      makes a margin of one such step falsifiable rather than merely reportable -- and
+      `candidate_image_decided_win_rate` says it again without the ties in the denominator,
+      because on the pilot the two framings put the same candidate on opposite sides of 0.5.
     * the deployable ranking under `RANKED_GROUPS_KEY` -- spec:159. Note what it cannot say:
       every candidate in it is `filtered`, so the ranking never *chooses* the padding rule
       that spec:224 asks the tuning run to select. That evidence is in `padding_sensitivity`,
@@ -644,6 +697,10 @@ def summarize_decile_rows(
                 for severity, values in group_frame.groupby("severity")["selected_count"]
             },
         }
+        # Whether that scalar is a measurement at all. See `DEFINITIONAL_OVERLAP_MODES`.
+        group["clean_overlap_is_definitional"] = (
+            group["membership_mode"] in DEFINITIONAL_OVERLAP_MODES
+        )
         group["full_coverage"] = is_full_coverage(group)
         groups.append(group)
 
@@ -679,8 +736,8 @@ def summarize_decile_rows(
             "persistence_minus_confidence_spearman": _difference(
                 group["median_spearman"], control["median_spearman"]
             ),
-            "persistence_image_win_rate": _win_rate(
-                persistence_spearman, control_spearman, paired
+            **_outcome_rates(
+                "persistence_image", persistence_spearman, control_spearman, paired
             ),
             "paired_image_count": len(paired),
             "persistence_image_count": len(persistence_spearman),
@@ -705,8 +762,10 @@ def summarize_decile_rows(
         unfiltered_spearman = spearman_by_group[key]
         filtered_spearman = spearman_by_group[filtered_key]
         paired = _paired(unfiltered_spearman, filtered_spearman)
-        moved = _moved_images(arrays_by_group[key], arrays_by_group[filtered_key])
-        moved_and_paired = [image for image in paired if image in moved]
+        score_changed = _score_changed_images(
+            arrays_by_group[key], arrays_by_group[filtered_key]
+        )
+        changed_and_paired = [image for image in paired if image in score_changed]
         sensitivity.append({
             "signal": signal,
             "membership_mode": membership,
@@ -718,24 +777,26 @@ def summarize_decile_rows(
             "unfiltered_minus_filtered_spearman": _difference(
                 group["median_spearman"], filtered["median_spearman"]
             ),
-            "unfiltered_image_win_rate": _win_rate(
-                unfiltered_spearman, filtered_spearman, paired
+            **_outcome_rates(
+                "unfiltered_image", unfiltered_spearman, filtered_spearman, paired
             ),
             "paired_image_count": len(paired),
-            # How many images the padding mask actually reached, read off the scores. Without
-            # it the median difference cannot be told apart from a null result: an image with
-            # no padded tail selects the identical queries either way, and on the pilot that is
-            # 184 images out of 250.
-            "moved_image_count": len(moved),
-            # ... and the win rate restricted to those images. The unrestricted rate counts
-            # every unreached image as a loss, so on the pilot's dynamic bottom bin it reads
-            # 0.168 over all 250 while the unfiltered run out-trends the filtered one on 42 of
-            # the 64 images the mask reached -- 0.656. Both are true; only the pair is not
+            # How many images the mask changed the *score* of -- a lower bound on the images
+            # it reached, and named for what it measures. See `_score_changed_images`. Without
+            # some such count the median difference cannot be told apart from a null result:
+            # an image with no padded tail selects the identical queries either way, and on
+            # the pilot that is 184 images out of 250.
+            "score_changed_image_count": len(score_changed),
+            # ... and the outcomes restricted to those images. The unrestricted rate counts
+            # every unchanged image as a non-win, so on the pilot's dynamic bottom bin it
+            # reads 0.168 over all 250 while the unfiltered run out-trends the filtered one on
+            # 42 of the 64 whose score it changed. Both are true; only the pair is not
             # misleading.
-            "moved_image_win_rate": _win_rate(
-                unfiltered_spearman, filtered_spearman, moved_and_paired
+            **_outcome_rates(
+                "score_changed_image", unfiltered_spearman, filtered_spearman,
+                changed_and_paired,
             ),
-            "moved_and_paired_image_count": len(moved_and_paired),
+            "score_changed_and_paired_image_count": len(changed_and_paired),
         })
     sensitivity.sort(key=lambda entry: (
         entry["signal"], entry["membership_mode"], entry["confidence_bin"],
@@ -763,14 +824,8 @@ def summarize_decile_rows(
                 "candidate_minus_benchmark_spearman": _difference(
                     candidate["median_spearman"], benchmark["median_spearman"]
                 ),
-                "candidate_image_win_rate": _rate(
-                    candidate_spearman, benchmark_spearman, paired, operator.gt
-                ),
-                "candidate_image_tie_rate": _rate(
-                    candidate_spearman, benchmark_spearman, paired, operator.eq
-                ),
-                "candidate_image_loss_rate": _rate(
-                    candidate_spearman, benchmark_spearman, paired, operator.lt
+                **_outcome_rates(
+                    "candidate_image", candidate_spearman, benchmark_spearman, paired
                 ),
                 "paired_image_count": len(paired),
             })

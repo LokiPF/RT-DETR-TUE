@@ -775,9 +775,9 @@ def test_padding_sensitivity_pairs_the_same_selection_with_and_without_the_mask(
     assert sensitivity[0]["unfiltered_minus_filtered_spearman"] == pytest.approx(
         sensitivity[0]["unfiltered_median_spearman"] - sensitivity[0]["filtered_median_spearman"]
     )
-    assert sensitivity[0]["moved_image_count"] == 1
+    assert sensitivity[0]["score_changed_image_count"] == 1
     assert sensitivity[0]["unfiltered_image_win_rate"] == 0.0
-    assert sensitivity[0]["moved_image_win_rate"] == 0.0
+    assert sensitivity[0]["score_changed_image_win_rate"] == 0.0
 
 
 def test_the_moved_set_comes_from_the_scores_and_not_from_the_per_image_spearman():
@@ -808,13 +808,13 @@ def test_the_moved_set_comes_from_the_scores_and_not_from_the_per_image_spearman
     sensitivity = summarize_decile_rows(rows, {})["padding_sensitivity"][0]
     assert sensitivity["paired_image_count"] == 3
     # Two images were reached; only one of them changed its Spearman.
-    assert sensitivity["moved_image_count"] == 2
-    assert sensitivity["moved_and_paired_image_count"] == 2
+    assert sensitivity["score_changed_image_count"] == 2
+    assert sensitivity["score_changed_and_paired_image_count"] == 2
     # Image 3 is untouched and is counted as a loss by the unrestricted rate.
     assert sensitivity["unfiltered_image_win_rate"] == pytest.approx(1 / 3)
     # Restricted to the two the mask reached -- not to the one whose Spearman moved, which
     # would read 1.0.
-    assert sensitivity["moved_image_win_rate"] == 0.5
+    assert sensitivity["score_changed_image_win_rate"] == 0.5
 
 
 def test_a_severity_the_mask_removed_entirely_counts_as_a_move():
@@ -830,7 +830,7 @@ def test_a_severity_the_mask_removed_entirely_counts_as_a_move():
                 padding_mode="unfiltered",
             ))
     sensitivity = summarize_decile_rows(rows, {})["padding_sensitivity"][0]
-    assert sensitivity["moved_image_count"] == 1
+    assert sensitivity["score_changed_image_count"] == 1
 
 
 def test_the_padding_win_rate_is_reported_both_over_all_images_and_over_the_moved_ones():
@@ -855,10 +855,10 @@ def test_the_padding_win_rate_is_reported_both_over_all_images_and_over_the_move
     summary = summarize_decile_rows(rows, {})
     sensitivity = summary["padding_sensitivity"][0]
     assert sensitivity["paired_image_count"] == 2
-    assert sensitivity["moved_image_count"] == 1
+    assert sensitivity["score_changed_image_count"] == 1
     # Image 1 is untouched by the mask and is counted as a loss by the unrestricted rate.
     assert sensitivity["unfiltered_image_win_rate"] == 0.5
-    assert sensitivity["moved_image_win_rate"] == 1.0
+    assert sensitivity["score_changed_image_win_rate"] == 1.0
 
 
 def test_a_padding_control_that_reached_no_image_reports_no_restricted_rate():
@@ -869,10 +869,10 @@ def test_a_padding_control_that_reached_no_image_reports_no_restricted_rate():
             1, severity, "persistence", PRIMARY_SCORE_SCOPE, severity, padding_mode="unfiltered",
         ))
     sensitivity = summarize_decile_rows(rows, {})["padding_sensitivity"][0]
-    assert sensitivity["moved_image_count"] == 0
+    assert sensitivity["score_changed_image_count"] == 0
     # Nothing to take a rate over: reported as missing rather than as a zero a reader would
     # take for a measured failure.
-    assert sensitivity["moved_image_win_rate"] is None
+    assert sensitivity["score_changed_image_win_rate"] is None
     assert sensitivity["unfiltered_image_win_rate"] == 0.0
 
 
@@ -887,7 +887,7 @@ def test_two_unscored_severities_are_not_a_move():
             1, severity, "persistence", PRIMARY_SCORE_SCOPE, score, padding_mode="unfiltered",
         ))
     sensitivity = summarize_decile_rows(rows, {})["padding_sensitivity"][0]
-    assert sensitivity["moved_image_count"] == 0
+    assert sensitivity["score_changed_image_count"] == 0
 
 
 def test_padding_counts_are_rolled_up_from_the_producers_diagnostics():
@@ -1005,6 +1005,128 @@ def test_the_benchmark_is_never_itself_a_ranked_candidate():
     assert ALL_QUERY_BENCHMARK[2] not in {
         entry["padding_mode"] for entry in summary[RANKED_GROUPS_KEY]
     }
+
+
+def test_a_paired_rate_states_both_denominators_because_ties_invert_it():
+    """A rate that counts ties as non-wins is not the sign test a reader thinks it is.
+
+    Five images: the candidate wins two, ties two, loses one. Over all five that is 0.400,
+    which reads as "it loses the per-image majority"; over the three the comparison actually
+    decided it is 0.667, which is a clear win. The medians are identical, so the primary metric
+    calls it a dead heat and neither rate alone tells the reader what happened. This is the real
+    pilot's `decile_50_60 q90` in miniature.
+    """
+    rising = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+    falling = (5.0, 4.0, 3.0, 2.0, 1.0, 0.0)
+    rows = (
+        candidate_rows({1: rising, 2: rising, 3: rising, 4: rising, 5: falling})
+        + benchmark_rows({1: falling, 2: falling, 3: rising, 4: rising, 5: rising})
+    )
+    comparison = summarize_decile_rows(rows, {})["benchmark_comparisons"][0]
+    assert comparison["candidate_minus_benchmark_spearman"] == 0.0
+    assert comparison["paired_image_count"] == 5
+    assert comparison["candidate_image_win_rate"] == pytest.approx(0.4)
+    assert comparison["candidate_image_tie_rate"] == pytest.approx(0.4)
+    assert comparison["candidate_image_loss_rate"] == pytest.approx(0.2)
+    assert comparison["candidate_image_decided_image_count"] == 3
+    assert comparison["candidate_image_decided_win_rate"] == pytest.approx(2 / 3)
+
+
+@pytest.mark.parametrize("family", ["comparisons", "padding_sensitivity", "benchmark_comparisons"])
+def test_every_paired_rate_publishes_its_decided_denominator(family):
+    """One helper serves all three comparison families, so none of them can lose the second
+    denominator on its own."""
+    rising = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+    # `synthetic_rows()` already supplies the persistence/confidence pair *and* a group the
+    # ranking admits; the benchmark and the unfiltered twin complete the other two families.
+    rows = synthetic_rows() + benchmark_rows({1: rising, 2: rising})
+    for image_id in (1, 2):
+        for severity in range(6):
+            rows.append(row(
+                image_id, severity, "persistence", PRIMARY_SCORE_SCOPE, float(severity),
+                padding_mode="unfiltered",
+            ))
+    summary = summarize_decile_rows(rows, {})
+    prefixes = {
+        "comparisons": "persistence_image",
+        "padding_sensitivity": "unfiltered_image",
+        "benchmark_comparisons": "candidate_image",
+    }
+    prefix = prefixes[family]
+    assert summary[family]
+    for entry in summary[family]:
+        assert f"{prefix}_win_rate" in entry
+        assert f"{prefix}_tie_rate" in entry
+        assert f"{prefix}_loss_rate" in entry
+        assert f"{prefix}_decided_image_count" in entry
+        assert f"{prefix}_decided_win_rate" in entry
+        rates = [entry[f"{prefix}_{name}_rate"] for name in ("win", "tie", "loss")]
+        if all(rate is not None for rate in rates):
+            assert sum(rates) == pytest.approx(1.0)
+
+
+def test_the_score_changed_count_depends_on_the_summary_and_so_is_not_the_reached_set():
+    """The honest limit of `score_changed_image_count`, pinned rather than described.
+
+    One selection pair, two scene summaries. Under `mean` the mask changed image 1's score;
+    under `q90` the same changed selection produced the identical score at every severity,
+    because a summary is a many-to-one map. A set of "images the mask reached" cannot depend on
+    which summary was applied afterwards, so this statistic is a lower bound on that set -- 27
+    of the pilot's 34 sensitivity pairs recover the selection-derived count and 7 understate it.
+    """
+    rows = []
+    for severity in range(6):
+        for aggregation, unfiltered in (("mean", 2.0 * severity), ("q90", float(severity))):
+            rows.append(row(
+                1, severity, "persistence", PRIMARY_SCORE_SCOPE, float(severity),
+                aggregation=aggregation,
+            ))
+            rows.append(row(
+                1, severity, "persistence", PRIMARY_SCORE_SCOPE, unfiltered,
+                aggregation=aggregation, padding_mode="unfiltered",
+            ))
+    counts = {
+        entry["aggregation"]: entry["score_changed_image_count"]
+        for entry in summarize_decile_rows(rows, {})["padding_sensitivity"]
+    }
+    assert counts == {"mean": 1, "q90": 0}
+
+
+# --- spec:97, which 1.000 is a measurement --------------------------------------------------
+
+
+def test_the_clean_overlap_scalar_is_marked_definitional_for_frozen_and_shared():
+    """`clean_overlap` is 1.0 by construction for `frozen` and `shared`, and three of the pilot's
+    33 ranked candidates are `shared` -- so an unflagged 1.000 sits beside dynamic bins at 0.059
+    in the table Task 7 renders, reading as the most stable membership in the experiment."""
+    rows = []
+    for severity in range(6):
+        rows.append(row(
+            1, severity, "persistence", PRIMARY_SCORE_SCOPE, float(severity),
+            clean_overlap=1.0 if severity == 0 else 0.06,
+        ))
+        rows.append(row(
+            1, severity, "persistence", PRIMARY_SCORE_SCOPE, float(severity),
+            membership_mode="frozen", clean_overlap=1.0,
+        ))
+        rows.append(row(
+            1, severity, "persistence", PRIMARY_SCORE_SCOPE, float(severity),
+            membership_mode="shared", confidence_bin="all_valid", clean_overlap=1.0,
+        ))
+    summary = summarize_decile_rows(rows, {})
+    flags = {
+        entry["membership_mode"]: entry["clean_overlap_is_definitional"]
+        for entry in summary["groups"]
+    }
+    assert flags == {"dynamic": False, "frozen": True, "shared": True}
+    scalars = {
+        entry["membership_mode"]: entry["mean_clean_overlap_from_severity_1"]
+        for entry in summary["groups"]
+    }
+    assert scalars["dynamic"] == pytest.approx(0.06)
+    assert scalars["shared"] == 1.0
+    # The flag has to survive into the ranked table, which is where the two print side by side.
+    assert all("clean_overlap_is_definitional" in entry for entry in summary[RANKED_GROUPS_KEY])
 
 
 # --- JSON safety --------------------------------------------------------------------------------
