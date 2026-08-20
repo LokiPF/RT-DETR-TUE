@@ -311,7 +311,7 @@ def test_the_record_entry_point_delegates_to_the_id_primitive(monkeypatch):
 
 def confidence_record(confidence, image_id=None, **extra):
     """A slim severity record of the shape the analysis loader keeps: confidence, no fingerprints."""
-    item = {"confidence": torch.as_tensor(confidence, dtype=torch.float32), **extra}
+    item = {"query_confidence": torch.as_tensor(confidence, dtype=torch.float32), **extra}
     if image_id is not None:
         item["image_id"] = image_id
     return item
@@ -349,8 +349,8 @@ def test_non_divisible_count_differs_by_at_most_one():
 
 def test_frozen_ids_stay_clean_while_dynamic_ids_move():
     records = {
-        0: {"confidence": torch.arange(20, dtype=torch.float32)},
-        1: {"confidence": torch.arange(19, -1, -1, dtype=torch.float32)},
+        0: {"query_confidence": torch.arange(20, dtype=torch.float32)},
+        1: {"query_confidence": torch.arange(19, -1, -1, dtype=torch.float32)},
     }
     result = memberships_by_severity(records, torch.empty(0, dtype=torch.long))
     assert result[1]["frozen"]["decile_00_10"].tolist() == [0, 1]
@@ -623,5 +623,29 @@ def test_union_query_ids_refuses_a_uint8_selection_mask():
 
 
 def test_a_record_with_neither_logits_nor_confidence_is_rejected():
-    with pytest.raises(ValueError, match="logits or a confidence vector"):
+    with pytest.raises(ValueError, match="logits or a query_confidence vector"):
         memberships_by_severity({0: {"image_id": 3}}, NO_PADDING)
+
+
+def test_a_record_offering_only_the_caches_stale_confidence_field_is_refused():
+    """The key name is the guard: `confidence` is the pre-float16 field, never a bin input."""
+    records = {0: {"confidence": torch.arange(20, dtype=torch.float32)}}
+    with pytest.raises(ValueError, match="stale `confidence` field"):
+        memberships_by_severity(records, NO_PADDING)
+
+
+def test_logits_still_win_over_a_query_confidence_vector_that_disagrees():
+    rising = torch.linspace(-4.0, 4.0, 20).reshape(-1, 1)
+    records = {0: {"logits": rising, "query_confidence": rising.flip(0).reshape(-1).sigmoid()}}
+    result = memberships_by_severity(records, NO_PADDING)
+    assert result[0]["dynamic"]["decile_00_10"].tolist() == [0, 1]
+
+
+def test_a_non_divisible_split_puts_the_remainder_in_the_lowest_bins():
+    """The spread tests cannot see which end the extra queries go to; this pins it."""
+    bins = confidence_deciles(torch.arange(23, dtype=torch.float32), torch.arange(23))
+    assert [len(values) for values in bins.values()] == [3, 3, 3, 2, 2, 2, 2, 2, 2, 2]
+    assert bins["decile_00_10"].tolist() == [0, 1, 2]
+    assert bins["decile_20_30"].tolist() == [6, 7, 8]
+    assert bins["decile_30_40"].tolist() == [9, 10]
+    assert bins["decile_90_100"].tolist() == [21, 22]

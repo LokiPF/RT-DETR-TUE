@@ -282,22 +282,37 @@ def bin_overlap(bins: dict[str, Tensor], reference: dict[str, Tensor]) -> dict[s
 
 
 def _severity_confidence(record: dict) -> Tensor:
-    """The confidence vector of one severity record, from its logits whenever it still has them.
+    """The confidence vector of one severity record, from its logits or from `query_confidence`.
 
-    Records reach this function in two shapes. A raw cache record carries `logits` *and* a
-    stored `confidence` that disagrees with them; logits win, always, for the reason
-    `confidence_from_logits` documents. A record that has already been streamed down to
-    metadata carries only `confidence`, which the loader is required to have produced with
-    `confidence_from_logits` -- the design asks it to retain the confidence vector and discard
-    the fingerprints, so the logits are genuinely gone by then and there is nothing left to
-    recompute from. Preferring logits means the trap can only be sprung by a caller that
-    deletes the logits and keeps the stale field, which no loader in this package does.
+    Records reach this function in two shapes. A raw cache record carries `logits`, and those
+    win outright, for the reason `confidence_from_logits` documents. A record that has already
+    been streamed down to metadata has no logits left -- the design asks the loader to keep the
+    confidence vector and discard the fingerprints -- so it must carry the derived vector under
+    the key `query_confidence`.
+
+    The key name is the enforcement, not a convention. The cache also stores a field called
+    `confidence`, reduced from the full-precision logits before the float16 cast, and it is
+    close enough to the right answer to look authoritative while being wrong enough to move
+    decile membership on a third of the tuning records. A rule saying "do not read that field"
+    protects only the call sites that remember the rule; naming the derived vector something
+    the cache does not own means a caller who reaches for the stale field gets a `KeyError`
+    where it is read directly, and the named error below where it is read through here.
+
+    So a record holding only `confidence` is refused rather than used. That is not a
+    conservative default -- it is the whole point: the stale field must never silently become
+    a bin edge.
     """
     if "logits" in record:
         return confidence_from_logits(record["logits"])
-    if "confidence" not in record:
-        raise ValueError("a severity record must carry logits or a confidence vector")
-    return record["confidence"].float().cpu()
+    if "query_confidence" in record:
+        return record["query_confidence"].float().cpu()
+    if "confidence" in record:
+        raise ValueError(
+            "record carries the cache's stale `confidence` field, which was reduced from the "
+            "full-precision logits before they were cast to float16 and must not build a bin; "
+            "derive the vector with confidence_from_logits and pass it as `query_confidence`"
+        )
+    raise ValueError("a severity record must carry logits or a query_confidence vector")
 
 
 def _record_label(record: dict, severity: int) -> str:
@@ -328,6 +343,10 @@ def memberships_by_severity(records_by_severity: dict[int, dict], padded: Tensor
     `all_valid` is that same union-masked set, and it is the direct comparison with the
     existing all-query method -- every non-padded query, not all 300 and not a re-derivation
     from the ten bins.
+
+    Each record supplies its confidence as `logits`, or as a `query_confidence` vector already
+    derived with `confidence_from_logits`. The cache's own `confidence` field is refused; see
+    `_severity_confidence` for why the key name is doing the enforcing.
 
     Severity zero must be present, since there is nothing to freeze without it, and every
     severity must report the same query count, since one valid mask is applied to all of them.
