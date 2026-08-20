@@ -1,10 +1,12 @@
 import pytest
 import torch
 
+from src.scene_uncertainty import confidence_deciles
 from src.scene_uncertainty.confidence_deciles import (
     DECILE_NAMES,
     detect_padded_tail,
     union_padded_query_ids,
+    union_query_ids,
 )
 
 
@@ -248,3 +250,56 @@ def test_decile_names_are_the_ten_bins_the_spec_names():
         "decile_80_90",
         "decile_90_100",
     )
+
+
+def test_union_query_ids_merges_masks_that_are_not_nested():
+    """The wandering case: a later severity pads a region an earlier one did not."""
+    wide = torch.arange(141, 300)
+    disjoint = torch.arange(0, 8)
+    overlapping = torch.arange(100, 179)
+    expected = list(range(0, 8)) + list(range(100, 300))
+    assert union_query_ids([wide, disjoint, overlapping]).tolist() == expected
+    assert union_query_ids([overlapping, wide, disjoint]).tolist() == expected
+
+
+def test_union_query_ids_sorts_and_deduplicates():
+    assert union_query_ids([
+        torch.tensor([7, 2, 2]), torch.tensor([2, 5]), torch.tensor([7]),
+    ]).tolist() == [2, 5, 7]
+
+
+def test_union_query_ids_of_one_mask_returns_that_mask_as_an_index_tensor():
+    only = union_query_ids([torch.tensor([9, 4], dtype=torch.int32)])
+    assert only.tolist() == [4, 9]
+    assert only.dtype == torch.long
+
+
+def test_union_query_ids_of_masks_that_are_all_empty_is_empty():
+    nothing = union_query_ids([torch.empty(0, dtype=torch.long)] * 6 + [[]])
+    assert nothing.numel() == 0
+    assert nothing.dtype == torch.long
+
+
+def test_union_query_ids_refuses_no_masks_at_all():
+    with pytest.raises(ValueError, match="zero masks"):
+        union_query_ids([])
+
+
+def test_union_query_ids_refuses_a_boolean_selection_mask():
+    with pytest.raises(ValueError, match="integer query IDs"):
+        union_query_ids([torch.tensor([False, True, True])])
+
+
+def test_the_record_entry_point_delegates_to_the_id_primitive(monkeypatch):
+    seen = []
+
+    def spy(id_tensors):
+        seen.append([mask.tolist() for mask in id_tensors])
+        return torch.tensor([7], dtype=torch.long)
+
+    monkeypatch.setattr(confidence_deciles, "union_query_ids", spy)
+    result = union_padded_query_ids([
+        padded_record(10, 2, severity=0), padded_record(10, 5, severity=1)
+    ])
+    assert result.tolist() == [7]
+    assert seen == [[[8, 9], [5, 6, 7, 8, 9]]]

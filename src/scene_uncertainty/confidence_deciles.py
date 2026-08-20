@@ -78,6 +78,46 @@ def detect_padded_tail(record: dict) -> Tensor:
     return torch.arange(start, query_count, dtype=torch.long)
 
 
+def union_query_ids(id_tensors: Iterable[Tensor]) -> Tensor:
+    """Merge query-ID masks into one sorted, de-duplicated index tensor.
+
+    This is the rule the design states -- "take the union of padded query IDs detected across
+    its six severities" -- expressed over the IDs themselves, so the one caller that streams
+    the feature cache and keeps only the detected masks can apply it without holding six
+    severities of fingerprints in memory. `union_padded_query_ids` is the same rule reached
+    from whole records.
+
+    Unioning IDs is not the same as taking the longest mask, and the pilot is the reason to
+    care. Padded tails happen to be nested suffixes there, so the two agree today; but the
+    tail *wanders* with severity rather than growing -- one image runs 159, 165, 170, 63, 8,
+    79 padded queries across severities 0 to 5 -- and the moment any producer emits a mask
+    that is not a suffix, a longest-mask shortcut starts dropping IDs that a shorter mask was
+    the only one to see. Union is the rule; nesting is a coincidence of the current detector.
+
+    Three edge cases, each chosen rather than inherited:
+
+    Zero masks raises. An image whose records went missing must not read as an image with
+    nothing padded, since that difference is the whole valid-query mask and a silent empty
+    would quietly restore every placeholder query to the lowest confidence bin.
+
+    Masks that are *all* empty return empty, which is the ordinary case rather than an error:
+    184 of the pilot's 250 tuning images have no padding at any severity.
+
+    Boolean input raises. A `(query,)` selection mask of `True`/`False` casts to a tensor of
+    zeros and ones, which is a perfectly valid-looking pair of query IDs and completely wrong.
+    Empty masks skip that check, because they carry no ID to misread and because the plainest
+    way to say "nothing padded here" -- a bare `[]` -- is float64 before it is anything else.
+    """
+    masks = [torch.as_tensor(ids).reshape(-1) for ids in id_tensors]
+    if not masks:
+        raise ValueError("cannot build a query-ID union from zero masks")
+    for mask in masks:
+        misreadable = mask.dtype is torch.bool or mask.is_floating_point() or mask.is_complex()
+        if mask.numel() and misreadable:
+            raise ValueError(f"masks must hold integer query IDs, got dtype {mask.dtype}")
+    return torch.cat([mask.long().cpu() for mask in masks]).unique()
+
+
 def union_padded_query_ids(records: Iterable[dict]) -> Tensor:
     """One padding mask for an image, unioned over the severities it was cached at.
 
@@ -92,9 +132,10 @@ def union_padded_query_ids(records: Iterable[dict]) -> Tensor:
     first fixes the mask once per image, so severity moves the features and never the
     population.
 
-    The union is over query IDs rather than tail lengths. For suffixes of a fixed-length
-    sequence the two happen to agree, but nothing here guarantees the inputs stay suffixes,
-    and a mask of IDs is what the caller needs anyway.
+    This is the entry point for a caller that still holds whole records. `union_query_ids`
+    carries the actual rule and is the one to call once the fingerprints have been streamed
+    away and only the detected masks remain; both go through the same implementation so the
+    union cannot drift between the two call sites.
 
     Severity is not read. This unions whatever records it is handed and does not check that
     they are the six expected blur levels, or that a severity appears once; establishing that
@@ -110,5 +151,4 @@ def union_padded_query_ids(records: Iterable[dict]) -> Tensor:
     counts = {int(record["logits"].shape[0]) for record in records}
     if len(counts) != 1:
         raise ValueError(f"query-count mismatch across severities: {sorted(counts)}")
-    padded = sorted({int(index) for record in records for index in detect_padded_tail(record)})
-    return torch.tensor(padded, dtype=torch.long)
+    return union_query_ids([detect_padded_tail(record) for record in records])
