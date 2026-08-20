@@ -2301,8 +2301,25 @@ def _longest_equal_run(values: list) -> tuple[int, int, int]:
     return best
 
 
+
+
+def _top_indices(rates: list[float]) -> list[int]:
+    """Every index holding the column's highest rate, not only the first run of them.
+
+    A column can reach its maximum twice with a dip between -- `[0.20, 0.60, 0.30, 0.60, 0.20]`
+    -- and asking `_peak_span` whether the selected bin is at the top then answers a different
+    question than the one the sentence is about. Generated from that column with the winner in
+    the *second* run: "its highest rate is 0.600 at `decile_10_20`. The highest bin is not the
+    selected bin `decile_30_40`, which sits at 0.600." Told it is not the highest, one sentence
+    after 0.600 is named as the highest rate. Membership at the top is a question about
+    *values*; an index range answers it only when there is one run.
+    """
+    top = max(rates)
+    return [index for index, rate in enumerate(rates) if rate == top]
+
+
 def _peak_span(rates: list[float]) -> tuple[int, int]:
-    """`(first, last)` of the contiguous run of bins holding the column's highest rate.
+    """`(first, last)` of the *first contiguous run* at the column's highest rate.
 
     Not `max(range(len(rates)), key=rates.__getitem__)`, which returns index zero on a column
     with no variation at all and the first index of any plateau. Every claim the note builds on
@@ -2310,11 +2327,14 @@ def _peak_span(rates: list[float]) -> tuple[int, int]:
     about a bin that is not distinguishable from the bin beside it. The maximal run is what the
     words need: whatever sits either side of it is strictly lower by construction, and on a flat
     or monotone column there may be nothing either side of it at all.
+
+    This is what single-peakedness is decided from and what the neighbours are read from, and on
+    a `peaked` column it is the whole of `_top_indices`. It is deliberately *not* what the prose
+    asks whether the selected bin is at the top -- see `_top_indices`.
     """
-    top = max(rates)
-    first = rates.index(top)
-    last = first
-    while last + 1 < len(rates) and rates[last + 1] == top:
+    indices = _top_indices(rates)
+    first = last = indices[0]
+    while last + 1 in indices:
         last += 1
     return first, last
 
@@ -2334,6 +2354,11 @@ def _column_shape(rates: list[float]) -> str:
     Note what the four exclusive cases guarantee for the fifth: a `peaked` column both rises and
     falls, so its maximal run starts after the first bin and ends before the last, and the two
     bins either side of it exist and are strictly lower.
+
+    Both comparisons either side of the peak are **non-strict**, and they have to be: an equal
+    pair on a *flank* -- `[0.20, 0.30, 0.30, 0.45, 0.60, ...]` -- is a unimodal column, and
+    making them strict calls it `multi_peaked`. The plateau in `[0.2, 0.6, 0.6, 0.3]` is *at*
+    the peak, which these comparisons skip, so it is not a fixture that can tell the two apart.
     """
     rises = any(rates[index] < rates[index + 1] for index in range(len(rates) - 1))
     falls = any(rates[index] > rates[index + 1] for index in range(len(rates) - 1))
@@ -2351,9 +2376,100 @@ def _column_shape(rates: list[float]) -> str:
     return "peaked" if single_peaked else "multi_peaked"
 
 
+def _selection_key(group: dict) -> tuple:
+    """The identity of one selection across its scene summaries -- see `SELECTION_KEYS`."""
+    return tuple(group[key] for key in SELECTION_KEYS)
+
+
 def _selection_count(groups: list[dict]) -> int:
     """How many distinct *selections* a list of ranked rows holds -- see `SELECTION_KEYS`."""
-    return len({tuple(group[key] for key in SELECTION_KEYS) for group in groups})
+    return len({_selection_key(group) for group in groups})
+
+
+def _winner_standing(ranked: list[dict], winner: dict) -> dict[str, str]:
+    """Where the winning *selection* stands at each scene summary: alone, tied, behind, absent.
+
+    The ranking is one ordered list over every (selection, summary) row, so "it came first" is a
+    statement about one row. Whether the same selection also leads at the *other* summaries is a
+    different fact, it is already in the same list, and on this run it is the fact that most
+    cuts against the near-equals reading printed beside it: the leading bin is alone at the top
+    at two summaries and tied for it at the third, and is never beaten anywhere. Leaving that
+    out while publishing the near-equals count is selective quotation in favour of an argument
+    already written down, so it is derived here and published there.
+
+    `absent` is its own outcome and not a silent skip: a selection scored at two summaries and
+    not the third has no standing at the third, and saying nothing would read as a clean sweep.
+    """
+    key = _selection_key(winner)
+    standing = {}
+    for aggregation in sorted({group["aggregation"] for group in ranked}):
+        scored = [
+            group for group in ranked
+            if group["aggregation"] == aggregation and group["median_spearman"] is not None
+        ]
+        mine = [float(group["median_spearman"]) for group in scored
+                if _selection_key(group) == key]
+        theirs = [float(group["median_spearman"]) for group in scored
+                  if _selection_key(group) != key]
+        if not mine:
+            standing[aggregation] = "absent"
+        elif not theirs or max(mine) > max(theirs):
+            standing[aggregation] = "alone"
+        elif max(mine) == max(theirs):
+            standing[aggregation] = "tied"
+        else:
+            standing[aggregation] = "behind"
+    return standing
+
+
+def _and_list(items: list[str]) -> str:
+    """`a`, `b` and `c` -- one place, so the note's several lists cannot punctuate differently."""
+    if len(items) <= 2:
+        return " and ".join(items)
+    return ", ".join(items[:-1]) + f" and {items[-1]}"
+
+
+def _bin_span(profile: list[tuple], indices: list[int]) -> str:
+    """Name the bins at `indices`: one, a contiguous run as `a` through `b`, or a list."""
+    names = [f"`{profile[index][0]}`" for index in indices]
+    if len(names) == 1:
+        return names[0]
+    if indices[-1] - indices[0] + 1 == len(indices):
+        return f"{names[0]} through {names[-1]}"
+    return _and_list(names)
+
+
+def _standing_sentence(standing: dict[str, str]) -> str:
+    """The standing as one sentence, with its lead-in earned and its pronouns supported.
+
+    Two ways this can overstate, both reachable from real rankings. "Never behind at any scene
+    summary" is a claim, not a connective: it is false the moment any summary is behind or
+    unscored, and it flatters when there is only one summary to sweep. And "ties for **it**"
+    needs the clause naming the top median to have been printed first, which it has not been
+    when the selection ties everywhere and leads nowhere.
+    """
+    clauses = []
+    for kind, first_phrase, later_phrase in (
+        ("alone", "holds the top median alone at", "holds the top median alone at"),
+        ("tied", "ties for the top median at", "ties for it at"),
+        ("behind", "is behind the top median at", "is behind at"),
+        ("absent", "was not scored at", "was not scored at"),
+    ):
+        named = [f"`{name}`" for name, value in sorted(standing.items()) if value == kind]
+        if named:
+            phrase = first_phrase if not clauses else later_phrase
+            clauses.append(f"{phrase} {_and_list(named)}")
+    if not clauses:
+        return ""
+    clean = not any(value in ("behind", "absent") for value in standing.values())
+    if len(standing) == 1:
+        lead = "At the ranking's one scene summary the same selection "
+    elif clean:
+        lead = "Set against that, the same selection is never behind at any scene summary: it "
+    else:
+        lead = "Across the scene summaries the same selection "
+    body = clauses[0] if len(clauses) == 1 else ", ".join(clauses[:-1]) + f", and {clauses[-1]}"
+    return lead + body + "."
 
 
 def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
@@ -2363,7 +2479,7 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
     it leaves a reader to derive it unaided with no caution attached. So it is stated -- and
     stated the way the numbers support, which is not the way it first looks.
 
-    Five things this is careful about, each because a shorter version of it was wrong:
+    Six things this is careful about, each because a shorter version of it was wrong:
 
     * **"the only bin" is the wrong shape.** On this run the decided rate is a single-peaked
       curve in confidence and the peak's neighbours straddle even. A plateau reads very
@@ -2371,7 +2487,9 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
     * **but "one peak" is only one of five shapes.** Flat, monotone rising, monotone falling and
       twice-rising columns have no peak in them, and each was printed as one. `_column_shape`
       decides which of the five this is and there is a sentence for each; the neighbours are
-      named only where there are two of them and they are strictly below.
+      named only where there are two of them and they are strictly below. Which bins are *at*
+      the maximum is asked of `_top_indices` and not of an index range, because a column can
+      reach its maximum twice.
     * **the denominator changes the strength.** Far more rows clear even on the decided
       denominator than over every paired image. Both counts are published, because quoting the
       decided one alone overstates and quoting the all-paired one alone understates.
@@ -2385,10 +2503,17 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
     * **a ranked row is not a selection, and a frozen median is not a dynamic one.** The ranking
       holds every candidate once per scene summary, so a count of rows triples every selection
       in it -- which is exactly what the table's own caption forbids reading as three
-      measurements. Both counts are published with the distinction named. And the paragraph
-      states the frozen plateau as its own fact: it computes no distance from a frozen median to
-      a dynamic one, because they are two different columns and "how close are the runners-up"
-      is answered by the within-step count on the dynamic column alone.
+      measurements. Both counts are published with the distinction named, on every parenthetical
+      rather than the first. And the frozen paragraph states the plateau as its own fact: it
+      computes no distance from a frozen median to a dynamic one, because they are two different
+      columns and "how close are the runners-up" is answered on the dynamic column alone.
+    * **the near-equals reading is not the whole of what the ranking says.** The margin over the
+      best rival really is one `1/35` step, the smallest difference this statistic can express.
+      The same selection is also never beaten at any scene summary, and that is in the same
+      ranked list. Publishing the first without the second is selective quotation, so
+      `_winner_standing` derives the second and it is printed beside the first. Neither is
+      allowed to imply the other away: the ranking is determined, not discretionary, so the note
+      states the margin rather than calling the field interchangeable.
 
     Everything is computed from `membership_comparisons` and the ranking, so it describes
     whatever run it is handed rather than this one.
@@ -2411,9 +2536,9 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
 
     shape = _column_shape(rates)
     first, last = _peak_span(rates)
+    tops = _top_indices(rates)
     bins_word = "bin" if len(profile) == 1 else "bins"
-    span = (f"`{profile[first][0]}`" if first == last
-            else f"`{profile[first][0]}` through `{profile[last][0]}`")
+    span = _bin_span(profile, tops)
     opening = {
         "flat": (
             f"the decided rate is the same {_plain(rates[0])} in all {len(profile)} "
@@ -2452,10 +2577,10 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
             f"`{winner['membership_mode']}`, is not one of these bins and has no frozen twin "
             "scored at this summary, so this column says nothing about it."
         )
-    elif first <= winner_index <= last:
+    elif winner_index in tops:
         selection = (
             f"The {top_noun} is the bin the ranking selected."
-            if first == last else
+            if len(tops) == 1 else
             f"The highest rate {_plain(rates[first])} is shared by {span}, the selected bin "
             f"`{winner_bin}` among them."
         )
@@ -2463,13 +2588,14 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
         selection = (
             f"The {top_noun} is not the selected bin `{winner_bin}`, which sits at "
             f"{_plain(rates[winner_index])}."
-            if first == last else
+            if len(tops) == 1 else
             f"The highest rate {_plain(rates[first])} is shared by {span}, and the selected "
             f"bin `{winner_bin}` is not among them: it sits at {_plain(rates[winner_index])}."
         )
 
     neighbourhood = ""
-    if shape == "peaked" and winner_index is not None and first <= winner_index <= last:
+    if shape == "peaked" and winner_index is not None and winner_index in tops:
+        # `peaked` guarantees one run, away from both ends, with lower bins either side of it.
         below, above = rates[first - 1], rates[last + 1]
         neighbourhood = (
             f" Its neighbours -- `{profile[first - 1][0]}` at {_plain(below)} and "
@@ -2510,15 +2636,7 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
 
     frozen = [entry["frozen_median_spearman"] for _, entry in profile]
     length, start, stop = _longest_equal_run(frozen)
-    step = 1 / SPEARMAN_STEP_DENOMINATOR
-    top = winner["median_spearman"]
-    within_step = [
-        group for group in ranked
-        if group["median_spearman"] is not None and top is not None
-        and top - float(group["median_spearman"]) <= step + 1e-9
-    ]
-    sharing = [group for group in ranked if group["median_spearman"] == top]
-    if length >= 3 and top is not None:
+    if length >= 3:
         reach = (
             "a run that spans the whole confidence range, so the frozen column separates no "
             "bin from any other"
@@ -2533,29 +2651,63 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
             f"almost any kind scores about {_signed(frozen[start])} here once the membership "
             "is held still"
         )
-        near, selections = _selection_count(within_step), _selection_count(ranked)
-        # The winner's own selection is always in `sharing`, because `top` is its median.
-        matched = _selection_count(sharing) - 1
         note.extend([
-            "**What the frozen column and the ranked field say about the selection.** The "
+            "**What the frozen column says about the field the ranking chose from.** The "
             f"frozen medians are identical at {_signed(frozen[start])} across {length} "
             f"neighbouring bins, `{profile[start][0]}` through `{profile[stop][0]}` -- "
-            f"{reach}. On the dynamic column the ranking is choosing among near-equals: "
-            f"{near} of the {selections} ranked selections "
-            + ("sits" if near == 1 else "sit")
-            + f" within one 1/{SPEARMAN_STEP_DENOMINATOR} = {step:.4f} step of the top median "
-            + f"({len(within_step)} ranked "
-            + ("row" if len(within_step) == 1 else "rows")
-            + ", the same selections counted once per scene summary), and "
-            + ("no other selection matches the top median exactly" if matched == 0 else
-               f"{matched} other selection" + ("" if matched == 1 else "s") + " "
-               + ("matches" if matched == 1 else "match") + " the top median exactly")
-            + f" ({len(sharing)} ranked "
-            + ("row holds" if len(sharing) == 1 else "rows hold")
-            + " it). Which of those the ranking returns is a choice inside that field, and it "
-            "needs no explanation of where the paired peak falls.",
+            f"{reach}.",
             "",
         ])
+
+    step = 1 / SPEARMAN_STEP_DENOMINATOR
+    top = winner["median_spearman"]
+    if top is None:
+        return note
+    within_step = [
+        group for group in ranked
+        if group["median_spearman"] is not None
+        and top - float(group["median_spearman"]) <= step + 1e-9
+    ]
+    sharing = [group for group in ranked if group["median_spearman"] == top]
+    rivals = [
+        float(group["median_spearman"]) for group in ranked
+        if group["median_spearman"] is not None
+        and _selection_key(group) != _selection_key(winner)
+    ]
+    near, selections = _selection_count(within_step), _selection_count(ranked)
+    # The winner's own selection is always in `sharing`, because `top` is its median.
+    matched = _selection_count(sharing) - 1
+    ranked_field = (
+        "**What the ranked field says about the selection.** The ranking is choosing among "
+        f"near-equals: {near} of the {selections} ranked selections "
+        + ("sits" if near == 1 else "sit")
+        + f" within one 1/{SPEARMAN_STEP_DENOMINATOR} = {step:.4f} step of the top median "
+        + f"({len(within_step)} ranked "
+        + ("row, the same selection" if len(within_step) == 1 else "rows, the same selections")
+        + " counted once per scene summary), and "
+        + (
+            "no other selection matches the top median exactly -- "
+            + ("the one ranked row that holds it is the winner's own"
+               if len(sharing) == 1 else
+               f"the {len(sharing)} ranked rows that hold it are the winner's own scene "
+               "summaries")
+            if matched == 0 else
+            f"{matched} other selection" + ("" if matched == 1 else "s") + " "
+            + ("matches" if matched == 1 else "match") + " the top median exactly "
+            + f"({len(sharing)} ranked "
+            + ("row holds" if len(sharing) == 1 else "rows hold")
+            + " it, the winner's own among them)"
+        )
+        + "."
+    )
+    if rivals and matched == 0:
+        ranked_field += (
+            f" The margin over the best of the others is {_grid_steps(top - max(rivals))}."
+        )
+    standing = _standing_sentence(_winner_standing(ranked, winner))
+    if standing:
+        ranked_field += f" {standing}"
+    note.extend([ranked_field, ""])
     return note
 
 

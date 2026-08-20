@@ -20,6 +20,7 @@ from __future__ import annotations
 import ast
 import json
 import math
+import os
 import random
 import re
 from pathlib import Path
@@ -2645,10 +2646,12 @@ def test_the_movement_profile_lets_the_flat_frozen_medians_carry_the_selection_a
     # over a field whose nearest excluded candidate is 4.5 steps back can be doubled without
     # moving the count, which is how a doubled band survived 196 tests.
     assert ("5 of the 10 ranked selections sit within one 1/35 = 0.0286 step of the top "
-            "median (15 ranked rows") in note
+            "median (15 ranked rows, the same selections counted once per scene summary)"
+            ) in note
     # 30 rows, 10 selections: the ranked *count* multiplies each selection by its three scene
     # summaries, and the table's own caption says those three are one selection, not three.
-    assert "1 other selection matches the top median exactly (6 ranked rows hold it)" in note
+    assert ("1 other selection matches the top median exactly (6 ranked rows hold it, the "
+            "winner's own among them)") in note
 
 
 @pytest.mark.parametrize("frozen", [
@@ -2726,6 +2729,11 @@ def test_the_longest_equal_run_finds_the_longest_and_skips_the_absent(run, expec
     ([0.2, 0.6, 0.6, 0.3], "peaked", (1, 2)),
     ([0.2, 0.6, 0.3, 0.6, 0.2], "multi_peaked", (1, 1)),
     ([0.6, 0.3, 0.4, 0.2], "multi_peaked", (0, 0)),      # highest at an endpoint, not a peak
+    # A single-peaked column with an equal pair on each *flank*, away from the peak. Both
+    # comparisons either side of the peak have to be non-strict, and no fixture said so: making
+    # both strict reclassifies this unimodal column as `multi_peaked` and 664 tests passed. The
+    # plateau in `[0.2, 0.6, 0.6, 0.3]` above is *at* the peak, which those comparisons skip.
+    ([0.20, 0.30, 0.30, 0.45, 0.60, 0.45, 0.35, 0.35, 0.25, 0.20], "peaked", (4, 4)),
 ])
 def test_the_column_shape_and_the_peak_span_are_the_shape_the_numbers_have(rates, shape, span):
     """`max(range(...))` returns index zero on a flat column and the first index of any
@@ -2744,6 +2752,8 @@ FLAT_RATES = [0.42] * 10
 RISING_RATES = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55]
 FALLING_RATES = list(reversed(RISING_RATES))
 ENDPOINT_RATES = [0.60, 0.30, 0.40, 0.20, 0.18, 0.16, 0.14, 0.12, 0.10, 0.08]
+FLANK_PLATEAU_RATES = [0.20, 0.30, 0.30, 0.45, 0.60, 0.45, 0.35, 0.35, 0.25, 0.20]
+TWICE_AT_THE_TOP_RATES = [0.20, 0.60, 0.30, 0.60, 0.20, 0.18, 0.16, 0.14, 0.12, 0.10]
 
 
 @pytest.mark.parametrize(("rates", "expected", "forbidden"), [
@@ -2772,6 +2782,12 @@ ENDPOINT_RATES = [0.60, 0.30, 0.40, 0.20, 0.18, 0.16, 0.14, 0.12, 0.10, 0.08]
         "single-peaked: its highest rate is 0.600 at `decile_00_10`",
         "The highest bin is not the selected bin `decile_50_60`, which sits at 0.160",
     ], ["one peak", "Its neighbours"]),
+    # Unimodal, with an equal pair on each flank rather than at the peak.
+    (FLANK_PLATEAU_RATES, [
+        "runs from 0.200 at `decile_00_10` to 0.600 at `decile_40_50` and back to 0.200 at "
+        "`decile_90_100`, one peak with no second rise",
+        "The peak is not the selected bin `decile_50_60`, which sits at 0.450",
+    ], ["it is not single-peaked", "Its neighbours"]),
 ])
 def test_the_movement_profile_reports_a_shape_it_has_rather_than_a_peak_it_does_not(
     rates, expected, forbidden
@@ -2896,14 +2912,20 @@ def test_the_frozen_paragraph_measures_no_distance_between_a_frozen_and_a_dynami
 def test_the_ranked_counts_agree_in_number_with_the_count_they_quote():
     """"1 of the 10 ranked candidates sit within ...; and 1 share the top median exactly" --
     the note already conjugates `above_even` and `bins_word` against their counts, and these
-    two were the ones left behind."""
+    were the ones left behind.
+
+    The assertion runs to the end of the gloss rather than stopping at the count: the round-4
+    version stopped at `"(1 ranked row"`, one word before "selections", which is the word it
+    was written to catch.
+    """
     ranked = profile_ranked("decile_50_60", [22 / 35, *[0.1] * 9])
     note = "\n".join(reporting_module._movement_profile_note(
         profile_rows(UNIMODAL, FLAT_FROZEN), ranked
     ))
     assert ("1 of the 10 ranked selections sits within one 1/35 = 0.0286 step of the top "
-            "median (1 ranked row") in note
-    assert "no other selection matches the top median exactly (1 ranked row holds it)" in note
+            "median (1 ranked row, the same selection counted once per scene summary)") in note
+    assert ("no other selection matches the top median exactly -- the one ranked row that "
+            "holds it is the winner's own") in note
 
 
 # --- review round 4: a winner with no frozen twin, and the report as a whole -------------------
@@ -3013,3 +3035,263 @@ def test_nothing_is_published_when_a_figure_cannot_be_rendered(tmp_path, monkeyp
     with pytest.raises(RuntimeError):
         write_decile_report(full_grid_rows(), output, GRID_RUN_METADATA, grid_diagnostics())
     assert list(output.iterdir()) == []
+
+
+# --- review round 5: the fact that cuts against the argument, and the mechanism nothing pinned
+
+
+def ranked_by_summary(bin_name: str, medians: dict) -> list[dict]:
+    """Ranked rows whose medians differ *between* scene summaries.
+
+    `profile_ranked` gives every summary the same medians, so it cannot express a selection
+    that leads outright at one summary and ties at another -- which is the standing the real
+    run has and the note now publishes. Insertion order decides `ranked[0]`, so the winner's
+    own summary goes first.
+    """
+    names = [bin_name, *(name for name in DECILE_NAMES if name != bin_name)]
+    return [
+        {"signal": "persistence", "membership_mode": "dynamic", "confidence_bin": name,
+         "aggregation": summary, "score_scope": PRIMARY_SCORE_SCOPE,
+         "padding_mode": FILTERED_PADDING_MODE, "median_spearman": median}
+        for summary, row in medians.items()
+        for name, median in zip(names, row)
+    ]
+
+
+TOP_MEDIAN, STEP_BELOW = 22 / 35, 21 / 35
+
+# The real run's standing, in a fixture: the winner is alone at the top at two summaries and
+# ties for it at the third, and is never behind. Its ranked-field counts come out at the real
+# run's numbers too -- 3 selections within a step over 9 rows, 2 rows sharing the top median.
+REAL_SHAPED_STANDING = {
+    "top20_mean": [TOP_MEDIAN, STEP_BELOW, STEP_BELOW, *[0.4] * 7],
+    "mean": [TOP_MEDIAN, STEP_BELOW, STEP_BELOW, *[0.4] * 7],
+    "q90": [STEP_BELOW, STEP_BELOW, STEP_BELOW, *[0.4] * 7],
+}
+
+
+@pytest.mark.parametrize(("medians", "drop", "expected"), [
+    (REAL_SHAPED_STANDING, None,
+     {"mean": "alone", "q90": "tied", "top20_mean": "alone"}),
+    ({"top20_mean": [TOP_MEDIAN, STEP_BELOW, STEP_BELOW, *[0.4] * 7],
+      "mean": [0.4, TOP_MEDIAN, STEP_BELOW, *[0.4] * 7],
+      "q90": [STEP_BELOW, STEP_BELOW, STEP_BELOW, *[0.4] * 7]}, None,
+     {"mean": "behind", "q90": "tied", "top20_mean": "alone"}),
+    (REAL_SHAPED_STANDING, "q90",
+     {"mean": "alone", "q90": "absent", "top20_mean": "alone"}),
+])
+def test_the_winner_standing_is_read_per_summary_from_the_ranking(medians, drop, expected):
+    """Whether the winning selection also leads at the other scene summaries is a fact already
+    in the 33-row ranked table, and it is the fact that most cuts against "the ranking is
+    choosing among near-equals". Four outcomes per summary and each has to be derived: alone at
+    the top, tied for it, behind it, or not scored there at all."""
+    ranked = ranked_by_summary("decile_50_60", medians)
+    if drop is not None:
+        ranked = [group for group in ranked
+                  if not (group["aggregation"] == drop
+                          and group["confidence_bin"] == "decile_50_60")]
+    assert reporting_module._winner_standing(ranked, ranked[0]) == expected
+
+
+def test_the_note_publishes_the_winners_standing_beside_the_near_equals_reading():
+    """Omitting the one fact that cuts against the published reading is selective quotation in
+    favour of an argument already written down.
+
+    "Choosing among near-equals" is true -- the margin really is one 1/35 step, the smallest
+    difference the statistic can express, with two rivals at that distance. "It is never beaten
+    by anything, anywhere" is also true, and a reader is entitled to both. So both are derived
+    from the same ranked list and printed in the same paragraph.
+    """
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, FLAT_FROZEN, aggregation="top20_mean"),
+        ranked_by_summary("decile_50_60", REAL_SHAPED_STANDING),
+    ))
+    assert ("3 of the 10 ranked selections sit within one 1/35 = 0.0286 step of the top median "
+            "(9 ranked rows, the same selections counted once per scene summary)") in note
+    assert ("The margin over the best of the others is one step of the 1/35 = 0.0286 grid a "
+            "median over an even number of images can land on, which is the smallest "
+            "difference this metric can express.") in note
+    assert ("Set against that, the same selection is never behind at any scene summary: it "
+            "holds the top median alone at `mean` and `top20_mean`, and ties for it at "
+            "`q90`.") in note
+    # The three are not interchangeable and the ranking is not discretionary between them.
+    assert "choice inside that field" not in note
+
+
+def test_the_standing_sentence_drops_its_never_behind_lead_when_the_winner_is_behind():
+    """The lead-in is a claim, not a connective, and it is false as soon as any summary is
+    behind or unscored."""
+    behind = {
+        "top20_mean": [TOP_MEDIAN, STEP_BELOW, STEP_BELOW, *[0.4] * 7],
+        "mean": [0.4, TOP_MEDIAN, STEP_BELOW, *[0.4] * 7],
+        "q90": [STEP_BELOW, STEP_BELOW, STEP_BELOW, *[0.4] * 7],
+    }
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, FLAT_FROZEN, aggregation="top20_mean"),
+        ranked_by_summary("decile_50_60", behind),
+    ))
+    assert ("Across the scene summaries the same selection holds the top median alone at "
+            "`top20_mean`, ties for it at `q90`, and is behind at `mean`.") in note
+    assert "never behind at any scene summary" not in note
+
+
+def test_the_rows_sharing_the_top_median_are_named_as_the_winners_own():
+    """"(2 ranked rows hold it)" carries its disambiguating gloss only on the *first*
+    parenthetical, so a reader can take the 2 as two rows besides the winner's -- which is the
+    misreading the selection/row distinction exists to kill."""
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, FLAT_FROZEN, aggregation="top20_mean"),
+        ranked_by_summary("decile_50_60", REAL_SHAPED_STANDING),
+    ))
+    assert ("no other selection matches the top median exactly -- the 2 ranked rows that hold "
+            "it are the winner's own scene summaries") in note
+    assert "(2 ranked rows hold it)" not in note
+
+
+@pytest.mark.parametrize(("rates", "expected"), [
+    ([0.2, 0.6, 0.3], [1]),
+    ([0.2, 0.6, 0.6, 0.3], [1, 2]),
+    ([0.2, 0.6, 0.3, 0.6, 0.2], [1, 3]),
+    ([0.42] * 4, [0, 1, 2, 3]),
+])
+def test_the_top_indices_are_every_bin_at_the_maximum(rates, expected):
+    """`_peak_span` answers "where is the first maximal run", which is what single-peakedness is
+    decided from. Membership at the top is a question about *values*, and answering it with an
+    index range makes the note contradict itself on a column that reaches its maximum twice."""
+    assert reporting_module._top_indices(rates) == expected
+
+
+def test_a_winner_at_a_later_maximum_is_not_told_it_is_not_the_highest():
+    """Generated at the previous commit on `[0.20, 0.60, 0.30, 0.60, 0.20, ...]`:
+
+        "...its highest rate is 0.600 at `decile_10_20`. The highest bin is not the selected
+        bin `decile_30_40`, which sits at 0.600."
+
+    Told it is not the highest, one sentence after 0.600 is named as the highest rate.
+    """
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(TWICE_AT_THE_TOP_RATES, FLAT_FROZEN),
+        profile_ranked("decile_30_40", [22 / 35] * 10),
+    ))
+    assert ("it is not single-peaked: its highest rate is 0.600 at `decile_10_20` and "
+            "`decile_30_40`") in note
+    assert ("The highest rate 0.600 is shared by `decile_10_20` and `decile_30_40`, the "
+            "selected bin `decile_30_40` among them.") in note
+    assert "is not the selected bin" not in note
+
+
+def test_a_winner_outside_a_split_maximum_is_told_which_bins_hold_it():
+    """And the other side of the same branch: every bin at the maximum is named, not the first
+    run of them, so "is not among them" is checkable against the list in the same sentence."""
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(TWICE_AT_THE_TOP_RATES, FLAT_FROZEN),
+        profile_ranked("decile_60_70", [22 / 35] * 10),
+    ))
+    assert ("The highest rate 0.600 is shared by `decile_10_20` and `decile_30_40`, and the "
+            "selected bin `decile_60_70` is not among them: it sits at 0.160.") in note
+
+
+# --- review round 5: the staging mechanism, pinned rather than its litter ---------------------
+
+
+ARTIFACT_NAMES = frozenset({
+    "per_scene.csv", "summary.json", "confidence_decile_heatmap.png", "blur_curves.png",
+    "dynamic_vs_frozen.png", "padding_sensitivity.png", "easy-report.md",
+})
+
+
+def test_every_artifact_is_staged_under_a_temporary_and_renamed_into_place(tmp_path,
+                                                                           monkeypatch):
+    """Deleting the temp-file/rename mechanism outright -- `_temporary_for` returning `path` --
+    passed all 664 tests. `test_no_temporary_file_survives_a_completed_write` passes vacuously
+    against such a writer, because a writer that saves straight to the final path leaves no
+    `.tmp` files either, and the two atomicity tests pass because the cleanup handler unlinks
+    whatever `_temporary_for` returned.
+
+    So the *mechanism* is asserted rather than its litter: seven renames, each from a staged
+    temporary that exists onto a final path that does not yet.
+    """
+    real_replace = os.replace
+    calls = []
+
+    def recording_replace(source, destination):
+        calls.append((Path(source), Path(destination),
+                      Path(source).exists(), Path(destination).exists()))
+        real_replace(source, destination)
+
+    monkeypatch.setattr(reporting_module.os, "replace", recording_replace)
+    output = written(tmp_path)
+    assert len(calls) == 7
+    for source, destination, staged, published in calls:
+        assert source.name == destination.name + ".tmp"
+        assert source.parent == output and destination.parent == output
+        assert staged, f"{source.name} was renamed without having been staged"
+        assert not published, f"{destination.name} was written straight to its final path"
+    assert {destination.name for _, destination, _, _ in calls} == ARTIFACT_NAMES
+
+
+def test_a_failed_rewrite_leaves_the_previous_complete_report_untouched(tmp_path, monkeypatch):
+    """The seven artifacts are the previous run's until the moment they are the new run's. A
+    writer without the staging step truncates `per_scene.csv` in place and then deletes it on
+    the way out, destroying a file of a report that was complete before the call."""
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("no figure")
+
+    output = written(tmp_path)
+    before = {path.name: path.read_bytes() for path in output.iterdir()}
+    assert set(before) == ARTIFACT_NAMES
+    monkeypatch.setattr(reporting_module, "_blur_curve_figure", refuse)
+    with pytest.raises(RuntimeError):
+        write_decile_report(full_grid_rows(), output, GRID_RUN_METADATA, grid_diagnostics())
+    assert {path.name: path.read_bytes() for path in output.iterdir()} == before
+
+
+@pytest.mark.parametrize("figure", [
+    "_heatmap_figure", "_dynamic_frozen_figure", "_padding_sensitivity_figure",
+])
+def test_no_directory_is_created_when_a_summary_figure_cannot_be_rendered(
+    tmp_path, monkeypatch, figure
+):
+    """The three summary figures are rendered before the directory exists, so a figure that
+    cannot be drawn leaves nothing at all -- not even an empty directory to be mistaken for a
+    run that produced no output. Moving them after the `mkdir` was invisible to 664 tests."""
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("no figure")
+
+    monkeypatch.setattr(reporting_module, figure, refuse)
+    output = tmp_path / "report"
+    with pytest.raises(RuntimeError):
+        write_decile_report(full_grid_rows(), output, GRID_RUN_METADATA, grid_diagnostics())
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(("standing", "expected"), [
+    ({"mean": "alone", "q90": "tied", "top20_mean": "alone"},
+     "Set against that, the same selection is never behind at any scene summary: it holds the "
+     "top median alone at `mean` and `top20_mean`, and ties for it at `q90`."),
+    ({"mean": "behind", "q90": "tied", "top20_mean": "alone"},
+     "Across the scene summaries the same selection holds the top median alone at "
+     "`top20_mean`, ties for it at `q90`, and is behind at `mean`."),
+    ({"mean": "alone", "q90": "absent", "top20_mean": "alone"},
+     "Across the scene summaries the same selection holds the top median alone at `mean` and "
+     "`top20_mean`, and was not scored at `q90`."),
+    # No `alone` clause, so nothing has introduced "the top median" for "it" to refer back to.
+    ({"mean": "tied", "q90": "tied"},
+     "Set against that, the same selection is never behind at any scene summary: it ties for "
+     "the top median at `mean` and `q90`."),
+    # And one summary is not "any scene summary" -- the sweep is a claim about a field of them.
+    ({"top20_mean": "tied"},
+     "At the ranking's one scene summary the same selection ties for the top median at "
+     "`top20_mean`."),
+    ({"top20_mean": "alone"},
+     "At the ranking's one scene summary the same selection holds the top median alone at "
+     "`top20_mean`."),
+])
+def test_the_standing_sentence_never_leans_on_a_clause_that_is_not_there(standing, expected):
+    """Two ways the sentence can overstate or dangle, both reachable from real rankings.
+
+    A run scored at one scene summary is not a selection that is "never behind at any scene
+    summary" in the sense a reader takes from that phrase; and "ties for **it**" needs the
+    clause that names the top median to have been printed first.
+    """
+    assert reporting_module._standing_sentence(standing) == expected
