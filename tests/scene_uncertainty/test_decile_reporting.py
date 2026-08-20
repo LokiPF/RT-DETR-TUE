@@ -1,10 +1,18 @@
-"""Tests for the confidence-decile summariser.
+"""Tests for the confidence-decile summariser and the artifacts it writes.
 
-The brief's three tests, plus one test per binding sentence of the spec they leave
-unexercised. The added ones cluster around four places where a summary can be complete,
-plausible and wrong: a group key that stops separating two selections, a coverage gate that
-annotates instead of excluding, a paired statistic computed over marginal populations, and a
-raw score magnitude leaking into a number that is compared across scopes.
+The brief's tests, plus one test per binding sentence of the spec they leave unexercised.
+The summary tests cluster around four places where a summary can be complete, plausible and
+wrong: a group key that stops separating two selections, a coverage gate that annotates
+instead of excluding, a paired statistic computed over marginal populations, and a raw score
+magnitude leaking into a number that is compared across scopes.
+
+The writer tests cluster around three more, all of them failures a reader cannot see. A
+**figure that silently drops the bins it has no rows for** looks like a complete ten-bin
+measurement drawn on whatever subset happened to exist. A **sentence that outruns its
+numbers** -- "beat", "affected by padding", "80 percent likely" -- is the failure spec:111
+and spec:230 name outright, and prose is the one artifact no schema check reaches. And a
+**paired rate published with one denominator** inverts the reading, which is why the report
+is checked for both.
 """
 
 from __future__ import annotations
@@ -13,29 +21,44 @@ import ast
 import json
 import math
 import random
+import re
 from pathlib import Path
 
+import matplotlib
 import numpy as np
+import pandas as pd
 import pytest
 import torch
 
 from src.scene_uncertainty import decile_reporting as reporting_module
+from src.scene_uncertainty.confidence_deciles import DECILE_NAMES
 from src.scene_uncertainty.decile_analysis import (
     ALL_QUERY_BENCHMARK,
+    ALL_VALID_BENCHMARK,
     ROW_KEYS_EXCLUDED_FROM_CSV,
+    SENSITIVITY_BIN,
 )
 from src.scene_uncertainty.decile_reporting import (
     BENCHMARK_SELECTION,
+    EASY_REPORT_FINAL_SENTENCE,
     GROUP_KEYS,
+    RANDOM_BIN_OVERLAP,
     RANKED_GROUPS_KEY,
     RANKABLE_MEMBERSHIP_MODES,
     ROW_KEYS,
     SIGNALS,
+    SPEC_172_QUESTIONS,
     rank_deployable_groups,
     summarize_decile_rows,
     summary_frame,
+    write_decile_report,
 )
-from src.scene_uncertainty.decile_scoring import PRIMARY_SCORE_SCOPE, score_selection
+from src.scene_uncertainty.decile_scoring import (
+    CONFIDENCE_SCOPE,
+    DECILE_AGGREGATIONS,
+    PRIMARY_SCORE_SCOPE,
+    score_selection,
+)
 
 
 # --- fixtures ---------------------------------------------------------------------------
@@ -1190,3 +1213,703 @@ def test_the_summariser_cannot_reach_a_knn_or_extraction_path():
             imported.add(node.module or "")
     forbidden = {"knn", "evaluate", "extractor", "bank", "dataset", "pipeline"}
     assert not {name for name in imported if name.lstrip(".").split(".")[0] in forbidden}
+
+
+# --- the writer's fixture ------------------------------------------------------------------
+#
+# `full_grid_rows` is a miniature of exactly what `analyze_deciles` emits: ten dynamic bins
+# and ten frozen bins filtered, `all_valid` filtered, the lowest bin repeated unfiltered under
+# both memberships, and the all-300-query benchmark at `q90` with no confidence control. Two
+# images, six severities.
+#
+# Every per-image curve is a permutation of `range(6)` built by swapping position 0 with
+# position `d`, which fixes the per-image Spearman at exactly `1 - 2*d**2/35`. That is the
+# whole reason for the shape: the fixture's medians are known in closed form, so a test can
+# name the winner rather than discovering it, and the four qualitative facts the real pilot
+# shows are reproduced deliberately rather than by luck --
+#
+#   * a single mid-confidence bin wins (`decile_50_60`, at 1.0);
+#   * persistence beats its confidence control there and *loses* to it at the bottom bin;
+#   * the bottom bin is worthless dynamic (-0.4286) and strong frozen (+1.0);
+#   * removing padding *lowers* the every-query trend (0.9429 unfiltered -> 0.7714 filtered).
+
+SPEARMAN_FOR_DISTANCE = {distance: 1.0 - 2 * distance**2 / 35 for distance in range(6)}
+
+
+def swap_curve(distance: int) -> tuple[float, ...]:
+    """`range(6)` with positions 0 and `distance` exchanged -- Spearman `1 - 2d^2/35` exactly."""
+    values = list(range(6))
+    values[0], values[distance] = values[distance], values[0]
+    return tuple(float(value) for value in values)
+
+
+def _distance(image_id: int, index: int, kind: str) -> int:
+    """The swap distance for one bin, per image, per selection family."""
+    if kind == "dynamic_persistence":
+        return abs(index - 5) + (1 if image_id == 2 and index > 5 else 0)
+    if kind == "dynamic_confidence":
+        return min(5, 5 - abs(index - 5) + (1 if image_id == 2 and index < 5 else 0))
+    if kind == "frozen_persistence":
+        return 0 if index == 0 else min(5, abs(index - 5) + 2)
+    if kind == "frozen_confidence":
+        return min(5, 5 - abs(index - 5) + 1)
+    raise AssertionError(kind)
+
+
+GRID_RUN_METADATA = {
+    "artifact_type": "confidence_decile_scene_uncertainty",
+    "feature_cache_id": "cache-abc",
+    "source_result_id": "result-def",
+    "bank_id": "bank-ghi",
+    "normalization": "none",
+    "k": 5,
+    "source_partition": "tuning",
+    "severities": [0, 1, 2, 3, 4, 5],
+    "decoder_layers": [0, 1, 2],
+    "query_count": 300,
+    "image_count": 2,
+    "record_count": 12,
+}
+
+
+def grid_diagnostics() -> dict:
+    return {
+        "images": {
+            "1": {
+                "union_padded_query_ids": [296, 297, 298, 299],
+                "union_padded_count": 4,
+                "padded_query_ids_by_severity": {str(severity): [298, 299] for severity in range(6)},
+                "padded_count_by_severity": {str(severity): 2 for severity in range(6)},
+                "tail_identical_across_severities": False,
+            },
+            "2": {
+                "union_padded_query_ids": [],
+                "union_padded_count": 0,
+                "padded_query_ids_by_severity": {str(severity): [] for severity in range(6)},
+                "padded_count_by_severity": {str(severity): 0 for severity in range(6)},
+                "tail_identical_across_severities": True,
+            },
+        }
+    }
+
+
+def _grid_rows_for(image_id, severity, membership, confidence_bin, padding, overlap,
+                   selected_count, persistence_curve, confidence_curve, scopes):
+    emitted = []
+    for aggregation in DECILE_AGGREGATIONS:
+        for scope, curve in scopes:
+            emitted.append(row(
+                image_id, severity, "persistence", scope,
+                (persistence_curve if curve is None else curve)[severity],
+                membership_mode=membership, confidence_bin=confidence_bin,
+                padding_mode=padding, aggregation=aggregation, clean_overlap=overlap,
+                selected_count=selected_count,
+            ))
+        if confidence_curve is not None:
+            emitted.append(row(
+                image_id, severity, "confidence", CONFIDENCE_SCOPE,
+                0.1 * confidence_curve[severity],
+                membership_mode=membership, confidence_bin=confidence_bin,
+                padding_mode=padding, aggregation=aggregation, clean_overlap=overlap,
+                selected_count=selected_count,
+            ))
+    return emitted
+
+
+def full_grid_rows():
+    rows = []
+    for image_id in (1, 2):
+        for severity in range(6):
+            for index, name in enumerate(DECILE_NAMES):
+                # `layer_0` rises perfectly in every bin, so a ranking that forgot the
+                # primary-scope gate would put a secondary diagnostic first (spec:123).
+                scopes = ((PRIMARY_SCORE_SCOPE, None), ("layer_0", swap_curve(0)))
+                dynamic_overlap = 1.0 if severity == 0 else (0.25 if index == 9 else 0.06)
+                rows.extend(_grid_rows_for(
+                    image_id, severity, "dynamic", name, "filtered", dynamic_overlap, 30,
+                    swap_curve(_distance(image_id, index, "dynamic_persistence")),
+                    swap_curve(_distance(image_id, index, "dynamic_confidence")),
+                    scopes,
+                ))
+                rows.extend(_grid_rows_for(
+                    image_id, severity, "frozen", name, "filtered", 1.0, 30,
+                    swap_curve(_distance(image_id, index, "frozen_persistence")),
+                    swap_curve(_distance(image_id, index, "frozen_confidence")),
+                    scopes,
+                ))
+            rows.extend(_grid_rows_for(
+                image_id, severity, *ALL_VALID_BENCHMARK[:2], ALL_VALID_BENCHMARK[2], 1.0, 290,
+                # The confidence control over every valid query trends *down* with blur, as it
+                # does on the real pilot; a report that reads a big positive difference without
+                # looking at the control's own column would credit persistence for it.
+                swap_curve(2), swap_curve(5), ((PRIMARY_SCORE_SCOPE, None),),
+            ))
+            rows.extend(_grid_rows_for(
+                image_id, severity, "dynamic", SENSITIVITY_BIN, "unfiltered",
+                1.0 if severity == 0 else 0.07, 33,
+                swap_curve(3), swap_curve(2), ((PRIMARY_SCORE_SCOPE, None),),
+            ))
+            rows.extend(_grid_rows_for(
+                image_id, severity, "frozen", SENSITIVITY_BIN, "unfiltered", 1.0, 33,
+                swap_curve(1), swap_curve(3), ((PRIMARY_SCORE_SCOPE, None),),
+            ))
+            # Benchmark 1: q90 alone, persistence alone, all 300 queries (spec:131).
+            rows.append(row(
+                image_id, severity, "persistence", PRIMARY_SCORE_SCOPE,
+                swap_curve(1)[severity],
+                membership_mode=ALL_QUERY_BENCHMARK[0],
+                confidence_bin=ALL_QUERY_BENCHMARK[1],
+                padding_mode=ALL_QUERY_BENCHMARK[2],
+                aggregation="q90", clean_overlap=1.0, selected_count=300,
+            ))
+    return rows
+
+
+def grid_summary():
+    return summarize_decile_rows(full_grid_rows(), GRID_RUN_METADATA, grid_diagnostics())
+
+
+def written(tmp_path, rows=None, run_metadata=None, diagnostics=None):
+    output = tmp_path / "report"
+    write_decile_report(
+        full_grid_rows() if rows is None else rows,
+        output,
+        GRID_RUN_METADATA if run_metadata is None else run_metadata,
+        grid_diagnostics() if diagnostics is None else diagnostics,
+    )
+    return output
+
+
+def section(report: str, heading: str) -> str:
+    """The body of one `## ` section, so a test can assert *where* a sentence lives."""
+    parts = re.split(r"^## ", report, flags=re.MULTILINE)
+    for part in parts[1:]:
+        if part.startswith(heading):
+            return part
+    raise AssertionError(f"no section {heading!r} in the report")
+
+
+# --- the brief's artifact tests -------------------------------------------------------------
+
+
+def test_write_report_creates_every_declared_artifact(tmp_path):
+    write_decile_report(
+        synthetic_rows(), tmp_path,
+        run_metadata={"source_partition": "tuning"}, diagnostics={"images": {}},
+    )
+    expected = {
+        "per_scene.csv", "summary.json", "confidence_decile_heatmap.png",
+        "blur_curves.png", "dynamic_vs_frozen.png", "padding_sensitivity.png",
+        "easy-report.md",
+    }
+    assert expected <= {path.name for path in tmp_path.iterdir()}
+    text = (tmp_path / "summary.json").read_text()
+    assert "NaN" not in text
+    assert json.loads(text)["run_metadata"]["source_partition"] == "tuning"
+
+
+def test_easy_report_names_winner_controls_and_test_status(tmp_path):
+    write_decile_report(synthetic_rows(), tmp_path, {"source_partition": "tuning"}, {})
+    report = (tmp_path / "easy-report.md").read_text()
+    assert "Best confidence range" in report
+    assert "confidence alone" in report
+    assert "all-query benchmark" in report
+    assert "held-out test images were not used" in report
+
+
+# --- spec:163-165, `per_scene.csv` -----------------------------------------------------------
+
+
+def test_the_csv_is_exactly_the_summary_frame(tmp_path):
+    """Kills a second frame built by hand: it would drift from the summarised table silently."""
+    output = written(tmp_path)
+    written_back = pd.read_csv(output / "per_scene.csv", float_precision="round_trip")
+    expected = summary_frame(full_grid_rows())
+    assert list(written_back.columns) == list(expected.columns)
+    pd.testing.assert_frame_equal(written_back, expected, check_dtype=False)
+
+
+def test_the_csv_round_trips_every_score_exactly(tmp_path):
+    """Kills a writer that truncates floats: an adjacent-step comparison is a strict `>=`.
+
+    `float_precision="round_trip"` is on the *reader*, as in `reporting.read_result_csv`;
+    what this pins is that the writer emitted enough digits for that reader to recover the
+    value it was handed.
+    """
+    output = written(tmp_path)
+    written_back = pd.read_csv(output / "per_scene.csv", float_precision="round_trip")
+    assert written_back["score"].tolist() == summary_frame(full_grid_rows())["score"].tolist()
+
+
+def test_the_csv_never_carries_the_excluded_column(tmp_path):
+    """Spec:165 wants one row per selection, not ~280 MB of quoted query-id lists beside it."""
+    output = written(tmp_path)
+    header = (output / "per_scene.csv").read_text().splitlines()[0].split(",")
+    assert set(ROW_KEYS_EXCLUDED_FROM_CSV).isdisjoint(header)
+    assert set(ROW_KEYS) <= set(header)
+
+
+def test_the_writer_never_reads_the_excluded_column(tmp_path):
+    """Kills `pd.DataFrame(rows).drop(columns=[...])` in the writer as well as the summariser.
+
+    That form materialises the column before discarding it, and raises `KeyError` on a table
+    that legitimately never carried it. This table never carried it.
+    """
+    stripped = [
+        {key: value for key, value in scored.items() if key not in ROW_KEYS_EXCLUDED_FROM_CSV}
+        for scored in full_grid_rows()
+    ]
+    output = written(tmp_path, rows=stripped)
+    assert (output / "per_scene.csv").exists()
+
+
+def test_the_csv_holds_one_row_per_output_result_key(tmp_path):
+    """Spec:165 -- one row per image, severity, signal, membership, bin, summary and scope."""
+    output = written(tmp_path)
+    written_back = pd.read_csv(output / "per_scene.csv", float_precision="round_trip")
+    assert not written_back.duplicated(subset=list(ROW_KEYS)).any()
+    assert len(written_back) == len(full_grid_rows())
+
+
+# --- spec:166, `summary.json` ----------------------------------------------------------------
+
+
+def test_the_summary_json_carries_the_whole_provenance_and_not_only_the_partition(tmp_path):
+    """Spec:166 asks for provenance and the exact configuration, not one field of it."""
+    output = written(tmp_path)
+    summary = json.loads((output / "summary.json").read_text())
+    assert summary["run_metadata"] == GRID_RUN_METADATA
+    assert summary["diagnostics"]["row_count"] == len(full_grid_rows())
+    assert summary["padding"]["images_with_padding"] == 1
+    assert summary[RANKED_GROUPS_KEY]
+
+
+def test_the_summary_json_is_the_summariser_output_unchanged(tmp_path):
+    output = written(tmp_path)
+    assert json.loads((output / "summary.json").read_text()) == grid_summary()
+
+
+def test_a_non_finite_number_cannot_reach_the_summary_file(tmp_path):
+    """`allow_nan=False` -- a bare `NaN` token is not JSON and half the world parses it as text."""
+    rows = [
+        {**scored, "score": float("nan")} if scored["severity"] == 5 else scored
+        for scored in full_grid_rows()
+    ]
+    output = written(tmp_path, rows=rows)
+    assert "NaN" not in (output / "summary.json").read_text()
+
+
+# --- writing is atomic, and refuses before it writes ------------------------------------------
+
+
+def test_a_malformed_table_is_refused_before_any_artifact_is_written(tmp_path):
+    rows = full_grid_rows()
+    output = tmp_path / "report"
+    with pytest.raises(ValueError, match="duplicate"):
+        write_decile_report(rows + [rows[0]], output, GRID_RUN_METADATA, grid_diagnostics())
+    assert not output.exists()
+
+
+def test_no_temporary_file_survives_a_completed_write(tmp_path):
+    """Kills a writer that saves straight to the final path: a crash mid-write would leave a
+    truncated PNG or a half-serialised JSON that reads as a finished report."""
+    output = written(tmp_path)
+    assert [path.name for path in output.iterdir() if path.name.endswith(".tmp")] == []
+
+
+def test_rewriting_the_same_directory_replaces_rather_than_accumulates(tmp_path):
+    output = written(tmp_path)
+    before = sorted(path.name for path in output.iterdir())
+    write_decile_report(full_grid_rows(), output, GRID_RUN_METADATA, grid_diagnostics())
+    assert sorted(path.name for path in output.iterdir()) == before
+
+
+# --- spec:167-170, the four figures ------------------------------------------------------------
+
+
+FIGURE_NAMES = (
+    "confidence_decile_heatmap.png", "blur_curves.png",
+    "dynamic_vs_frozen.png", "padding_sensitivity.png",
+)
+
+
+@pytest.mark.parametrize("name", FIGURE_NAMES)
+def test_every_figure_is_a_real_non_empty_png(tmp_path, name):
+    data = (written(tmp_path) / name).read_bytes()
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    assert len(data) > 5_000
+
+
+def test_the_backend_is_pinned_before_pyplot_is_imported():
+    """There is no display on the report box, so the backend cannot be left to autodetection.
+
+    Asserted on the source order rather than only on `get_backend()`: by the time a test runs,
+    something else may already have pinned Agg, and this module has to pin it itself.
+    """
+    assert matplotlib.get_backend().lower() == "agg"
+    source = Path(reporting_module.__file__).read_text()
+    assert source.index('matplotlib.use("Agg")') < source.index("import matplotlib.pyplot")
+
+
+def test_the_heatmap_keeps_all_ten_decile_columns_in_spec_order(tmp_path):
+    """Kills alphabetical ordering, and kills dropping the bins with no rows.
+
+    A heatmap drawn over only the bins that happened to exist reads as a complete ten-bin
+    measurement. The axis carries all ten of `DECILE_NAMES` whatever the table holds; a bin
+    with no row is a blank cell, which a reader can see.
+    """
+    figure = reporting_module._heatmap_figure(grid_summary())
+    axis = figure.axes[0]
+    assert [text.get_text() for text in axis.get_xticklabels()] == list(DECILE_NAMES)
+    thin = summarize_decile_rows(synthetic_rows(), {"source_partition": "tuning"})
+    assert [
+        text.get_text() for text in reporting_module._heatmap_figure(thin).axes[0].get_xticklabels()
+    ] == list(DECILE_NAMES)
+
+
+def test_the_heatmap_has_one_row_per_signal(tmp_path):
+    """Spec:167 -- median Spearman by confidence bin *and signal*."""
+    axis = reporting_module._heatmap_figure(grid_summary()).axes[0]
+    labels = [text.get_text() for text in axis.get_yticklabels()]
+    assert len(labels) == len(SIGNALS)
+    assert any("persistence" in label for label in labels)
+    assert any("confidence" in label for label in labels)
+
+
+def test_the_blur_curves_put_the_two_signals_on_separate_axes(tmp_path):
+    """Spec:157 -- persistence distance and `1 - confidence` share no unit.
+
+    One axis carrying both would invite the reader to compare their magnitudes, which is the
+    one comparison the design forbids. Two panels is the mutation this kills.
+    """
+    figure = reporting_module._blur_curve_figure(summary_frame(full_grid_rows()))
+    assert len(figure.axes) == 2
+    assert len({axis.get_ylabel() for axis in figure.axes}) == 2
+    for axis in figure.axes:
+        # Matplotlib prefixes unlabelled artists with `_`; the zero reference line is one.
+        labels = [line.get_label() for line in axis.get_lines()]
+        assert [label for label in labels if not label.startswith("_")] == list(DECILE_NAMES)
+
+
+def test_the_dynamic_and_frozen_series_are_drawn_apart_and_never_summed(tmp_path):
+    """Spec:230 -- they answer different questions and must not be combined into one score."""
+    figure = reporting_module._dynamic_frozen_figure(grid_summary())
+    axis = figure.axes[0]
+    labels = [container.get_label() for container in axis.containers]
+    assert labels == ["dynamic", "frozen"]
+    summary = grid_summary()
+    for container, mode in zip(axis.containers, ("dynamic", "frozen")):
+        expected = [
+            _grid_group(summary, mode, name)["median_spearman"] for name in DECILE_NAMES
+        ]
+        drawn = [patch.get_height() for patch in container]
+        assert drawn == pytest.approx(expected, nan_ok=True)
+
+
+def _grid_group(summary, membership, confidence_bin):
+    return next(
+        entry for entry in summary["groups"]
+        if entry["signal"] == "persistence"
+        and entry["score_scope"] == PRIMARY_SCORE_SCOPE
+        and entry["aggregation"] == "q90"
+        and entry["padding_mode"] == "filtered"
+        and entry["membership_mode"] == membership
+        and entry["confidence_bin"] == confidence_bin
+    )
+
+
+def test_the_dynamic_frozen_figure_shows_query_movement_beside_it(tmp_path):
+    """Spec:169 is "query movement versus feature movement"; the overlap panel is the first half.
+
+    Frozen and `shared` overlaps are 1.0 by construction, so plotting them beside a dynamic
+    0.06 would print arithmetic as if it were stability. Only the dynamic bins are drawn.
+    """
+    figure = reporting_module._dynamic_frozen_figure(grid_summary())
+    assert len(figure.axes) == 2
+    overlap = figure.axes[1]
+    assert [container.get_label() for container in overlap.containers] == ["dynamic"]
+    drawn = [patch.get_height() for patch in overlap.containers[0]]
+    assert drawn == pytest.approx([0.06] * 9 + [0.25])
+
+
+def test_the_padding_figure_shows_both_padding_modes_for_the_lowest_bin(tmp_path):
+    """Spec:170 -- filtered *and* unfiltered, lowest bin, both signals."""
+    figure = reporting_module._padding_sensitivity_figure(grid_summary())
+    axis = figure.axes[0]
+    assert [container.get_label() for container in axis.containers] == ["filtered", "unfiltered"]
+    labels = [text.get_text() for text in axis.get_xticklabels()]
+    assert len(labels) == 4
+    assert all("persistence" in label or "confidence" in label for label in labels)
+    # The bin the control is scoped to is named on the figure itself (spec:69), because these
+    # PNGs get pasted into write-ups on their own.
+    assert SENSITIVITY_BIN in axis.get_title()
+
+
+def test_a_figure_with_nothing_to_draw_says_so_instead_of_showing_an_empty_axis(tmp_path):
+    """A blank axis reads as a measured zero. The mutation is drawing it anyway."""
+    thin = summarize_decile_rows(synthetic_rows(), {"source_partition": "tuning"})
+    figure = reporting_module._padding_sensitivity_figure(thin)
+    axis = figure.axes[0]
+    assert axis.containers == []
+    assert any("no unfiltered" in text.get_text() for text in axis.texts)
+
+
+# --- spec:171-172, the easy report --------------------------------------------------------------
+
+
+def test_the_easy_report_leads_with_the_four_questions_in_spec_order(tmp_path):
+    """Spec:172 fixes both the content of the opening section and the order inside it."""
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    assert report.startswith("# Confidence-Decile Blur Experiment")
+    assert re.search(r"^## ", report, flags=re.MULTILINE).start() == report.index("## Short answer")
+    short = section(report, "Short answer")
+    positions = [short.index(question) for question in SPEC_172_QUESTIONS]
+    assert positions == sorted(positions)
+
+
+def test_the_easy_report_carries_every_heading_the_brief_names(tmp_path):
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    headings = re.findall(r"^## (.+)$", report, flags=re.MULTILINE)
+    assert headings == [
+        "Short answer", "Best confidence range", "Persistence versus confidence alone",
+        "Dynamic versus frozen queries", "Effect of padded queries",
+        "Metrics in plain language", "What this does not prove", "Next decision",
+    ]
+
+
+def test_the_easy_report_names_the_winner_the_ranking_chose(tmp_path):
+    """Kills a report that recomputes its own winner, or that reads position -1."""
+    output = written(tmp_path)
+    report = (output / "easy-report.md").read_text()
+    winner = grid_summary()[RANKED_GROUPS_KEY][0]
+    assert winner["confidence_bin"] == "decile_50_60"
+    best = section(report, "Best confidence range")
+    assert winner["confidence_bin"] in best
+    assert winner["membership_mode"] in best
+    assert winner["aggregation"] in best
+    assert f"{winner['median_spearman']:+.4f}" in best
+
+
+PROBABILITY_WORDS = (
+    "likelihood", "chance of", "odds of", "percent chance", "% chance", "how likely",
+    "probability of", "probability that",
+)
+
+
+@pytest.mark.parametrize("word", PROBABILITY_WORDS)
+def test_the_easy_report_never_calls_a_score_a_probability(tmp_path, word):
+    """Spec:111 -- "A value such as 0.8 must not be described as an 80-percent probability of
+    corruption." The transformation reverses direction and trains and calibrates nothing."""
+    report = (written(tmp_path) / "easy-report.md").read_text().lower()
+    assert word not in report
+
+
+def test_every_use_of_the_word_probability_is_a_denial(tmp_path):
+    """The bare word cannot be banned -- spec:111's disclaimer needs it -- so what is checked
+    is that it never appears except in a negation. A sentence that slipped from denying the
+    reading to offering it would keep the word and lose the "neither"."""
+    report = (written(tmp_path) / "easy-report.md").read_text().lower()
+    positions = [match.start() for match in re.finditer("probabilit", report)]
+    assert positions
+    for position in positions:
+        assert "neither" in report[max(0, position - 60):position]
+
+
+def test_the_easy_report_says_outright_that_neither_score_is_a_probability(tmp_path):
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    assert "Neither score is a probability" in report
+    assert "nothing here is trained or calibrated" in report
+
+
+def test_the_easy_report_marks_frozen_as_diagnostic_and_never_recommends_it(tmp_path):
+    """Spec:230 -- a strong frozen-only result is not a deployable method.
+
+    The fixture makes this bite: the frozen bottom bin scores +1.0 against the dynamic bottom
+    bin's -0.4286, so a report that ranked on the number alone would recommend it.
+    """
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    frozen = section(report, "Dynamic versus frozen queries")
+    assert "diagnostic" in frozen
+    assert "not combined" in frozen or "never combined" in frozen
+    assert "no paired clean version" in frozen
+    assert "frozen" not in section(report, "Short answer").split("Does padding")[0]
+
+
+def test_the_easy_report_states_both_denominators_for_every_paired_rate(tmp_path):
+    """A rate over all paired images counts ties as non-wins; a rate over the decided ones
+    hides how much of the run the comparison could not separate. Either alone inverts the
+    sentence a reader writes, so the report publishes both everywhere."""
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    lines = [line for line in report.splitlines() if "win rate" in line]
+    assert lines
+    for line in lines:
+        assert "decided" in line, line
+    assert report.count("it decided") >= 2
+
+
+def test_the_easy_report_calls_the_padding_count_a_lower_bound(tmp_path):
+    """`score_changed_image_count` counts images whose *score* moved and varies with the scene
+    summary, so it can never be labelled "images affected by padding"."""
+    padding = section((written(tmp_path) / "easy-report.md").read_text(), "Effect of padded")
+    assert "lower bound" in padding
+    assert "affected by padding" not in padding
+
+
+def test_the_easy_report_calls_a_definitional_overlap_arithmetic(tmp_path):
+    """A `clean_overlap` of 1.000 on a `shared` or `frozen` row is arithmetic, not evidence."""
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    assert "arithmetic" in report
+
+
+def test_the_easy_report_says_the_ranking_did_not_choose_the_padding_rule(tmp_path):
+    """Spec:224 asks the tuning run to select a padding rule; the ranking admits only
+    `filtered` candidates, so it never chose one. That evidence is in the sensitivity table."""
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    assert "did not choose the padding rule" in report
+
+
+def test_the_easy_report_says_the_choice_was_made_on_the_same_images_it_reports(tmp_path):
+    report = section((written(tmp_path) / "easy-report.md").read_text(), "What this does not")
+    assert "best of" in report
+    assert "not a hypothesis test" in report
+
+
+def test_the_easy_report_ends_with_the_held_out_sentence(tmp_path):
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    assert report.rstrip().endswith(EASY_REPORT_FINAL_SENTENCE)
+
+
+def test_the_easy_report_reports_no_candidate_rather_than_naming_one(tmp_path):
+    """Every group under-covered: the report must say there is no deployable candidate, not
+    reach into an empty ranking or fall back to the best of the excluded groups."""
+    rows = [
+        scored for scored in full_grid_rows()
+        if not (scored["image_id"] == 2 and scored["severity"] == 5)
+    ]
+    report = (written(tmp_path, rows=rows) / "easy-report.md").read_text()
+    assert "No candidate" in report
+    assert EASY_REPORT_FINAL_SENTENCE in report
+
+
+def test_the_easy_report_is_deterministic(tmp_path):
+    """Two runs over the same rows in different orders must produce the same sentences."""
+    rows = full_grid_rows()
+    first = (written(tmp_path / "a", rows=rows) / "easy-report.md").read_text()
+    shuffled = list(rows)
+    random.Random(7).shuffle(shuffled)
+    second = (written(tmp_path / "b", rows=shuffled) / "easy-report.md").read_text()
+    assert first == second
+
+
+def test_the_random_overlap_baseline_is_derived_from_the_bin_count():
+    """Ten equal-count bins over one valid population: two independent bins share `m^2/N` of
+    `2m - m^2/N` queries, which is `1/19` for ten bins and never a literal 0.0526."""
+    assert RANDOM_BIN_OVERLAP == pytest.approx(1 / (2 * len(DECILE_NAMES) - 1))
+
+
+def test_the_easy_report_compares_the_winner_against_the_named_benchmark(tmp_path):
+    """Spec:229 -- and the benchmark row is the producer's, not three literals."""
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    summary = grid_summary()
+    benchmark = next(
+        entry for entry in summary["groups"]
+        if (entry["signal"], entry["membership_mode"], entry["confidence_bin"],
+            entry["score_scope"], entry["padding_mode"]) == BENCHMARK_SELECTION
+    )
+    assert f"{benchmark['median_spearman']:+.4f}" in report
+    assert "all-query benchmark" in report
+
+
+def test_a_candidate_that_does_not_win_its_paired_comparison_is_called_undecided(tmp_path):
+    """"The benchmark beat it" is the wrong extraction from a null.
+
+    The fixture puts `decile_40_50` on exactly the benchmark's median with every paired image
+    a tie, and the report has to say the comparison decided nothing rather than reporting a
+    defeat. A generator that turned "did not win" into "lost" dies here.
+    """
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    best = section(report, "Best confidence range")
+    assert "**undecided**" in best
+    assert "counter-example" in best
+    for word in ("lost to", "was beaten", "defeated", "loses to the benchmark"):
+        assert word not in report
+
+
+def test_the_report_counts_how_often_the_paired_comparison_favours_a_candidate(tmp_path):
+    """A comparison that favoured every candidate would be a property of the comparison.
+
+    The three counts have to add up to the number of (candidate, benchmark) pairs, so a
+    generator that quietly folded the exact ties into either side is visible here.
+    """
+    summary = grid_summary()
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    total = len(summary["benchmark_comparisons"])
+    match = re.search(
+        r"favour (\d+) times, against it (\d+) times, and exactly even (\d+) times", report
+    )
+    assert match is not None
+    assert sum(int(value) for value in match.groups()) == total
+
+
+def test_the_report_reads_the_confidence_control_as_a_trend_of_its_own(tmp_path):
+    """A large positive difference against a control that is itself anti-correlated is partly
+    a statement about the control. The fixture makes the control negative at `all_valid`."""
+    report = (written(tmp_path) / "easy-report.md").read_text()
+    assert "anti-correlated in its own right" in section(
+        report, "Persistence versus confidence alone"
+    )
+
+
+def test_the_frozen_twin_is_read_by_its_gap_and_not_by_its_sign(tmp_path):
+    """Spec:172's fourth question needs an answer, and the answer comes from the two numbers.
+
+    Freezing removes the bin movement and leaves the fingerprint motion, so the gap between
+    the dynamic and frozen medians of one bin is what says whether movement explains the
+    result. A gap the metric cannot resolve is reported as no gap.
+    """
+    summary = grid_summary()
+    winner = summary[RANKED_GROUPS_KEY][0]
+    twin = _grid_group(summary, "frozen", winner["confidence_bin"])
+    assert winner["median_spearman"] != twin["median_spearman"]
+    short = section((written(tmp_path) / "easy-report.md").read_text(), "Short answer")
+    assert f"{twin['median_spearman']:+.4f}" in short.split("Does padding")[1]
+
+
+def test_a_confidence_control_that_rises_with_blur_is_read_the_other_way(tmp_path):
+    """The other half of the branch above: a control that moves the right way is not a
+    reason to discount the difference, and the report must not say it is."""
+    summary = grid_summary()
+    for group in summary["groups"]:
+        if (group["signal"], group["membership_mode"], group["confidence_bin"],
+                group["aggregation"], group["padding_mode"]) == (
+                    "confidence", ALL_VALID_BENCHMARK[0], ALL_VALID_BENCHMARK[1],
+                    "q90", ALL_VALID_BENCHMARK[2]):
+            group["median_spearman"] = 0.4
+    text = "\n".join(
+        reporting_module._confidence_section(summary, summary[RANKED_GROUPS_KEY][0])
+    )
+    assert "both move with blur" in text
+    assert "anti-correlated" not in text
+
+
+def test_a_missing_heatmap_cell_cannot_be_mistaken_for_a_score_of_zero(tmp_path):
+    """The `bad` colour must not be the colormap's own midpoint.
+
+    `coolwarm` is a light grey at zero, so a bin scoring 0.00 and a bin with no row at all
+    would be drawn in nearly the same colour -- and the second is the one a reader must not
+    read as a measurement.
+    """
+    figure = reporting_module._heatmap_figure(grid_summary())
+    image = figure.axes[0].images[0]
+    bad = np.asarray(image.cmap.get_bad())
+    midpoint = np.asarray(image.cmap(image.norm(0.0)))
+    assert np.abs(bad[:3] - midpoint[:3]).max() > 0.2
+
+
+def test_the_confidence_panel_is_not_captioned_with_a_persistence_scope(tmp_path):
+    """Spec:125 -- the confidence control has no decoder-layer scope, so a panel of
+    `1 - confidence` values captioned `persistence at layer_2` states something untrue."""
+    figure = reporting_module._blur_curve_figure(summary_frame(full_grid_rows()))
+    persistence, confidence = figure.axes
+    assert PRIMARY_SCORE_SCOPE in persistence.get_title()
+    assert PRIMARY_SCORE_SCOPE not in confidence.get_title()

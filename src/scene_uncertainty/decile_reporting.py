@@ -32,22 +32,61 @@ internally consistent, and describes a population nobody chose.
 refusal lives (spec:194). `analyze_deciles` cannot produce a collision and has a test proving
 it does not, but rows also arrive from a CSV, from two concatenated runs, or from a future
 producer -- so the check belongs at the boundary rows arrive through, and here it is.
+
+`write_decile_report` adds the seven artifacts spec:163-171 names, and three more hazards
+come with them -- all of them invisible to a reader of the output:
+
+* A **figure drawn over the bins that happen to exist** publishes a complete-looking ten-bin
+  measurement over whatever subset the table held, in whatever order pandas grouped them.
+  Every axis here is built from `DECILE_NAMES` and carries all ten positions whatever the
+  table holds; a bin with no row is a blank cell or an absent bar, which a reader can see. A
+  panel with nothing at all to draw says so in words rather than showing an empty axis, which
+  reads as a measured zero.
+* A **sentence that outruns its numbers**, which is the one artifact no schema check reaches.
+  Three specific sentences are forbidden outright and the generator cannot produce them: a
+  score described as a probability of corruption (spec:111), a dynamic and a frozen result
+  combined into one recommendation (spec:230), and a paired rate quoted with one denominator.
+  Every verdict word `_easy_report` emits is chosen from the win and loss *counts* and is
+  followed by both denominators, and no verdict claims significance -- the candidate was
+  selected best-of-N on the images it is reported over, so the counts describe this run and
+  the held-out run spec:224-225 orders is the confirmation.
+* A **half-written artifact that reads as a finished one**. Every file goes out through a
+  temporary and `os.replace`, and the summary is computed *before* the output directory is
+  created, so a table the summariser refuses leaves no directory behind at all.
+
+The writer builds the results frame exactly twice over its whole life and never at the same
+time: once inside `summarize_decile_rows`, which drops it, and once afterwards for the CSV and
+the blur curves, which share it. `pd.DataFrame(rows)` on the real table costs ~280 MB in
+`selected_query_ids` alone, so the order matters -- see `summary_frame`.
 """
 
 from __future__ import annotations
 
+import json
 import math
 import operator
+import os
+from pathlib import Path
 
-import numpy as np
-import pandas as pd
+import matplotlib
 
-from .decile_analysis import (
+# The report is written on a headless box, so the backend is pinned before pyplot is
+# imported rather than left to whatever matplotlib would autodetect.
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+
+from .confidence_deciles import DECILE_NAMES  # noqa: E402
+from .decile_analysis import (  # noqa: E402
     ALL_QUERY_BENCHMARK,
+    ALL_VALID_BENCHMARK,
     EXPECTED_SEVERITIES,
     ROW_KEYS_EXCLUDED_FROM_CSV,
+    SENSITIVITY_BIN,
 )
-from .decile_scoring import (
+from .decile_scoring import (  # noqa: E402
     COMBINED_SCOPE,
     CONFIDENCE_BINS,
     CONFIDENCE_SCOPE,
@@ -56,7 +95,7 @@ from .decile_scoring import (
     PADDING_MODES,
     PRIMARY_SCORE_SCOPE,
 )
-from .metrics import monotonicity_metrics
+from .metrics import monotonicity_metrics  # noqa: E402
 
 
 GROUP_KEYS = (
@@ -120,6 +159,68 @@ which is arithmetic. Three of the pilot's 33 ranked candidates are `shared`, and
 
 FILTERED_PADDING_MODE = "filtered"
 UNFILTERED_PADDING_MODE = "unfiltered"
+
+BENCHMARK_AGGREGATION = "q90"
+"""The scene summary the figures slice on, and the one the published benchmark exists at.
+
+Spec:131 scores the all-300-query benchmark at `q90` alone, so it is the only summary in
+which every row a figure wants is present. The figures say so on their own titles rather than
+letting a reader assume they show the winner, which may well be at another summary -- the
+easy report is where all three summaries of the winning bin are laid out."""
+
+SPEARMAN_STEP_DENOMINATOR = (
+    len(EXPECTED_SEVERITIES) * (len(EXPECTED_SEVERITIES) ** 2 - 1) // 6
+)
+"""How coarse the primary metric is, derived rather than quoted: 35 for six severities.
+
+A per-image Spearman over `n` severities is `1 - 6*S/(n*(n^2-1))` with `S` a sum of squared
+rank differences, so it lands on a grid of `1/35` -- and because `S` is always even, on a grid
+of `2/35 = 0.057` for a single image. Only 36 values exist at all. A *median* over an even
+number of images is the mean of two of them and so lands on the `1/35 = 0.029` grid.
+
+This is why the design's primary metric needs the paired comparison beside it and not instead
+of it: on the pilot the leading candidate's median difference against the benchmark is exactly
+0.000 at `q90` while the per-image comparison favours it 122 to 92. A dead heat at this
+resolution is not a dead heat in the data."""
+
+RANDOM_BIN_OVERLAP = 1.0 / (2 * len(DECILE_NAMES) - 1)
+"""What a Jaccard overlap between two *unrelated* decile memberships would be, derived.
+
+Ten equal-count bins over one valid population of `N` queries give bins of `m = N/10`. Two
+independently drawn bins share `m^2/N` queries in expectation and cover `2m - m^2/N`, so the
+ratio is `1/(2*10 - 1) = 1/19 = 0.0526` for any `N`. It follows from the bin count alone,
+which is why it is computed from `DECILE_NAMES` instead of written down.
+
+It is the reference the design's dynamic-bin overlaps have to be read against (spec:97). On
+the pilot, nine of the ten dynamic bins sit at 0.057-0.078 from severity 1 onward -- barely
+above this line -- and only `decile_90_100` reaches 0.248. Without the line, nine numbers
+within 0.02 of each other read as "membership was reasonably stable"."""
+
+EASY_REPORT_TITLE = "# Confidence-Decile Blur Experiment"
+
+EASY_REPORT_FINAL_SENTENCE = "The held-out test images were not used."
+"""The last line of every easy report, and a statement about the run rather than a hope.
+
+The loader refuses a result artifact built for the held-out partition and the summariser
+refuses a table spanning two, so by the time this sentence is written it has already been
+enforced twice. It is last because it is the sentence that decides what any number above it
+is worth: spec:224-225 makes the tuning run a *selection* and the held-out run the
+confirmation, and a reader who stops early should still meet it."""
+
+SPEC_172_QUESTIONS = (
+    "Which confidence range worked best",
+    "Did it beat confidence alone",
+    "Did it beat the existing all-query benchmark",
+    "Does padding or bin movement explain the result",
+)
+"""Spec:172's four questions, in its order, as the literal headings of the opening section.
+
+"The easy report must lead with which confidence range worked best, whether it beat confidence
+alone, whether it beat the existing all-query benchmark, and whether padding or bin movement
+explains the result." Written as a constant so the order is a thing a test asserts rather than
+a property of however the paragraphs were typed."""
+
+_UNMEASURED = "not measured"
 
 
 def describe_row_key(key) -> str:
@@ -856,3 +957,1244 @@ def summarize_decile_rows(
         RANKED_GROUPS_KEY: ranked,
     }
     return _jsonable(summary)
+
+
+DYNAMIC_MEMBERSHIP_MODE = "dynamic"
+FROZEN_MEMBERSHIP_MODE = "frozen"
+
+PERSISTENCE_PANEL_LABEL = f"persistence ({PRIMARY_SCORE_SCOPE})"
+CONFIDENCE_PANEL_LABEL = "confidence control (1 - confidence)"
+
+FIGURE_SLICE = (
+    f"{DYNAMIC_MEMBERSHIP_MODE} membership, {FILTERED_PADDING_MODE} queries, "
+    f"{BENCHMARK_AGGREGATION} scene summary"
+)
+FIGURE_SLICE_NOTE = f"{FIGURE_SLICE}, persistence at {PRIMARY_SCORE_SCOPE}"
+"""What every figure is a slice of, printed on the figure.
+
+Two forms, because the scope clause is a lie on a confidence panel: the confidence control has
+no decoder-layer scope at all (spec:125), and a panel captioned "persistence at layer_2" over
+`1 - confidence` values tells the reader something untrue about what they are looking at.
+
+All four fix the scene summary at `q90` because that is the only summary the published
+all-300-query benchmark exists at (spec:131), so it is the only one in which a figure and the
+benchmark row describe the same thing. The winning candidate may well be at another summary --
+the easy report lays out all three for the winning bin, and the figures say what they are so a
+reader does not assume otherwise.
+"""
+
+
+# --- lookups over a finished summary ----------------------------------------------------------
+
+
+def _lookup(entries, **match) -> dict | None:
+    """The single entry matching every field, or `None`.
+
+    `None` rather than a raise, because "this table has no all-300-query benchmark" is a
+    legitimate state -- the brief's own fixture is one -- and the callers turn it into a
+    sentence saying so. What is *not* legitimate is two matches, which would mean the key
+    being matched on does not identify a row; that raises.
+    """
+    found = [
+        entry for entry in entries
+        if all(entry.get(field) == value for field, value in match.items())
+    ]
+    if len(found) > 1:
+        raise ValueError(f"{len(found)} entries match {match}; that key does not identify a row")
+    return found[0] if found else None
+
+
+def _decile_group(summary: dict, membership: str, confidence_bin: str,
+                  signal: str = "persistence", scope: str | None = None) -> dict | None:
+    return _lookup(
+        summary["groups"], signal=signal,
+        score_scope=PRIMARY_SCORE_SCOPE if scope is None else scope,
+        membership_mode=membership, confidence_bin=confidence_bin,
+        aggregation=BENCHMARK_AGGREGATION, padding_mode=FILTERED_PADDING_MODE,
+    )
+
+
+def _benchmark_group(summary: dict) -> dict | None:
+    """The published all-300-query row, matched on the producer's own label tuple (spec:137)."""
+    signal, membership, confidence_bin, scope, padding = BENCHMARK_SELECTION
+    return _lookup(
+        summary["groups"], signal=signal, membership_mode=membership,
+        confidence_bin=confidence_bin, score_scope=scope, padding_mode=padding,
+        aggregation=BENCHMARK_AGGREGATION,
+    )
+
+
+def _group_key(group: dict) -> dict:
+    return {key: group[key] for key in GROUP_KEYS if key != "signal"}
+
+
+# --- formatting ---------------------------------------------------------------------------------
+
+
+def _signed(value, digits: int = 4) -> str:
+    if value is None or not math.isfinite(float(value)):
+        return _UNMEASURED
+    return f"{float(value):+.{digits}f}"
+
+
+def _plain(value, digits: int = 3) -> str:
+    if value is None or not math.isfinite(float(value)):
+        return _UNMEASURED
+    return f"{float(value):.{digits}f}"
+
+
+def _whole(rate, total) -> int | None:
+    """A count recovered from a published rate and its denominator.
+
+    Every rate here is a mean of booleans, so it is exactly `k/n` and `round(rate * n)` is
+    `k`. Counts are what a reader can check and argue with; a bare rate of 0.488 hides that it
+    stands for 122 images against 88 with 40 ties.
+    """
+    if rate is None or total in (None, 0):
+        return None
+    return int(round(float(rate) * int(total)))
+
+
+def _verdict(win: int | None, loss: int | None) -> str:
+    """The verb, chosen from the counts and never from a threshold.
+
+    Three outcomes and no fourth. Note what is missing: nothing here says "beat", "significant"
+    or "better". A majority of decided images describes this run; the candidate was selected on
+    these same images, so the count is not a test of anything and the sentence that follows it
+    says so. A comparison that comes out 103 to 112 is *undecided*, not a defeat, and
+    "does not out-trend" is the strongest thing this may say about it.
+    """
+    if win is None or loss is None:
+        return "cannot be compared image by image with"
+    if win > loss:
+        return "out-trends"
+    if win < loss:
+        return "does not out-trend"
+    return "splits evenly with"
+
+
+def _outcome(entry: dict | None, prefix: str, total_key: str = "paired_image_count") -> tuple:
+    """`(verb, sentence)` for one paired comparison, with both denominators in the sentence.
+
+    Both, always. The rate over every paired image counts each tie as a non-win, which pushes
+    a candidate that wins 122 and loses 88 below 0.5 and invites "it loses the per-image
+    majority"; the rate over the decided images alone hides how much of the run the comparison
+    could not separate. On the pilot those two framings put the same candidate on opposite
+    sides of 0.5.
+    """
+    if entry is None:
+        return "cannot be compared image by image with", "there is no paired comparison to make"
+    total = entry.get(total_key)
+    win = _whole(entry.get(f"{prefix}_win_rate"), total)
+    tie = _whole(entry.get(f"{prefix}_tie_rate"), total)
+    loss = _whole(entry.get(f"{prefix}_loss_rate"), total)
+    decided = entry.get(f"{prefix}_decided_image_count")
+    decided_rate = entry.get(f"{prefix}_decided_win_rate")
+    if not total:
+        return _verdict(win, loss), "no image was measured on both sides, so nothing is compared"
+    tail = (
+        f"{_plain(decided_rate)} over the {decided} it decided"
+        if decided else "and the comparison decided none of them"
+    )
+    return _verdict(win, loss), (
+        f"it wins {win}, ties {tie} and loses {loss} of the {total} images both sides "
+        f"measured -- a win rate of {_plain(entry.get(f'{prefix}_win_rate'))} over all "
+        f"{total}, {tail}"
+    )
+
+
+def _table(headers: list[str], body: list[list[str]]) -> list[str]:
+    return [
+        "| " + " | ".join(headers) + " |",
+        "|" + "|".join("---" for _ in headers) + "|",
+        *["| " + " | ".join(cells) + " |" for cells in body],
+    ]
+
+
+# --- atomic output --------------------------------------------------------------------------------
+
+
+def _atomic_text(path: Path, text: str) -> None:
+    """Write through a temporary and rename, so a crash never leaves a readable half-file.
+
+    A truncated `summary.json` is a parse error, which is loud. A truncated `easy-report.md`
+    is a shorter report that stops mid-sentence and looks finished, which is not.
+    """
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    os.replace(temporary, path)
+
+
+def _save_figure(figure, path: Path) -> None:
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    figure.tight_layout()
+    figure.savefig(temporary, format="png", dpi=160)
+    plt.close(figure)
+    os.replace(temporary, path)
+
+
+def _absent(axis, message: str) -> None:
+    """Say a panel had nothing to draw, rather than drawing an empty one.
+
+    An empty axis with a y label and a zero line is indistinguishable from a measurement that
+    came out flat. This prints the reason across the panel and removes the ticks, so the only
+    thing a reader can conclude is the only thing that is true.
+    """
+    axis.text(
+        0.5, 0.5, message, ha="center", va="center", fontsize=9, color="0.3",
+        transform=axis.transAxes, wrap=True,
+    )
+    axis.set_xticks([])
+    axis.set_yticks([])
+
+
+# --- the four figures -------------------------------------------------------------------------------
+
+
+def _heatmap_figure(summary: dict):
+    """Spec:167 -- median Spearman by confidence bin and signal.
+
+    Ten columns always, in `DECILE_NAMES` order, whatever the table holds; a bin with no row
+    is a grey cell reading `n/a`. Drawing only the bins that exist, sorted however the group-by
+    returned them, would publish a complete-looking ten-bin measurement over a subset -- and
+    alphabetical order happens to agree with decile order for these names, which is exactly
+    the kind of coincidence that hides the bug until the labels change.
+
+    The colour scale is fixed to [-1, +1] and centred on zero rather than fitted to the data,
+    so a run where every bin is weakly negative cannot be coloured to look like a spread of
+    strong results, and two runs' heatmaps can be laid side by side.
+    """
+    signals = (
+        ("persistence", PRIMARY_SCORE_SCOPE, PERSISTENCE_PANEL_LABEL),
+        ("confidence", CONFIDENCE_SCOPE, CONFIDENCE_PANEL_LABEL),
+    )
+    matrix = []
+    for signal, scope, _ in signals:
+        line = []
+        for name in DECILE_NAMES:
+            found = _decile_group(summary, DYNAMIC_MEMBERSHIP_MODE, name, signal, scope)
+            value = None if found is None else found["median_spearman"]
+            line.append(math.nan if value is None else float(value))
+        matrix.append(line)
+
+    figure, axis = plt.subplots(figsize=(10, 3.4))
+    data = np.ma.masked_invalid(np.asarray(matrix, dtype=np.float64))
+    # `RdBu_r` and not `coolwarm`: coolwarm's midpoint is a light grey indistinguishable from
+    # the colour a masked cell would be drawn in, so a bin scoring 0.00 and a bin with no row
+    # at all would look the same. `RdBu_r` is near-white at zero.
+    colours = matplotlib.colormaps["RdBu_r"].with_extremes(bad="0.72")
+    drawn = axis.imshow(data, cmap=colours, vmin=-1.0, vmax=1.0, aspect="auto")
+    axis.set_xticks(range(len(DECILE_NAMES)), list(DECILE_NAMES), rotation=45, ha="right")
+    axis.set_yticks(range(len(signals)), [label for _, _, label in signals])
+    for row_index, line in enumerate(matrix):
+        for column_index, value in enumerate(line):
+            axis.text(
+                column_index, row_index,
+                "n/a" if not math.isfinite(value) else f"{value:+.2f}",
+                ha="center", va="center", fontsize=7,
+                color="white" if not math.isfinite(value) else "black",
+            )
+    figure.colorbar(drawn, ax=axis, label="median per-image Spearman")
+    axis.set_title(
+        f"Median per-image Spearman by confidence bin and signal\n{FIGURE_SLICE_NOTE}"
+        "; grey `n/a` = no row in this table",
+        fontsize=8,
+    )
+    return figure
+
+
+def _clean_relative_curves(frame: pd.DataFrame, signal: str, scope: str) -> dict:
+    """Median clean-relative score per severity, per decile bin.
+
+    Clean-relative means each image's own severity-0 score subtracted from its own curve, so
+    the median across images describes the *rise* rather than the level. Without it the median
+    is dominated by how far apart the images' baselines happen to be, and a bin whose images
+    all rise steeply from different starting points looks flat.
+    """
+    subset = frame[
+        (frame["signal"] == signal)
+        & (frame["score_scope"] == scope)
+        & (frame["membership_mode"] == DYNAMIC_MEMBERSHIP_MODE)
+        & (frame["padding_mode"] == FILTERED_PADDING_MODE)
+        & (frame["aggregation"] == BENCHMARK_AGGREGATION)
+        & (frame["confidence_bin"].isin(list(DECILE_NAMES)))
+    ]
+    if subset.empty:
+        return {}
+    clean = subset.loc[subset["severity"] == 0, ["image_id", "confidence_bin", "score"]]
+    merged = subset.merge(
+        clean.rename(columns={"score": "clean_score"}),
+        on=["image_id", "confidence_bin"], how="left",
+    )
+    merged["relative"] = merged["score"] - merged["clean_score"]
+    grouped = merged.groupby(["confidence_bin", "severity"])["relative"].median()
+    return {
+        name: grouped.loc[name].sort_index()
+        for name in DECILE_NAMES
+        if name in set(grouped.index.get_level_values(0))
+    }
+
+
+def _blur_curve_figure(frame: pd.DataFrame):
+    """Spec:168 -- clean-relative severity curves for persistence and confidence.
+
+    **Two panels, never one axis.** A persistence score is a distance between fingerprints and
+    the control is `1 - confidence`; they share no unit, and spec:157 forbids comparing their
+    magnitudes. One axis carrying both would invite exactly that comparison, and the reader
+    would have no way to know it was meaningless. What *is* comparable between the panels is
+    the shape of the curves, which is what the design's trend metrics measure.
+
+    Within a panel the ten curves are the same unit, but they are still not a ranking: a bin
+    that rises further in absolute distance is not thereby a better blur signal, because the
+    per-image Spearman the design ranks on is invariant under rescaling. The heatmap is the
+    ranking; this figure is where a reader sees whether a rise is smooth or collapses.
+    """
+    panels = (
+        ("persistence", PRIMARY_SCORE_SCOPE,
+         f"median clean-relative persistence distance ({PRIMARY_SCORE_SCOPE})"),
+        ("confidence", CONFIDENCE_SCOPE, "median clean-relative (1 - confidence)"),
+    )
+    figure, axes = plt.subplots(1, 2, figsize=(12, 4.4))
+    colours = matplotlib.colormaps["viridis"](np.linspace(0.0, 0.95, len(DECILE_NAMES)))
+    for axis, (signal, scope, ylabel) in zip(axes, panels):
+        axis.set_ylabel(ylabel, fontsize=8)
+        axis.set_xlabel("Gaussian blur severity")
+        curves = _clean_relative_curves(frame, signal, scope)
+        if not curves:
+            _absent(axis, f"no {DYNAMIC_MEMBERSHIP_MODE} {FILTERED_PADDING_MODE} "
+                          f"{BENCHMARK_AGGREGATION} {signal} rows in this results table")
+            continue
+        for colour, name in zip(colours, DECILE_NAMES):
+            series = curves.get(name)
+            if series is None:
+                continue
+            axis.plot(
+                [int(value) for value in series.index], series.to_numpy(dtype=np.float64),
+                marker="o", markersize=3, color=colour, label=name,
+            )
+        missing = [name for name in DECILE_NAMES if name not in curves]
+        axis.set_title(
+            f"{signal}\n"
+            + (FIGURE_SLICE_NOTE if signal == "persistence" else FIGURE_SLICE)
+            + (f"\nmissing from this table: {', '.join(missing)}" if missing else ""),
+            fontsize=7,
+        )
+        axis.axhline(0.0, color="0.6", linewidth=0.8, linestyle=":")
+        axis.legend(fontsize=6, ncol=2)
+    figure.suptitle(
+        "Clean-relative severity curves -- two panels because the two signals share no unit; "
+        "their magnitudes must not be compared",
+        fontsize=8,
+    )
+    return figure
+
+
+def _dynamic_frozen_figure(summary: dict):
+    """Spec:169 -- query movement versus feature movement, and never one combined score.
+
+    The two bars per bin are drawn side by side and labelled, never stacked, averaged or
+    differenced. Spec:230: dynamic and frozen answer different questions and must not be
+    combined into one score. The pilot makes the cost concrete -- the bottom bin is -0.029
+    dynamic and +0.486 frozen, so any single number covering both describes neither, and the
+    frozen one is not a policy anyone can run because a naturally corrupted image has no
+    paired clean version to freeze a membership from.
+
+    The lower panel is the *reason* the two differ, and it carries dynamic bins only. Frozen
+    membership is severity zero's by construction, so its overlap is 1.0 arithmetically; a bar
+    of 1.0 printed beside a dynamic 0.06 would read as stability rather than as a definition.
+    The dashed line is the overlap two unrelated decile memberships would show -- see
+    `RANDOM_BIN_OVERLAP` -- without which nine bins clustered at 0.06 look reassuring.
+    """
+    figure, (trend, overlap) = plt.subplots(2, 1, figsize=(11, 6.6), sharex=True)
+    positions = np.arange(len(DECILE_NAMES), dtype=np.float64)
+    for offset, mode in ((-0.2, DYNAMIC_MEMBERSHIP_MODE), (0.2, FROZEN_MEMBERSHIP_MODE)):
+        heights = []
+        for name in DECILE_NAMES:
+            found = _decile_group(summary, mode, name)
+            value = None if found is None else found["median_spearman"]
+            heights.append(math.nan if value is None else float(value))
+        trend.bar(positions + offset, heights, width=0.4, label=mode)
+    trend.axhline(0.0, color="0.4", linewidth=0.8)
+    trend.set_ylabel("median per-image Spearman", fontsize=8)
+    trend.legend(fontsize=8)
+    trend.set_title(
+        "Persistence trend by confidence bin under two memberships -- two answers, never one"
+        f"\n{FIGURE_SLICE_NOTE}"
+        "\nFrozen is a diagnostic: it needs a paired clean image, which a naturally corrupted "
+        "one does not have.",
+        fontsize=8,
+    )
+
+    overlaps = []
+    for name in DECILE_NAMES:
+        found = _decile_group(summary, DYNAMIC_MEMBERSHIP_MODE, name)
+        value = None if found is None else found["mean_clean_overlap_from_severity_1"]
+        overlaps.append(math.nan if value is None else float(value))
+    overlap.bar(positions, overlaps, width=0.6, color="0.45", label=DYNAMIC_MEMBERSHIP_MODE)
+    overlap.axhline(
+        RANDOM_BIN_OVERLAP, color="crimson", linestyle="--", linewidth=1.0,
+        label=f"unrelated memberships ({RANDOM_BIN_OVERLAP:.4f})",
+    )
+    overlap.set_xticks(positions, list(DECILE_NAMES), rotation=45, ha="right")
+    overlap.set_ylabel("mean Jaccard vs severity 0\n(severities 1-5)", fontsize=8)
+    overlap.legend(fontsize=7)
+    overlap.set_title(
+        "How much of each bin's membership survives blur. Dynamic bins only -- a frozen or "
+        "shared bin is 1.000 by construction, which is arithmetic and not stability.",
+        fontsize=8,
+    )
+    return figure
+
+
+def _padding_sensitivity_figure(summary: dict):
+    """Spec:170 -- the lowest bin with the padding union removed and kept.
+
+    Only the lowest bin, because spec:69 scopes the control to it: "A sensitivity control
+    repeats only the lowest-confidence-bin analysis without filtering". Widening it would
+    publish nine padding measurements the design never asked for.
+
+    The count annotated over each pair is `score_changed_image_count`, and the axis label says
+    what it is: a **lower bound** on the images the mask reached. The mask reaches an image
+    whenever it changes that image's selection, and a changed selection can still produce a
+    bit-identical scene score -- a summary is a many-to-one map. On the pilot the same
+    selection pair reports 66, 64 and 65 under the three scene summaries, and a set of images
+    a mask reached cannot depend on the summary applied afterwards.
+    """
+    entries = sorted(
+        (
+            entry for entry in summary["padding_sensitivity"]
+            if entry["confidence_bin"] == SENSITIVITY_BIN
+            and entry["aggregation"] == BENCHMARK_AGGREGATION
+            and entry["score_scope"] in (PRIMARY_SCORE_SCOPE, CONFIDENCE_SCOPE)
+        ),
+        key=lambda entry: (entry["membership_mode"], entry["signal"]),
+    )
+    figure, axis = plt.subplots(figsize=(9, 4.6))
+    axis.set_title(
+        f"Padding sensitivity, {SENSITIVITY_BIN} only ({BENCHMARK_AGGREGATION}, "
+        f"persistence at {PRIMARY_SCORE_SCOPE}).\nUnfiltered keeps the repeated decoder "
+        "placeholders the primary analysis removes.",
+        fontsize=8,
+    )
+    axis.set_ylabel("median per-image Spearman", fontsize=8)
+    if not entries:
+        _absent(
+            axis,
+            f"no unfiltered {SENSITIVITY_BIN} rows in this results table, so the padding "
+            "control could not be drawn",
+        )
+        return figure
+    positions = np.arange(len(entries), dtype=np.float64)
+    for offset, key, label in (
+        (-0.2, "filtered_median_spearman", FILTERED_PADDING_MODE),
+        (0.2, "unfiltered_median_spearman", UNFILTERED_PADDING_MODE),
+    ):
+        heights = [
+            math.nan if entry[key] is None else float(entry[key]) for entry in entries
+        ]
+        axis.bar(positions + offset, heights, width=0.4, label=label)
+    for position, entry in zip(positions, entries):
+        # Annotated against the top of the axis rather than against zero: a pair of positive
+        # bars would otherwise have the count printed across them.
+        axis.text(
+            position, 0.98, f"score changed on\n{entry['score_changed_image_count']} images",
+            transform=axis.get_xaxis_transform(), ha="center", va="top",
+            fontsize=6, color="0.25",
+        )
+    axis.axhline(0.0, color="0.4", linewidth=0.8)
+    # Headroom for the annotations, which are anchored to the top of the axis.
+    bottom, top = axis.get_ylim()
+    axis.set_ylim(bottom, top + 0.22 * (top - bottom))
+    axis.set_xticks(
+        positions,
+        [f"{entry['membership_mode']}\n{entry['signal']}" for entry in entries],
+        fontsize=8,
+    )
+    axis.legend(fontsize=8)
+    axis.set_xlabel(
+        "The annotated count is a LOWER BOUND on the images the padding mask reached: it "
+        "counts images whose scene score moved, and that varies with the scene summary.",
+        fontsize=6,
+    )
+    return figure
+
+
+# --- the plain-language report ------------------------------------------------------------------
+
+
+def _matches(entries, **match) -> list[dict]:
+    return [
+        entry for entry in entries
+        if all(entry.get(field) == value for field, value in match.items())
+    ]
+
+
+def _preamble(summary: dict) -> list[str]:
+    metadata = summary.get("run_metadata") or {}
+    diagnostics = summary.get("diagnostics") or {}
+    severities = diagnostics.get("severities") or []
+    return [
+        f"Recomputed from saved artifacts over {diagnostics.get('image_count', 0)} images at "
+        f"{len(severities)} blur levels in the `{metadata.get('source_partition', 'unknown')}` "
+        "partition. No detector was run and no nearest-neighbour search was performed: every "
+        "number below comes from the cached features and the saved query distances.",
+        "",
+        f"Provenance: feature cache `{metadata.get('feature_cache_id', 'unknown')}`, kNN result "
+        f"`{metadata.get('source_result_id', 'unknown')}`, clean bank "
+        f"`{metadata.get('bank_id', 'unknown')}`, k={metadata.get('k', 'unknown')}, "
+        f"normalization `{metadata.get('normalization', 'unknown')}`. "
+        f"{diagnostics.get('row_count', 0)} scored rows in "
+        f"{diagnostics.get('group_count', 0)} groups, "
+        f"{diagnostics.get('deployable_group_count', 0)} of which cleared the deployable gate.",
+        "",
+    ]
+
+
+def _winner_sentence(ranked: list[dict], winner: dict | None, group_count: int) -> str:
+    if winner is None:
+        return (
+            f"No candidate qualified. To be ranked, a selection has to be persistence at "
+            f"`{PRIMARY_SCORE_SCOPE}`, built with the padding union removed, on a membership "
+            f"that can be rebuilt on a single image, and scored at every image and every one "
+            f"of the {len(EXPECTED_SEVERITIES)} severities. Of the {group_count} groups "
+            "measured, none met all four, so nothing in this report recommends a confidence "
+            "range."
+        )
+    return (
+        f"`{winner['confidence_bin']}`, using `{winner['membership_mode']}` membership, the "
+        f"`{winner['aggregation']}` scene summary and persistence at `{winner['score_scope']}`, "
+        f"with the padded decoder queries removed. Its median per-image Spearman against blur "
+        f"severity is {_signed(winner['median_spearman'])}, its adjacent non-decrease rate "
+        f"{_plain(winner['mean_adjacent_monotonicity'])}, its maximum-blur-above-clean rate "
+        f"{_plain(winner['endpoint_increase_rate'])}, and it scored "
+        f"{winner['scored_severity_count']} of the {winner['expected_severity_count']} "
+        f"image-severity pairs it swept. It came first of {len(ranked)} candidates that "
+        "cleared the deployable gate."
+    )
+
+
+def _confidence_sentence(summary: dict, winner: dict | None) -> str:
+    if winner is None:
+        return (
+            "There is no candidate to compare, so this question is unanswered on this run. "
+            "The bin-by-bin comparison below still reports every matched pair that was scored."
+        )
+    comparison = _lookup(summary["comparisons"], **_group_key(winner))
+    if comparison is None:
+        return (
+            "This selection was scored for persistence only, so it has no matched confidence "
+            "control to be compared against (the all-300-query benchmark is scored this way "
+            "by design). Nothing here answers the question for it."
+        )
+    verb, sentence = _outcome(comparison, "persistence_image")
+    return (
+        f"On the same selected queries and the same scene summary, persistence {verb} its "
+        f"confidence control: median Spearman {_signed(comparison['persistence_median_spearman'])} "
+        f"against {_signed(comparison['confidence_median_spearman'])}, a difference of "
+        f"{_signed(comparison['persistence_minus_confidence_spearman'])}. Image by image, "
+        f"{sentence}."
+    )
+
+
+def _grid_steps(difference) -> str:
+    """A difference in medians expressed in units of the metric's own resolution.
+
+    Written this way because a bare "+0.0286" reads as a small margin, and it is not a small
+    margin -- it is the *smallest one this metric can express*. A margin of one grid step and
+    a margin of zero are adjacent states of the same statistic, and a reader who is not told
+    the grid size cannot tell which of the two they are looking at.
+    """
+    if difference is None or not math.isfinite(float(difference)):
+        return _UNMEASURED
+    steps = abs(float(difference)) * SPEARMAN_STEP_DENOMINATOR
+    grid = f"1/{SPEARMAN_STEP_DENOMINATOR} = {1 / SPEARMAN_STEP_DENOMINATOR:.4f} grid a median "
+    if steps < 0.5:
+        return (
+            "exactly zero at the resolution of the primary metric, which is why the paired "
+            "comparison beside it is the informative one here"
+        )
+    if steps < 1.5:
+        return (
+            f"one step of the {grid}over an even number of images can land on, which is the "
+            "smallest difference this metric can express"
+        )
+    return f"{steps:.1f} steps of the {grid}over an even number of images can land on"
+
+
+def _benchmark_sentence(summary: dict, winner: dict | None) -> str:
+    if winner is None:
+        return (
+            "There is no candidate to compare against the benchmark on this run."
+        )
+    entries = sorted(
+        _matches(summary["benchmark_comparisons"], **_group_key(winner)),
+        key=lambda entry: entry["benchmark_aggregation"],
+    )
+    if not entries:
+        return (
+            "This results table carries no all-300-query benchmark row, so the comparison the "
+            "design asks for could not be made from it."
+        )
+    entry = entries[0]
+    verb, sentence = _outcome(entry, "candidate_image")
+    return (
+        f"The existing all-query benchmark reproduces from these artifacts at "
+        f"{_signed(entry['benchmark_median_spearman'])} "
+        f"(`{entry['benchmark_aggregation']}`, `{entry['score_scope']}`, all queries kept). "
+        f"The candidate's median is {_signed(entry['candidate_median_spearman'])}, a difference "
+        f"of {_signed(entry['candidate_minus_benchmark_spearman'])} -- "
+        f"{_grid_steps(entry['candidate_minus_benchmark_spearman'])}. Paired image by image it "
+        f"{verb} the benchmark: {sentence}."
+    )
+
+
+def _freezing_reading(dynamic_median, frozen_median) -> str:
+    """What the frozen twin's number says about bin movement, decided by the numbers.
+
+    Freezing the membership at severity zero removes the movement and leaves the fingerprint
+    motion, so the *sign* of the gap is the answer to spec:172's fourth question for this bin.
+    A gap smaller than one grid step is not a gap at all: the metric cannot resolve it.
+    """
+    if dynamic_median is None or frozen_median is None:
+        return "one of the two was not measured, so the comparison cannot be made"
+    gap = float(frozen_median) - float(dynamic_median)
+    if abs(gap) * SPEARMAN_STEP_DENOMINATOR < 1.5:
+        return (
+            "a gap of at most one step of the metric's own grid, so on this run the movement "
+            "of queries between bins is not what produces the trend and is not costing it "
+            "anything either"
+        )
+    if gap > 0:
+        return (
+            "higher with the membership held still, so on this run the movement of queries "
+            "between bins is costing this selection some of its trend"
+        )
+    return (
+        "lower with the membership held still, so on this run the trend does not survive "
+        "freezing the membership and rebuilding the bins is part of what produces it"
+    )
+
+
+def _movement_sentence(summary: dict, winner: dict | None) -> str:
+    if winner is None:
+        return "No candidate was selected, so there is no result for either to explain."
+    parts = ["Neither is shown to."]
+    overlap = winner.get("mean_clean_overlap_from_severity_1")
+    if winner.get("clean_overlap_is_definitional"):
+        parts.append(
+            f"`{winner['confidence_bin']}` under `{winner['membership_mode']}` membership is "
+            "the same query set at every severity by construction, so it has no bin movement "
+            "at all and none can be explaining it."
+        )
+    elif overlap is None:
+        parts.append("Membership stability was not measured for this selection.")
+    else:
+        settled = (
+            "so its queries are almost entirely reselected at every blur level: whatever the "
+            "trend is, it belongs to the confidence range and not to any particular queries"
+            if float(overlap) <= 2 * RANDOM_BIN_OVERLAP else
+            "so a substantial part of its membership survives blur, and the trend is partly a "
+            "property of the queries themselves"
+        )
+        parts.append(
+            f"`{winner['confidence_bin']}` keeps {_plain(overlap, 4)} of its severity-zero "
+            f"membership from severity 1 onward, against {RANDOM_BIN_OVERLAP:.4f} for two "
+            f"unrelated memberships -- {settled}."
+        )
+    twin = _lookup(
+        summary["groups"], signal="persistence", score_scope=winner["score_scope"],
+        membership_mode=FROZEN_MEMBERSHIP_MODE, confidence_bin=winner["confidence_bin"],
+        aggregation=winner["aggregation"], padding_mode=winner["padding_mode"],
+    )
+    if twin is not None:
+        parts.append(
+            f"Holding that bin's membership fixed at severity zero scores "
+            f"{_signed(twin['median_spearman'])} instead of "
+            f"{_signed(winner['median_spearman'])} -- "
+            f"{_freezing_reading(winner['median_spearman'], twin['median_spearman'])}. That "
+            "frozen number is a diagnostic and not an alternative method, and the two are "
+            "never combined into one score."
+        )
+    sensitivity = _lookup(
+        summary["padding_sensitivity"], signal="persistence",
+        membership_mode=winner["membership_mode"], confidence_bin=winner["confidence_bin"],
+        aggregation=winner["aggregation"], score_scope=winner["score_scope"],
+    )
+    if sensitivity is not None:
+        parts.append(
+            f"Keeping the padded queries instead of removing them moves this selection from "
+            f"{_signed(sensitivity['filtered_median_spearman'])} to "
+            f"{_signed(sensitivity['unfiltered_median_spearman'])}, and the scene score moved "
+            f"on {sensitivity['score_changed_image_count']} images."
+        )
+    else:
+        padding = summary.get("padding") or {}
+        parts.append(
+            f"The padding control is scoped to `{SENSITIVITY_BIN}` alone, so it does not test "
+            f"`{winner['confidence_bin']}` directly."
+        )
+        every_query = _lookup(
+            summary["padding_sensitivity"], signal="persistence",
+            membership_mode=ALL_VALID_BENCHMARK[0], confidence_bin=ALL_VALID_BENCHMARK[1],
+            aggregation=BENCHMARK_AGGREGATION, score_scope=PRIMARY_SCORE_SCOPE,
+        )
+        if every_query is not None:
+            parts.append(
+                f"Where padding can be measured -- the every-query selection -- removing the "
+                f"repeated decoder placeholders moves the trend from "
+                f"{_signed(every_query['unfiltered_median_spearman'])} to "
+                f"{_signed(every_query['filtered_median_spearman'])}, so on this run the "
+                f"placeholders were adding to the old benchmark rather than to this bin. "
+                f"{padding.get('images_with_padding', 0)} of "
+                f"{padding.get('image_count', 0)} images carried any padding at all."
+            )
+    return " ".join(parts)
+
+
+def _short_answer(summary: dict, ranked: list[dict], winner: dict | None) -> list[str]:
+    group_count = (summary.get("diagnostics") or {}).get("group_count", 0)
+    answers = (
+        _winner_sentence(ranked, winner, group_count),
+        _confidence_sentence(summary, winner),
+        _benchmark_sentence(summary, winner),
+        _movement_sentence(summary, winner),
+    )
+    lines = ["## Short answer", ""]
+    for question, answer in zip(SPEC_172_QUESTIONS, answers):
+        lines.extend([f"**{question}?** {answer}", ""])
+    return lines
+
+
+def _bin_versus_benchmark(summary: dict, groups: list[dict]) -> list[str]:
+    """The winning bin against the published benchmark, one row per scene summary.
+
+    This table is where the primary metric's resolution becomes visible instead of being
+    described. A summary whose median difference is exactly 0.000 can still take the paired
+    comparison decisively -- on the pilot, `q90` is a dead heat on the median and 122 to 92 on
+    the images -- and no single-number presentation can show that. Publishing the three rows
+    together is also the honest place to say that they are three views of one bin: they share
+    the selections and the images, so the agreement between them is arithmetic.
+    """
+    body = []
+    for group in sorted(groups, key=lambda group: group["aggregation"]):
+        for entry in sorted(
+            _matches(summary["benchmark_comparisons"], **_group_key(group)),
+            key=lambda entry: entry["benchmark_aggregation"],
+        ):
+            total = entry["paired_image_count"]
+            body.append([
+                f"`{group['aggregation']}`",
+                _signed(entry["candidate_median_spearman"]),
+                _signed(entry["benchmark_median_spearman"]),
+                _signed(entry["candidate_minus_benchmark_spearman"]),
+                f"{_whole(entry['candidate_image_win_rate'], total)}/"
+                f"{_whole(entry['candidate_image_tie_rate'], total)}/"
+                f"{_whole(entry['candidate_image_loss_rate'], total)}",
+                _plain(entry["candidate_image_win_rate"]),
+                f"{_plain(entry['candidate_image_decided_win_rate'])} "
+                f"({entry['candidate_image_decided_image_count']})",
+            ])
+    if not body:
+        return []
+    return [
+        "Against the all-query benchmark, one row per scene summary. The difference of medians "
+        "is what the design ranks on; the paired columns are what make a difference of zero "
+        "readable, because a median over an even number of images can only move in steps of "
+        f"{1 / SPEARMAN_STEP_DENOMINATOR:.4f}.",
+        "",
+        *_table(
+            ["summary", "candidate", "benchmark", "difference", "W/T/L",
+             "win rate, all paired", "decided, over N"],
+            body,
+        ),
+        "",
+    ]
+
+
+def _benchmark_counterexample(summary: dict, ranked: list[dict]) -> list[str]:
+    """The honesty check: how often the paired comparison *fails* to favour a candidate.
+
+    A paired win rate that favoured every candidate would be a property of the comparison
+    rather than of the candidates, and the leading candidate's numbers would be worth nothing.
+    So the counts are published for the whole ranked field, and the strongest counter-example
+    is named -- a candidate that matches or beats the benchmark on the primary metric and
+    still does not take the per-image comparison.
+
+    That counter-example is reported as *undecided*, never as a defeat. On the pilot it is
+    `decile_40_50` at `mean`: 103 wins against 112 losses with 35 ties, which separates
+    nothing in either direction. "The benchmark beat it" is the wrong reading of a null.
+    """
+    favoured, unfavoured, even, candidates = 0, 0, 0, []
+    for group in ranked:
+        for entry in _matches(summary["benchmark_comparisons"], **_group_key(group)):
+            total = entry["paired_image_count"]
+            win = _whole(entry.get("candidate_image_win_rate"), total)
+            loss = _whole(entry.get("candidate_image_loss_rate"), total)
+            if win is None or loss is None:
+                continue
+            favoured += win > loss
+            unfavoured += win < loss
+            even += win == loss
+            difference = entry.get("candidate_minus_benchmark_spearman")
+            if win <= loss and difference is not None and float(difference) >= 0.0:
+                candidates.append((win < loss, group, entry, win, loss,
+                                   _whole(entry["candidate_image_tie_rate"], total)))
+    if favoured + unfavoured + even == 0:
+        return []
+    lines = [
+        "Across the ranked field the paired comparison against the benchmark comes out in the "
+        f"candidate's favour {favoured} times, against it {unfavoured} times, and exactly even "
+        f"{even} times, so it is not a procedure that favours whatever it is handed."
+    ]
+    # A candidate that is genuinely behind on the images is a sharper counter-example than one
+    # that is exactly level, so it is preferred; both are reported as undecided rather than lost.
+    strict = [entry for entry in candidates if entry[0]]
+    chosen = (strict or candidates or [None])[0]
+    if chosen is not None:
+        _, group, entry, win, loss, tie = chosen
+        decided = entry["candidate_image_decided_image_count"]
+        tail = (
+            f"{_plain(entry['candidate_image_decided_win_rate'])} of the {decided} images it "
+            "decided" if decided else "and the comparison decided none of them at all"
+        )
+        lines.append(
+            f"The clearest counter-example is `{group['confidence_bin']}` at "
+            f"`{group['aggregation']}`, which matches or beats the benchmark's median "
+            f"({_signed(entry['candidate_median_spearman'])} against "
+            f"{_signed(entry['benchmark_median_spearman'])}) and still comes out {win} wins to "
+            f"{loss} losses with {tie} ties -- {tail}. At counts that close the comparison is "
+            "**undecided**: it has not established the candidate, and it has not established "
+            "the benchmark either."
+        )
+    lines.append("")
+    return lines
+
+
+def _ranked_section(summary: dict, ranked: list[dict], winner: dict | None) -> list[str]:
+    lines = ["## Best confidence range", ""]
+    if winner is None:
+        lines.extend([
+            "No group cleared the deployable gate, so no confidence range is recommended. "
+            "The full group table in `summary.json` still holds every measurement.",
+            "",
+        ])
+        return lines
+    tied = [
+        group for group in ranked if group["median_spearman"] == winner["median_spearman"]
+    ]
+    lines.append(
+        f"The ranking puts `{winner['confidence_bin']}` "
+        f"(`{winner['membership_mode']}`, `{winner['aggregation']}`) first at "
+        f"{_signed(winner['median_spearman'])}."
+    )
+    if len(tied) > 1:
+        others = len(tied) - 1
+        lines.append(
+            f"It shares that median with {others} other candidate"
+            f"{'' if others == 1 else 's'} of the {len(ranked)} ranked, and the order among "
+            "them is settled by the adjacent non-decrease rate and then by the violation "
+            "magnitude -- both far finer than the metric they are breaking a tie in, so the "
+            "first place is not a gap over the second."
+        )
+    same_bin = [
+        group for group in ranked
+        if group["confidence_bin"] == winner["confidence_bin"]
+        and group["membership_mode"] == winner["membership_mode"]
+    ]
+    if len(same_bin) > 1:
+        spread = ", ".join(
+            f"`{group['aggregation']}` {_signed(group['median_spearman'])}"
+            for group in sorted(same_bin, key=lambda group: group["aggregation"])
+        )
+        lines.append(
+            f"The same bin across every scene summary it was ranked at: {spread}. These are "
+            f"{len(same_bin)} views of one bin on the same images, not "
+            f"{len(same_bin)} independent confirmations of it."
+        )
+    lines.append("")
+    lines.extend(_bin_versus_benchmark(summary, same_bin or [winner]))
+    lines.extend(_benchmark_counterexample(summary, ranked))
+    lines.append(
+        "The deployable ranking, best first. Only candidates with the padding union removed, "
+        f"at `{PRIMARY_SCORE_SCOPE}`, on a membership a single image can rebuild, and at full "
+        "coverage, appear in it at all."
+    )
+    lines.append("")
+    shown = ranked[:15]
+    lines.extend(_table(
+        ["#", "membership", "bin", "summary", "median Spearman", "adjacent non-decrease",
+         "max blur above clean", "overlap vs severity 0", "coverage"],
+        [
+            [
+                str(position), f"`{group['membership_mode']}`", f"`{group['confidence_bin']}`",
+                f"`{group['aggregation']}`", _signed(group["median_spearman"]),
+                _plain(group["mean_adjacent_monotonicity"]),
+                _plain(group["endpoint_increase_rate"]),
+                _plain(group["mean_clean_overlap_from_severity_1"], 4)
+                + (" (arithmetic)" if group["clean_overlap_is_definitional"] else ""),
+                f"{group['scored_severity_count']}/{group['expected_severity_count']}",
+            ]
+            for position, group in enumerate(shown, start=1)
+        ],
+    ))
+    if len(ranked) > len(shown):
+        lines.append("")
+        lines.append(
+            f"{len(ranked) - len(shown)} further candidates are in `summary.json` under "
+            f"`{RANKED_GROUPS_KEY}`."
+        )
+    lines.append("")
+    return lines
+
+
+def _confidence_section(summary: dict, winner: dict | None) -> list[str]:
+    lines = ["## Persistence versus confidence alone", ""]
+    lines.extend([_confidence_sentence(summary, winner), ""])
+    lines.append(
+        "Every pair below shares one selection and one scene summary, which is what makes the "
+        "comparison fair; the two scores are in unrelated units, so only their trends are ever "
+        "compared. Both denominators are given because a per-image Spearman over "
+        f"{len(EXPECTED_SEVERITIES)} severities lands on a coarse grid and exact ties are "
+        "common: a win rate over every paired image counts each tie as a non-win, while a rate "
+        "over the decided images alone hides how much of the run could not be separated."
+    )
+    lines.append("")
+    control = _lookup(
+        summary["groups"], signal="confidence", score_scope=CONFIDENCE_SCOPE,
+        membership_mode=ALL_VALID_BENCHMARK[0], confidence_bin=ALL_VALID_BENCHMARK[1],
+        aggregation=BENCHMARK_AGGREGATION, padding_mode=ALL_VALID_BENCHMARK[2],
+    )
+    if control is not None and control["median_spearman"] is not None:
+        median = float(control["median_spearman"])
+        if median < 0:
+            lines.extend([
+                "**Read the difference column with the control's own column beside it.** Over "
+                f"every valid query the confidence control itself trends "
+                f"{_signed(median)}: `1 - confidence` *falls* as blur rises in this "
+                "configuration, so the control is strongly anti-correlated in its own right. "
+                "A large positive difference is therefore partly a statement about the "
+                "control and only partly about persistence, and the persistence column is the "
+                "one that says whether the signal rises at all. The bottom bin is the clearest "
+                "case: it out-trends its control while barely trending itself.",
+                "",
+            ])
+        else:
+            lines.extend([
+                "Over every valid query the confidence control itself trends "
+                f"{_signed(median)}, so the difference column below is a comparison between "
+                "two signals that both move with blur rather than a comparison against a "
+                "control that moves the wrong way.",
+                "",
+            ])
+    body = []
+    for name in [*DECILE_NAMES, ALL_VALID_BENCHMARK[1]]:
+        for membership in (DYNAMIC_MEMBERSHIP_MODE, FROZEN_MEMBERSHIP_MODE,
+                           ALL_VALID_BENCHMARK[0]):
+            entry = _lookup(
+                summary["comparisons"], membership_mode=membership, confidence_bin=name,
+                aggregation=BENCHMARK_AGGREGATION, score_scope=PRIMARY_SCORE_SCOPE,
+                padding_mode=FILTERED_PADDING_MODE,
+            )
+            if entry is None:
+                continue
+            total = entry["paired_image_count"]
+            body.append([
+                f"`{membership}`", f"`{name}`",
+                _signed(entry["persistence_median_spearman"]),
+                _signed(entry["confidence_median_spearman"]),
+                _signed(entry["persistence_minus_confidence_spearman"]),
+                f"{_whole(entry['persistence_image_win_rate'], total)}/"
+                f"{_whole(entry['persistence_image_tie_rate'], total)}/"
+                f"{_whole(entry['persistence_image_loss_rate'], total)}",
+                _plain(entry["persistence_image_win_rate"]),
+                f"{_plain(entry['persistence_image_decided_win_rate'])} "
+                f"({entry['persistence_image_decided_image_count']})",
+            ])
+    if body:
+        lines.extend(_table(
+            ["membership", "bin", "persistence", "confidence", "difference",
+             "W/T/L", "win rate, all paired", "decided, over N"],
+            body,
+        ))
+    else:
+        lines.append("No matched persistence/confidence pair was scored in this table.")
+    lines.append("")
+    return lines
+
+
+def _dynamic_frozen_section(summary: dict) -> list[str]:
+    lines = ["## Dynamic versus frozen queries", ""]
+    lines.append(
+        "`dynamic` rebuilds the ten bins from the blurred image itself, which is something a "
+        "single image can do. `frozen` reuses the bins built from the clean image, which a "
+        "naturally corrupted image cannot: there is no paired clean version of it. So a strong "
+        "frozen result is a diagnostic -- it says how far the fingerprints moved once "
+        "membership is held still -- and never a method. The two are reported side by side and "
+        "are never combined into one score."
+    )
+    lines.append("")
+    body = []
+    for name in DECILE_NAMES:
+        dynamic = _decile_group(summary, DYNAMIC_MEMBERSHIP_MODE, name)
+        frozen = _decile_group(summary, FROZEN_MEMBERSHIP_MODE, name)
+        if dynamic is None and frozen is None:
+            continue
+        body.append([
+            f"`{name}`",
+            _UNMEASURED if dynamic is None else _signed(dynamic["median_spearman"]),
+            _UNMEASURED if frozen is None else _signed(frozen["median_spearman"]),
+            _UNMEASURED if dynamic is None
+            else _plain(dynamic["mean_clean_overlap_from_severity_1"], 4),
+        ])
+    if body:
+        lines.extend(_table(
+            ["bin", "dynamic", "frozen (diagnostic)", "dynamic overlap vs severity 0"], body
+        ))
+        lines.append("")
+    lines.append(
+        f"Two unrelated decile memberships would overlap at {RANDOM_BIN_OVERLAP:.4f}, so a bin "
+        "sitting close to that line is being rebuilt almost from scratch at every severity. A "
+        "`frozen` or `shared` row would print 1.000 in that column by construction, which is "
+        "arithmetic rather than a measurement, and it is left out of the column above for that "
+        "reason."
+    )
+    lines.append("")
+    return lines
+
+
+def _padding_section(summary: dict) -> list[str]:
+    padding = summary.get("padding") or {}
+    lines = ["## Effect of padded queries", ""]
+    padded_images = padding.get("images_with_padding", 0)
+    image_count = padding.get("image_count", 0)
+    lines.append(
+        f"{padded_images} of {image_count} images carry a repeated decoder tail; together they "
+        f"contribute {padding.get('total_union_padded_count', 0)} padded query slots, and the "
+        f"largest single image loses {padding.get('max_union_padded_count', 0)} of them. Of "
+        f"those {padded_images} padded images, "
+        f"{padding.get('padded_images_with_identical_tails', 0)} have the same detected tail "
+        "at all six severities -- the tail wanders with blur rather than growing, which is why "
+        "one mask is taken per image and reused at every severity instead of one per severity. "
+        f"On the remaining {max(image_count - padded_images, 0)} images there is nothing to "
+        "remove, so the control is a no-op there by construction and any median taken over all "
+        f"{image_count} images is diluted by them."
+    )
+    lines.append("")
+    entries = sorted(
+        (
+            entry for entry in summary["padding_sensitivity"]
+            if entry["aggregation"] == BENCHMARK_AGGREGATION
+            and entry["score_scope"] in (PRIMARY_SCORE_SCOPE, CONFIDENCE_SCOPE)
+        ),
+        key=lambda entry: (entry["confidence_bin"], entry["membership_mode"], entry["signal"]),
+    )
+    if entries:
+        lines.extend(_table(
+            ["bin", "membership", "signal", "filtered", "unfiltered", "difference",
+             "score changed on", "decided win rate on those, over N"],
+            [
+                [
+                    f"`{entry['confidence_bin']}`", f"`{entry['membership_mode']}`",
+                    f"`{entry['signal']}`",
+                    _signed(entry["filtered_median_spearman"]),
+                    _signed(entry["unfiltered_median_spearman"]),
+                    _signed(entry["unfiltered_minus_filtered_spearman"]),
+                    str(entry["score_changed_image_count"]),
+                    f"{_plain(entry['score_changed_image_decided_win_rate'])} "
+                    f"({entry['score_changed_image_decided_image_count']})",
+                ]
+                for entry in entries
+            ],
+        ))
+        lines.append("")
+    else:
+        lines.extend(["No unfiltered control was scored in this table.", ""])
+    lines.append(
+        "The `score changed on` column is a **lower bound** on the images the padding mask "
+        "reached. It counts the images whose scene score moved, and a changed selection can "
+        "still produce a bit-identical score because a scene summary is a many-to-one map -- "
+        "the same selection pair reports different counts under different summaries, which a "
+        "set of images a mask reached could not do. It must not be read as the images the "
+        "padding changed."
+    )
+    lines.append("")
+    return lines
+
+
+def _metrics_section(summary: dict) -> list[str]:
+    return [
+        "## Metrics in plain language",
+        "",
+        "- **Median per-image Spearman** is the headline. For one image, rank its six scene "
+        "scores against the six blur levels and correlate the ranks; +1 means the score rose "
+        "at every step, 0 means no relation, -1 means it fell throughout. The median is taken "
+        "across images. Over "
+        f"{len(EXPECTED_SEVERITIES)} severities this can only land on "
+        f"{len(EXPECTED_SEVERITIES) * (len(EXPECTED_SEVERITIES) ** 2 - 1) // 6 + 1} distinct "
+        f"values, spaced {2 / SPEARMAN_STEP_DENOMINATOR:.4f} apart, so two configurations can "
+        "tie here while differing on most images. That is why every comparison is also made "
+        "image by image.",
+        "- **Adjacent non-decrease rate** is the share of the five steps between neighbouring "
+        "blur levels on which the score did not fall. **Violation magnitude** is how far it "
+        "fell when it did, as a share of that image's own score range.",
+        "- **Maximum-blur-above-clean rate** is the share of images whose worst blur level "
+        "scored above their clean one -- the weakest thing a useful signal must do.",
+        "- **Coverage** is scored image-severity pairs against the pairs the sweep should have "
+        "produced. A configuration that collapsed at high blur and one that rose the whole way "
+        "can publish the same median, so full coverage is required rather than noted.",
+        "- **Overlap vs severity 0** is the Jaccard overlap between a bin's membership at a "
+        "blur level and the same bin on the clean image, averaged over severities 1 to 5. "
+        f"Two unrelated memberships would score {RANDOM_BIN_OVERLAP:.4f}. A 1.000 on a "
+        "`frozen` or `shared` row is arithmetic, not evidence: those selections are the same "
+        "query set at every severity by construction.",
+        "- **W/T/L and the two win rates.** Ties are common at this resolution, so a rate over "
+        "every paired image and a rate over the decided ones alone can fall on opposite sides "
+        "of 0.5. Both are always given; neither is a significance test.",
+        "",
+        "**Neither score is a probability.** Persistence uncertainty is a distance from an "
+        "image's decoder fingerprints to the nearest clean ones, and the confidence control is "
+        "one minus the detector's largest class score. That subtraction only reverses "
+        "direction -- nothing here is trained or calibrated, and a value of 0.8 does not mean "
+        "an image is 80 percent corrupted. Distances and `1 - confidence` share no unit, so "
+        "the two signals are only ever compared through their trends and never through their "
+        "raw magnitudes.",
+        "",
+    ]
+
+
+def _limits_section(summary: dict, ranked: list[dict]) -> list[str]:
+    return [
+        "## What this does not prove",
+        "",
+        "- **Selecting and reporting on the same images.** Any candidate named above was "
+        f"chosen best of {len(ranked)} ranked candidates on the same images the numbers "
+        "describe. Its counts are conditioned on that choice and are not a hypothesis test of "
+        "anything.",
+        "- **Three scene summaries of one bin are one result.** They are computed from the "
+        "same selections on the same images; agreement between them is arithmetic, not "
+        "replication.",
+        "- **The ranking did not choose the padding rule.** Every candidate it admits has the "
+        "padding union removed, so the choice between removing and keeping the decoder "
+        "placeholders is not settled by the ranking. The sensitivity table above is the "
+        "evidence for that half of the decision, and on a run where the unfiltered rows trend "
+        "higher, what that shows is that the placeholders carry a blur signal of their own -- "
+        "not that the method should keep them.",
+        "- **A frozen result is not a method.** It needs a paired clean image, which a "
+        "naturally corrupted one does not have. Frozen rows are excluded from the ranking by "
+        "design and are never added to or averaged with dynamic ones.",
+        "- **`score changed on` is a lower bound**, not the set of images the padding mask "
+        "reached.",
+        "- **An undecided comparison is not a loss.** A pair that comes out close to even, "
+        "with many ties, has not established anything in either direction.",
+        "",
+    ]
+
+
+def _next_section(summary: dict, winner: dict | None) -> list[str]:
+    lines = ["## Next decision", ""]
+    if winner is None:
+        lines.append(
+            "Nothing here is ready to carry forward: no selection cleared the deployable gate."
+        )
+    else:
+        lines.append(
+            f"The tuning run is allowed to fix at most one confidence bin, one membership "
+            f"rule, one scene summary and one padding rule. On this run that is "
+            f"`{winner['confidence_bin']}` / `{winner['membership_mode']}` / "
+            f"`{winner['aggregation']}` for the first three; the fourth is not decided by the "
+            "ranking and has to be argued from the sensitivity table."
+        )
+    lines.extend([
+        "",
+        "That choice is a proposal to be reviewed before anything is scored on the held-out "
+        "images. Until that review and that run happen, every number in this report describes "
+        "the images it was selected on.",
+        "",
+        EASY_REPORT_FINAL_SENTENCE,
+    ])
+    return lines
+
+
+def _easy_report(summary: dict) -> str:
+    """The plain-language report spec:171 asks for, generated from the summary and nothing else.
+
+    Every sentence with a number in it is built from `summary`, so two runs over the same rows
+    produce the same file and a reader can check any claim against `summary.json`. Nothing is
+    quoted from a previous run.
+
+    The opening section is fixed by spec:172 -- which confidence range worked best, whether it
+    beat confidence alone, whether it beat the existing all-query benchmark, and whether
+    padding or bin movement explains the result, in that order. `SPEC_172_QUESTIONS` is the
+    order, so it is asserted rather than typed.
+
+    Three sentences this generator cannot produce, each because the design forbids it:
+
+    * a score described as a probability of corruption (spec:111) -- the confidence control is
+      `1 - confidence`, which reverses direction and calibrates nothing;
+    * a dynamic and a frozen result merged into one recommendation (spec:230) -- frozen rows
+      are absent from the ranking and are labelled diagnostic wherever they appear;
+    * a paired rate quoted with one denominator -- `_outcome` publishes both, because on the
+      pilot the two framings put the same candidate on opposite sides of 0.5.
+
+    And one word it avoids: nothing here "beats" anything. The verdict verbs come from
+    `_verdict`, which reads the win and loss counts and has no threshold in it, and every
+    verdict is followed by the counts it was derived from.
+    """
+    ranked = list(summary.get(RANKED_GROUPS_KEY) or [])
+    winner = ranked[0] if ranked else None
+    lines = [EASY_REPORT_TITLE, ""]
+    lines.extend(_preamble(summary))
+    lines.extend(_short_answer(summary, ranked, winner))
+    lines.extend(_ranked_section(summary, ranked, winner))
+    lines.extend(_confidence_section(summary, winner))
+    lines.extend(_dynamic_frozen_section(summary))
+    lines.extend(_padding_section(summary))
+    lines.extend(_metrics_section(summary))
+    lines.extend(_limits_section(summary, ranked))
+    lines.extend(_next_section(summary, winner))
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_decile_report(
+    rows: list[dict], output_dir, run_metadata: dict | None = None,
+    diagnostics: dict | None = None,
+) -> None:
+    """Write the seven artifacts spec:163-171 names, or write nothing at all.
+
+    The order is deliberate on two counts.
+
+    **The summary is computed first, before the output directory exists.** Every refusal the
+    design asks for -- a duplicated result key, a label outside its vocabulary, a table
+    spanning two partitions -- lives in `summarize_decile_rows`, so a table that cannot be
+    summarised leaves no directory behind to be mistaken for a partial run.
+
+    **The results frame is built exactly twice over the whole call and never twice at once.**
+    `summarize_decile_rows` builds one and drops it; the CSV and the blur curves then share a
+    second. On the real tuning table that frame is 523,500 rows, and `summary_frame` is what
+    keeps the ~280 MB `selected_query_ids` column out of it -- reused here rather than
+    rebuilt, so the CSV is by construction the same table the summary describes.
+
+    Every file goes out through a temporary and `os.replace`. A truncated `summary.json` is a
+    parse error, which is loud; a truncated `easy-report.md` is a shorter report that stops
+    mid-sentence and reads as finished.
+    """
+    summary = summarize_decile_rows(rows, run_metadata, diagnostics)
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+
+    frame = summary_frame(rows)
+    csv_path = output / "per_scene.csv"
+    csv_temporary = csv_path.with_suffix(".csv.tmp")
+    frame.to_csv(csv_temporary, index=False)
+    os.replace(csv_temporary, csv_path)
+    _save_figure(_blur_curve_figure(frame), output / "blur_curves.png")
+    del frame
+
+    _atomic_text(
+        output / "summary.json",
+        json.dumps(summary, indent=2, sort_keys=True, allow_nan=False),
+    )
+    _save_figure(_heatmap_figure(summary), output / "confidence_decile_heatmap.png")
+    _save_figure(_dynamic_frozen_figure(summary), output / "dynamic_vs_frozen.png")
+    _save_figure(_padding_sensitivity_figure(summary), output / "padding_sensitivity.png")
+    _atomic_text(output / "easy-report.md", _easy_report(summary))
