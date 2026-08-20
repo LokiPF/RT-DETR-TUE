@@ -1,6 +1,7 @@
 import json
 import os
 import pickle
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from src.scene_uncertainty import pipeline
+from src.scene_uncertainty import cli, pipeline
 from src.scene_uncertainty.artifacts import ShardWriter, iter_records, load_manifest
 from src.scene_uncertainty.cli import build_parser, main
 from src.scene_uncertainty.pipeline import PipelineError
@@ -34,6 +35,7 @@ def test_cli_exposes_complete_artifact_pipeline():
         "build-bank",
         "evaluate-knn",
         "report",
+        "analyze-confidence-deciles",
     }
 
 
@@ -44,6 +46,7 @@ def test_cli_exposes_complete_artifact_pipeline():
 
 @pytest.mark.parametrize("command", [
     "select", "extract-reference", "extract-blur", "build-bank", "evaluate-knn", "report",
+    "analyze-confidence-deciles",
 ])
 def test_every_subcommand_documents_itself(command, capsys):
     with pytest.raises(SystemExit) as exit_info:
@@ -58,8 +61,48 @@ def test_top_level_help_lists_every_subcommand(capsys):
     with pytest.raises(SystemExit):
         build_parser().parse_args(["--help"])
     help_text = capsys.readouterr().out
-    for command in ("select", "extract-reference", "extract-blur", "build-bank", "evaluate-knn", "report"):
+    for command in ("select", "extract-reference", "extract-blur", "build-bank", "evaluate-knn",
+                    "report", "analyze-confidence-deciles"):
         assert command in help_text
+
+
+# The module docstring is the top-level epilog and the only ordered listing of the chain, so it
+# is the one place where a subcommand can be added to the parser and stay invisible to a reader
+# of `--help`. Spelled out rather than derived because the docstring spells it out.
+SUBCOMMAND_COUNT_WORDS = {5: "Five", 6: "Six", 7: "Seven", 8: "Eight"}
+
+
+def test_the_pipeline_overview_counts_and_names_every_subcommand():
+    """`--help`'s overview must list what the parser actually accepts, and say how many.
+
+    `test_top_level_help_lists_every_subcommand` is satisfied by argparse's own generated
+    listing of subparser names, so it passes whether or not the overview above it mentions the
+    command at all -- and it says nothing about the count sentence, which is the part that goes
+    stale silently.
+    """
+    subcommands = list(build_parser()._subparsers._group_actions[0].choices)
+    overview = cli.__doc__
+    assert f"{SUBCOMMAND_COUNT_WORDS[len(subcommands)]} subcommands" in overview
+    for name in subcommands:
+        assert re.search(rf"^    {re.escape(name)} +-> ", overview, re.MULTILINE), name
+
+
+def test_confidence_decile_command_has_only_cache_results_and_output():
+    """Three arguments and nothing else -- in particular, no `--partition`.
+
+    `load_decile_inputs` refuses any result manifest that was not built for the tuning
+    partition, and the held-out test images are meant to stay unspendable from the command
+    line. A `--partition` flag here would be the one way to spend them, so this compares the
+    whole namespace rather than looking up the three arguments it expects to find.
+    """
+    args = build_parser().parse_args([
+        "analyze-confidence-deciles",
+        "--cache", "cache", "--results", "raw_k5.csv", "--output", "report",
+    ])
+    assert vars(args) == {
+        "command": "analyze-confidence-deciles",
+        "cache": "cache", "results": "raw_k5.csv", "output": "report",
+    }
 
 
 def test_missing_required_argument_is_refused_at_parse_time(capsys):

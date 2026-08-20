@@ -1,13 +1,14 @@
 """The one entry point for the class-independent persistence scene-uncertainty study.
 
-Six subcommands, run in this order:
+Seven subcommands, run in this order:
 
-    select            -> reference.json + evaluation.json (which COCO images are used)
-    extract-reference -> a feature cache over the clean reference images
-    extract-blur      -> a feature cache over the evaluation images, all six blur levels
-    build-bank        -> a class-independent query bank per decoder layer
-    evaluate-knn      -> scored rows + per-query distances + a result manifest
-    report            -> summary.json and the trend plots
+    select                     -> reference.json + evaluation.json (which COCO images are used)
+    extract-reference          -> a feature cache over the clean reference images
+    extract-blur               -> a feature cache over the evaluation images, all six blur levels
+    build-bank                 -> a class-independent query bank per decoder layer
+    evaluate-knn               -> scored rows + per-query distances + a result manifest
+    report                     -> summary.json and the trend plots
+    analyze-confidence-deciles -> the confidence-decile experiment, re-reading the two artifacts
 
 Argument validation lives here rather than in `pipeline`, so a typo in a policy name,
 an unreadable checkpoint, or a negative batch size fails at parse time instead of an
@@ -75,6 +76,24 @@ deliberately kept out of the artifact id: two runs that differ only in it are th
 _REPORT_EPILOG = """\
 `--results` is the CSV written by evaluate-knn; its `<results>.manifest.json` sibling is
 read for the run metadata and must sit next to it.
+"""
+
+_DECILE_EPILOG = """\
+This command runs no detector forward pass and no kNN search, and it builds no bank. It reads
+two artifacts that already exist: `--cache` supplies the cached logits, boxes and per-layer
+persistence fingerprints, and `--results` supplies the saved per-query distances, the layer
+score scales and the run provenance, taken from the `.query_distances.pt`, `.normalizers.pt`
+and `.manifest.json` siblings named beside it. So it costs minutes on a CPU, not GPU hours,
+and it can be rerun against a different result set over the same cache.
+
+Tuning results only. There is deliberately no `--partition` switch, and a result manifest
+whose `source_partition` is `test` or `all` is refused, so the held-out test images cannot be
+spent from the command line.
+
+`--output` is refused when it already holds a finished report, which means a directory
+containing `summary.json`. Nothing is overwritten. A directory left behind by a run that died
+part-way is written into, because the seven artifacts are published together or not at all and
+there is nothing in such a directory to preserve.
 """
 
 
@@ -212,6 +231,15 @@ def build_parser() -> argparse.ArgumentParser:
     report = add("report", "Summarize scored rows into plots and summary.json.", _REPORT_EPILOG)
     report.add_argument("--results", required=True, help="results CSV written by evaluate-knn")
     report.add_argument("--output", required=True, help="report directory")
+
+    deciles = add(
+        "analyze-confidence-deciles",
+        "Compare persistence and model confidence across confidence deciles.",
+        _DECILE_EPILOG,
+    )
+    deciles.add_argument("--cache", required=True, help="six-severity evaluation feature cache")
+    deciles.add_argument("--results", required=True, help="tuning CSV written by evaluate-knn")
+    deciles.add_argument("--output", required=True, help="new confidence-decile report directory")
     return parser
 
 

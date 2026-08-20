@@ -43,6 +43,8 @@ from src.zoo.rtdetr.matcher import HungarianMatcher
 from .artifacts import ShardWriter, assert_compatible, iter_records, load_manifest, manifest_id
 from .bank import deterministic_reservoir, streaming_coverage_bank
 from .dataset import make_coco_loader
+from .decile_analysis import analyze_deciles, load_decile_inputs
+from .decile_reporting import write_decile_report
 from .evaluate import compute_query_distances, score_cached_record
 from .extractor import ClassificationPersistenceExtractor
 from .knn import fit_clean_distance_scale
@@ -720,6 +722,56 @@ def command_report(args) -> None:
     _report(f"report: summarized {len(rows)} rows into {args.output}")
 
 
+# --------------------------------------------------------------------------------------
+# analyze-confidence-deciles
+# --------------------------------------------------------------------------------------
+
+
+def command_analyze_confidence_deciles(args) -> None:
+    """The confidence-decile experiment, over two artifacts that already exist.
+
+    No detector, no bank, no kNN: `load_decile_inputs` reads the cached logits, boxes and
+    persistence fingerprints out of `--cache` and joins them to the per-query distances and
+    layer score scales saved beside `--results`. Which is why this wrapper is short -- there
+    is no device to validate, no name list to check and no artifact to seal.
+
+    Three deliberate details.
+
+    **`--cache` goes through `_existing_artifact` and `--results` through `_existing_path`.**
+    The cache is a directory whose `manifest.json` certifies it; the results argument is a CSV
+    path whose siblings are found by name. Letting `load_decile_inputs` discover a missing
+    cache manifest for itself would still refuse, but the message would name a path the
+    operator never typed instead of the flag that was wrong.
+
+    **Both existence checks sit outside the `try`.** `PipelineError` is a `ValueError`, so a
+    check moved inside it would come back out re-labelled `Cannot analyze confidence deciles:
+    --results does not exist`, blaming the analysis for an argument that never reached it.
+
+    **The finished-report guard is `summary.json`, not the directory.** `write_decile_report`
+    publishes its seven artifacts together or leaves none, so a directory holding some of them
+    is a run that died during publication and has nothing in it worth preserving; refusing on
+    `output.exists()` would make that state unrecoverable without a manual delete. A directory
+    that holds `summary.json` is a finished report and is never overwritten.
+
+    `DecileAnalysisError` is a `ValueError` but not a `PipelineError`, and so are the plain
+    `ValueError`s that `confidence_deciles`, `decile_scoring` and `decile_reporting` raise for
+    the same class of problem. Catching `ValueError` is what turns all of them into the one
+    line on stderr that `main` prints, instead of a traceback through the analysis.
+    """
+    cache = _existing_artifact(args.cache, "--cache")
+    results = _existing_path(args.results, "--results")
+    output = Path(args.output)
+    if (output / "summary.json").exists():
+        raise FileExistsError(f"Confidence-decile report is already complete: {output}")
+    try:
+        inputs = load_decile_inputs(cache, results)
+        rows, diagnostics = analyze_deciles(inputs)
+        write_decile_report(rows, output, inputs.run_metadata, diagnostics)
+    except ValueError as error:
+        raise PipelineError(f"Cannot analyze confidence deciles: {error}") from error
+    _report(f"analyze-confidence-deciles: summarized {len(rows)} score rows into {output}")
+
+
 COMMANDS = {
     "select": command_select,
     "extract-reference": command_extract_reference,
@@ -727,4 +779,5 @@ COMMANDS = {
     "build-bank": command_build_bank,
     "evaluate-knn": command_evaluate_knn,
     "report": command_report,
+    "analyze-confidence-deciles": command_analyze_confidence_deciles,
 }
