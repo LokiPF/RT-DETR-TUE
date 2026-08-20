@@ -97,7 +97,13 @@ class ShardWriter:
     def existing_record_keys(self) -> set[tuple[int, int]]:
         keys = set()
         for shard in self.shards:
-            records = torch.load(self.directory / shard, map_location="cpu", weights_only=False)
+            # `weights_only=True` throughout this module. Artifact directories are routinely
+            # copied between hosts, so an unpickling read is arbitrary code execution on data
+            # from somewhere else, and nothing here needs it: a record is tensors, ints,
+            # floats, strs, None and an int-keyed dict of tensors, all of which the safe
+            # loader restores unchanged (checked against the pilot's caches and banks). Only
+            # `runtime.py` keeps `weights_only=False`, for the EMA checkpoint that needs it.
+            records = torch.load(self.directory / shard, map_location="cpu", weights_only=True)
             keys.update((int(record["image_id"]), int(record.get("severity", 0))) for record in records)
         return keys
 
@@ -135,7 +141,8 @@ def iter_records(directory: str | Path) -> Iterator[dict]:
     root = Path(directory)
     manifest = load_manifest(root)
     for shard in manifest["shards"]:
-        yield from torch.load(root / shard, map_location="cpu", weights_only=False)
+        # Safe load; see `ShardWriter.existing_record_keys`.
+        yield from torch.load(root / shard, map_location="cpu", weights_only=True)
 
 
 def assert_compatible(actual: Mapping, expected: Mapping, keys: Iterable[str]) -> None:

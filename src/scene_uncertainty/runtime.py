@@ -33,6 +33,12 @@ def load_frozen_detector(
     device: torch.device,
 ) -> nn.Module:
     cfg = YAMLConfig(str(config_path))
+    # The only unpickling read left in this package, and deliberately so: the checkpoint
+    # is a file the operator names on the command line, and a full training checkpoint
+    # carries optimizer, LR-scheduler and EMA state that `weights_only=True` can refuse
+    # to reconstruct depending on how it was written. The artifact readers in
+    # `artifacts.py` and `pipeline.py` get no such exemption -- those directories are
+    # copied between hosts, so they are read with `weights_only=True`.
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state = _checkpoint_state(checkpoint)
     incompatible = cfg.model.load_state_dict(state, strict=False)

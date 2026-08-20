@@ -1,3 +1,5 @@
+import json
+import pickle
 from pathlib import Path
 
 import pytest
@@ -178,3 +180,96 @@ def test_close_is_idempotent(tmp_path: Path):
     writer.close()
     writer.close()
     assert [record["image_id"] for record in iter_records(tmp_path)] == [1]
+
+
+# --------------------------------------------------------------------------------------
+# Artifact directories are read, never executed
+# --------------------------------------------------------------------------------------
+
+_EXECUTED: list[str] = []
+
+
+def _run_on_unpickle():
+    """Stand-in for whatever a hostile shard would run. Records that it ran."""
+    _EXECUTED.append("executed")
+    return {"image_id": 1, "severity": 0}
+
+
+class _ArbitraryCodePayload:
+    """Pickles as a call to `_run_on_unpickle`, the way any `__reduce__` payload would."""
+
+    def __reduce__(self):
+        return (_run_on_unpickle, ())
+
+
+def _poisoned_artifact(directory: Path) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    torch.save([_ArbitraryCodePayload()], directory / "shard_00000.pt")
+    (directory / "manifest.json").write_text(
+        json.dumps({"schema_version": 1, "record_count": 1, "shards": ["shard_00000.pt"],
+                    "checkpoint_sha256": "abc"}),
+        encoding="utf-8",
+    )
+    return directory
+
+
+def test_iter_records_reads_a_shard_without_executing_it(tmp_path: Path):
+    """Feature caches get copied between hosts by the run bridge.
+
+    A shard is tensors, ints, floats, strs, None and an int-keyed dict of tensors --
+    nothing that needs the unpickler's ability to call arbitrary code. Reading one with
+    `weights_only=False` therefore buys nothing and hands a copied directory the power to
+    run whatever it likes.
+    """
+    _EXECUTED.clear()
+    directory = _poisoned_artifact(tmp_path / "cache")
+    with pytest.raises(pickle.UnpicklingError):
+        list(iter_records(directory))
+    assert _EXECUTED == []
+
+
+def test_resume_scan_reads_completed_shards_without_executing_them(tmp_path: Path):
+    """The resume path deserializes every finished shard before it writes anything."""
+    _EXECUTED.clear()
+    directory = _poisoned_artifact(tmp_path / "cache")
+    (directory / "manifest.json").unlink()
+    (directory / "partial_manifest.json").write_text(
+        json.dumps({"schema_version": 1, "checkpoint_sha256": "abc", "shard_size": 2,
+                    "record_count": 1, "shards": ["shard_00000.pt"]}),
+        encoding="utf-8",
+    )
+    writer = ShardWriter(directory, {"checkpoint_sha256": "abc"}, shard_size=2)
+    with pytest.raises(pickle.UnpicklingError):
+        writer.existing_record_keys()
+    assert _EXECUTED == []
+
+
+def test_a_real_record_still_survives_the_safe_loader(tmp_path: Path):
+    """Every field the extractor ships, including the int-keyed layer dict.
+
+    `weights_only=True` is only an option because none of these need the unpickler: fp16
+    layer tensors under **int** keys, fp16 logits, fp32 boxes, bool masks, `None` for
+    `reference_group` and str partitions all come back unchanged.
+    """
+    record = {
+        "image_id": 885,
+        "severity": 0,
+        "blur_radius": 0.0,
+        "corruption_type": "gaussian_blur",
+        "source_partition": "tuning",
+        "reference_group": None,
+        "layers": {0: torch.ones(4, 3, dtype=torch.float16), 2: torch.zeros(4, 3, dtype=torch.float16)},
+        "logits": torch.zeros(4, 80, dtype=torch.float16),
+        "boxes": torch.ones(4, 4),
+        "is_matched": torch.tensor([True, False, True, False]),
+        "matched_annotation_id": torch.tensor([10, -1, 11, -1]),
+    }
+    with ShardWriter(tmp_path, {"checkpoint_sha256": "abc"}, shard_size=4) as writer:
+        writer.add(record)
+    loaded, = iter_records(tmp_path)
+    assert sorted(loaded["layers"]) == [0, 2]
+    assert all(isinstance(key, int) for key in loaded["layers"])
+    assert loaded["layers"][0].dtype == torch.float16
+    assert loaded["reference_group"] is None
+    assert loaded["source_partition"] == "tuning"
+    assert loaded["is_matched"].tolist() == [True, False, True, False]

@@ -1,5 +1,6 @@
 import json
 import os
+import pickle
 import subprocess
 import sys
 from pathlib import Path
@@ -878,6 +879,39 @@ def test_evaluate_refuses_a_k_larger_than_the_bank(tmp_path: Path):
     args.k = 8
     with pytest.raises(PipelineError, match="--k 8"):
         pipeline.command_evaluate_knn(args)
+
+
+_EXECUTED: list[str] = []
+
+
+def _run_on_unpickle():
+    """Stand-in for whatever a hostile bank file would run. Records that it ran."""
+    _EXECUTED.append("executed")
+    return torch.zeros(8, PERSISTENCE_DIM)
+
+
+class _ArbitraryCodePayload:
+    """Pickles as a call to `_run_on_unpickle`, the way any `__reduce__` payload would."""
+
+    def __reduce__(self):
+        return (_run_on_unpickle, ())
+
+
+def test_evaluate_reads_the_bank_without_executing_it(tmp_path: Path):
+    """A bank directory is a float tensor plus a str-keyed sampling summary.
+
+    Banks are copied between hosts like every other artifact here, so loading one must
+    not be able to run what the copy contains. Nothing in the file needs the unpickler's
+    ability to call arbitrary code, so it is read with `weights_only=True`.
+    """
+    bank = _built_bank(tmp_path)
+    cache = _write_evaluation_cache(tmp_path / "evaluation")
+    layer = next(iter(json.loads((bank / "manifest.json").read_text())["layers"].values()))
+    torch.save({"vectors": _ArbitraryCodePayload(), "sampling": {}}, bank / layer["path"])
+    _EXECUTED.clear()
+    with pytest.raises(pickle.UnpicklingError):
+        pipeline.command_evaluate_knn(_evaluate_args(tmp_path, cache, bank))
+    assert _EXECUTED == []
 
 
 def test_evaluate_refuses_a_missing_bank(tmp_path: Path):

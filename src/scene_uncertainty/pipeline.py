@@ -581,8 +581,10 @@ def command_evaluate_knn(args) -> None:
 
     _reset_peak_memory(device)
     raw_banks = {
+        # Safe load: a bank file is a float tensor and a str-keyed sampling summary, so
+        # reading one must not be able to execute what a copied directory contains.
         int(layer_id): torch.load(
-            bank_root / layer["path"], map_location="cpu", weights_only=False
+            bank_root / layer["path"], map_location="cpu", weights_only=True
         )["vectors"]
         for layer_id, layer in bank_manifest["layers"].items()
     }
