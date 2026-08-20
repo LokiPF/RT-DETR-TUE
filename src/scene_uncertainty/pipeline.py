@@ -49,7 +49,13 @@ from .knn import fit_clean_distance_scale
 from .normalization import fit_normalizer, transform_vectors
 from .query_policy import ORACLE_POLICIES
 from .reference import select_evaluation_ids, select_reference_ids
-from .reporting import read_result_csv, write_report, write_result_csv
+from .reporting import (
+    describe_result_key,
+    find_duplicate_result_key,
+    read_result_csv,
+    write_report,
+    write_result_csv,
+)
 from .runtime import checkpoint_sha256, load_frozen_detector
 
 
@@ -701,6 +707,14 @@ def command_report(args) -> None:
         raise PipelineError(
             f"{results} holds no scored rows, so there is nothing to report; it was written for "
             f"--partition {metadata.get('source_partition', 'unknown')}"
+        )
+    duplicate = find_duplicate_result_key(rows)
+    if duplicate is not None:
+        raise PipelineError(
+            f"{results} holds more than one row for {describe_result_key(duplicate)}. One "
+            f"`evaluate-knn` run writes one row per key; concatenating two result CSVs "
+            f"multiplies rows through the severity-0 join and inflates the adjacent-step "
+            f"counts with no error. Report each result file separately."
         )
     write_report(rows, args.output, run_metadata=metadata)
     _report(f"report: summarized {len(rows)} rows into {args.output}")

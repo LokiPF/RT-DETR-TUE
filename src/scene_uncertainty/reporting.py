@@ -41,6 +41,35 @@ from .metrics import has_class_switch, jaccard_overlap, monotonicity_metrics
 
 STRUCTURED_COLUMNS = ("layer_scores", "clean_scaled_layer_scores", "selected_query_ids", "matched_predictions")
 
+# One scored row per key. `evaluate-knn` produces exactly one, but `report --results`
+# accepts any CSV, and concatenating two result files is an obvious operator move.
+RESULT_KEY_COLUMNS = ("image_id", "severity", "policy", "aggregation", "source_partition")
+
+
+def find_duplicate_result_key(rows: list[dict]) -> tuple | None:
+    """The first `RESULT_KEY_COLUMNS` tuple that appears twice, or None.
+
+    A duplicated key is not a cosmetic problem. `write_report` joins every row against
+    its own severity-0 row, so a key that appears twice multiplies through that join --
+    two copies of one image's six rows produce four severity-0 pairings, and the adjacent
+    step counts inflate quadratically rather than doubling. Measured on the six-severity
+    fixture in `tests/scene_uncertainty/test_reporting.py`: duplicating the rows takes
+    `no_switch_step_count` from 4 to 22 (not 8) and `scored_severity_count` from 6 to 12.
+    None of the trend statistics notice: `median_spearman` still reads a confident 1.0,
+    because every duplicated pair is perfectly consistent with itself.
+    """
+    seen = set()
+    for row in rows:
+        key = tuple(row[column] for column in RESULT_KEY_COLUMNS)
+        if key in seen:
+            return key
+        seen.add(key)
+    return None
+
+
+def describe_result_key(key) -> str:
+    return ", ".join(f"{column}={value}" for column, value in zip(RESULT_KEY_COLUMNS, key))
+
 
 def write_result_csv(rows: list[dict], path: str | Path) -> None:
     """Write scored rows to CSV, JSON-encoding the nested columns.
@@ -171,6 +200,14 @@ def write_report(rows: list[dict], output_dir: str | Path, run_metadata: dict | 
     """
     if not rows:
         raise ValueError("write_report needs at least one scored row")
+    duplicate = find_duplicate_result_key(rows)
+    if duplicate is not None:
+        raise ValueError(
+            "write_report needs one row per (image_id, severity, policy, aggregation, "
+            f"source_partition); {describe_result_key(duplicate)} appears more than once. "
+            "Concatenated result CSVs inflate the severity-0 join and the adjacent-step "
+            "counts with no error, so this is refused rather than summarized."
+        )
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     write_result_csv(rows, output / "per_scene.csv")

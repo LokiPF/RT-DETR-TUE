@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from src.scene_uncertainty.reporting import read_result_csv, write_report, write_result_csv
+from src.scene_uncertainty.reporting import (
+    find_duplicate_result_key,
+    read_result_csv,
+    write_report,
+    write_result_csv,
+)
 
 
 def make_rows():
@@ -256,3 +261,34 @@ def test_empty_input_round_trips_as_no_rows_and_is_refused_by_write_report(tmp_p
     assert read_result_csv(path) == []
     with pytest.raises(ValueError, match="at least one"):
         write_report([], tmp_path / "report")
+
+
+def test_write_report_refuses_a_duplicated_result_key(tmp_path: Path):
+    """Concatenating two result CSVs is an obvious operator move and silently inflates.
+
+    Every row is joined against its own severity-0 row, so a key present twice produces
+    four severity-0 pairings instead of one and the adjacent-step diagnostics grow
+    quadratically: with the guard removed, `write_report(make_rows() * 2)` publishes
+    `no_switch_step_count` 22 instead of 4 (doubling would be 8) and
+    `scored_severity_count` 12 instead of 6, while `median_spearman` still reads a
+    confident 1.0. Nothing downstream can tell that apart from a real run, so it is
+    refused here, by name.
+    """
+    rows = make_rows()
+    with pytest.raises(ValueError, match=r"image_id=1, severity=0, policy=all"):
+        write_report(rows + rows, tmp_path)
+    assert not (tmp_path / "summary.json").exists()
+    assert not (tmp_path / "per_scene.csv").exists()
+
+
+def test_the_duplicate_check_reports_the_first_repeated_key():
+    rows = make_rows()
+    assert find_duplicate_result_key(rows) is None
+    repeated = dict(rows[3])
+    assert find_duplicate_result_key([*rows, repeated]) == (1, 3, "all", "mean", "tuning")
+
+
+def test_rows_that_differ_in_any_key_column_are_not_duplicates():
+    """The key is all five columns; two policies over one image are a normal report."""
+    rows = make_rows() + [{**row, "policy": "top10"} for row in make_rows()]
+    assert find_duplicate_result_key(rows) is None

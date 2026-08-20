@@ -1003,6 +1003,29 @@ def test_report_names_an_empty_result_set_instead_of_failing_inside_pandas(tmp_p
         pipeline.command_report(args)
 
 
+def test_report_refuses_a_concatenated_results_csv(tmp_path: Path):
+    """`--results` accepts any CSV, and merging two result files is an obvious move.
+
+    One `evaluate-knn` run writes one row per (image_id, severity, policy, aggregation,
+    source_partition), and `_validate_evaluation_cache` refuses a duplicated cache
+    record, so this is unreachable inside the sanctioned chain -- and entirely reachable
+    from the command line, where it inflates the adjacent-step counts with no error.
+    """
+    scored = _scored(tmp_path)
+    rows = pipeline.read_result_csv(scored.output)
+    concatenated = tmp_path / "concatenated.csv"
+    pipeline.write_result_csv(rows + rows, concatenated)
+    concatenated.with_suffix(".manifest.json").write_bytes(
+        Path(scored.output).with_suffix(".manifest.json").read_bytes()
+    )
+    args = build_parser().parse_args([
+        "report", "--results", str(concatenated), "--output", str(tmp_path / "report"),
+    ])
+    with pytest.raises(PipelineError, match="image_id=11"):
+        pipeline.command_report(args)
+    assert not (tmp_path / "report").exists()
+
+
 def test_report_refuses_results_without_their_manifest(tmp_path: Path):
     scored = _scored(tmp_path)
     Path(scored.output).with_suffix(".manifest.json").unlink()
