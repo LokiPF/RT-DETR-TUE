@@ -4,6 +4,16 @@
 import importlib.metadata
 from torch import Tensor 
 
+# The three branches below keep the *detector* training path importable on torchvision
+# 0.15.2, 0.16 and 0.17, where the v2 transforms and tv_tensors lived under different
+# names. They are not the supported floor for this repository: the scene-uncertainty
+# blur loader (`src/scene_uncertainty/dataset.py`) hands `SanitizeBoundingBoxes` a
+# `labels_getter` that returns a tuple of per-annotation tensors, and that transform
+# only accepts a tuple/list from torchvision 0.18.0 onwards. `requirements.txt`
+# therefore declares `torchvision>=0.18.0`, and an environment built from it always
+# takes the last branch; the earlier two are kept only for pre-existing detector-only
+# installations.
+
 if importlib.metadata.version('torchvision').startswith('0.15.2'):
     import torchvision
     torchvision.disable_beta_transforms_warning()
@@ -30,7 +40,10 @@ elif importlib.metadata.version('torchvision') >= '0.17':
     _boxes_keys = ['format', 'canvas_size']
 
 else:
-    raise RuntimeError('Please make sure torchvision version >= 0.15.2')
+    raise RuntimeError(
+        'Please make sure torchvision version >= 0.15.2 for the detector, '
+        'or >= 0.18.0 for the scene uncertainty pipeline (see requirements.txt)'
+    )
 
 
 

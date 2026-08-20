@@ -17,6 +17,11 @@ The following is the corresponding `torch` and `torchvision` versions.
 | `-` | `2.1` | `0.16` |
 | `-` | `2.0` | `0.15` |
 
+Those rows are the **detector-only** combinations. The scene-uncertainty pipeline needs
+`torchvision >= 0.18` (torch `2.3`), because its blur loader passes a tuple-returning
+`labels_getter` to `SanitizeBoundingBoxes` and earlier versions accept only a single
+tensor. `requirements.txt` declares that floor.
+
 </details>
 
 <details open>
@@ -161,3 +166,141 @@ If you use `RTDETR` or `RTDETRv2` in your work, please use the following BibTeX 
 ```
 </details>
 # RT-DETR-TUE
+
+## Scene uncertainty pilot
+
+Class-independent persistence scene uncertainty: a scene is scored by how far its decoder
+queries sit from a bank of queries drawn from clean reference images, and the study asks
+whether that score rises as the scene is blurred. One entry point, six subcommands, run in
+order.
+
+**A raw kNN score is not a corruption probability.** It is a mean distance to the *k*
+nearest bank vectors, divided by the inter-quartile spread of the same distance measured on
+clean reference queries, and averaged over the three decoder layers. Nothing in this
+pipeline is fitted against a corruption label, so a score is comparable across the
+severities of one configuration and means nothing on its own scale. `report` publishes
+trend statistics, not calibrated probabilities.
+
+```bash
+UE_PY=/path/to/python
+COCO=dataset/coco
+CKPT=pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth
+CFG=configs/scene_uncertainty/rtdetrv2_r18vd_coco.yml
+OUT=output/scene_uncertainty/pilot
+
+# Record the commit in every artifact. `git rev-parse` fails on a host running from an
+# rsync'd tree -- provenance then degrades to "unknown" with a warning -- so take the sha
+# from wherever the code was edited and pass it in. The value is compared when an
+# interrupted extraction is resumed: export it for every command of a run, or for none.
+export SCENE_UNCERTAINTY_GIT_COMMIT=9184adb65864b802378ad3e261b7ea62be5a3b98  # <- your sha
+
+$UE_PY tools/scene_uncertainty.py select \
+  --train-ann $COCO/annotations/instances_train2017.json \
+  --val-ann $COCO/annotations/instances_val2017.json \
+  --output $OUT/splits
+
+$UE_PY tools/scene_uncertainty.py extract-reference \
+  --config $CFG --checkpoint $CKPT \
+  --images $COCO/train2017 \
+  --annotations $COCO/annotations/instances_train2017.json \
+  --selection $OUT/splits/reference.json \
+  --output $OUT/reference_cache
+
+$UE_PY tools/scene_uncertainty.py extract-blur \
+  --config $CFG --checkpoint $CKPT \
+  --images $COCO/val2017 \
+  --annotations $COCO/annotations/instances_val2017.json \
+  --selection $OUT/splits/evaluation.json \
+  --output $OUT/blur_cache
+
+$UE_PY tools/scene_uncertainty.py build-bank \
+  --cache $OUT/reference_cache \
+  --population coverage --capacity 25000 \
+  --output $OUT/bank_coverage_25k
+
+$UE_PY tools/scene_uncertainty.py evaluate-knn \
+  --cache $OUT/blur_cache --bank $OUT/bank_coverage_25k \
+  --normalization raw --k 5 --partition tuning \
+  --output $OUT/results/raw_k5.csv
+
+$UE_PY tools/scene_uncertainty.py report \
+  --results $OUT/results/raw_k5.csv \
+  --output $OUT/reports/raw_k5
+```
+
+Add `--limit 4 --batch-size 1 --num-workers 0` to both extract commands for a four-image
+smoke run in a scratch `--output`; every later command works unchanged on the smaller
+artifacts (use a smaller `--capacity`).
+
+The default `--partition tuning` scores the 250 tuning images and leaves the 250 test
+images cached but unscored. Spend the held-out half once, after the policy and
+normalization have been chosen on the tuning half -- the names below are a placeholder for
+whatever that choice turns out to be, not a recommendation:
+
+```bash
+$UE_PY tools/scene_uncertainty.py evaluate-knn \
+  --cache $OUT/blur_cache --bank $OUT/bank_coverage_25k \
+  --normalization raw --k 5 --partition test \
+  --policies top20,smooth_1 --aggregations mean,median \
+  --output $OUT/results/final_raw_k5.csv
+$UE_PY tools/scene_uncertainty.py report \
+  --results $OUT/results/final_raw_k5.csv \
+  --output $OUT/reports/final_raw_k5
+```
+
+### Reading the artifacts
+
+* **One writer per `--output`.** The immutability guard is a file check, so two extractions
+  aimed at one directory both pass it and silently overwrite each other's shards. Run the
+  commands in sequence.
+* **`near_duplicate_fraction`, in `<results>.manifest.json` under `clean_distance_fit`.**
+  The share of sampled bank rows whose nearest other row is closer than half the typical
+  clean distance. Every score is divided by the `scale` fitted beside it, and near-duplicate
+  rows inflate that `scale` -- 20% twins inflated it about 2.8x on a synthetic bank. Above 1%
+  the run says so on stderr, and **the commands above do print that warning for all three
+  layers**: the 25,000-vector coverage bank in this repository reads 0.023-0.034 (0.043-0.047
+  at 50,000), because the detector emits bit-identical outputs for several query slots at
+  once, so ~1.6% of bank rows are exact duplicates of another row. That is expected here, not
+  a misconfiguration. What an inflated `scale` changes is the *amplitude* of every curve --
+  the score axis is compressed -- and not the rank statistics the report leads with
+  (`median_spearman`, `mean_adjacent_monotonicity`), which a positive rescale cannot move.
+* **`scored_image_count` and `scored_severity_count`, in `summary.json`.** A policy that
+  stops selecting queries under blur produces no score at those severities, and the trend
+  statistics are computed over what survived. A curve truncated at severity 2 and a curve
+  that rose across the whole sweep both publish `median_spearman: 1.0`; the counts beside
+  them, and `empty_selection_frequency`, are the only things that tell them apart.
+* **`has_class_switch` is blind to detection loss.** It compares only annotations matched at
+  both severities, so `no_switch` means "nothing that was still detected changed class", not
+  "the detector was unaffected". Blur mostly makes detections disappear, and that does not
+  appear in this split at all.
+* **`smooth_*` policies are reported under `weighted_mean`.** A smoothed policy carries its
+  signal in per-query weights, so its aggregation is forced to the weighted mean and the row
+  is labelled with the aggregation that actually ran, whatever `--aggregations` asked for.
+
+### What the first bounded pilot measured
+
+Run on `rtdetrv2_r18vd_120e_coco_rerun_48.1.pth` over 5,000 reference and 500 evaluation
+images (250 of them scored, the other 250 held out): 50 min to extract the reference cache
+and 30 min to extract the six-severity blur cache on one RTX 4090 (156 MiB peak CUDA), then
+under two minutes for the bank, the 69,000 scored rows and the report.
+
+**The raw score fell as the blur got worse for every confidence-selected policy.**
+`top20/mean` reached a median Spearman of -0.89 across the 250 tuning images, and the whole
+top-K, threshold and smoothed family sat between -0.6 and -0.9. Only the upper-quantile
+aggregation over all queries rose at all (`all/q90`, +0.43), and it dips before it rises.
+Most of that drop is not about *which* queries get selected. Freezing each image's
+severity-0 top-20 query ids and re-scoring that same frozen set at every severity still gives
+a median per-image Spearman of **-0.771** (medians +0.175, +0.142, +0.091, +0.039, -0.107,
+-0.161): the surviving queries themselves move *toward* the reference bank as the image is
+blurred, because the persistence vector shrinks toward the origin, into the dense
+low-magnitude region of a bank that is 54% background. That frozen set is 71% of the drop by
+amplitude (0.336 of the 0.471-IQR span) and 87% of it by median Spearman; selection churn
+supplies only the remaining 13-29%, with median Jaccard against the severity-0 selection
+collapsed to 0.29 by severity 1.
+
+Read `summary.json` before assuming a rising curve. The trend rides on persistence-vector
+*magnitude*, and two of the four `--normalization` modes keep that magnitude: `raw`, and
+`robust_z`, which is a per-feature affine rescale rather than a magnitude removal. `unit`
+discards it and `shape_scale` demotes it to one coordinate in 336. `robust_z` is the control
+that separates per-dimension rescaling from magnitude removal, and none of the three
+alternatives has been run yet.
