@@ -283,12 +283,19 @@ under two minutes for the bank, the 69,000 scored rows and the report.
 `top20/mean` reached a median Spearman of -0.89 across the 250 tuning images, and the whole
 top-K, threshold and smoothed family sat between -0.6 and -0.9. Only the upper-quantile
 aggregation over all queries rose at all (`all/q90`, +0.43), and it dips before it rises.
-Roughly half of that drop is not about *which* queries get selected. Freezing each image's
+Most of that drop is not about *which* queries get selected. Freezing each image's
 severity-0 top-20 query ids and re-scoring that same frozen set at every severity still gives
 a median per-image Spearman of **-0.771** (medians +0.175, +0.142, +0.091, +0.039, -0.107,
 -0.161): the surviving queries themselves move *toward* the reference bank as the image is
 blurred, because the persistence vector shrinks toward the origin, into the dense
-low-magnitude region of a bank that is 54% background. Selection churn supplies the rest --
-median Jaccard against the severity-0 selection has already collapsed to 0.29 by severity 1 --
-taking -0.771 to -0.886. Read `summary.json` before assuming a rising curve, and note that
-`raw` is the one normalization that keeps the magnitude this trend rides on.
+low-magnitude region of a bank that is 54% background. That frozen set is 71% of the drop by
+amplitude (0.336 of the 0.471-IQR span) and 87% of it by median Spearman; selection churn
+supplies only the remaining 13-29%, with median Jaccard against the severity-0 selection
+collapsed to 0.29 by severity 1.
+
+Read `summary.json` before assuming a rising curve. The trend rides on persistence-vector
+*magnitude*, and two of the four `--normalization` modes keep that magnitude: `raw`, and
+`robust_z`, which is a per-feature affine rescale rather than a magnitude removal. `unit`
+discards it and `shape_scale` demotes it to one coordinate in 336. `robust_z` is the control
+that separates per-dimension rescaling from magnitude removal, and none of the three
+alternatives has been run yet.
