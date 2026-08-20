@@ -20,8 +20,12 @@ import pytest
 import torch
 
 from src.scene_uncertainty import decile_reporting as reporting_module
-from src.scene_uncertainty.decile_analysis import ROW_KEYS_EXCLUDED_FROM_CSV
+from src.scene_uncertainty.decile_analysis import (
+    ALL_QUERY_BENCHMARK,
+    ROW_KEYS_EXCLUDED_FROM_CSV,
+)
 from src.scene_uncertainty.decile_reporting import (
+    BENCHMARK_SELECTION,
     GROUP_KEYS,
     RANKED_GROUPS_KEY,
     RANKABLE_MEMBERSHIP_MODES,
@@ -136,6 +140,34 @@ def rows_with_incomplete_group():
                 membership_mode="shared", confidence_bin="all_valid",
             ))
     return rows
+
+
+def benchmark_rows(curves):
+    """The published all-300-query benchmark: `("shared", "all_valid", "unfiltered")` at q90.
+
+    Built from `ALL_QUERY_BENCHMARK` rather than from the three literals, so a test that stops
+    describing the producer's benchmark fails here instead of quietly comparing candidates
+    against a selection nothing emits.
+    """
+    membership, confidence_bin, padding = ALL_QUERY_BENCHMARK
+    return [
+        row(
+            image_id, severity, "persistence", PRIMARY_SCORE_SCOPE, curve[severity],
+            membership_mode=membership, confidence_bin=confidence_bin, padding_mode=padding,
+            selected_count=300,
+        )
+        for image_id, curve in curves.items()
+        for severity in range(6)
+    ]
+
+
+def candidate_rows(curves):
+    """A filtered, full-coverage, layer-2 dynamic selection -- the shape the ranking admits."""
+    return [
+        row(image_id, severity, "persistence", PRIMARY_SCORE_SCOPE, curve[severity])
+        for image_id, curve in curves.items()
+        for severity in range(6)
+    ]
 
 
 def dipping_rows():
@@ -638,7 +670,7 @@ def test_no_published_number_moves_under_a_positive_affine_rescale_of_the_scores
     "scored_severity_count",
     "total_severity_count",
     "median_selected_count_by_severity",
-    "mean_clean_overlap",
+    "mean_clean_overlap_from_severity_1",
     "mean_clean_overlap_by_severity",
 ])
 def test_every_group_publishes_the_supporting_metrics_the_spec_names(metric):
@@ -671,7 +703,7 @@ def test_the_supporting_metrics_carry_the_values_they_claim():
     # Maximum blur above clean: 5.0 > 0.0.
     assert persistence["endpoint_increase_rate"] == 1.0
     assert persistence["median_selected_count_by_severity"] == {str(k): 30.0 for k in range(6)}
-    assert persistence["mean_clean_overlap"] == 1.0
+    assert persistence["mean_clean_overlap_from_severity_1"] == 1.0
     assert persistence["mean_clean_overlap_by_severity"] == {str(k): 1.0 for k in range(6)}
 
 
@@ -707,7 +739,12 @@ def test_a_non_finite_supporting_metric_is_published_as_null():
     json.dumps(summary, allow_nan=False)
 
 
-def test_clean_overlap_is_reported_per_severity_and_not_flattened():
+def test_clean_overlap_is_reported_per_severity_and_excludes_the_definitional_term():
+    """Severity 0 is 1.0 by construction for every membership mode, so averaging it into the
+    scalar adds a sixth of a point to every bin alike. On the pilot that turns nine dynamic
+    bins sitting at ~0.06 -- barely above the 1/19 chance baseline -- into ~0.216, a number
+    printed beside a ranked candidate that looks like evidence the membership was stable.
+    """
     rows = [
         {**scored, "clean_overlap": 1.0 if scored["severity"] == 0 else 0.06}
         for scored in dipping_rows()
@@ -716,7 +753,8 @@ def test_clean_overlap_is_reported_per_severity_and_not_flattened():
     persistence = group(summary, "persistence", PRIMARY_SCORE_SCOPE)
     assert persistence["mean_clean_overlap_by_severity"]["0"] == 1.0
     assert persistence["mean_clean_overlap_by_severity"]["5"] == pytest.approx(0.06)
-    assert persistence["mean_clean_overlap"] == pytest.approx((1.0 + 5 * 0.06) / 6)
+    assert persistence["mean_clean_overlap_from_severity_1"] == pytest.approx(0.06)
+    assert persistence["mean_clean_overlap_from_severity_1"] != pytest.approx((1.0 + 5 * 0.06) / 6)
 
 
 def test_padding_sensitivity_pairs_the_same_selection_with_and_without_the_mask():
@@ -737,15 +775,68 @@ def test_padding_sensitivity_pairs_the_same_selection_with_and_without_the_mask(
     assert sensitivity[0]["unfiltered_minus_filtered_spearman"] == pytest.approx(
         sensitivity[0]["unfiltered_median_spearman"] - sensitivity[0]["filtered_median_spearman"]
     )
-    assert sensitivity[0]["differing_image_count"] == 1
+    assert sensitivity[0]["moved_image_count"] == 1
     assert sensitivity[0]["unfiltered_image_win_rate"] == 0.0
-    assert sensitivity[0]["differing_image_win_rate"] == 0.0
+    assert sensitivity[0]["moved_image_win_rate"] == 0.0
+
+
+def test_the_moved_set_comes_from_the_scores_and_not_from_the_per_image_spearman():
+    """The two meanings of "the mask reached this image" diverge, and only one is the truth.
+
+    Three images. Image 1 is reached and its trend changes. Image 2 is reached -- every one of
+    its six scores is different -- but its Spearman lands on the same value, because a rank
+    correlation over six severities takes only 35 distinct values. Image 3 is not reached at
+    all. Reading the moved set off the Spearman calls image 2 untouched, which is exactly the
+    error that reports 50 to 56 moved images on the pilot where the selections provably differ
+    on all 66 that carry a padded tail.
+    """
+    curves = {
+        1: (DIPPING_CURVE, (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)),
+        2: ((0.0, 1.0, 2.0, 3.0, 4.0, 5.0), (0.0, 2.0, 4.0, 6.0, 8.0, 10.0)),
+        3: ((0.0, 1.0, 2.0, 3.0, 4.0, 5.0), (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)),
+    }
+    rows = []
+    for image_id, (filtered, unfiltered) in curves.items():
+        for severity in range(6):
+            rows.append(row(
+                image_id, severity, "persistence", PRIMARY_SCORE_SCOPE, filtered[severity],
+            ))
+            rows.append(row(
+                image_id, severity, "persistence", PRIMARY_SCORE_SCOPE, unfiltered[severity],
+                padding_mode="unfiltered",
+            ))
+    sensitivity = summarize_decile_rows(rows, {})["padding_sensitivity"][0]
+    assert sensitivity["paired_image_count"] == 3
+    # Two images were reached; only one of them changed its Spearman.
+    assert sensitivity["moved_image_count"] == 2
+    assert sensitivity["moved_and_paired_image_count"] == 2
+    # Image 3 is untouched and is counted as a loss by the unrestricted rate.
+    assert sensitivity["unfiltered_image_win_rate"] == pytest.approx(1 / 3)
+    # Restricted to the two the mask reached -- not to the one whose Spearman moved, which
+    # would read 1.0.
+    assert sensitivity["moved_image_win_rate"] == 0.5
+
+
+def test_a_severity_the_mask_removed_entirely_counts_as_a_move():
+    """A severity scored under one rule and absent under the other is the largest move the mask
+    can make, not the absence of one. Treating a one-sided score as equal to nothing files it
+    as untouched, and the image then never enters the restricted rate."""
+    rows = []
+    for severity in range(6):
+        rows.append(row(1, severity, "persistence", PRIMARY_SCORE_SCOPE, float(severity)))
+        if severity < 5:
+            rows.append(row(
+                1, severity, "persistence", PRIMARY_SCORE_SCOPE, float(severity),
+                padding_mode="unfiltered",
+            ))
+    sensitivity = summarize_decile_rows(rows, {})["padding_sensitivity"][0]
+    assert sensitivity["moved_image_count"] == 1
 
 
 def test_the_padding_win_rate_is_reported_both_over_all_images_and_over_the_moved_ones():
     """Spec:69's control is a no-op on an image that had no padded tail to remove.
 
-    Two images: the mask moves the second and leaves the first untouched. Counting the
+    Two images: the mask reaches the second and leaves the first untouched. Counting the
     untouched image as a loss halves the rate, which is exactly what happens on the pilot --
     184 of its 250 images carry no padding at all -- and it makes a control that helped on
     every image it could reach read as a control that helped on half of them.
@@ -764,13 +855,13 @@ def test_the_padding_win_rate_is_reported_both_over_all_images_and_over_the_move
     summary = summarize_decile_rows(rows, {})
     sensitivity = summary["padding_sensitivity"][0]
     assert sensitivity["paired_image_count"] == 2
-    assert sensitivity["differing_image_count"] == 1
+    assert sensitivity["moved_image_count"] == 1
     # Image 1 is untouched by the mask and is counted as a loss by the unrestricted rate.
     assert sensitivity["unfiltered_image_win_rate"] == 0.5
-    assert sensitivity["differing_image_win_rate"] == 1.0
+    assert sensitivity["moved_image_win_rate"] == 1.0
 
 
-def test_a_padding_control_that_moved_no_image_reports_no_restricted_rate():
+def test_a_padding_control_that_reached_no_image_reports_no_restricted_rate():
     rows = []
     for severity in range(6):
         rows.append(row(1, severity, "persistence", PRIMARY_SCORE_SCOPE, severity))
@@ -778,11 +869,25 @@ def test_a_padding_control_that_moved_no_image_reports_no_restricted_rate():
             1, severity, "persistence", PRIMARY_SCORE_SCOPE, severity, padding_mode="unfiltered",
         ))
     sensitivity = summarize_decile_rows(rows, {})["padding_sensitivity"][0]
-    assert sensitivity["differing_image_count"] == 0
+    assert sensitivity["moved_image_count"] == 0
     # Nothing to take a rate over: reported as missing rather than as a zero a reader would
     # take for a measured failure.
-    assert sensitivity["differing_image_win_rate"] is None
+    assert sensitivity["moved_image_win_rate"] is None
     assert sensitivity["unfiltered_image_win_rate"] == 0.0
+
+
+def test_two_unscored_severities_are_not_a_move():
+    """A severity nobody could score under either rule is the mask making no difference, not a
+    difference nobody can measure. `nan != nan` would file it as a move on every such image."""
+    rows = []
+    for severity in range(6):
+        score = float("nan") if severity == 5 else float(severity)
+        rows.append(row(1, severity, "persistence", PRIMARY_SCORE_SCOPE, score))
+        rows.append(row(
+            1, severity, "persistence", PRIMARY_SCORE_SCOPE, score, padding_mode="unfiltered",
+        ))
+    sensitivity = summarize_decile_rows(rows, {})["padding_sensitivity"][0]
+    assert sensitivity["moved_image_count"] == 0
 
 
 def test_padding_counts_are_rolled_up_from_the_producers_diagnostics():
@@ -815,6 +920,91 @@ def test_a_summary_without_diagnostics_still_reports_padding_as_unmeasured():
     summary = summarize_decile_rows(synthetic_rows(), {})
     assert summary["padding"]["image_count"] == 0
     assert summary["padding"]["max_union_padded_count"] is None
+
+
+# --- spec:229, the candidate against the published benchmark ------------------------------
+
+
+def test_the_benchmark_selection_is_the_producers_and_not_three_literals():
+    """A drift guard. If `ALL_QUERY_BENCHMARK`'s encoding ever changes, the comparison follows
+    it instead of silently finding no benchmark and publishing an empty list."""
+    assert BENCHMARK_SELECTION == (
+        "persistence", ALL_QUERY_BENCHMARK[0], ALL_QUERY_BENCHMARK[1],
+        PRIMARY_SCORE_SCOPE, ALL_QUERY_BENCHMARK[2],
+    )
+
+
+def test_every_ranked_candidate_is_compared_against_the_all_query_benchmark():
+    rising = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+    rows = candidate_rows({1: rising, 2: rising}) + benchmark_rows({1: rising, 2: rising})
+    summary = summarize_decile_rows(rows, {})
+    assert len(summary[RANKED_GROUPS_KEY]) == 1
+    assert summary["diagnostics"]["benchmark_comparison_count"] == 1
+    comparison = summary["benchmark_comparisons"][0]
+    assert comparison["membership_mode"] == "dynamic"
+    assert comparison["benchmark_aggregation"] == "q90"
+    assert comparison["paired_image_count"] == 2
+    assert comparison["candidate_minus_benchmark_spearman"] == 0.0
+    assert comparison["candidate_image_tie_rate"] == 1.0
+    assert comparison["candidate_image_win_rate"] == 0.0
+
+
+def test_the_benchmark_win_rate_is_paired_and_separates_ties_from_losses():
+    """A difference of two medians cannot say how many images it rests on, and that is the whole
+    question when the margin is one step of a six-point Spearman.
+
+    Here the candidate's median beats the benchmark's by a full point while winning on exactly
+    one of the two images and tying on the other. Folding ties into the loss rate would report
+    a 50 percent win as though the other half were a defeat.
+    """
+    rising = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+    falling = (5.0, 4.0, 3.0, 2.0, 1.0, 0.0)
+    rows = (
+        candidate_rows({1: rising, 2: rising})
+        + benchmark_rows({1: rising, 2: falling})
+    )
+    comparison = summarize_decile_rows(rows, {})["benchmark_comparisons"][0]
+    assert comparison["candidate_median_spearman"] == 1.0
+    assert comparison["benchmark_median_spearman"] == 0.0
+    assert comparison["candidate_minus_benchmark_spearman"] == 1.0
+    assert comparison["candidate_image_win_rate"] == 0.5
+    assert comparison["candidate_image_tie_rate"] == 0.5
+    assert comparison["candidate_image_loss_rate"] == 0.0
+    rates = (
+        comparison["candidate_image_win_rate"]
+        + comparison["candidate_image_tie_rate"]
+        + comparison["candidate_image_loss_rate"]
+    )
+    assert rates == 1.0
+
+
+def test_the_benchmark_win_rate_uses_only_images_both_sides_scored():
+    rising = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+    falling = (5.0, 4.0, 3.0, 2.0, 1.0, 0.0)
+    rows = (
+        candidate_rows({1: rising, 2: rising})
+        + benchmark_rows({1: falling, 3: falling})
+    )
+    comparison = summarize_decile_rows(rows, {})["benchmark_comparisons"][0]
+    assert comparison["paired_image_count"] == 1
+    assert comparison["candidate_image_win_rate"] == 1.0
+
+
+def test_a_table_with_no_benchmark_publishes_no_benchmark_comparison():
+    """`synthetic_rows()` has no all-300-query row, and an absent bar is reported as absent
+    rather than as a candidate that failed to clear it."""
+    summary = summarize_decile_rows(synthetic_rows(), {})
+    assert summary["benchmark_comparisons"] == []
+    assert summary["diagnostics"]["benchmark_comparison_count"] == 0
+
+
+def test_the_benchmark_is_never_itself_a_ranked_candidate():
+    rising = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0)
+    rows = candidate_rows({1: rising, 2: rising}) + benchmark_rows({1: rising, 2: rising})
+    summary = summarize_decile_rows(rows, {})
+    assert ALL_QUERY_BENCHMARK[2] not in {
+        entry["padding_mode"] for entry in summary[RANKED_GROUPS_KEY]
+    }
 
 
 # --- JSON safety --------------------------------------------------------------------------------

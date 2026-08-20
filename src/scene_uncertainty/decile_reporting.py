@@ -33,11 +33,16 @@ producer -- so the check belongs at the boundary rows arrive through, and here i
 from __future__ import annotations
 
 import math
+import operator
 
 import numpy as np
 import pandas as pd
 
-from .decile_analysis import EXPECTED_SEVERITIES, ROW_KEYS_EXCLUDED_FROM_CSV
+from .decile_analysis import (
+    ALL_QUERY_BENCHMARK,
+    EXPECTED_SEVERITIES,
+    ROW_KEYS_EXCLUDED_FROM_CSV,
+)
 from .decile_scoring import (
     COMBINED_SCOPE,
     CONFIDENCE_BINS,
@@ -278,17 +283,18 @@ def find_duplicate_row_key(frame: pd.DataFrame) -> tuple | None:
     return tuple(frame[column].iloc[first] for column in ROW_KEYS)
 
 
-def _image_metrics(group_frame: pd.DataFrame) -> dict[int, dict]:
-    """`monotonicity_metrics` per image, over a frame already sorted by image then severity.
+def _image_metrics(image_ids, severities, scores) -> dict[int, dict]:
+    """`monotonicity_metrics` per image, over arrays already sorted by image then severity.
 
     The severities with no score are handed in rather than filtered out. That is what makes
     `finite_count` and `total_count` mean anything: a policy that collapsed at high severity
     and one that rose the whole way publish the same Spearman, and the counts are the only
     thing that separates them -- which is why the deployable gate is built on them.
+
+    The three arrays are arguments rather than something this function extracts, because the
+    caller keeps them: the padding-sensitivity pair has to ask whether the mask changed an
+    image's *scores*, and a per-image Spearman cannot answer that question.
     """
-    image_ids = group_frame["image_id"].to_numpy()
-    severities = group_frame["severity"].to_numpy()
-    scores = group_frame["score"].to_numpy(dtype=np.float64)
     cuts = np.flatnonzero(image_ids[1:] != image_ids[:-1]) + 1
     starts = np.concatenate(([0], cuts))
     stops = np.concatenate((cuts, [image_ids.size]))
@@ -369,15 +375,90 @@ def rank_deployable_groups(groups: list[dict]) -> list[dict]:
     return sorted(candidates, key=_ranking_sort_key)
 
 
+BENCHMARK_SELECTION = ("persistence", *ALL_QUERY_BENCHMARK[:2], PRIMARY_SCORE_SCOPE,
+                       ALL_QUERY_BENCHMARK[2])
+"""The published all-300-query result every deployable candidate is measured against.
+
+Five of the six group labels; the scene summary is left open because the producer scores this
+selection at `q90` alone (spec:131) and a later run that published it at three summaries
+should be compared against each, not against whichever one this module guessed. The triple
+comes from `decile_analysis.ALL_QUERY_BENCHMARK` rather than being re-spelled, because it is
+an encoding decision recorded there and a second copy here would be a second thing to drift.
+
+It is *not* a deployable candidate itself -- it is `unfiltered`, so it scores the padded
+decoder placeholders that spec:71 removes from the primary analysis. It is the bar, not a
+runner.
+"""
+
+
+def _benchmark_keys(by_key: dict[tuple, dict]) -> list[tuple]:
+    return sorted(
+        key for key in by_key
+        if (key[0], key[1], key[2], key[4], key[5]) == BENCHMARK_SELECTION
+    )
+
+
 def _paired(left: dict[int, float], right: dict[int, float]) -> list[int]:
     """The images both groups measured a trend for -- the only ones a per-image win can use."""
     return sorted(set(left) & set(right))
 
 
-def _win_rate(left: dict[int, float], right: dict[int, float], images: list[int]) -> float | None:
+def _rate(left, right, images: list[int], compare) -> float | None:
+    """The fraction of `images` on which `compare(left, right)` holds, or `None` for none.
+
+    `None` and not `0.0`: an empty population has no rate, and a published `0.0` reads as a
+    measured failure rather than as a comparison nobody could make.
+    """
     if not images:
         return None
-    return float(np.mean([left[image] > right[image] for image in images]))
+    return float(np.mean([compare(left[image], right[image]) for image in images]))
+
+
+def _win_rate(left: dict[int, float], right: dict[int, float], images: list[int]) -> float | None:
+    return _rate(left, right, images, operator.gt)
+
+
+def _score_index(arrays) -> dict[tuple[int, int], float]:
+    image_ids, severities, scores = arrays
+    return {
+        (int(image_id), int(severity)): float(score)
+        for image_id, severity, score in zip(image_ids, severities, scores)
+    }
+
+
+def _same_score(left: float | None, right: float | None) -> bool:
+    if left is None or right is None:
+        return False
+    if math.isnan(left) and math.isnan(right):
+        return True
+    return left == right
+
+
+def _moved_images(left_arrays, right_arrays) -> set[int]:
+    """The images whose scene scores differ between two padding modes -- the ones the mask
+    actually reached.
+
+    Score equality, not Spearman equality, and the difference is not academic. The filtered
+    and unfiltered selections differ on every image that carries a padded tail -- 66 of the
+    pilot's 250 -- but a per-image Spearman takes only 35 distinct values over six severities,
+    so on many of those images the scores all move and the rank correlation lands on the same
+    value it had before. Reading the moved set off the Spearman counts those images as
+    untouched: on the pilot it reports 50 to 56 of 250 where the score-derived answer is 64 to
+    66, and a rate restricted to it is a tie-excluding sign test wearing the label "the images
+    the control could reach". The `all_valid` pair is the case with no room for judgement --
+    its two selections are every valid query against every query, so they differ on exactly the
+    66 images that carry a padded tail, and that is what this returns.
+
+    An image scored on one side and absent from the other counts as moved, and two `nan`
+    scores count as unmoved -- both severities were unscored under either rule, which is the
+    mask making no difference rather than making one nobody can measure.
+    """
+    left = _score_index(left_arrays)
+    right = _score_index(right_arrays)
+    return {
+        key[0] for key in left.keys() | right.keys()
+        if not _same_score(left.get(key), right.get(key))
+    }
 
 
 def _jsonable(value):
@@ -460,10 +541,19 @@ def summarize_decile_rows(
       therefore a marginal statistic; `paired_image_count` sits beside it so a reader can see
       whether the two medians rest on the same images. The win fraction is the paired one.
     * `padding_sensitivity` -- the same selection with and without the padding union (spec:155),
-      including `differing_image_count` and a win rate restricted to those images, because the
+      including `moved_image_count` and a win rate restricted to those images, because the
       control is a no-op on any image that had no padding to remove and the unrestricted rate
       counts every such image as a loss.
-    * the deployable ranking under `RANKED_GROUPS_KEY` -- spec:159.
+    * `benchmark_comparisons` -- every ranked candidate against the published all-300-query
+      result (spec:229), paired per image. The spec asks only whether a candidate beats the
+      benchmark; a difference of two medians answers that with a number whose resolution is
+      1/35, because a Spearman over six severities takes 35 distinct values. The win, tie and
+      loss rates say how many of the images the difference actually rests on, which is what
+      makes a margin of one such step falsifiable rather than merely reportable.
+    * the deployable ranking under `RANKED_GROUPS_KEY` -- spec:159. Note what it cannot say:
+      every candidate in it is `filtered`, so the ranking never *chooses* the padding rule
+      that spec:224 asks the tuning run to select. That evidence is in `padding_sensitivity`,
+      and the two must not be read as one recommendation.
 
     No number here is a raw score magnitude, and none compares one. Persistence distance and
     `1 - confidence` share no unit; every statistic published about a score -- Spearman, the
@@ -492,8 +582,18 @@ def summarize_decile_rows(
     )
     groups: list[dict] = []
     spearman_by_group: dict[tuple, dict[int, float]] = {}
+    # The (image, severity, score) arrays of every group, kept so that the padding pair can
+    # ask whether the mask changed an image's scores. Three int/float arrays per group over
+    # the real table is about 13 MB, against the 164 MB this function already costs.
+    arrays_by_group: dict[tuple, tuple] = {}
     for keys, group_frame in frame.groupby(list(GROUP_KEYS), sort=False):
-        image_metrics = _image_metrics(group_frame)
+        arrays = (
+            group_frame["image_id"].to_numpy(),
+            group_frame["severity"].to_numpy(),
+            group_frame["score"].to_numpy(dtype=np.float64),
+        )
+        arrays_by_group[keys] = arrays
+        image_metrics = _image_metrics(*arrays)
         # An image with fewer than two surviving severities has no trend to describe.
         # `monotonicity_metrics` says so with `nan` for three of its four statistics -- but
         # `endpoint_increase` comes back a definite `False`, which a plain mean would average
@@ -526,7 +626,15 @@ def summarize_decile_rows(
             "endpoint_increase_rate": _finite_mean(
                 value["endpoint_increase"] for value in measured
             ),
-            "mean_clean_overlap": _finite_mean(group_frame["clean_overlap"]),
+            # Severity 0 is excluded because it is 1.0 by construction for every membership
+            # mode -- a dynamic bin at severity 0 *is* its own severity-zero reference. Averaging
+            # it in adds a sixth of a point to every bin alike and pulls the pilot's ~0.06
+            # dynamic overlaps up to ~0.216, which is a number that looks like a measurement of
+            # stability and is mostly a measurement of the definition. The per-severity dict
+            # below keeps severity 0, where it belongs as the reference point it is.
+            "mean_clean_overlap_from_severity_1": _finite_mean(
+                group_frame.loc[group_frame["severity"] > 0, "clean_overlap"]
+            ),
             "mean_clean_overlap_by_severity": {
                 str(int(severity)): _finite_mean(values)
                 for severity, values in group_frame.groupby("severity")["clean_overlap"]
@@ -597,10 +705,8 @@ def summarize_decile_rows(
         unfiltered_spearman = spearman_by_group[key]
         filtered_spearman = spearman_by_group[filtered_key]
         paired = _paired(unfiltered_spearman, filtered_spearman)
-        differing = [
-            image for image in paired
-            if unfiltered_spearman[image] != filtered_spearman[image]
-        ]
+        moved = _moved_images(arrays_by_group[key], arrays_by_group[filtered_key])
+        moved_and_paired = [image for image in paired if image in moved]
         sensitivity.append({
             "signal": signal,
             "membership_mode": membership,
@@ -616,17 +722,20 @@ def summarize_decile_rows(
                 unfiltered_spearman, filtered_spearman, paired
             ),
             "paired_image_count": len(paired),
-            # How many images the padding mask actually moved. Without it the median difference
-            # cannot be told apart from a null result: an image with no padded tail selects the
-            # identical queries either way, and on the pilot that is 184 images out of 250.
-            "differing_image_count": len(differing),
+            # How many images the padding mask actually reached, read off the scores. Without
+            # it the median difference cannot be told apart from a null result: an image with
+            # no padded tail selects the identical queries either way, and on the pilot that is
+            # 184 images out of 250.
+            "moved_image_count": len(moved),
             # ... and the win rate restricted to those images. The unrestricted rate counts
-            # every unmoved image as a loss, so on the pilot's dynamic bottom bin it reads 0.168
-            # while the unfiltered run actually out-trends the filtered one on 42 of the 55
-            # images the mask touched. Both numbers are true; only the pair is not misleading.
-            "differing_image_win_rate": _win_rate(
-                unfiltered_spearman, filtered_spearman, differing
+            # every unreached image as a loss, so on the pilot's dynamic bottom bin it reads
+            # 0.168 over all 250 while the unfiltered run out-trends the filtered one on 42 of
+            # the 64 images the mask reached -- 0.656. Both are true; only the pair is not
+            # misleading.
+            "moved_image_win_rate": _win_rate(
+                unfiltered_spearman, filtered_spearman, moved_and_paired
             ),
+            "moved_and_paired_image_count": len(moved_and_paired),
         })
     sensitivity.sort(key=lambda entry: (
         entry["signal"], entry["membership_mode"], entry["confidence_bin"],
@@ -634,6 +743,38 @@ def summarize_decile_rows(
     ))
 
     ranked = rank_deployable_groups(groups)
+    benchmark_comparisons = []
+    for candidate in ranked:
+        candidate_key = tuple(candidate[name] for name in GROUP_KEYS)
+        candidate_spearman = spearman_by_group[candidate_key]
+        for benchmark_key in _benchmark_keys(by_key):
+            benchmark = by_key[benchmark_key]
+            benchmark_spearman = spearman_by_group[benchmark_key]
+            paired = _paired(candidate_spearman, benchmark_spearman)
+            benchmark_comparisons.append({
+                "membership_mode": candidate["membership_mode"],
+                "confidence_bin": candidate["confidence_bin"],
+                "aggregation": candidate["aggregation"],
+                "score_scope": candidate["score_scope"],
+                "padding_mode": candidate["padding_mode"],
+                "benchmark_aggregation": benchmark["aggregation"],
+                "candidate_median_spearman": candidate["median_spearman"],
+                "benchmark_median_spearman": benchmark["median_spearman"],
+                "candidate_minus_benchmark_spearman": _difference(
+                    candidate["median_spearman"], benchmark["median_spearman"]
+                ),
+                "candidate_image_win_rate": _rate(
+                    candidate_spearman, benchmark_spearman, paired, operator.gt
+                ),
+                "candidate_image_tie_rate": _rate(
+                    candidate_spearman, benchmark_spearman, paired, operator.eq
+                ),
+                "candidate_image_loss_rate": _rate(
+                    candidate_spearman, benchmark_spearman, paired, operator.lt
+                ),
+                "paired_image_count": len(paired),
+            })
+
     summary = {
         "run_metadata": dict(run_metadata or {}),
         "diagnostics": {
@@ -650,11 +791,13 @@ def summarize_decile_rows(
             "comparison_count": len(comparisons),
             "persistence_groups_without_confidence_control": without_control,
             "padding_sensitivity_count": len(sensitivity),
+            "benchmark_comparison_count": len(benchmark_comparisons),
         },
         "padding": _padding_rollup(diagnostics),
         "groups": groups,
         "comparisons": comparisons,
         "padding_sensitivity": sensitivity,
+        "benchmark_comparisons": benchmark_comparisons,
         RANKED_GROUPS_KEY: ranked,
     }
     return _jsonable(summary)
