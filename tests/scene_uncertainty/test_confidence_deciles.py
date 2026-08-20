@@ -649,3 +649,14 @@ def test_a_non_divisible_split_puts_the_remainder_in_the_lowest_bins():
     assert bins["decile_20_30"].tolist() == [6, 7, 8]
     assert bins["decile_30_40"].tolist() == [9, 10]
     assert bins["decile_90_100"].tolist() == [21, 22]
+
+
+def test_query_confidence_is_used_on_a_record_that_also_carries_the_stale_field():
+    """The refusal must sit *below* the `query_confidence` lookup, not above it."""
+    records = {0: {
+        "query_confidence": torch.arange(20, dtype=torch.float32),
+        "confidence": torch.arange(19, -1, -1, dtype=torch.float32),
+    }}
+    result = memberships_by_severity(records, NO_PADDING)
+    assert result[0]["dynamic"]["decile_00_10"].tolist() == [0, 1]
+    assert result[0]["dynamic"]["decile_90_100"].tolist() == [18, 19]
