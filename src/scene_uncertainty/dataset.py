@@ -21,6 +21,11 @@ def _per_annotation_tensors(sample):
     tensors themselves, not copies: the sanitizer matches them by object identity.
     Defined at module level rather than as a lambda so the loader stays picklable for
     worker processes.
+
+    This getter is the reason `make_coco_loader` may ask `CocoDetection` for
+    `annotation_ids` at all: the key is opt-in precisely because a pipeline that
+    sanitizes with the default getter would silently desync it. Adding a per-annotation
+    tensor to the target dict without adding it here reintroduces that desync.
     """
     target = sample[1]
     return target["labels"], target["annotation_ids"], target["area"], target["iscrowd"]
@@ -49,6 +54,10 @@ def make_coco_loader(
         transforms=transforms,
         return_masks=False,
         remap_mscoco_category=True,
+        # The extractor attributes every matched query to a COCO annotation, so this loader is
+        # the one caller that needs the ids -- and the transform list above keeps them
+        # aligned. No detector config asks for them.
+        return_annotation_ids=True,
     )
     available = set(int(image_id) for image_id in dataset.ids)
     requested = [int(image_id) for image_id in image_ids]

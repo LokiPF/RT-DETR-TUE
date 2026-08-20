@@ -26,13 +26,15 @@ class CocoDetection(torchvision.datasets.CocoDetection, DetDataset):
     __inject__ = ['transforms', ]
     __share__ = ['remap_mscoco_category']
     
-    def __init__(self, img_folder, ann_file, transforms, return_masks=False, remap_mscoco_category=False):
+    def __init__(self, img_folder, ann_file, transforms, return_masks=False, remap_mscoco_category=False,
+                 return_annotation_ids=False):
         super(CocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
-        self.prepare = ConvertCocoPolysToMask(return_masks)
+        self.prepare = ConvertCocoPolysToMask(return_masks, return_annotation_ids)
         self.img_folder = img_folder
         self.ann_file = ann_file
         self.return_masks = return_masks
+        self.return_annotation_ids = return_annotation_ids
         self.remap_mscoco_category = remap_mscoco_category
 
     def __getitem__(self, idx):
@@ -105,8 +107,24 @@ def convert_coco_poly_to_mask(segmentations, height, width):
 
 
 class ConvertCocoPolysToMask(object):
-    def __init__(self, return_masks=False):
+    """Turn one COCO annotation list into the target dict the transforms operate on.
+
+    `annotation_ids` is **opt-in**, and must stay that way. Any pipeline that asks for it
+    and then runs `SanitizeBoundingBoxes` has to name it in that transform's
+    `labels_getter`, because the default heuristic matches only keys containing "label":
+    an unlisted `annotation_ids` survives the box mask unfiltered and silently
+    re-attributes ids to the wrong boxes -- measured at 22 of 60 train2017 targets under
+    `configs/rtdetrv2/include/dataloader.yml`. The detector configs
+    (`configs/rtdetr*/include/dataloader.yml`,
+    `configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_tue_calibration.yml`) all sanitize with the
+    default getter and none of them reads the ids, so they are not handed the key at all
+    rather than being handed a desynced one. `src/scene_uncertainty/dataset.py` is the one
+    caller that turns it on, and it passes the getter that keeps it aligned.
+    """
+
+    def __init__(self, return_masks=False, return_annotation_ids=False):
         self.return_masks = return_masks
+        self.return_annotation_ids = return_annotation_ids
 
     def __call__(self, image: Image.Image, target, **kwargs):
         w, h = image.size
@@ -145,15 +163,17 @@ class ConvertCocoPolysToMask(object):
             if num_keypoints:
                 keypoints = keypoints.view(num_keypoints, -1, 3)
 
-        annotation_ids = torch.tensor(
-            [int(obj["id"]) for obj in anno],
-            dtype=torch.int64,
-        )
+        if self.return_annotation_ids:
+            annotation_ids = torch.tensor(
+                [int(obj["id"]) for obj in anno],
+                dtype=torch.int64,
+            )
 
         keep = (boxes[:, 3] > boxes[:, 1]) & (boxes[:, 2] > boxes[:, 0])
         boxes = boxes[keep]
         labels = labels[keep]
-        annotation_ids = annotation_ids[keep]
+        if self.return_annotation_ids:
+            annotation_ids = annotation_ids[keep]
         if self.return_masks:
             masks = masks[keep]
         if keypoints is not None:
@@ -162,7 +182,8 @@ class ConvertCocoPolysToMask(object):
         target = {}
         target["boxes"] = boxes
         target["labels"] = labels
-        target["annotation_ids"] = annotation_ids
+        if self.return_annotation_ids:
+            target["annotation_ids"] = annotation_ids
         if self.return_masks:
             target["masks"] = masks
         target["image_id"] = image_id

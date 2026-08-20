@@ -1,13 +1,28 @@
 import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+import yaml
 from PIL import Image
 
+from src.data.dataset import CocoDetection
 from src.data.dataset.coco_dataset import ConvertCocoPolysToMask
+from src.data.transforms import Compose, ConvertPILImage, Resize, SanitizeBoundingBoxes
 from src.scene_uncertainty.blur import FixedGaussianBlur
 from src.scene_uncertainty.dataset import make_coco_loader
+
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
+
+# Every pre-existing config that runs `SanitizeBoundingBoxes` with the default
+# `labels_getter`, which filters `boxes` and `labels` and nothing else.
+_DEFAULT_GETTER_CONFIGS = (
+    "configs/rtdetrv2/include/dataloader.yml",
+    "configs/rtdetr/include/dataloader.yml",
+    "configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_tue_calibration.yml",
+)
 
 
 _CATEGORIES = [
@@ -67,7 +82,9 @@ def test_converter_preserves_filtered_annotation_ids():
             {"id": 102, "bbox": [2, 2, 0, 4], "category_id": 4, "area": 0, "iscrowd": 0},
         ],
     }
-    _, converted = ConvertCocoPolysToMask(False)(image, target, category2label={3: 0, 4: 1})
+    _, converted = ConvertCocoPolysToMask(False, return_annotation_ids=True)(
+        image, target, category2label={3: 0, 4: 1}
+    )
     assert converted["annotation_ids"].tolist() == [101]
 
 
@@ -81,7 +98,7 @@ def test_converter_keeps_annotation_ids_aligned_with_boxes():
             {"id": 103, "bbox": [3, 3, 6, 6], "category_id": 5, "area": 36, "iscrowd": 0},
         ],
     }
-    _, converted = ConvertCocoPolysToMask(False)(
+    _, converted = ConvertCocoPolysToMask(False, return_annotation_ids=True)(
         image, target, category2label={3: 0, 4: 1, 5: 2}
     )
     assert converted["annotation_ids"].tolist() == [101, 103]
@@ -174,3 +191,88 @@ def test_annotation_free_image_survives_the_loader(tmp_path):
     for key in ("boxes", "labels", "annotation_ids", "area", "iscrowd"):
         assert target[key].shape[0] == 0, key
     assert int(target["image_id"]) == 4
+
+
+def _mapping_nodes(node):
+    """Every mapping anywhere in a parsed YAML document."""
+    if isinstance(node, dict):
+        yield node
+        for value in node.values():
+            yield from _mapping_nodes(value)
+    elif isinstance(node, list):
+        for value in node:
+            yield from _mapping_nodes(value)
+
+
+def test_converter_withholds_annotation_ids_unless_they_are_asked_for():
+    """The shared training path must not be handed a key it will not keep aligned.
+
+    `SanitizeBoundingBoxes`' default `labels_getter` matches only keys containing
+    "label", so an `annotation_ids` in the target dict survives the box mask unfiltered
+    and re-attributes ids to the wrong boxes. The detector configs all sanitize with that
+    default getter and none of them reads the ids, so the converter does not emit the key
+    unless a caller asks for it -- and the only caller that asks, `make_coco_loader`,
+    lists it in its getter.
+    """
+    image = Image.new("RGB", (20, 20), color="white")
+    target = {
+        "image_id": 9,
+        "annotations": [{"id": 101, "bbox": [1, 1, 5, 5], "category_id": 3, "area": 25, "iscrowd": 0}],
+    }
+    _, default = ConvertCocoPolysToMask(False)(image, dict(target), category2label={3: 0})
+    assert "annotation_ids" not in default
+    assert default["boxes"].shape[0] == 1 and default["labels"].tolist() == [0]
+
+    _, asked = ConvertCocoPolysToMask(False, return_annotation_ids=True)(
+        image, dict(target), category2label={3: 0}
+    )
+    assert asked["annotation_ids"].tolist() == [101]
+
+
+def test_the_default_getter_pipeline_is_never_handed_annotation_ids(tmp_path):
+    """Reproduce the pre-existing configs' transform stack over a box the sanitizer drops.
+
+    Resize + `SanitizeBoundingBoxes(min_size=1)` with the *default* getter is exactly what
+    `configs/rtdetrv2/include/dataloader.yml` builds. With the ids emitted, `boxes` comes
+    back with two rows and `annotation_ids` with three, silently misaligned; the key must
+    simply not be there.
+    """
+    image_dir, annotation_file = _write_coco(
+        tmp_path,
+        (1,),
+        [
+            _annotation(201, 1, [1, 1, 4, 4], category_id=1),
+            _annotation(202, 1, [5, 1, 0.001, 4], category_id=2),
+            _annotation(203, 1, [1, 5, 4, 2], category_id=3),
+        ],
+    )
+    dataset = CocoDetection(
+        img_folder=str(image_dir),
+        ann_file=str(annotation_file),
+        transforms=Compose([
+            Resize(size=[640, 640]),
+            SanitizeBoundingBoxes(min_size=1),
+            ConvertPILImage(dtype="float32", scale=True),
+        ]),
+        return_masks=False,
+        remap_mscoco_category=False,
+    )
+    _, target = dataset[0]
+    assert "annotation_ids" not in target
+    assert target["boxes"].shape[0] == 2
+    assert target["labels"].tolist() == [0, 2]
+
+
+def test_the_detector_configs_sanitize_with_the_default_getter_and_never_ask_for_the_ids():
+    """The producer's opt-in has to be checked against the configs it protects.
+
+    If a config ever both sanitizes with the default getter and turns `annotation_ids`
+    on, the ids desync with no error and nothing else in the suite would notice.
+    """
+    for relative in _DEFAULT_GETTER_CONFIGS:
+        document = yaml.safe_load((REPOSITORY_ROOT / relative).read_text(encoding="utf-8"))
+        mappings = list(_mapping_nodes(document))
+        sanitizers = [node for node in mappings if node.get("type") == "SanitizeBoundingBoxes"]
+        assert sanitizers, f"{relative} no longer sanitizes; drop it from this list"
+        assert [node for node in sanitizers if "labels_getter" not in node], relative
+        assert not [node for node in mappings if node.get("return_annotation_ids")], relative
