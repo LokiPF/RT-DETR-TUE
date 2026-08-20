@@ -22,8 +22,11 @@ Two of the assertions below look like bugs at first reading and are not:
 
 from __future__ import annotations
 
+import ast
+import importlib.metadata
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -334,3 +337,71 @@ def test_the_scene_uncertainty_pipeline_imports_without_supervisely():
     )
     assert result.returncode == 0, result.stderr
     assert "no_supervisely" in result.stdout
+
+
+# --------------------------------------------------------------------------------------
+# requirements.txt
+# --------------------------------------------------------------------------------------
+
+# Import name -> the distribution that provides it, wherever the two differ.
+_DISTRIBUTION_OF = {"PIL": "pillow", "yaml": "pyyaml", "cv2": "opencv-python"}
+
+
+def _declared_requirements() -> dict[str, str]:
+    """Every requirement line, keyed by its normalised distribution name."""
+    declared = {}
+    for line in (REPOSITORY_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines():
+        line = line.split("#")[0].strip()
+        if not line:
+            continue
+        name = re.split(r"[<>=!~\[; ]", line, maxsplit=1)[0]
+        declared[name.lower().replace("_", "-")] = line
+    return declared
+
+
+def _declared_floor(distribution: str) -> tuple[int, ...]:
+    match = re.search(r">=\s*([0-9]+(?:\.[0-9]+)*)", _declared_requirements()[distribution])
+    assert match, f"{distribution} declares no >= floor"
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def test_requirements_declare_every_third_party_module_the_pipeline_imports():
+    """A clean environment built from `requirements.txt` must be able to run the CLI.
+
+    `reporting.py` imports pandas and matplotlib at module scope and `pipeline.py` imports
+    `reporting`, so an undeclared one of those fails *all six* subcommands at import --
+    and it cannot be excused by "it arrives with supervisely", because
+    `test_the_scene_uncertainty_pipeline_imports_without_supervisely` forbids exactly that
+    dependency being present.
+    """
+    declared = _declared_requirements()
+    missing: dict[str, set[str]] = {}
+    for path in sorted((REPOSITORY_ROOT / "src" / "scene_uncertainty").glob("*.py")):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                roots = [alias.name.split(".")[0] for alias in node.names]
+            elif isinstance(node, ast.ImportFrom) and not node.level:
+                roots = [(node.module or "").split(".")[0]]
+            else:
+                continue
+            for root in roots:
+                if not root or root == "src" or root in sys.stdlib_module_names:
+                    continue
+                distribution = _DISTRIBUTION_OF.get(root, root).lower().replace("_", "-")
+                if distribution not in declared:
+                    missing.setdefault(distribution, set()).add(path.name)
+    assert not missing, f"requirements.txt declares none of {missing}"
+
+
+def test_requirements_demand_a_torchvision_that_accepts_a_tuple_labels_getter():
+    """`make_coco_loader` passes a tuple-returning `labels_getter`.
+
+    `SanitizeBoundingBoxes` rejected anything but a single tensor or None up to and
+    including 0.17.2; the tuple/list branch first appears in 0.18.0. A floor below that
+    -- 0.15.2, say -- declares an environment in which the blur loader raises on every
+    batch, so the floor is asserted here rather than left to a comment.
+    """
+    floor = _declared_floor("torchvision")
+    assert floor >= (0, 18), f"torchvision floor {floor} predates tuple labels_getter support"
+    installed = importlib.metadata.version("torchvision").split("+")[0].split(".")
+    assert tuple(int(part) for part in installed[:len(floor)]) >= floor
