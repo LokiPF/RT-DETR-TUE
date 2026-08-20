@@ -2417,7 +2417,8 @@ def test_the_median_blindness_note_stays_silent_when_the_run_cannot_show_it(tmp_
 @pytest.mark.parametrize(("low_rate", "high_rate"), [
     (0.523, 0.540),   # both above even -- they differ, they do not disagree
     (0.410, 0.449),   # both below even
-    (0.500, 0.600),   # one exactly even, which is not the opposite side of anything
+    (0.500, 0.600),   # the low one exactly even, which is not the opposite side of anything
+    (0.410, 0.500),   # and the high one exactly even, which is the same fact on the other end
 ])
 def test_the_median_blindness_note_stays_silent_when_the_ties_agree(low_rate, high_rate):
     """Two tied rows that merely *differ* show the paired statistic has more resolution than
@@ -2491,13 +2492,19 @@ def test_the_unpaired_fallback_is_only_reached_without_a_frozen_twin(tmp_path):
 # --- review round 3: the ten-bin reading, derived -------------------------------------------
 
 
-def profile_rows(rates: list[float], frozen: list[float], aggregation: str = "q90") -> dict:
+def profile_rows(rates: list[float], frozen: list[float], aggregation: str = "q90",
+                 paired: list[float] | None = None) -> dict:
     """A `membership_comparisons` slice with a chosen decided-rate profile and frozen column.
 
     Built directly rather than from scored rows because the note is a function of these numbers
     and nothing else, and because `full_grid_rows` cannot be bent into a profile that peaks at
     its own winning bin without moving figures a dozen other tests pin.
+
+    `paired` is separate from `rates` because the note counts the two denominators with two
+    independent comparisons and the default `0.9 * rate` can never land either of them on
+    exactly 0.5. A boundary a fixture cannot express is a boundary no assertion can pin.
     """
+    all_paired = [rate * 0.9 for rate in rates] if paired is None else paired
     return {
         "membership_comparisons": [
             {
@@ -2507,9 +2514,9 @@ def profile_rows(rates: list[float], frozen: list[float], aggregation: str = "q9
                 "dynamic_median_spearman": 0.6, "frozen_median_spearman": frozen[index],
                 "dynamic_minus_frozen_spearman": 0.6 - frozen[index],
                 "paired_image_count": 250,
-                "dynamic_image_win_rate": rates[index] * 0.9,
+                "dynamic_image_win_rate": all_paired[index],
                 "dynamic_image_tie_rate": 0.1,
-                "dynamic_image_loss_rate": 0.9 - rates[index] * 0.9,
+                "dynamic_image_loss_rate": 0.9 - all_paired[index],
                 "dynamic_image_decided_image_count": 225,
                 "dynamic_image_decided_win_rate": rates[index],
                 "dynamic_mean_clean_overlap_from_severity_1": 0.06,
@@ -2519,12 +2526,33 @@ def profile_rows(rates: list[float], frozen: list[float], aggregation: str = "q9
     }
 
 
-def profile_ranked(bin_name: str, medians: list[float], aggregation: str = "q90") -> list[dict]:
+THREE_SUMMARIES = ("q90", "mean", "top20_mean")
+
+
+def profile_ranked(bin_name: str, medians: list[float], aggregation: str = "q90",
+                   summaries: tuple[str, ...] = ()) -> list[dict]:
+    """Ranked rows over ten distinct bins, optionally scored at more than one scene summary.
+
+    Two things this is careful about, both because the note counts over it.
+
+    * **Ten distinct bins.** Overwriting `DECILE_NAMES[0]` with `bin_name` left the winning bin
+      in the list twice, carrying two different medians -- which no real ranking can hold,
+      since one selection at one summary has one median.
+    * **`summaries`.** The real ranking holds every candidate once per scene summary, so a
+      count of ranked *rows* multiplies each selection by three. A fixture with one row per
+      selection cannot tell the two counts apart, and the note publishes both.
+
+    Row order is summary-major, so `ranked[0]` is `bin_name` at `summaries[0]`. It is not
+    sorted by median: the note reads `ranked[0]` as the winner and otherwise only counts, so
+    the order of the rest is not a fact it uses.
+    """
+    names = [bin_name, *(name for name in DECILE_NAMES if name != bin_name)][:len(medians)]
     return [
-        {"membership_mode": "dynamic", "confidence_bin": bin_name if index == 0 else name,
-         "aggregation": aggregation, "score_scope": PRIMARY_SCORE_SCOPE,
+        {"signal": "persistence", "membership_mode": "dynamic", "confidence_bin": name,
+         "aggregation": summary, "score_scope": PRIMARY_SCORE_SCOPE,
          "padding_mode": FILTERED_PADDING_MODE, "median_spearman": median}
-        for index, (name, median) in enumerate(zip(DECILE_NAMES, medians))
+        for summary in (summaries or (aggregation,))
+        for name, median in zip(names, medians)
     ]
 
 
@@ -2552,8 +2580,10 @@ def test_the_movement_profile_is_derived_from_the_paired_rows():
         profile_rows(shifted, FLAT_FROZEN), ranked
     ))
     assert "0.600 at `decile_20_30`" in moved
-    assert "The peak is not the selected bin `decile_50_60`" in moved
+    assert "The highest bin is not the selected bin `decile_50_60`, which sits at 0.390" in moved
     assert "it is not single-peaked" in moved
+    # A column with two rises has no peak, so nothing in it may be called one.
+    assert "The peak" not in moved
 
 
 def test_the_movement_profile_names_the_peaks_neighbours_rather_than_calling_it_the_only_bin():
@@ -2599,23 +2629,43 @@ def test_the_movement_profile_lets_the_flat_frozen_medians_carry_the_selection_a
     # band. The real medians are always exact grid values; a fixture that rounds them makes
     # this note look broken when it is not.
     top, step_below = 22 / 35, 21 / 35
+    two_steps_below = 20 / 35
     ranked = profile_ranked(
-        "decile_50_60", [top, top, step_below, step_below, step_below, 0.5, 0.4, 0.3, 0.2, 0.1]
+        "decile_50_60",
+        [top, top, step_below, step_below, step_below, two_steps_below, 0.4, 0.3, 0.2, 0.1],
+        summaries=THREE_SUMMARIES,
     )
     note = "\n".join(reporting_module._movement_profile_note(
         profile_rows(UNIMODAL, FLAT_FROZEN), ranked
     ))
     assert "identical at +0.6000 across 6 neighbouring bins" in note
     assert "`decile_10_20` through `decile_60_70`" in note
-    assert "5 of the 10 ranked candidates sit within one 1/35 = 0.0286 step of the top" in note
-    assert "2 share the top median exactly" in note
+    # Both edges of the band are in the fixture: `step_below` is exactly one step back and has
+    # to be counted, `two_steps_below` is exactly two and has to be left out. A band asserted
+    # over a field whose nearest excluded candidate is 4.5 steps back can be doubled without
+    # moving the count, which is how a doubled band survived 196 tests.
+    assert ("5 of the 10 ranked selections sit within one 1/35 = 0.0286 step of the top "
+            "median (15 ranked rows") in note
+    # 30 rows, 10 selections: the ranked *count* multiplies each selection by its three scene
+    # summaries, and the table's own caption says those three are one selection, not three.
+    assert "1 other selection matches the top median exactly (6 ranked rows hold it)" in note
 
 
-def test_the_movement_profile_omits_the_frozen_argument_when_nothing_is_flat():
+@pytest.mark.parametrize("frozen", [
+    [0.1 * index for index in range(10)],                   # no two neighbours equal at all
+    [0.6, 0.6, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 0.8, 0.9],     # the longest run is exactly two
+    [0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 0.8, 0.9, 0.6, 0.6],     # and again, at the far end
+])
+def test_the_movement_profile_omits_the_frozen_argument_without_three_equal_bins(frozen):
     """A frozen column with no run of three is no evidence of "any middle bin scores about X",
-    and the paragraph that says so must not appear."""
+    and the paragraph that says so must not appear.
+
+    Two equal neighbours are not a plateau -- every column of ten has a pair somewhere by
+    coincidence, and `_longest_equal_run` returns 2 for a great many shapes that say nothing.
+    A fixture whose longest run is 1 cannot tell 3 from 2, which is how `length >= 2` survived.
+    """
     note = "\n".join(reporting_module._movement_profile_note(
-        profile_rows(UNIMODAL, [0.1 * index for index in range(10)]),
+        profile_rows(UNIMODAL, frozen),
         profile_ranked("decile_50_60", [0.6286] * 10),
     ))
     assert "The shape of that column" in note
@@ -2627,13 +2677,25 @@ def test_the_movement_profile_says_nothing_without_a_ranking():
 
 
 def test_the_movement_profile_survives_the_full_fixture(tmp_path):
-    """And on the shared fixture -- whose peak is *not* its winning bin -- it says so rather
-    than reporting a peak that is not there."""
+    """And on the shared fixture -- whose decided rate rises to 1.000 at the second bin and
+    then never moves -- it reports a rise with no peak in it.
+
+    This fixture is the endpoint case the old reading got wrong in the report a reader would
+    actually have received: `max` returned the first of the nine tied bins, and the paragraph
+    said "runs from 0.000 at `decile_00_10` to 1.000 at `decile_10_20` and back to 1.000 at
+    `decile_90_100`, one peak with no second rise" -- a peak that is not there, reached and
+    returned from at the same value.
+    """
     summary = grid_summary()
     note = "\n".join(
         reporting_module._movement_profile_note(summary, summary[RANKED_GROUPS_KEY])
     )
-    assert "The peak is not the selected bin" in note
+    assert "rises from 0.000 at `decile_00_10` to 1.000 at `decile_90_100`" in note
+    assert "never falls" in note
+    assert ("The highest rate 1.000 is shared by `decile_10_20` through `decile_90_100`, the "
+            "selected bin `decile_50_60` among them") in note
+    assert "one peak with no second rise" not in note
+    assert "and back to" not in note
     assert note in (written(tmp_path) / "easy-report.md").read_text()
 
 
@@ -2649,3 +2711,305 @@ def test_the_longest_equal_run_finds_the_longest_and_skips_the_absent(run, expec
     returned the *first* run rather than the longest, or that counted a run of `None`s as
     flatness, would publish a claim about a stretch of bins that is not flat."""
     assert reporting_module._longest_equal_run(run) == expected
+
+
+# --- review round 4: the shapes the reading had no branch for ---------------------------------
+
+
+@pytest.mark.parametrize(("rates", "shape", "span"), [
+    ([0.42] * 10, "flat", (0, 9)),
+    ([0.1, 0.2, 0.3, 0.4], "rising", (3, 3)),
+    ([0.1, 0.2, 0.2, 0.3], "rising", (3, 3)),
+    ([0.4, 0.3, 0.2, 0.1], "falling", (0, 0)),
+    ([0.4, 0.3, 0.3, 0.1], "falling", (0, 0)),
+    ([0.2, 0.6, 0.3], "peaked", (1, 1)),
+    ([0.2, 0.6, 0.6, 0.3], "peaked", (1, 2)),
+    ([0.2, 0.6, 0.3, 0.6, 0.2], "multi_peaked", (1, 1)),
+    ([0.6, 0.3, 0.4, 0.2], "multi_peaked", (0, 0)),      # highest at an endpoint, not a peak
+])
+def test_the_column_shape_and_the_peak_span_are_the_shape_the_numbers_have(rates, shape, span):
+    """`max(range(...))` returns index zero on a flat column and the first index of any
+    plateau, and "one peak with no second rise" is vacuously true at both endpoints -- so a
+    flat, a rising and a falling column each printed a peak, named one bin as both the start
+    and the top, and then described an equal neighbour as sitting below it.
+
+    The span is the *maximal* run at the highest rate, which is what makes "its neighbours sit
+    below it on both sides" true by construction rather than by luck.
+    """
+    assert reporting_module._column_shape(rates) == shape
+    assert reporting_module._peak_span(rates) == span
+
+
+FLAT_RATES = [0.42] * 10
+RISING_RATES = [0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55]
+FALLING_RATES = list(reversed(RISING_RATES))
+ENDPOINT_RATES = [0.60, 0.30, 0.40, 0.20, 0.18, 0.16, 0.14, 0.12, 0.10, 0.08]
+
+
+@pytest.mark.parametrize(("rates", "expected", "forbidden"), [
+    (FLAT_RATES, [
+        "the decided rate is the same 0.420 in all 10 bins, so it has no peak and separates "
+        "no bin from any other",
+        "The highest rate 0.420 is shared by `decile_00_10` through `decile_90_100`, the "
+        "selected bin `decile_50_60` among them",
+        "0 of the 10 bins are above even at this summary",
+    ], ["one peak", "and back to", "sit below it on both sides", "straddle even",
+        "Its neighbours"]),
+    (RISING_RATES, [
+        "rises from 0.100 at `decile_00_10` to 0.550 at `decile_90_100` and never falls, so "
+        "it has no peak inside the range -- its highest rate is the one it ends on",
+        "The highest bin is not the selected bin `decile_50_60`, which sits at 0.350",
+        "1 of the 10 bins is above even at this summary",
+    ], ["one peak", "and back to", "Its neighbours"]),
+    (FALLING_RATES, [
+        "falls from 0.550 at `decile_00_10` to 0.100 at `decile_90_100` and never rises, so "
+        "it has no peak inside the range -- its highest rate is the one it starts from",
+        "The highest bin is not the selected bin `decile_50_60`, which sits at 0.300",
+        "1 of the 10 bins is above even at this summary",
+    ], ["one peak", "and back to", "Its neighbours"]),
+    (ENDPOINT_RATES, [
+        "runs from 0.600 at `decile_00_10` to 0.080 at `decile_90_100`, and it is not "
+        "single-peaked: its highest rate is 0.600 at `decile_00_10`",
+        "The highest bin is not the selected bin `decile_50_60`, which sits at 0.160",
+    ], ["one peak", "Its neighbours"]),
+])
+def test_the_movement_profile_reports_a_shape_it_has_rather_than_a_peak_it_does_not(
+    rates, expected, forbidden
+):
+    """Measured output on a flat column before this: "the decided rate runs from 0.420 at
+    `decile_00_10` to 0.420 at `decile_00_10` and back to 0.420 at `decile_90_100`, one peak
+    with no second rise ... Its neighbours -- `decile_10_20` at 0.420 -- sit below it on both
+    sides." A peak asserted where there is none, a neighbour that is equal rather than below,
+    and one side described as both.
+    """
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(rates, FLAT_FROZEN), profile_ranked("decile_50_60", [22 / 35] * 10)
+    ))
+    for sentence in expected:
+        assert sentence in note
+    for sentence in forbidden:
+        assert sentence not in note
+
+
+@pytest.mark.parametrize(("rates", "expected", "forbidden"), [
+    # Neighbours below even on both sides: nothing straddles anything.
+    ([0.20, 0.22, 0.25, 0.28, 0.30, 0.60, 0.30, 0.25, 0.22, 0.20],
+     "`decile_40_50` at 0.300 and `decile_60_70` at 0.300 -- sit below it on both sides",
+     "straddle even"),
+    # And one neighbour exactly even, which is not the far side of even either.
+    ([0.20, 0.22, 0.25, 0.28, 0.50, 0.60, 0.30, 0.25, 0.22, 0.20],
+     "`decile_40_50` at 0.500 and `decile_60_70` at 0.300 -- sit below it on both sides",
+     "straddle even"),
+    (UNIMODAL,
+     "`decile_40_50` at 0.520 and `decile_60_70` at 0.490 -- straddle even",
+     "sit below it on both sides"),
+])
+def test_the_plateau_reading_is_conditional_on_the_neighbours_actually_straddling_even(
+    rates, expected, forbidden
+):
+    """"A short plateau of near-even bins and not one bin standing apart" is a claim about two
+    measured neighbours. Made unconditional it printed over neighbours at 0.300 and 0.300, and
+    196 tests did not notice because only the straddling fixture was ever asserted on."""
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(rates, FLAT_FROZEN), profile_ranked("decile_50_60", [22 / 35] * 10)
+    ))
+    assert expected in note
+    assert forbidden not in note
+
+
+def test_the_movement_profile_counts_an_exactly_even_rate_on_neither_side():
+    """`> 0.5` and `>= 0.5` differ on exactly one value, and `decile_40_50` at `q90` is
+    107/36/107 on the real run -- an exactly even row the counting boundary decides.
+
+    `UNIMODAL` holds no rate at 0.5, so nothing in the suite pinned the strictness of any of
+    the three counts: bins above even, rows above even on the decided denominator, and rows
+    above even over every paired image. All three are asserted here against a profile that
+    contains the boundary on both denominators.
+    """
+    rates = [0.20, 0.31, 0.39, 0.50, 0.52, 0.60, 0.49, 0.43, 0.28, 0.22]
+    paired = [0.18, 0.28, 0.35, 0.45, 0.50, 0.54, 0.44, 0.39, 0.25, 0.20]
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(rates, FLAT_FROZEN, paired=paired),
+        profile_ranked("decile_50_60", [22 / 35] * 10),
+    ))
+    assert "2 of the 10 bins are above even at this summary" in note
+    assert "10 rows of this slice, 2 clear 0.5 on the images the comparison decided" in note
+    assert "1 clear it over every paired image" in note
+
+
+@pytest.mark.parametrize(("frozen", "expected", "forbidden"), [
+    ([0.6, 0.6, 0.6, 0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 0.8],
+     "`decile_00_10` through `decile_20_30` -- a run that reaches the bottom of the confidence "
+     "range, so it is a flat stretch of that end and not a statement about middle bins",
+     "a middle bin of almost any kind"),
+    ([0.1, 0.2, 0.3, 0.4, 0.5, 0.7, 0.8, 0.6, 0.6, 0.6],
+     "`decile_70_80` through `decile_90_100` -- a run that reaches the top of the confidence "
+     "range, so it is a flat stretch of that end and not a statement about middle bins",
+     "a middle bin of almost any kind"),
+    ([0.6] * 10,
+     "a run that spans the whole confidence range, so the frozen column separates no bin from "
+     "any other",
+     "a middle bin of almost any kind"),
+    (FLAT_FROZEN,
+     "a run that touches neither end of the confidence range, so a middle bin of almost any "
+     "kind scores about +0.6000 here once the membership is held still",
+     "reaches the bottom"),
+])
+def test_the_frozen_run_is_only_called_a_middle_bin_when_it_is_one(frozen, expected, forbidden):
+    """"A middle bin of almost any kind scores about X" fired on a flat frozen run at
+    `decile_00_10`-`decile_20_30` and at `decile_70_80`-`decile_90_100` alike. Neither is a
+    statement about middle bins; one is a statement about the bottom of the range."""
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, frozen), profile_ranked("decile_50_60", [22 / 35] * 10)
+    ))
+    assert expected in note
+    assert forbidden not in note
+
+
+def test_the_frozen_paragraph_measures_no_distance_between_a_frozen_and_a_dynamic_median():
+    """"What the ranking selected is the one that landed a step above" subtracted a *frozen*
+    median from a *dynamic* one. It read correctly on the pilot only because the frozen plateau
+    (+0.6000) and the dynamic runners-up (+0.6000) happen to coincide there; with the plateau
+    fifteen steps lower the same sentence still said "a step above".
+
+    So: move the whole frozen column and nothing in the paragraph may move but the frozen
+    number itself. That is a stronger check than forbidding the phrase, because it forbids the
+    arithmetic rather than one wording of it.
+    """
+    ranked = profile_ranked(
+        "decile_50_60", [22 / 35, 22 / 35, 21 / 35, 21 / 35, 0.4, 0.3, 0.2, 0.1, 0.0, -0.1],
+        summaries=THREE_SUMMARIES,
+    )
+    high = [0.5429, *[0.6] * 6, 0.5429, 0.4857, -0.5429]
+    low = [0.1429, *[0.2] * 6, 0.1429, 0.0857, -0.5429]
+    note_high = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, high), ranked))
+    note_low = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, low), ranked))
+    assert "identical at +0.6000 across 6 neighbouring bins" in note_high
+    assert "identical at +0.2000 across 6 neighbouring bins" in note_low
+    assert "step above" not in note_high
+    assert "step above" not in note_low
+    assert note_high.replace("+0.6000", "<plateau>") == note_low.replace("+0.2000", "<plateau>")
+
+
+def test_the_ranked_counts_agree_in_number_with_the_count_they_quote():
+    """"1 of the 10 ranked candidates sit within ...; and 1 share the top median exactly" --
+    the note already conjugates `above_even` and `bins_word` against their counts, and these
+    two were the ones left behind."""
+    ranked = profile_ranked("decile_50_60", [22 / 35, *[0.1] * 9])
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, FLAT_FROZEN), ranked
+    ))
+    assert ("1 of the 10 ranked selections sits within one 1/35 = 0.0286 step of the top "
+            "median (1 ranked row") in note
+    assert "no other selection matches the top median exactly (1 ranked row holds it)" in note
+
+
+# --- review round 4: a winner with no frozen twin, and the report as a whole -------------------
+
+
+def all_valid_winning_rows():
+    """The grid table with the null result this experiment is designed to be able to report:
+    the selection no confidence ranking produced beats every decile bin.
+
+    `RANKABLE_MEMBERSHIP_MODES` admits `shared`, so `("shared", "all_valid", "filtered")` is a
+    ranked candidate and on the real run it sits at rank 12 with three of its rows in the list.
+    A run in which it sits at rank 1 is not exotic -- it is the outcome that would say the
+    confidence deciles buy nothing -- and `membership_comparisons` holds dynamic-versus-frozen
+    *decile* pairs only, so the winner has no row in it.
+    """
+    rows = []
+    for scored in full_grid_rows():
+        scored = dict(scored)
+        selection = (scored["membership_mode"], scored["confidence_bin"],
+                     scored["padding_mode"])
+        if scored["signal"] == "persistence" and selection == ALL_VALID_BENCHMARK:
+            scored["score"] = float(scored["severity"])            # a perfect rise: +1.0000
+        elif (scored["signal"] == "persistence" and scored["membership_mode"] == "dynamic"
+                and scored["padding_mode"] == FILTERED_PADDING_MODE):
+            # Distance 1 -- +0.9429, behind the every-query selection in every bin, and the one
+            # distance `_distance(..., "frozen_persistence")` never uses. A dynamic bin that
+            # matches its frozen twin exactly ties on every image, which leaves the decided
+            # rate `None` and takes the whole note out rather than exercising it.
+            scored["score"] = swap_curve(1)[scored["severity"]]
+        rows.append(scored)
+    return rows
+
+
+def test_a_winner_with_no_frozen_twin_is_reported_rather_than_raised():
+    """`at_summary` holds decile bins, and the winner is indexed into it raw. On the real
+    ranking, moving any of the three `all_valid` rows to the front raises
+    `KeyError: 'all_valid'` out of the middle of the report generator."""
+    ranked = [
+        {"signal": "persistence", "membership_mode": "shared", "confidence_bin": "all_valid",
+         "aggregation": "q90", "score_scope": PRIMARY_SCORE_SCOPE,
+         "padding_mode": FILTERED_PADDING_MODE, "median_spearman": 22 / 35},
+        *profile_ranked("decile_50_60", [21 / 35] * 10),
+    ]
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, FLAT_FROZEN), ranked
+    ))
+    assert ("The candidate the ranking put first, `all_valid` under `shared`, is not one of "
+            "these bins and has no frozen twin scored at this summary, so this column says "
+            "nothing about it") in note
+    # The shape of the column is still a fact about the column, and is still reported.
+    assert "one peak with no second rise" in note
+    assert "The peak is the bin the ranking selected" not in note
+
+
+def test_a_winning_bin_whose_frozen_twin_was_never_scored_degrades_the_same_way():
+    """The same hole, reached without `shared`: a dynamic bin the frozen membership was not
+    run for has no `membership_comparisons` row, so it is missing from `at_summary` too."""
+    rows = profile_rows(UNIMODAL, FLAT_FROZEN)
+    rows["membership_comparisons"] = [
+        entry for entry in rows["membership_comparisons"]
+        if entry["confidence_bin"] != "decile_50_60"
+    ]
+    note = "\n".join(reporting_module._movement_profile_note(
+        rows, profile_ranked("decile_50_60", [22 / 35] * 10)
+    ))
+    assert ("The candidate the ranking put first, `decile_50_60` under `dynamic`, is not one "
+            "of these bins and has no frozen twin scored at this summary") in note
+
+
+def test_a_winner_with_no_frozen_twin_still_writes_all_seven_artifacts(tmp_path):
+    """`easy-report.md` was written last, so the raise above left six of the seven artifacts on
+    disk -- against `write_decile_report`'s own "or write nothing at all"."""
+    output = written(tmp_path, rows=all_valid_winning_rows())
+    assert {path.name for path in output.iterdir()} == {
+        "per_scene.csv", "summary.json", "confidence_decile_heatmap.png", "blur_curves.png",
+        "dynamic_vs_frozen.png", "padding_sensitivity.png", "easy-report.md",
+    }
+    summary = json.loads((output / "summary.json").read_text())
+    winner = summary[RANKED_GROUPS_KEY][0]
+    assert (winner["membership_mode"], winner["confidence_bin"]) == ALL_VALID_BENCHMARK[:2]
+    report = (output / "easy-report.md").read_text()
+    assert "`all_valid` under `shared`" in section(report, "Dynamic versus frozen queries")
+
+
+def test_nothing_is_published_when_the_prose_cannot_be_built(tmp_path, monkeypatch):
+    """Every artifact's text is built before any of them is renamed into place, so a sentence
+    that cannot be generated leaves no directory rather than six files."""
+    def refuse(*_args, **_kwargs):
+        raise KeyError("all_valid")
+
+    monkeypatch.setattr(reporting_module, "_movement_profile_note", refuse)
+    output = tmp_path / "report"
+    with pytest.raises(KeyError):
+        write_decile_report(full_grid_rows(), output, GRID_RUN_METADATA, grid_diagnostics())
+    assert not output.exists()
+
+
+def test_nothing_is_published_when_a_figure_cannot_be_rendered(tmp_path, monkeypatch):
+    """The blur curves are the one artifact that needs the results frame, so they are rendered
+    after the CSV has been staged. Staged, not published: the failure removes the temporary and
+    leaves the directory empty rather than leaving `per_scene.csv` beside nothing else."""
+    def refuse(*_args, **_kwargs):
+        raise RuntimeError("no figure")
+
+    monkeypatch.setattr(reporting_module, "_blur_curve_figure", refuse)
+    output = tmp_path / "report"
+    with pytest.raises(RuntimeError):
+        write_decile_report(full_grid_rows(), output, GRID_RUN_METADATA, grid_diagnostics())
+    assert list(output.iterdir()) == []

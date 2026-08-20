@@ -62,6 +62,7 @@ the blur curves, which share it. `pd.DataFrame(rows)` on the real table costs ~2
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import operator
@@ -107,6 +108,17 @@ All six, together. `confidence_bin` alone does not identify a selection: the all
 benchmark and the padding-removed `all_valid` benchmark carry the *same* bin label and differ
 only in `padding_mode`, and the bottom decile appears under three membership modes. Grouping on
 any subset silently merges selections whose whole purpose is to be compared against each other.
+"""
+
+SELECTION_KEYS = tuple(key for key in GROUP_KEYS if key != "aggregation")
+"""What identifies one *selection* across the several scene summaries it was scored at.
+
+`_slice_caption` prints, above every table in the report, that rows differing only in the
+summary "are views of one selection on the same images, not independent measurements of it".
+A count of ranked *rows* therefore multiplies each selection by however many summaries it was
+scored at -- three, on this design -- so "9 of the 33 ranked candidates sit within one step"
+describes three bins and reads as nine. Derived from `GROUP_KEYS` rather than re-typed, so the
+caption's rule and the counts under it cannot drift apart.
 """
 
 ROW_KEYS = ("image_id", "severity", *GROUP_KEYS)
@@ -1237,23 +1249,29 @@ def _table(headers: list[str], body: list[list[str]]) -> list[str]:
 # --- atomic output --------------------------------------------------------------------------------
 
 
-def _atomic_text(path: Path, text: str) -> None:
-    """Write through a temporary and rename, so a crash never leaves a readable half-file.
+def _temporary_for(path: Path) -> Path:
+    """Where an artifact is staged before it is renamed into place.
 
-    A truncated `summary.json` is a parse error, which is loud. A truncated `easy-report.md`
-    is a shorter report that stops mid-sentence and looks finished, which is not.
+    Every file goes out through one of these and `os.replace`, so a crash never leaves a
+    readable half-file. A truncated `summary.json` is a parse error, which is loud. A truncated
+    `easy-report.md` is a shorter report that stops mid-sentence and looks finished, which is
+    not.
     """
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(text, encoding="utf-8")
-    os.replace(temporary, path)
+    return path.with_suffix(path.suffix + ".tmp")
 
 
-def _save_figure(figure, path: Path) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
+def _figure_bytes(figure) -> bytes:
+    """Render a figure to PNG bytes rather than to a path.
+
+    A figure that renders into memory can be produced *before* the first artifact is published,
+    which is what lets `write_decile_report` keep its promise to write seven files or none. The
+    figures are tens of kilobytes each; the object being closed here is the expensive one.
+    """
+    buffer = io.BytesIO()
     figure.tight_layout()
-    figure.savefig(temporary, format="png", dpi=160)
+    figure.savefig(buffer, format="png", dpi=160)
     plt.close(figure)
-    os.replace(temporary, path)
+    return buffer.getvalue()
 
 
 def _absent(axis, message: str) -> None:
@@ -2283,27 +2301,94 @@ def _longest_equal_run(values: list) -> tuple[int, int, int]:
     return best
 
 
+def _peak_span(rates: list[float]) -> tuple[int, int]:
+    """`(first, last)` of the contiguous run of bins holding the column's highest rate.
+
+    Not `max(range(len(rates)), key=rates.__getitem__)`, which returns index zero on a column
+    with no variation at all and the first index of any plateau. Every claim the note builds on
+    that index -- "the peak", "its neighbours sit below it on both sides" -- is then a statement
+    about a bin that is not distinguishable from the bin beside it. The maximal run is what the
+    words need: whatever sits either side of it is strictly lower by construction, and on a flat
+    or monotone column there may be nothing either side of it at all.
+    """
+    top = max(rates)
+    first = rates.index(top)
+    last = first
+    while last + 1 < len(rates) and rates[last + 1] == top:
+        last += 1
+    return first, last
+
+
+def _column_shape(rates: list[float]) -> str:
+    """Which of five shapes a column has: `flat`, `rising`, `falling`, `peaked`, `multi_peaked`.
+
+    "One peak with no second rise" was decided by checking the sequence either side of
+    `max(...)`, which makes it *vacuously* true at both endpoints and on a column that never
+    moves. Measured output on a flat column, every bin at 0.420: "the decided rate runs from
+    0.420 at `decile_00_10` to 0.420 at `decile_00_10` and back to 0.420 at `decile_90_100`,
+    one peak with no second rise ... Its neighbours -- `decile_10_20` at 0.420 -- sit below it
+    on both sides." A peak where there is none, a neighbour that is equal rather than below,
+    and one side described as both. Monotone rising and monotone falling fail the same way.
+
+    A column with no interior maximum has no peak, and the report has to say the shape it has.
+    Note what the four exclusive cases guarantee for the fifth: a `peaked` column both rises and
+    falls, so its maximal run starts after the first bin and ends before the last, and the two
+    bins either side of it exist and are strictly lower.
+    """
+    rises = any(rates[index] < rates[index + 1] for index in range(len(rates) - 1))
+    falls = any(rates[index] > rates[index + 1] for index in range(len(rates) - 1))
+    if not rises and not falls:
+        return "flat"
+    if not falls:
+        return "rising"
+    if not rises:
+        return "falling"
+    first, last = _peak_span(rates)
+    single_peaked = (
+        all(rates[index] <= rates[index + 1] for index in range(first))
+        and all(rates[index] >= rates[index + 1] for index in range(last, len(rates) - 1))
+    )
+    return "peaked" if single_peaked else "multi_peaked"
+
+
+def _selection_count(groups: list[dict]) -> int:
+    """How many distinct *selections* a list of ranked rows holds -- see `SELECTION_KEYS`."""
+    return len({tuple(group[key] for key in SELECTION_KEYS) for group in groups})
+
+
 def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
-    """The shape of the paired column across the ten bins, derived rather than written down.
+    """The shape of the paired column across the confidence bins, derived rather than written.
 
     The 30-row table above already contains this; leaving the reading out does not withhold it,
     it leaves a reader to derive it unaided with no caution attached. So it is stated -- and
     stated the way the numbers support, which is not the way it first looks.
 
-    Three things this is careful about, each because a shorter version of it was wrong:
+    Five things this is careful about, each because a shorter version of it was wrong:
 
-    * **"the only bin" is the wrong shape.** The decided rate is a single-peaked curve in
-      confidence, and the peak's neighbours straddle even. A plateau reads very differently from
-      an outlier, and the difference is visible in the same column.
+    * **"the only bin" is the wrong shape.** On this run the decided rate is a single-peaked
+      curve in confidence and the peak's neighbours straddle even. A plateau reads very
+      differently from an outlier, and the difference is visible in the same column.
+    * **but "one peak" is only one of five shapes.** Flat, monotone rising, monotone falling and
+      twice-rising columns have no peak in them, and each was printed as one. `_column_shape`
+      decides which of the five this is and there is a sentence for each; the neighbours are
+      named only where there are two of them and they are strictly below.
     * **the denominator changes the strength.** Far more rows clear even on the decided
       denominator than over every paired image. Both counts are published, because quoting the
       decided one alone overstates and quoting the all-paired one alone understates.
-    * **the frozen column is the cleaner evidence about the peak.** Frozen medians that are flat
-      across a run of middle bins, a ranked field whose top places sit inside one `1/35` step,
-      and a winner sharing its median with others together say that a middle bin of any kind
-      scores about the same here and the ranking picked the one that landed a step above. That
-      is a statement about the selection, and it needs no inference about why the paired peak
-      falls where it does.
+    * **the winner need not be one of these bins.** `RANKABLE_MEMBERSHIP_MODES` admits `shared`,
+      so `all_valid` is a ranked candidate -- and an all-valid selection beating every decile is
+      the null result this experiment exists to be able to report. `membership_comparisons`
+      pairs dynamic against frozen *deciles* only, so that winner has no row here and neither
+      does a decile whose frozen twin was never scored. The note says so and goes on; it used to
+      index the winner's bin into the profile raw and raise `KeyError` out of the middle of the
+      report.
+    * **a ranked row is not a selection, and a frozen median is not a dynamic one.** The ranking
+      holds every candidate once per scene summary, so a count of rows triples every selection
+      in it -- which is exactly what the table's own caption forbids reading as three
+      measurements. Both counts are published with the distinction named. And the paragraph
+      states the frozen plateau as its own fact: it computes no distance from a frozen median to
+      a dynamic one, because they are two different columns and "how close are the runners-up"
+      is answered by the within-step count on the dynamic column alone.
 
     Everything is computed from `membership_comparisons` and the ranking, so it describes
     whatever run it is handed rather than this one.
@@ -2324,16 +2409,78 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
     if len(profile) < 3 or any(rate is None for rate in rates):
         return []
 
-    peak = max(range(len(profile)), key=lambda index: rates[index])
-    single_peaked = (
-        all(rates[index] <= rates[index + 1] for index in range(peak))
-        and all(rates[index] >= rates[index + 1] for index in range(peak, len(rates) - 1))
+    shape = _column_shape(rates)
+    first, last = _peak_span(rates)
+    bins_word = "bin" if len(profile) == 1 else "bins"
+    span = (f"`{profile[first][0]}`" if first == last
+            else f"`{profile[first][0]}` through `{profile[last][0]}`")
+    opening = {
+        "flat": (
+            f"the decided rate is the same {_plain(rates[0])} in all {len(profile)} "
+            f"{bins_word}, so it has no peak and separates no bin from any other"
+        ),
+        "rising": (
+            f"the decided rate rises from {_plain(rates[0])} at `{profile[0][0]}` to "
+            f"{_plain(rates[-1])} at `{profile[-1][0]}` and never falls, so it has no peak "
+            "inside the range -- its highest rate is the one it ends on"
+        ),
+        "falling": (
+            f"the decided rate falls from {_plain(rates[0])} at `{profile[0][0]}` to "
+            f"{_plain(rates[-1])} at `{profile[-1][0]}` and never rises, so it has no peak "
+            "inside the range -- its highest rate is the one it starts from"
+        ),
+        "peaked": (
+            f"the decided rate runs from {_plain(rates[0])} at `{profile[0][0]}` to "
+            f"{_plain(rates[first])} at {span} and back to {_plain(rates[-1])} at "
+            f"`{profile[-1][0]}`, one peak with no second rise"
+        ),
+        "multi_peaked": (
+            f"the decided rate runs from {_plain(rates[0])} at `{profile[0][0]}` to "
+            f"{_plain(rates[-1])} at `{profile[-1][0]}`, and it is not single-peaked: its "
+            f"highest rate is {_plain(rates[first])} at {span}"
+        ),
+    }[shape]
+
+    winner_bin = winner["confidence_bin"]
+    winner_index = next(
+        (index for index, (name, _) in enumerate(profile) if name == winner_bin), None
     )
-    neighbours = [
-        f"`{profile[index][0]}` at {_plain(rates[index])}"
-        for index in (peak - 1, peak + 1) if 0 <= index < len(profile)
-    ]
-    straddling = [rates[index] for index in (peak - 1, peak + 1) if 0 <= index < len(profile)]
+    top_noun = "peak" if shape == "peaked" else "highest bin"
+    if winner_index is None:
+        selection = (
+            f"The candidate the ranking put first, `{winner_bin}` under "
+            f"`{winner['membership_mode']}`, is not one of these bins and has no frozen twin "
+            "scored at this summary, so this column says nothing about it."
+        )
+    elif first <= winner_index <= last:
+        selection = (
+            f"The {top_noun} is the bin the ranking selected."
+            if first == last else
+            f"The highest rate {_plain(rates[first])} is shared by {span}, the selected bin "
+            f"`{winner_bin}` among them."
+        )
+    else:
+        selection = (
+            f"The {top_noun} is not the selected bin `{winner_bin}`, which sits at "
+            f"{_plain(rates[winner_index])}."
+            if first == last else
+            f"The highest rate {_plain(rates[first])} is shared by {span}, and the selected "
+            f"bin `{winner_bin}` is not among them: it sits at {_plain(rates[winner_index])}."
+        )
+
+    neighbourhood = ""
+    if shape == "peaked" and winner_index is not None and first <= winner_index <= last:
+        below, above = rates[first - 1], rates[last + 1]
+        neighbourhood = (
+            f" Its neighbours -- `{profile[first - 1][0]}` at {_plain(below)} and "
+            f"`{profile[last + 1][0]}` at {_plain(above)} -- "
+            + ("straddle even, so this is a short plateau of near-even bins and not one bin "
+               "standing apart"
+               if min(below, above) < 0.5 < max(below, above)
+               else "sit below it on both sides")
+            + "."
+        )
+
     above_even = sum(1 for rate in rates if rate > 0.5)
     decided_above = sum(
         1 for entry in slice_rows
@@ -2346,39 +2493,10 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
         and entry["dynamic_image_win_rate"] > 0.5
     )
 
-    frozen = [entry["frozen_median_spearman"] for _, entry in profile]
-    length, start, stop = _longest_equal_run(frozen)
-    step = 1 / SPEARMAN_STEP_DENOMINATOR
-    top = winner["median_spearman"]
-    within_step = [
-        group for group in ranked
-        if group["median_spearman"] is not None and top is not None
-        and top - float(group["median_spearman"]) <= step + 1e-9
-    ]
-    sharing = [group for group in ranked if group["median_spearman"] == top]
-
-    bins_word = "bin" if len(profile) == 1 else "bins"
-    shape = [
+    note = [
         f"**The shape of that column across the {len(profile)} {bins_word}.** At "
-        f"`{winner['aggregation']}` the decided rate runs from {_plain(rates[0])} at "
-        f"`{profile[0][0]}` to {_plain(rates[peak])} at `{profile[peak][0]}` and back to "
-        f"{_plain(rates[-1])} at `{profile[-1][0]}`"
-        + (", one peak with no second rise" if single_peaked
-           else ", and it is not single-peaked")
-        + (
-            f". The peak is the bin the ranking selected. Its neighbours -- "
-            f"{' and '.join(neighbours)} -- "
-            + (
-                "straddle even, so this is a short plateau of near-even bins and not one bin "
-                "standing apart"
-                if straddling and min(straddling) < 0.5 <= max(straddling)
-                else "sit below it on both sides"
-            )
-            if profile[peak][0] == winner["confidence_bin"]
-            else f". The peak is not the selected bin `{winner['confidence_bin']}`, which sits "
-                 f"at {_plain(at_summary[winner['confidence_bin']]['dynamic_image_decided_win_rate'])}"
-        )
-        + f". {above_even} of the {len(profile)} {bins_word} "
+        f"`{winner['aggregation']}` {opening}. {selection}{neighbourhood} {above_even} of the "
+        f"{len(profile)} {bins_word} "
         + ("is" if above_even == 1 else "are")
         + " above even at this summary.",
         "",
@@ -2389,19 +2507,57 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
         "is why both are here.",
         "",
     ]
+
+    frozen = [entry["frozen_median_spearman"] for _, entry in profile]
+    length, start, stop = _longest_equal_run(frozen)
+    step = 1 / SPEARMAN_STEP_DENOMINATOR
+    top = winner["median_spearman"]
+    within_step = [
+        group for group in ranked
+        if group["median_spearman"] is not None and top is not None
+        and top - float(group["median_spearman"]) <= step + 1e-9
+    ]
+    sharing = [group for group in ranked if group["median_spearman"] == top]
     if length >= 3 and top is not None:
-        shape.extend([
-            "**What the frozen column says to read into the peak.** The frozen medians are "
-            f"identical at {_signed(frozen[start])} across {length} neighbouring bins, "
-            f"`{profile[start][0]}` through `{profile[stop][0]}`; {len(within_step)} of the "
-            f"{len(ranked)} ranked candidates sit within one 1/{SPEARMAN_STEP_DENOMINATOR} = "
-            f"{step:.4f} step of the top; and {len(sharing)} share the top median exactly. A "
-            f"middle bin of almost any kind scores about {_signed(frozen[start])} here, and "
-            "what the ranking selected is the one that landed a step above -- which is a fact "
-            "about the selection and needs no explanation of where the paired peak falls.",
+        reach = (
+            "a run that spans the whole confidence range, so the frozen column separates no "
+            "bin from any other"
+            if start == 0 and stop == len(profile) - 1 else
+            "a run that reaches the bottom of the confidence range, so it is a flat stretch "
+            "of that end and not a statement about middle bins"
+            if start == 0 else
+            "a run that reaches the top of the confidence range, so it is a flat stretch of "
+            "that end and not a statement about middle bins"
+            if stop == len(profile) - 1 else
+            "a run that touches neither end of the confidence range, so a middle bin of "
+            f"almost any kind scores about {_signed(frozen[start])} here once the membership "
+            "is held still"
+        )
+        near, selections = _selection_count(within_step), _selection_count(ranked)
+        # The winner's own selection is always in `sharing`, because `top` is its median.
+        matched = _selection_count(sharing) - 1
+        note.extend([
+            "**What the frozen column and the ranked field say about the selection.** The "
+            f"frozen medians are identical at {_signed(frozen[start])} across {length} "
+            f"neighbouring bins, `{profile[start][0]}` through `{profile[stop][0]}` -- "
+            f"{reach}. On the dynamic column the ranking is choosing among near-equals: "
+            f"{near} of the {selections} ranked selections "
+            + ("sits" if near == 1 else "sit")
+            + f" within one 1/{SPEARMAN_STEP_DENOMINATOR} = {step:.4f} step of the top median "
+            + f"({len(within_step)} ranked "
+            + ("row" if len(within_step) == 1 else "rows")
+            + ", the same selections counted once per scene summary), and "
+            + ("no other selection matches the top median exactly" if matched == 0 else
+               f"{matched} other selection" + ("" if matched == 1 else "s") + " "
+               + ("matches" if matched == 1 else "match") + " the top median exactly")
+            + f" ({len(sharing)} ranked "
+            + ("row holds" if len(sharing) == 1 else "rows hold")
+            + " it). Which of those the ranking returns is a choice inside that field, and it "
+            "needs no explanation of where the paired peak falls.",
             "",
         ])
-    return shape
+    return note
+
 
 
 def _padding_section(summary: dict) -> list[str]:
@@ -2608,40 +2764,77 @@ def write_decile_report(
 ) -> None:
     """Write the seven artifacts spec:163-171 names, or write nothing at all.
 
-    The order is deliberate on two counts.
+    The order is deliberate on three counts.
 
     **The summary is computed first, before the output directory exists.** Every refusal the
     design asks for -- a duplicated result key, a label outside its vocabulary, a table
     spanning two partitions -- lives in `summarize_decile_rows`, so a table that cannot be
     summarised leaves no directory behind to be mistaken for a partial run.
 
+    **Every artifact's *content* is built before any artifact is published.** The prose used to
+    be built last, and it is the artifact most able to fail: it is the only one that indexes
+    derived numbers into derived tables. It did fail -- a winning candidate with no
+    dynamic-versus-frozen pair raised `KeyError` out of `_movement_profile_note` -- and the
+    other six files were already on disk by then, which is exactly the state the sentence above
+    promises cannot happen. So the JSON text, the report text and the three summary figures are
+    all produced before the directory is created, the CSV and the blur curves are *staged* under
+    `.tmp` names rather than published, and a failure anywhere in that removes the temporaries
+    it made. What is left behind is an empty directory or no directory at all, never a readable
+    report of six files.
+
+    What is *not* claimed: the seven publications are seven `os.replace` calls, not one
+    transaction. Nothing but the next call runs between them and each is a rename within one
+    directory, so the window is as small as this filesystem allows -- but a process killed
+    inside that loop can leave a prefix of the seven. The guarantee above is about computation
+    failing, which is the failure this code can have; it is not a guarantee about power loss.
+
     **The results frame is built exactly twice over the whole call and never twice at once.**
     `summarize_decile_rows` builds one and drops it; the CSV and the blur curves then share a
     second. On the real tuning table that frame is 523,500 rows, and `summary_frame` is what
     keeps the ~280 MB `selected_query_ids` column out of it -- reused here rather than
-    rebuilt, so the CSV is by construction the same table the summary describes.
+    rebuilt, so the CSV is by construction the same table the summary describes. The three
+    summary figures are rendered before it is built rather than after it is dropped, which
+    keeps them off the same peak.
 
     Every file goes out through a temporary and `os.replace`. A truncated `summary.json` is a
     parse error, which is loud; a truncated `easy-report.md` is a shorter report that stops
     mid-sentence and reads as finished.
     """
     summary = summarize_decile_rows(rows, run_metadata, diagnostics)
+    payloads = [
+        ("summary.json", json.dumps(summary, indent=2, sort_keys=True, allow_nan=False)),
+        ("easy-report.md", _easy_report(summary)),
+        ("confidence_decile_heatmap.png", _figure_bytes(_heatmap_figure(summary))),
+        ("dynamic_vs_frozen.png", _figure_bytes(_dynamic_frozen_figure(summary))),
+        ("padding_sensitivity.png", _figure_bytes(_padding_sensitivity_figure(summary))),
+    ]
+
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
+    staged: list[tuple[Path, Path]] = []
+    temporaries: list[Path] = []
+    try:
+        csv_path = output / "per_scene.csv"
+        csv_temporary = _temporary_for(csv_path)
+        temporaries.append(csv_temporary)
+        frame = summary_frame(rows)
+        frame.to_csv(csv_temporary, index=False)
+        staged.append((csv_temporary, csv_path))
+        payloads.append(("blur_curves.png", _figure_bytes(_blur_curve_figure(frame))))
+        del frame
+        for name, payload in payloads:
+            path = output / name
+            temporary = _temporary_for(path)
+            temporaries.append(temporary)
+            if isinstance(payload, bytes):
+                temporary.write_bytes(payload)
+            else:
+                temporary.write_text(payload, encoding="utf-8")
+            staged.append((temporary, path))
+    except BaseException:
+        for temporary in temporaries:
+            temporary.unlink(missing_ok=True)
+        raise
 
-    frame = summary_frame(rows)
-    csv_path = output / "per_scene.csv"
-    csv_temporary = csv_path.with_suffix(".csv.tmp")
-    frame.to_csv(csv_temporary, index=False)
-    os.replace(csv_temporary, csv_path)
-    _save_figure(_blur_curve_figure(frame), output / "blur_curves.png")
-    del frame
-
-    _atomic_text(
-        output / "summary.json",
-        json.dumps(summary, indent=2, sort_keys=True, allow_nan=False),
-    )
-    _save_figure(_heatmap_figure(summary), output / "confidence_decile_heatmap.png")
-    _save_figure(_dynamic_frozen_figure(summary), output / "dynamic_vs_frozen.png")
-    _save_figure(_padding_sensitivity_figure(summary), output / "padding_sensitivity.png")
-    _atomic_text(output / "easy-report.md", _easy_report(summary))
+    for temporary, path in staged:
+        os.replace(temporary, path)
