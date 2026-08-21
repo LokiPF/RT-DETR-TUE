@@ -810,7 +810,7 @@ def test_the_moved_set_comes_from_the_scores_and_not_from_the_per_image_spearman
 
     Three images. Image 1 is reached and its trend changes. Image 2 is reached -- every one of
     its six scores is different -- but its Spearman lands on the same value, because a rank
-    correlation over six severities takes only 35 distinct values. Image 3 is not reached at
+    correlation over six severities takes only 36 distinct values. Image 3 is not reached at
     all. Reading the moved set off the Spearman calls image 2 untouched, which is exactly the
     error that reports 50 to 56 moved images on the pilot where the selections provably differ
     on all 66 that carry a padded tail.

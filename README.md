@@ -269,12 +269,15 @@ persistence fingerprints; `--results` supplies the saved per-query distances, th
 score scales and the run provenance, read from the `.query_distances.pt`, `.normalizers.pt`
 and `.manifest.json` siblings named beside that CSV. There is no detector forward pass, no
 bank build, no kNN search, no training and no re-fitting of a normalizer or any other
-calibration: every score is a saved distance divided by the scale the result artifact already
-carries. So the command costs minutes on a CPU rather than GPU hours, and it can be rerun
-against a different result set over the same cache. (Confidence itself is recomputed from the
-cached logits as each query's largest sigmoid class score, and is deliberately *not* the
-cache's own `confidence` field, which was reduced before the float16 cast and is wrong by
-~1e-5 -- invisible to a threshold, decisive for a rank.)
+calibration: every score is a summary of the saved per-query distances, or of `1 - confidence`,
+over one selection. Only the `combined` scope uses the layer scales the result artifact already
+carries; a per-layer scope such as `layer_2` -- the primary one, and the one the ranking and
+the figures use -- is the summarised distance itself, divided by nothing. So the command costs
+minutes on a CPU rather than GPU hours, and it can be rerun against a different result set over
+the same cache. (Confidence itself is recomputed from the cached logits as each query's largest
+sigmoid class score, and is deliberately *not* the cache's own `confidence` field, which was
+reduced before the float16 cast and is wrong by ~1e-5 -- invisible to a threshold, decisive for
+a rank.)
 
 **Tuning results only.** There is deliberately no `--partition` flag. A result manifest whose
 `source_partition` is `test` or `all` is refused, as is any individual saved-distance row
@@ -286,35 +289,47 @@ image missing any of the six severities, or left with fewer than ten non-padded 
 the run rather than being scored in part.
 
 `--output` is refused when it already holds a finished report, which means a directory
-containing `summary.json`; nothing is ever overwritten. A directory left behind by a run that
-died part-way *is* written into, because there is nothing in it worth preserving: the seven
-artifacts below are published together or not at all, and a run that fails leaves at most an
-empty directory, never a readable report of six files. (The seven publications are seven
+containing `summary.json`; a finished report is never overwritten. A directory left by a run
+that died part-way *is* written into, because there is nothing in it worth preserving: the
+seven artifacts below are published together or not at all, and a run that fails leaves at most
+an empty directory, never a readable report of six files. (The seven publications are seven
 renames rather than one transaction, so a process *killed* inside that loop can still leave a
 prefix; what is ruled out is a failure of the analysis itself.)
 
-* **`per_scene.csv`** -- every scored row, keyed by `image_id`, `severity`, `signal`,
-  `score_scope`, `confidence_bin`, `membership_mode`, `padding_mode` and `aggregation`, with
-  `score`, `selected_count` and `clean_overlap` beside it. The per-row `selected_query_ids`
-  lists are held in memory and deliberately kept out of the file.
+* **`per_scene.csv`** -- every scored row, in twelve columns: `image_id`, `severity`,
+  `source_partition`, `membership_mode`, `confidence_bin`, `padding_mode`, `selected_count`,
+  `clean_overlap`, `signal`, `score_scope`, `aggregation`, `score`. The per-row
+  `selected_query_ids` lists are held in memory and deliberately kept out of the file.
 * **`summary.json`** -- the grouped metrics; each persistence group beside its matched
   confidence control; each dynamic bin against its frozen twin; the lowest bin with and without
   the padding filter; every candidate against the published all-query benchmark; and a ranking
   restricted to the deployable ones -- persistence only, primary scope, padding-filtered,
   non-frozen membership, full severity coverage. Paired image counts sit next to every rate,
   and wins, ties and losses are reported separately, because a per-image Spearman over six
-  severities takes only 35 distinct values and exact ties are common.
+  severities takes only 36 distinct values and exact ties are common.
 * **`easy-report.md`** -- the same summary in prose, generated from that summary and nothing
   else, so every sentence in it can be checked against `summary.json`.
+
+Each of the four figures is a slice of that table, not a view of all of it, and each prints its
+own slice in its title. All four fix the scene summary at `q90`, the only summary the published
+all-query benchmark exists at, and every persistence panel or bar is at `layer_2`:
+
 * **`blur_curves.png`** -- median clean-relative score against severity, per decile bin, with
   each image's own severity-0 score subtracted so the curve shows the rise rather than the
-  level. Persistence and confidence get separate panels because the two share no unit.
-* **`confidence_decile_heatmap.png`** -- median Spearman by confidence bin and signal, always
-  all ten bins, with an empty bin drawn as `n/a` rather than omitted.
-* **`dynamic_vs_frozen.png`** -- each bin's dynamic result beside its frozen twin, side by side
-  and never averaged into one number.
-* **`padding_sensitivity.png`** -- the lowest bin repeated with the padded-query union removed
-  and kept.
+  level. Persistence and confidence get separate panels because the two share no unit. Dynamic
+  membership and filtered queries only.
+* **`confidence_decile_heatmap.png`** -- median Spearman by confidence bin and signal over that
+  same dynamic, filtered slice; always all ten bins, with an empty one drawn as `n/a` rather
+  than omitted.
+* **`dynamic_vs_frozen.png`** -- two panels. The upper one puts each bin's dynamic result
+  beside its frozen twin, side by side and never averaged into one number. The lower one is why
+  they differ: how much of each bin's membership survives blur, as the mean Jaccard against
+  severity 0 over severities 1-5, against a line for what two unrelated memberships would
+  score. Dynamic bins only there -- a frozen bin is 1.0 by construction, which is arithmetic
+  and not stability.
+* **`padding_sensitivity.png`** -- the lowest bin only, repeated with the padded-query union
+  removed and kept, under both memberships and for persistence and its confidence control.
+  Each pair is annotated with a lower bound on the images the mask actually reached.
 
 As with `report`, nothing here is fitted against a corruption label. Every statistic published
 about a score is invariant under a positive affine rescale of it, which is the only sense in

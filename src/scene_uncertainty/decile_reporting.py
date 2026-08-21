@@ -19,7 +19,7 @@ internally consistent, and describes a population nobody chose.
   against, and it has two halves. The fraction of images where persistence beats its
   confidence control is only meaningful over images both signals scored, so
   `paired_image_count` is published next to it. And a per-image Spearman over six severities
-  takes only 35 distinct values, so exact ties are common and a rate that counts them as
+  takes only 36 distinct values, so exact ties are common and a rate that counts them as
   non-wins reads as a defeat: every paired rate here is published as a win/tie/loss triple
   over the full population *and* again over the decided images alone, because either
   denominator on its own inverts the sentence a reader writes.
@@ -569,7 +569,7 @@ def _outcome_rates(prefix: str, left, right, images: list[int]) -> dict:
     """Win, tie and loss over `images`, and the win rate again over the *decided* ones only.
 
     Both denominators, always, because either one alone inverts the reading. A per-image
-    Spearman over six severities takes 35 distinct values, so exact ties are common -- 15.6
+    Spearman over six severities takes 36 distinct values, so exact ties are common -- 15.6
     percent of images on the pilot's leading candidate against the all-query benchmark. The
     rate over all paired images counts every tie as a non-win, which pushes a candidate that
     wins 122 images and loses 88 below 0.5 and invites the sentence "it loses the per-image
@@ -629,7 +629,7 @@ def _score_changed_images(left_arrays, right_arrays) -> set[int]:
     The exact set would need `selected_query_ids`, the ~280 MB column `summary_frame` drops
     before the DataFrame conversion, and buying exactness back at that price is the wrong
     trade for a diagnostic. What this rules out is the far larger error it replaced: reading
-    the set off the per-image *Spearman*, which takes only 35 distinct values over six
+    the set off the per-image *Spearman*, which takes only 36 distinct values over six
     severities and reported 50 to 56 of 250 -- a tie-excluding sign test wearing the label
     "the images the control could reach".
 
@@ -741,7 +741,7 @@ def summarize_decile_rows(
     * `benchmark_comparisons` -- every ranked candidate against the published all-300-query
       result (spec:229), paired per image. The spec asks only whether a candidate beats the
       benchmark; a difference of two medians answers that with a number whose resolution is
-      1/35, because a Spearman over six severities takes 35 distinct values. The win, tie and
+      1/35, because a Spearman over six severities takes 36 distinct values. The win, tie and
       loss rates say how many of the images the difference actually rests on, which is what
       makes a margin of one such step falsifiable rather than merely reportable -- and
       `candidate_image_decided_win_rate` says it again without the ties in the denominator,
