@@ -6,7 +6,7 @@ from torch import Tensor
 # `_require_index_dtype` is imported rather than re-spelled so that a boolean keep-mask is
 # refused with the same message wherever query IDs are accepted; two copies of that rule
 # would be two chances for one of them to drift into accepting a mask.
-from .confidence_deciles import DECILE_NAMES, _require_index_dtype
+from .confidence_deciles import DECILE_NAMES, QUINTILE_NAMES, _require_index_dtype
 from .query_policy import aggregate_scores
 
 
@@ -35,6 +35,22 @@ is neither from having to borrow one of their names."""
 
 PADDING_MODES = ("filtered", "unfiltered")
 CONFIDENCE_BINS = DECILE_NAMES + ("all_valid",)
+
+BUCKET_NAMES = {
+    "decile": frozenset(DECILE_NAMES),
+    "quintile": frozenset(QUINTILE_NAMES),
+}
+"""The bin names each bucket scheme may produce, written out as an explicit pairing.
+
+A scheme and a bin name are two statements about one partition, and the only way they can
+disagree is by mistake -- a quintile selection filed as `decile`, or a decile name carried
+into a quintile run. Checking the pair here is what lets every later reader take the recorded
+scheme at face value instead of parsing `confidence_bin` for a prefix, which would be a second
+definition of what the bins are, free to drift from this one.
+
+`all_valid` is deliberately in neither set. It is the whole valid record rather than a bucket
+of it, so no scheme cut it, and it stays legal only on the scheme-less path where the legacy
+`CONFIDENCE_BINS` vocabulary applies."""
 
 
 def _checked_indices(indices: Tensor, query_count: int) -> Tensor:
@@ -197,6 +213,7 @@ def score_selection(
     clean_overlap: float,
     aggregations: tuple[str, ...] = DECILE_AGGREGATIONS,
     include_confidence: bool = True,
+    bucket_scheme: str | None = None,
 ) -> list[dict]:
     """Score one confidence-bin selection with both uncertainty signals, matched exactly.
 
@@ -231,6 +248,19 @@ def score_selection(
     a phantom group with a handful of rows in it and silently subtract those rows from the
     group they belonged to.
 
+    `bucket_scheme` names how the bins were cut -- `decile` or `quintile` -- and is written
+    into every row *only* when a caller asks for it. Its absence is a compatibility guarantee
+    rather than a default: the published decile command's rows are already sitting in a
+    results artifact, and a key appearing in them that was not there when they were analysed
+    would make the same command's old and new output two different schemas. So the field is
+    opt-in, and a caller that omits it gets back exactly the dictionaries it got before.
+
+    Naming a scheme also narrows `confidence_bin` from the legacy vocabulary to that scheme's
+    own names. An unchecked provenance field is one that can be wrong, and the entire point of
+    recording the scheme is that no later reader has to infer it by parsing a bin name for its
+    prefix -- a reader that has to fall back on parsing has been given nothing. Note that
+    `all_valid` belongs to no scheme and is legal only when none is named.
+
     `clean_overlap` is recorded, not derived: it is the design's dynamic-bin Jaccard against
     the severity-zero membership, and it is a diagnostic for how much of a result comes from
     queries changing bin rather than fingerprints moving. Under frozen membership it is 1.0 by
@@ -250,10 +280,21 @@ def score_selection(
         raise ValueError(
             f"unknown padding mode {padding_mode!r}, expected {list(PADDING_MODES)}"
         )
-    if confidence_bin not in CONFIDENCE_BINS:
-        raise ValueError(
-            f"unknown confidence bin {confidence_bin!r}, expected {list(CONFIDENCE_BINS)}"
-        )
+    if bucket_scheme is None:
+        if confidence_bin not in CONFIDENCE_BINS:
+            raise ValueError(
+                f"unknown confidence bin {confidence_bin!r}, expected {list(CONFIDENCE_BINS)}"
+            )
+    else:
+        if bucket_scheme not in BUCKET_NAMES:
+            raise ValueError(
+                f"unknown bucket scheme {bucket_scheme!r}, expected {sorted(BUCKET_NAMES)}"
+            )
+        if confidence_bin not in BUCKET_NAMES[bucket_scheme]:
+            raise ValueError(
+                f"confidence bin {confidence_bin!r} does not belong to bucket scheme "
+                f"{bucket_scheme!r}"
+            )
     requested = _checked_aggregations(aggregations)
     if query_confidence.ndim != 1:
         raise ValueError(
@@ -278,6 +319,10 @@ def score_selection(
         "selected_count": int(selected.numel()),
         "clean_overlap": float(clean_overlap),
     }
+    # The compatibility boundary: rows written by a caller that named no scheme keep exactly
+    # the keys the published experiment's rows have, so its output stays one schema.
+    if bucket_scheme is not None:
+        provenance["bucket_scheme"] = bucket_scheme
     selected_query_ids = selected.tolist()
 
     def row(signal: str, scope: str, aggregation: str, score: float) -> dict:

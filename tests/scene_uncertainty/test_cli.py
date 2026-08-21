@@ -36,6 +36,7 @@ def test_cli_exposes_complete_artifact_pipeline():
         "evaluate-knn",
         "report",
         "analyze-confidence-deciles",
+        "analyze-corruption-sensitivity",
     }
 
 
@@ -46,7 +47,7 @@ def test_cli_exposes_complete_artifact_pipeline():
 
 @pytest.mark.parametrize("command", [
     "select", "extract-reference", "extract-blur", "build-bank", "evaluate-knn", "report",
-    "analyze-confidence-deciles",
+    "analyze-confidence-deciles", "analyze-corruption-sensitivity",
 ])
 def test_every_subcommand_documents_itself(command, capsys):
     with pytest.raises(SystemExit) as exit_info:
@@ -62,7 +63,7 @@ def test_top_level_help_lists_every_subcommand(capsys):
         build_parser().parse_args(["--help"])
     help_text = capsys.readouterr().out
     for command in ("select", "extract-reference", "extract-blur", "build-bank", "evaluate-knn",
-                    "report", "analyze-confidence-deciles"):
+                    "report", "analyze-confidence-deciles", "analyze-corruption-sensitivity"):
         assert command in help_text
 
 
@@ -133,6 +134,78 @@ def test_the_confidence_decile_command_refuses_a_partition_flag(capsys):
         ])
     assert exit_info.value.code == 2
     assert "unrecognized arguments: --partition test" in capsys.readouterr().err
+
+
+def test_analyze_corruption_sensitivity_accepts_only_saved_artifacts_and_output():
+    """Three saved-artifact paths and nothing else, compared as a whole namespace.
+
+    The same rule as the decile command above, for the same reason -- `load_corruption_inputs`
+    refuses any result manifest not built for the tuning partition, and a `--partition` flag
+    would be the one way to spend the held-out half from a command line -- plus one this command
+    adds: it is cache-only, so a `--config`, `--checkpoint`, `--bank` or `--device` argument
+    would not merely be inert, it would be an argument for work this command must never do.
+
+    The three values are compared as `Path`, which is what `type=Path` makes them. Strings
+    would compare equal to nothing here, so the conversion cannot be dropped without failing.
+    """
+    args = build_parser().parse_args([
+        "analyze-corruption-sensitivity",
+        "--cache", "cache",
+        "--results", "results/raw_k5.csv",
+        "--output", "reports/corruption",
+    ])
+
+    assert vars(args) == {
+        "command": "analyze-corruption-sensitivity",
+        "cache": Path("cache"),
+        "results": Path("results/raw_k5.csv"),
+        "output": Path("reports/corruption"),
+    }
+
+
+# Every flag that would ask this command to measure something rather than read something
+# already measured, plus the partition switch. `vars(args)` above pins "no argument with a
+# materialised default" and an `argparse.SUPPRESS` default would satisfy it while the parser
+# still bound the flag, so what is asserted here is the refusal itself.
+CORRUPTION_REJECTED_OPTIONS = [
+    ["--partition", "test"],
+    ["--bank", "bank_coverage_25k"],
+    ["--config", "rtdetrv2_r18vd_coco.yml"],
+    ["--checkpoint", "detector.pth"],
+    ["--device", "cuda:0"],
+    ["--num-workers", "4"],
+]
+
+
+@pytest.mark.parametrize("option", CORRUPTION_REJECTED_OPTIONS)
+def test_the_corruption_command_refuses_every_flag_that_would_recompute(option, capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args([
+            "analyze-corruption-sensitivity",
+            "--cache", "c", "--results", "r", "--output", "o",
+            *option,
+        ])
+    assert exit_info.value.code == 2
+    assert f"unrecognized arguments: {' '.join(option)}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("omitted", ["--cache", "--results", "--output"])
+def test_the_corruption_command_needs_all_three_saved_artifact_paths(omitted, capsys):
+    """None of the three has a default, and a default is what an omitted path would get.
+
+    `--output` in particular: argparse would leave it `None`, `Path(None)` raises `TypeError`,
+    and the operator would meet a traceback instead of a usage line naming the flag.
+    """
+    given = {"--cache": "c", "--results": "r", "--output": "o"}
+    argv = ["analyze-corruption-sensitivity"]
+    for flag, value in given.items():
+        if flag != omitted:
+            argv += [flag, value]
+
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(argv)
+    assert exit_info.value.code == 2
+    assert omitted in capsys.readouterr().err
 
 
 def test_missing_required_argument_is_refused_at_parse_time(capsys):

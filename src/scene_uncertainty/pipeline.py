@@ -42,6 +42,8 @@ from src.zoo.rtdetr.matcher import HungarianMatcher
 
 from .artifacts import ShardWriter, assert_compatible, iter_records, load_manifest, manifest_id
 from .bank import deterministic_reservoir, streaming_coverage_bank
+from .corruption_analysis import analyze_corruption_sensitivity, load_corruption_inputs
+from .corruption_reporting import write_corruption_report
 from .dataset import make_coco_loader
 from .decile_analysis import analyze_deciles, load_decile_inputs
 from .decile_reporting import write_decile_report
@@ -772,6 +774,64 @@ def command_analyze_confidence_deciles(args) -> None:
     _report(f"analyze-confidence-deciles: summarized {len(rows)} score rows into {output}")
 
 
+# --------------------------------------------------------------------------------------
+# analyze-corruption-sensitivity
+# --------------------------------------------------------------------------------------
+
+
+def command_analyze_corruption_sensitivity(args) -> None:
+    """The confidence-decile experiment re-cut into quintiles as well, and the two compared.
+
+    Three calls and a line on stderr, and short for a reason rather than by omission: every
+    check it might make is already made by something that had to make it anyway.
+
+    **No existence pre-check on `--cache` or `--results`.** The sibling above does its own so
+    that its message names the flag the operator typed. Here both arguments arrive as `Path`
+    from the parser and go straight into `load_corruption_inputs`, which is the published
+    command's `_load_scene_query_inputs` under a different `artifact_type`: it refuses a cache
+    without a manifest, an absent distance or normalizer sibling, a result manifest that fails
+    its own content address, and any partition but tuning -- naming the path each time. A second
+    copy of those checks here would be a second place for the two commands' provenance rules to
+    drift apart, which is the whole reason they share one loader.
+
+    **No finished-report guard either.** `write_corruption_report` refuses an `--output` that
+    already exists, before it computes anything, and publishes by renaming a staging directory
+    into place. So there is no half-published state here for a marker-file guard to tell apart
+    from a finished one -- which is what the decile command's `summary.json` check exists for,
+    its seven artifacts being seven separate renames. `FileExistsError` is one of the three
+    exceptions `cli.main` turns into a single line on stderr.
+
+    **`except ValueError`, for the reason the sibling gives.** `DecileAnalysisError` is a
+    `ValueError` but not a `PipelineError`, and so are the plain `ValueError`s that
+    `confidence_deciles`, `decile_scoring` and `corruption_reporting` raise for the same class
+    of problem -- a collapsed clean-distance scale is the reachable one, raised at the point of
+    division several frames inside the analysis. Catching `ValueError` is what turns all of them
+    into the one line `cli.main` prints, instead of a traceback through twenty frames of torch
+    for what is an operator's mistyped flag. Narrowing this to `DecileAnalysisError` would let
+    the second group straight back out.
+
+    **What that conversion deliberately does not swallow.** `FileExistsError` is an `OSError`,
+    so the rerun refusal passes through untouched to the handler in `cli.main` that already
+    knows it. And `write_corruption_report`'s own file-set check raises `RuntimeError`, which
+    also passes through: a bundle that staged the wrong files is a bug in this package, not an
+    argument the operator got wrong, and it should look like one.
+    """
+    try:
+        inputs = load_corruption_inputs(args.cache, args.results)
+        rows, diagnostics = analyze_corruption_sensitivity(inputs)
+        write_corruption_report(
+            args.output,
+            score_rows=rows,
+            diagnostics=diagnostics,
+        )
+    except ValueError as error:
+        raise PipelineError(f"Cannot analyze corruption sensitivity: {error}") from error
+    _report(
+        f"analyze-corruption-sensitivity: summarized {len(rows)} score rows "
+        f"into {args.output}"
+    )
+
+
 COMMANDS = {
     "select": command_select,
     "extract-reference": command_extract_reference,
@@ -780,4 +840,5 @@ COMMANDS = {
     "evaluate-knn": command_evaluate_knn,
     "report": command_report,
     "analyze-confidence-deciles": command_analyze_confidence_deciles,
+    "analyze-corruption-sensitivity": command_analyze_corruption_sensitivity,
 }

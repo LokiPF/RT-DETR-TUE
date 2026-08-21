@@ -171,8 +171,8 @@ If you use `RTDETR` or `RTDETRv2` in your work, please use the following BibTeX 
 
 Class-independent persistence scene uncertainty: a scene is scored by how far its decoder
 queries sit from a bank of queries drawn from clean reference images, and the study asks
-whether that score rises as the scene is blurred. One entry point, seven subcommands, run in
-order -- six that build the artifacts, and one cache-only analysis over what they wrote.
+whether that score rises as the scene is blurred. One entry point, eight subcommands, run in
+order -- six that build the artifacts, and two cache-only analyses over what they wrote.
 
 **A raw kNN score is not a corruption probability.** It is a mean distance to the *k*
 nearest bank vectors, divided by the inter-quartile spread of the same distance measured on
@@ -334,6 +334,134 @@ all-query benchmark exists at, and every persistence panel or bar is at `layer_2
 As with `report`, nothing here is fitted against a corruption label. Every statistic published
 about a score is invariant under a positive affine rescale of it, which is the only sense in
 which a persistence distance and `1 - confidence` can be compared at all.
+
+### The same experiment at two bucket widths
+
+Was the ten-way cut load-bearing, or incidental? `analyze-corruption-sensitivity` runs the
+experiment above again at two resolutions -- ten confidence bins per image and five -- cut from
+one confidence ranking of one union-filtered valid query set and scored by the same code over
+the same saved artifacts, so the two results differ in bin width and in nothing else. If both
+schemes rank the signals the same way the resolution was incidental and the coarser bucket is
+the safer one to deploy; if they do not, the decile result depended on a bin width nobody chose
+for a reason.
+
+```bash
+$UE_PY tools/scene_uncertainty.py analyze-corruption-sensitivity \
+  --cache $OUT/blur_cache \
+  --results $OUT/results/raw_k5.csv \
+  --output $OUT/reports/corruption_sensitivity_raw_k5
+```
+
+**Nothing is recomputed here either.** It reads the same two artifacts as
+`analyze-confidence-deciles` and through the same loader, under the same rules: the saved tuning
+per-query distances from the `.query_distances.pt` sibling of `--results`, the fitted layer score
+scales from `.normalizers.pt` and the provenance from `.manifest.json`, joined to the cached
+logits, boxes and per-layer persistence fingerprints in `--cache`. No detector forward pass, no
+bank build, no kNN search, no re-fitted normalizer -- every score is a summary of the distances
+`evaluate-knn` searched once, and both bucket schemes read that one set, which is what makes
+them comparable at all. Tuning results only: there is deliberately no `--partition` flag, and a
+result manifest built for `test` or `all` is refused, so the held-out half stays unspendable
+from this command line.
+
+**Confidence is the matched control, not a second contestant.** Persistence and `1 - confidence`
+are summarised over the same selected queries, in the same call, for every bucket of both
+schemes -- so the two are compared as trends over one population and never as magnitudes. The
+control is published in full and every persistence candidate is reported beside it; what it
+stays out of is the deployable ranking, which is persistence only.
+
+**What is published is a ranking statistic, never a calibrated probability.** Each candidate
+carries its curve across the six severities and an AUROC separating the clean scenes from each
+of severities 1-5, published per severity (`auroc_by_severity`) and as their equally weighted
+mean (`macro_auroc`) -- how well the score *orders* clean scenes against blurred ones, nothing
+more. As everywhere else in this pipeline nothing is fitted against a corruption label, so no
+number here is the probability that a scene is corrupted. Those two statistics are rank-based
+and a positive affine rescale of the score cannot move either; the per-severity means, medians
+and quartiles published beside them describe the raw distances and are not invariant, which is
+why they are reported per candidate and never compared across signals.
+
+Four of the eight published files are figures, and they draw the actual distances rather than a
+derived statistic: `persistence_actual_distance_deciles.png` and
+`persistence_actual_distance_quintiles.png` put the raw scene score against severity, one panel
+per confidence bucket -- ten panels for the decile cut, five for the quintile cut -- as a median
+with an interquartile band, and `confidence_actual_distance_deciles.png` and
+`confidence_actual_distance_quintiles.png` do the same for the control. The values are
+un-oriented, so a candidate whose distance *falls* as blur rises is drawn falling. All panels of
+one signal share a single y-range and the two signals never share one, because a persistence
+distance and `1 - confidence` have no common unit. Everything except the confidence bucket is
+held fixed across the panels: dynamic membership, padding-filtered queries, the `q90` scene
+summary and persistence at `layer_2`. The other four files are `per_scene.csv` (every scored
+row), `candidate_metrics.csv` (one row per candidate, with `bucket_scheme` telling the two cuts
+apart), `summary.json` and `easy-report.md`.
+
+Unlike `analyze-confidence-deciles`, `--output` must not exist at all. The eight files are
+written into a staging directory beside it and renamed into place in one step, so a run that
+fails leaves neither a partial bundle nor an empty directory, and a directory that does exist is
+a finished report that is never overwritten.
+
+**Auditing a published bundle.** `tools/audit_corruption_bundle.py` re-derives the bundle's
+claims from the bundle's own eight files and prints one PASS/FAIL line per check, each stating
+the size of the population it examined:
+
+```bash
+$UE_PY tools/audit_corruption_bundle.py $OUT/reports/corruption_sensitivity_raw_k5
+```
+
+**It has three exit statuses and the third is not a failure.** `0` means every check ran against
+a non-empty population and passed; `1` means the bundle was read and at least one check failed;
+`2` means **nothing was audited** -- the path is not a directory, is missing one of the four data
+files, or holds files that cannot be parsed as themselves, so no check ran at all. A column being
+present is not the same as its cells parsing, so the fields the checks will coerce are coerced at
+load and any exception escaping the load lands on the same refusal. Scripting this as a gate on
+`!= 0` is right; treating a `2` as "checks failed" is wrong, and treating it as "not a failure,
+carry on" is worse. A check that was handed an empty population -- a `per_scene.csv` with a
+header and no rows, say -- fails rather than passing vacuously, because every element of an empty
+set satisfies every predicate and PASS is the line a reader quotes. The one exception is the
+deployable ranking on a run of **fewer than 250 images**, where an empty ranking is admitted by
+design rather than by starvation -- and it exempts the ranking alone, not the rest of that
+check; on a full run the exemption does not apply at all, and a zero the check cannot
+corroborate is a failure like any other.
+
+It is read-only and it deliberately imports nothing from `src/scene_uncertainty`: every
+constant and formula in it is restated from the design, so the two spellings can disagree. An
+auditor that imported `CANDIDATE_KEY` or `_statistics` from the code that wrote the bundle
+would agree with any change to them and call the result correct. It checks the file set, the
+`image_count x 3060` row budget and its decomposition, per-candidate image and severity
+coverage, candidate-key uniqueness, every deployability gate on the ranking and its sort order,
+each macro AUROC against the mean of its five per-severity AUROCs, each row's absolute Spearman
+against the absolute value of its own signed Spearman, each candidate's published orientation
+against the median of that candidate's own per-image signed trends, all six per-severity
+statistics -- including the *population* variance -- recomputed from the raw scores, and the
+recorded `axis_limits` against a recomputation of the y-range rule.
+
+Orientation is re-derived rather than read because it was the one input to the gate that the
+ranking cross-check could only restate. A sign error in `choose_orientation` writes the same
+wrong direction into `summary.json` and into `candidate_metrics.csv` and leaves every AUROC
+computed the other way, so nothing in the bundle contradicts anything else and every other check
+agrees with it. `per_scene.csv` carries `signed_spearman` on every row, so the median that
+decided the direction is taken again -- dropping non-finite trends rather than reading them as
+zero, and treating a median of exactly zero as no direction rather than as a third one.
+
+The ranking is checked against two other statements of the same fact, in every direction.
+Three sources name the candidates that passed every gate: the ranking in `summary.json`, the
+`deployable` column of `candidate_metrics.csv`, and the auditor's own re-derivation of the gate
+from the raw rows. Any two of them disagreeing is a finding, and which two says what kind -- a
+qualifying candidate absent from the ranking, a ranked candidate that does not qualify, a
+`deployable` column that disagrees with the re-derived set, or a ranking whose re-derived
+population came out empty and so cannot support it either way. One direction is not enough:
+with only "qualifying but unranked" able to fail, anything that collapsed the re-derived set to
+zero made the whole cross-check vacuous, and the two published files were free to contradict
+each other on a PASS line.
+
+The columns that cross-check depends on -- `orientation`, `deployable`, `measured_count`,
+`image_count` -- have their domains proved at load for the same reason, so an unreadable cell is
+a refusal rather than a silent exclusion. On a run over fewer than 250 images the gate can admit
+nothing, so it reports the manifest count and asserts the ranking is empty; it never rescales
+the deployability gate to fit the run it was given. The three-way agreement is checked at every
+run size and not only at 250, because below that count nothing can qualify: a `deployable`
+column marking candidates, or a non-zero `deployable_candidate_count`, disagrees with a
+re-derived set that is empty by the gate's own definition. It does not inspect PNG pixels --
+that claim belongs to `tests/scene_uncertainty/test_corruption_plots.py`, which asserts it
+against the `Axes` objects.
 
 ### Reading the artifacts
 

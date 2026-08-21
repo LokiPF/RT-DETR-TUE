@@ -412,7 +412,12 @@ def _slim_record(record: dict, key: tuple[int, int, str], query_count: int) -> d
     }
 
 
-def load_decile_inputs(cache_value: str | Path, results_value: str | Path) -> DecileInputs:
+def _load_scene_query_inputs(
+    cache_value: str | Path,
+    results_value: str | Path,
+    *,
+    artifact_type: str,
+) -> DecileInputs:
     """Stream the blur cache once, join it to the saved query distances, or raise.
 
     The order of the checks is chosen so that the *first* thing to fail is the thing an
@@ -422,6 +427,20 @@ def load_decile_inputs(cache_value: str | Path, results_value: str | Path) -> De
     the record that failed is still nameable; and the whole-image rules -- six severities,
     ten surviving queries -- run at the end because they are the only ones that need every
     record of an image at once.
+
+    `artifact_type` is the *only* thing a caller varies, and it is a label rather than a
+    switch: it names the analysis the loaded inputs are about to feed, and nothing below reads
+    it. That is deliberate. Two analyses read this pair of artifacts -- the published decile
+    experiment through `load_decile_inputs`, and the corruption-sensitivity comparison through
+    `corruption_analysis.load_corruption_inputs` -- and they must be held to the same
+    provenance rules, including the refusal of anything but the tuning partition, or the second
+    one becomes a way to reach the held-out data the first one is forbidden. So this stays one
+    body with one set of checks, and the two entry points differ only in the word they write
+    into `run_metadata` for whoever reads the analysis directory later.
+
+    Private because the entry points are the contract: a caller that names its own artifact
+    type is naming the experiment it is running, and that is a decision for a module, not for a
+    call site.
 
     Test-partition records in the cache are skipped rather than refused; the cache holds both
     partitions by design. The refusal that matters lives in `_load_result_manifest` and
@@ -519,7 +538,7 @@ def load_decile_inputs(cache_value: str | Path, results_value: str | Path) -> De
         distances=distances,
         layer_score_scales=scales,
         run_metadata={
-            "artifact_type": ANALYSIS_ARTIFACT_TYPE,
+            "artifact_type": artifact_type,
             "feature_cache_id": cache_manifest["artifact_id"],
             "source_result_id": result_manifest["artifact_id"],
             "bank_id": result_manifest["bank_id"],
@@ -532,6 +551,22 @@ def load_decile_inputs(cache_value: str | Path, results_value: str | Path) -> De
             "image_count": len(records_by_image),
             "record_count": len(seen),
         },
+    )
+
+
+def load_decile_inputs(cache_value: str | Path, results_value: str | Path) -> DecileInputs:
+    """The confidence-decile experiment's inputs: `_load_scene_query_inputs` at its own type.
+
+    A bare wrapper, for the reason `confidence_deciles.confidence_deciles` is one: this is the
+    entry point the published command runs through, so it must keep loading exactly what it
+    loaded before and refusing exactly what it refused before, in the same order and in the
+    same words. Adding a second copy of the body -- or a default argument that a later caller
+    could override -- would be adding a way for those two things to stop being true.
+    """
+    return _load_scene_query_inputs(
+        cache_value,
+        results_value,
+        artifact_type=ANALYSIS_ARTIFACT_TYPE,
     )
 
 
