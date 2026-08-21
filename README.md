@@ -398,6 +398,29 @@ written into a staging directory beside it and renamed into place in one step, s
 fails leaves neither a partial bundle nor an empty directory, and a directory that does exist is
 a finished report that is never overwritten.
 
+**Auditing a published bundle.** `tools/audit_corruption_bundle.py` re-derives the bundle's
+claims from the bundle's own eight files and prints one PASS/FAIL line per check, exiting
+non-zero if any of them failed:
+
+```bash
+$UE_PY tools/audit_corruption_bundle.py $OUT/reports/corruption_sensitivity_raw_k5
+```
+
+It is read-only and it deliberately imports nothing from `src/scene_uncertainty`: every
+constant and formula in it is restated from the design, so the two spellings can disagree. An
+auditor that imported `CANDIDATE_KEY` or `_statistics` from the code that wrote the bundle
+would agree with any change to them and call the result correct. It checks the file set, the
+`image_count x 3060` row budget and its decomposition, per-candidate image and severity
+coverage, candidate-key uniqueness, every deployability gate on the ranking and its sort order,
+each macro AUROC against the mean of its five per-severity AUROCs, each row's absolute Spearman
+against the absolute value of its own signed Spearman, all six per-severity statistics --
+including the *population* variance -- recomputed from the raw scores, and the recorded
+`axis_limits` against a recomputation of the y-range rule. On a run over fewer than 250 images
+it reports the manifest count and asserts the ranking is empty; it never rescales the
+deployability gate to fit the run it was given. It does not inspect PNG pixels -- that claim
+belongs to `tests/scene_uncertainty/test_corruption_plots.py`, which asserts it against the
+`Axes` objects.
+
 ### Reading the artifacts
 
 * **One writer per `--output`.** The immutability guard is a file check, so two extractions
