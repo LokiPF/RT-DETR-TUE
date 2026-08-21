@@ -9,6 +9,7 @@ from .metrics import jaccard_overlap
 
 
 DECILE_NAMES = tuple(f"decile_{lower:02d}_{lower + 10:02d}" for lower in range(0, 100, 10))
+QUINTILE_NAMES = tuple(f"quintile_{lower:02d}_{lower + 20:02d}" for lower in range(0, 100, 20))
 
 
 def _rows_equal_to_last(values: Tensor) -> Tensor:
@@ -208,37 +209,72 @@ def confidence_from_logits(logits: Tensor) -> Tensor:
     return logits.float().sigmoid().amax(dim=-1).cpu()
 
 
-def confidence_deciles(confidence: Tensor, valid_indices: Tensor, label: str = "") -> dict[str, Tensor]:
-    """Split the valid queries into ten equal-count confidence bins, lowest first.
+def confidence_buckets(
+    confidence: Tensor,
+    valid_indices: Tensor,
+    *,
+    names: tuple[str, ...],
+    noun: str,
+    label: str = "",
+) -> dict[str, Tensor]:
+    """Split the valid queries into `len(names)` equal-count confidence bins, lowest first.
+
+    Every bucketing scheme in the analysis comes through this one function, and that is the
+    point rather than an economy. Deciles and quintiles are the same ordered sequence of valid
+    queries cut in different places, and building both here is what keeps that sequence
+    identical -- one stable sort under one tie-break -- rather than two independent views that
+    agree most of the time and disagree wherever a tie broke differently. `names` chooses the
+    resolution and labels the bins; `noun` names the scheme in the messages, since a caller
+    told it needs "at least 5 valid queries" has to know which partition refused it.
+
+    Shared ordering is not nested cuts, and it is worth not assuming otherwise. `tensor_split`
+    hands its remainder to the lowest bins of each scheme separately, so at 23 valid queries
+    the deciles run 3,3,3,2,2,2,2,2,2,2 while the quintiles run 5,5,5,4,4 -- not the 6,5,4,4,4
+    that pairing adjacent deciles would give. A quintile is a rank range of the same ordering,
+    not a union of two deciles.
 
     Ties are the reason this is written with a stable sort over an already-sorted index
     tensor rather than a plain `argsort`. Confidence comes from float16 logits, so exact ties
     are ordinary rather than exotic: every one of the pilot's 1,500 tuning records has some,
     a median of 55 of its 300 queries share a confidence with another query, and the largest
-    tie group runs to 257. A decile edge therefore falls inside a tie block routinely, and an
+    tie group runs to 257. A bin edge therefore falls inside a tie block routinely, and an
     unstable sort would return different bins for the same record on different runs. Sorting
     `valid_indices` first and then sorting *stably* by confidence makes ascending query ID the
-    tie-break the design asks for, and makes the result reproducible.
+    tie-break the design asks for, and makes the result reproducible. Coarser schemes have
+    fewer edges to land badly, not safer ones: the edges they do have sit at the same ranks a
+    decile edge sits at, so the tie-break has to be the same rule or the two disagree.
 
-    Bin sizes differ by at most one when the count is not divisible by ten; the remainder goes
-    to the lowest bins, which is `tensor_split`'s rule and is arbitrary but fixed. Every valid
-    query lands in exactly one bin, so concatenating the ten bins reproduces `valid_indices`.
+    Bin sizes differ by at most one when the count is not divisible by `len(names)`; the
+    remainder goes to the lowest bins, which is `tensor_split`'s rule and is arbitrary but
+    fixed. Every valid query lands in exactly one bin, so concatenating the bins reproduces
+    `valid_indices`.
 
     Each bin is returned in ascending *confidence* order, not ascending query ID. Membership
     is what the analysis consumes, so the order is incidental there, but it is stable and it
     means `bins[name][0]` is the least confident query of that bin.
 
-    Fewer than ten valid queries raises rather than returning short or empty bins, because a
+    Fewer valid queries than names raises rather than returning short or empty bins, because a
     record that cannot fill its bins is an invalid record and its score would silently mean
-    something different from every other record's. `label` names that record in the message;
-    `memberships_by_severity` fills it in, and a direct caller that leaves it empty gets the
-    same check with a less useful message.
+    something different from every other record's. The floor is `len(names)` and nothing more,
+    so five valid queries are enough to fill five quintiles. A caller that needs a wider record
+    than its own bin count implies -- `decile_analysis.MINIMUM_VALID_QUERIES` refuses an image
+    below ten before the scoring loop reaches any partition -- has to say so where it knows
+    every scheme it will build, not here. `label` names the record in the message;
+    `memberships_by_scheme_severity` fills it in, and a direct caller that leaves it empty gets
+    the same check with a less useful message.
+
+    `names` must be non-empty and free of repeats. No names would ask `tensor_split` for zero
+    chunks, and a repeated name would let the later bin overwrite the earlier one in the
+    returned dict -- handing back a partition with fewer bins than the caller asked for, and
+    dropping the queries of the shadowed bin without a word.
 
     Two inputs that look right and are not: a `(query, class)` logit tensor, which would rank
     rows instead of queries, and a boolean keep-mask where the index tensor belongs. Both
     raise. Non-finite confidence raises too -- `argsort` sorts `nan` to the end, which would
-    quietly place a broken query in the top decile.
+    quietly place a broken query in the highest bin.
     """
+    if not names or len(set(names)) != len(names):
+        raise ValueError("confidence bucket names must be non-empty and unique")
     scores = confidence.float().cpu()
     if scores.ndim != 1:
         raise ValueError(
@@ -247,9 +283,13 @@ def confidence_deciles(confidence: Tensor, valid_indices: Tensor, label: str = "
     _require_index_dtype(valid_indices, "valid query indices")
     valid = torch.sort(valid_indices.reshape(-1).long().cpu()).values
     named = f" for {label}" if label else ""
-    if valid.numel() < len(DECILE_NAMES):
+    if valid.numel() < len(names):
+        # The decile scheme keeps the spelled-out "ten" it has always raised with: that
+        # message reached the published decile results through `confidence_deciles`, and this
+        # generalisation is required to leave that command failing identically.
+        minimum = "ten" if noun == "confidence deciles" else str(len(names))
         raise ValueError(
-            f"confidence deciles need at least ten valid queries, got {valid.numel()}{named}"
+            f"{noun} need at least {minimum} valid queries, got {valid.numel()}{named}"
         )
     if valid.unique().numel() != valid.numel():
         raise ValueError(f"valid query indices must be unique{named}")
@@ -259,8 +299,26 @@ def confidence_deciles(confidence: Tensor, valid_indices: Tensor, label: str = "
     if not bool(torch.isfinite(selected).all()):
         raise ValueError(f"confidence must be finite to rank queries{named}")
     order = torch.argsort(selected, stable=True)
-    chunks = torch.tensor_split(valid.index_select(0, order), len(DECILE_NAMES))
-    return {name: chunk for name, chunk in zip(DECILE_NAMES, chunks)}
+    chunks = torch.tensor_split(valid.index_select(0, order), len(names))
+    return {name: chunk for name, chunk in zip(names, chunks)}
+
+
+def confidence_deciles(confidence: Tensor, valid_indices: Tensor, label: str = "") -> dict[str, Tensor]:
+    """Ten equal-count confidence bins, lowest first: `confidence_buckets` at decile resolution.
+
+    This is the entry point the published decile experiment runs through, and it stays a bare
+    wrapper so that it cannot drift from the generic partition -- the same bins in the same
+    order, and the same errors in the same words, including the "at least ten valid queries"
+    wording that experiment's tests pin. Read `confidence_buckets` for why the sort is stable,
+    what the bin order means, and which look-alike inputs it refuses.
+    """
+    return confidence_buckets(
+        confidence,
+        valid_indices,
+        names=DECILE_NAMES,
+        noun="confidence deciles",
+        label=label,
+    )
 
 
 def bin_overlap(bins: dict[str, Tensor], reference: dict[str, Tensor]) -> dict[str, float]:
@@ -325,10 +383,23 @@ def _record_label(record: dict, severity: int) -> str:
     return f"image {int(image_id)} severity {severity}"
 
 
-def memberships_by_severity(records_by_severity: dict[int, dict], padded: Tensor) -> dict[int, dict]:
-    """Dynamic and clean-frozen decile memberships for one image, at every cached severity.
+def memberships_by_scheme_severity(
+    records_by_severity: dict[int, dict],
+    padded: Tensor,
+    *,
+    names: tuple[str, ...],
+    noun: str,
+) -> dict[int, dict]:
+    """Dynamic and clean-frozen bucket memberships for one image, at every cached severity.
 
-    `dynamic` re-sorts and rebuilds all ten bins at each severity: a policy that a single
+    `names` and `noun` go straight to `confidence_buckets` and are the only thing that fixes
+    the resolution: `DECILE_NAMES` for the published decile experiment, `QUINTILE_NAMES` for a
+    coarser cut of the same ordering. Nothing below counts bins, so a caller that wants both
+    schemes for one image asks twice over the same records, and the two answers rank those
+    queries identically because they come from the same sort -- see `confidence_buckets` for
+    why that is shared ordering rather than nested cuts.
+
+    `dynamic` re-sorts and rebuilds every bin at each severity: a policy that a single
     image could actually run, whose membership moves as confidence moves. `frozen` is severity
     zero's membership reused unchanged everywhere: a diagnostic, since a naturally corrupted
     image has no paired clean version, whose point is to hold the queries still so that any
@@ -346,7 +417,7 @@ def memberships_by_severity(records_by_severity: dict[int, dict], padded: Tensor
 
     `all_valid` is that same union-masked set, and it is the direct comparison with the
     existing all-query method -- every non-padded query, not all 300 and not a re-derivation
-    from the ten bins.
+    from the bins.
 
     Each record supplies its confidence as `logits`, or as a `query_confidence` vector already
     derived with `confidence_from_logits`. The cache's own `confidence` field is refused; see
@@ -372,13 +443,21 @@ def memberships_by_severity(records_by_severity: dict[int, dict], padded: Tensor
     keep = torch.ones(query_count, dtype=torch.bool)
     keep[padded] = False
     valid = torch.where(keep)[0]
-    frozen = confidence_deciles(
-        confidence[0], valid, label=_record_label(records_by_severity[0], 0)
+    frozen = confidence_buckets(
+        confidence[0],
+        valid,
+        names=names,
+        noun=noun,
+        label=_record_label(records_by_severity[0], 0),
     )
     memberships = {}
     for severity, record in ordered:
-        dynamic = confidence_deciles(
-            confidence[severity], valid, label=_record_label(record, severity)
+        dynamic = confidence_buckets(
+            confidence[severity],
+            valid,
+            names=names,
+            noun=noun,
+            label=_record_label(record, severity),
         )
         memberships[severity] = {
             "dynamic": dynamic,
@@ -387,3 +466,19 @@ def memberships_by_severity(records_by_severity: dict[int, dict], padded: Tensor
             "dynamic_overlap": bin_overlap(dynamic, frozen),
         }
     return memberships
+
+
+def memberships_by_severity(records_by_severity: dict[int, dict], padded: Tensor) -> dict[int, dict]:
+    """Decile memberships for one image: `memberships_by_scheme_severity` at decile resolution.
+
+    The published decile experiment's entry point, kept as a bare wrapper for the reason
+    `confidence_deciles` is one -- identical bins, identical errors, and no second copy of the
+    logic to drift from. See `memberships_by_scheme_severity` for what each severity's four
+    keys hold and why `padded` has to be the image-level union rather than one severity's tail.
+    """
+    return memberships_by_scheme_severity(
+        records_by_severity,
+        padded,
+        names=DECILE_NAMES,
+        noun="confidence deciles",
+    )

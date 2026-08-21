@@ -4,10 +4,13 @@ import torch
 from src.scene_uncertainty import confidence_deciles as decile_module
 from src.scene_uncertainty.confidence_deciles import (
     DECILE_NAMES,
+    QUINTILE_NAMES,
     bin_overlap,
+    confidence_buckets,
     confidence_deciles,
     confidence_from_logits,
     detect_padded_tail,
+    memberships_by_scheme_severity,
     memberships_by_severity,
     union_padded_query_ids,
     union_query_ids,
@@ -660,3 +663,181 @@ def test_query_confidence_is_used_on_a_record_that_also_carries_the_stale_field(
     result = memberships_by_severity(records, NO_PADDING)
     assert result[0]["dynamic"]["decile_00_10"].tolist() == [0, 1]
     assert result[0]["dynamic"]["decile_90_100"].tolist() == [18, 19]
+
+
+# --- confidence_buckets: the generic partition -------------------------------------------
+
+
+def test_quintile_names_are_the_five_bins_the_spec_names():
+    assert QUINTILE_NAMES == (
+        "quintile_00_20",
+        "quintile_20_40",
+        "quintile_40_60",
+        "quintile_60_80",
+        "quintile_80_100",
+    )
+
+
+def test_confidence_quintiles_split_twenty_queries_lowest_first():
+    confidence = torch.tensor([
+        0.9, 0.1, 0.8, 0.2, 0.7, 0.3, 0.6, 0.4, 0.5, 0.0,
+        0.91, 0.11, 0.81, 0.21, 0.71, 0.31, 0.61, 0.41, 0.51, 0.01,
+    ])
+    bins = confidence_buckets(
+        confidence,
+        torch.arange(20),
+        names=QUINTILE_NAMES,
+        noun="confidence quintiles",
+    )
+
+    assert tuple(bins) == QUINTILE_NAMES
+    assert [len(bins[name]) for name in QUINTILE_NAMES] == [4, 4, 4, 4, 4]
+    assert torch.equal(torch.cat(list(bins.values())).sort().values, torch.arange(20))
+
+
+def test_confidence_buckets_break_ties_by_ascending_query_id():
+    confidence = torch.ones(10)
+    bins = confidence_buckets(
+        confidence,
+        torch.tensor([9, 3, 7, 1, 5, 0, 8, 2, 6, 4]),
+        names=QUINTILE_NAMES,
+        noun="confidence quintiles",
+    )
+
+    assert [values.tolist() for values in bins.values()] == [
+        [0, 1], [2, 3], [4, 5], [6, 7], [8, 9],
+    ]
+
+
+def test_legacy_confidence_deciles_match_generic_partition():
+    confidence = torch.linspace(0.0, 1.0, 23)
+    valid = torch.tensor([22, 0, 5, 12, 3, 7, 18, 2, 9, 14, 4, 8, 17, 6, 1])
+
+    legacy = confidence_deciles(confidence, valid, label="sample")
+    generic = confidence_buckets(
+        confidence,
+        valid,
+        names=DECILE_NAMES,
+        noun="confidence deciles",
+        label="sample",
+    )
+
+    assert legacy.keys() == generic.keys()
+    assert all(torch.equal(legacy[name], generic[name]) for name in DECILE_NAMES)
+
+
+def test_five_valid_queries_are_enough_to_fill_the_quintiles():
+    """The ten-query floor belongs to the decile scheme, not to the partition primitive."""
+    bins = confidence_buckets(
+        torch.tensor([0.4, 0.1, 0.5, 0.2, 0.3]),
+        torch.arange(5),
+        names=QUINTILE_NAMES,
+        noun="confidence quintiles",
+    )
+    assert [values.tolist() for values in bins.values()] == [[1], [3], [4], [0], [2]]
+
+
+def test_four_valid_queries_are_too_few_for_quintiles():
+    message = "confidence quintiles need at least 5 valid queries, got 4 for sample"
+    with pytest.raises(ValueError, match=message):
+        confidence_buckets(
+            torch.arange(4, dtype=torch.float32),
+            torch.arange(4),
+            names=QUINTILE_NAMES,
+            noun="confidence quintiles",
+            label="sample",
+        )
+
+
+def test_confidence_buckets_reject_duplicate_valid_indices():
+    with pytest.raises(ValueError, match="must be unique"):
+        confidence_buckets(
+            torch.arange(10, dtype=torch.float32),
+            torch.tensor([0, 0, 1, 2, 3, 4]),
+            names=QUINTILE_NAMES,
+            noun="confidence quintiles",
+        )
+
+
+def test_confidence_buckets_reject_a_valid_index_outside_the_confidence_vector():
+    confidence = torch.arange(10, dtype=torch.float32)
+    with pytest.raises(ValueError, match="outside the confidence vector"):
+        confidence_buckets(
+            confidence, torch.arange(6, 12), names=QUINTILE_NAMES, noun="confidence quintiles"
+        )
+    with pytest.raises(ValueError, match="outside the confidence vector"):
+        confidence_buckets(
+            confidence, torch.arange(-3, 3), names=QUINTILE_NAMES, noun="confidence quintiles"
+        )
+
+
+def test_confidence_buckets_refuse_to_rank_a_non_finite_confidence():
+    confidence = torch.arange(10, dtype=torch.float32)
+    confidence[7] = float("inf")
+    with pytest.raises(ValueError, match="finite"):
+        confidence_buckets(
+            confidence, torch.arange(10), names=QUINTILE_NAMES, noun="confidence quintiles"
+        )
+
+
+def test_confidence_buckets_refuse_bucket_names_that_cannot_label_a_partition():
+    """Zero names would split nothing; a repeated name would collapse two bins into one key."""
+    confidence = torch.arange(10, dtype=torch.float32)
+    with pytest.raises(ValueError, match="non-empty and unique"):
+        confidence_buckets(confidence, torch.arange(10), names=(), noun="confidence buckets")
+    with pytest.raises(ValueError, match="non-empty and unique"):
+        confidence_buckets(
+            confidence, torch.arange(10), names=("low", "low"), noun="confidence buckets"
+        )
+
+
+def test_quintile_memberships_are_built_for_every_severity():
+    generator = torch.Generator().manual_seed(5)
+    records = {
+        severity: confidence_record(torch.rand(40, generator=generator))
+        for severity in range(6)
+    }
+    result = memberships_by_scheme_severity(
+        records,
+        torch.tensor([38, 39]),
+        names=QUINTILE_NAMES,
+        noun="confidence quintiles",
+    )
+
+    assert sorted(result) == list(range(6))
+    clean = as_lists(result[0]["dynamic"])
+    for severity in range(6):
+        membership = result[severity]
+        assert tuple(membership["dynamic"]) == QUINTILE_NAMES
+        assert as_lists(membership["frozen"]) == clean
+        assert membership["all_valid"].tolist() == list(range(38))
+        assert set(membership["dynamic_overlap"]) == set(QUINTILE_NAMES)
+    assert result[0]["dynamic_overlap"] == {name: 1.0 for name in QUINTILE_NAMES}
+    assert any(as_lists(result[severity]["dynamic"]) != clean for severity in range(1, 6))
+
+
+def test_quintiles_and_deciles_cut_one_shared_ordering():
+    """Both schemes slice the *same* confidence-ranked sequence; only the cut points differ.
+
+    Twenty-three valid queries is the point of the count: neither scheme divides it evenly, so
+    the two remainder distributions genuinely disagree -- 3,3,3,2,... against 5,5,5,4,4 -- and
+    the concatenations can only match if one ordering underlies both. Rounding the scores to
+    eighths puts real ties in that ordering, so the shared tie-break is under test too, not
+    just the shared sort.
+    """
+    generator = torch.Generator().manual_seed(23)
+    confidence = (torch.rand(30, generator=generator) * 8).round() / 8
+    valid = torch.arange(7, 30)
+
+    quintiles = confidence_buckets(
+        confidence, valid, names=QUINTILE_NAMES, noun="confidence quintiles"
+    )
+    deciles = confidence_buckets(
+        confidence, valid, names=DECILE_NAMES, noun="confidence deciles"
+    )
+
+    assert [len(values) for values in deciles.values()] == [3, 3, 3, 2, 2, 2, 2, 2, 2, 2]
+    assert [len(values) for values in quintiles.values()] == [5, 5, 5, 4, 4]
+    assert torch.equal(
+        torch.cat(list(quintiles.values())), torch.cat(list(deciles.values()))
+    )
