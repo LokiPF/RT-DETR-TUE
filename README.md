@@ -409,13 +409,13 @@ $UE_PY tools/audit_corruption_bundle.py $OUT/reports/corruption_sensitivity_raw_
 **It has three exit statuses and the third is not a failure.** `0` means every check ran against
 a non-empty population and passed; `1` means the bundle was read and at least one check failed;
 `2` means **nothing was audited** -- the path is not a directory, is missing one of the four data
-files, or holds files that cannot be parsed as themselves, so no check ran at all. Scripting
-this as a gate on `!= 0` is right; treating a `2` as "checks failed" is wrong, and treating it
-as "not a failure, carry on" is worse. A check that was handed an empty population -- a
-`per_scene.csv` with a header and no rows, say -- fails rather than passing vacuously, because
-every element of an empty set satisfies every predicate and PASS is the line a reader quotes.
-The one exception is the deployable ranking, where an empty population is a documented outcome
-and is reported as one.
+files, or holds files that cannot be parsed as themselves, so no check ran at all. A column being
+present is not the same as its cells parsing, so the fields the checks will coerce are coerced at
+load and any exception escaping the load lands on the same refusal. Scripting this as a gate on
+`!= 0` is right; treating a `2` as "checks failed" is wrong, and treating it as "not a failure,
+carry on" is worse. A check that was handed an empty population -- a `per_scene.csv` with a
+header and no rows, say -- fails rather than passing vacuously, because every element of an empty
+set satisfies every predicate and PASS is the line a reader quotes.
 
 It is read-only and it deliberately imports nothing from `src/scene_uncertainty`: every
 constant and formula in it is restated from the design, so the two spellings can disagree. An
@@ -426,9 +426,15 @@ coverage, candidate-key uniqueness, every deployability gate on the ranking and 
 each macro AUROC against the mean of its five per-severity AUROCs, each row's absolute Spearman
 against the absolute value of its own signed Spearman, all six per-severity statistics --
 including the *population* variance -- recomputed from the raw scores, and the recorded
-`axis_limits` against a recomputation of the y-range rule. On a run over fewer than 250 images
-it reports the manifest count and asserts the ranking is empty; it never rescales the
-deployability gate to fit the run it was given. It does not inspect PNG pixels -- that claim
+`axis_limits` against a recomputation of the y-range rule.
+
+The ranking is checked in both directions. Which candidates *should* be ranked is re-derived
+from `candidate_metrics.csv` and the raw rows rather than read off the ranking, so a candidate
+that passes every gate and is missing from it is a finding -- without that, deleting the ranking
+wholesale is indistinguishable from a run where nothing qualified, and an empty ranking would be
+a vacuous pass that explains itself. On a run over fewer than 250 images the gate can admit
+nothing, so it reports the manifest count and asserts the ranking is empty; it never rescales
+the deployability gate to fit the run it was given. It does not inspect PNG pixels -- that claim
 belongs to `tests/scene_uncertainty/test_corruption_plots.py`, which asserts it against the
 `Axes` objects.
 

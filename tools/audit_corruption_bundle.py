@@ -18,11 +18,21 @@ The distinction matters to anyone scripting this as a gate: `2` means "I have no
 this bundle", which is the opposite of `1`. Treating a `2` as "checks failed" is wrong, and
 treating it as "not a failure, carry on" is worse.
 
-**A load failure is a refusal, not a green audit.** The four data files are checked for presence
-and then for being parseable, with the columns and keys every check below reads. A bundle that
-gets past that is one where the checks can be trusted to be examining something; one that does
-not is refused with an exit `2` naming the file and the reason. What is never allowed is a run
-that prints nine PASS lines because each check found nothing to look at -- see `_STARVED` below.
+**A load failure is a refusal, not a green audit.** The four data files are checked for presence,
+then for being parseable, then for holding the columns and keys every check below reads -- and
+the fields a check will later coerce are coerced *here*, because a column that exists is not a
+column that parses. A bundle that gets past all of that is one where the checks can be trusted
+to be examining something; one that does not is refused with an exit `2` naming the file and the
+reason. What is never allowed is a run that prints nine PASS lines because each check found
+nothing to look at -- see `_STARVED` below.
+
+That guarantee is made by construction rather than by enumeration: `main` maps *any* exception
+escaping the load to the same refusal, not only the `BundleUnreadable` ones raised deliberately.
+Twice now a specific unguarded read has been found in the constructor -- first a missing key,
+then a `severity` column that existed but did not parse as integers -- and each time the escape
+exited `1`, which this file defines as "the bundle was read and a check failed". Mis-signalling
+a bundle that was never read is worse than crashing on it, so the backstop is a catch-all and
+the enumerated cases exist only to produce a better message.
 
 **Why it does not import `scene_uncertainty`.** Every constant and every formula below is
 restated here from the design rather than imported from the code that wrote the bundle. An
@@ -118,6 +128,8 @@ refuse a bundle it could in fact audit."""
 CANDIDATE_METRIC_COLUMNS = (
     *CANDIDATE_KEY,
     "macro_auroc",
+    # Read by `_gate_qualified`, which re-derives who the deployable ranking should contain.
+    "orientation", "measured_count", "image_count",
     *(f"auroc_severity_{severity}" for severity in EXPECTED_SEVERITIES[1:]),
     *(
         f"{statistic}_severity_{severity}"
@@ -237,6 +249,40 @@ def _numeric(series: pd.Series) -> tuple[pd.Series, pd.Series]:
 
 def _candidate_id(row) -> tuple:
     return tuple(row[field] for field in CANDIDATE_KEY)
+
+
+def _gate_qualified(bundle) -> set[tuple]:
+    """Which candidates the deployable ranking *should* hold, re-derived from the tables.
+
+    This exists so that an empty ranking is a finding rather than an excuse. The check that reads
+    it used to print "empty on a full run means no candidate passed every gate" beside a zero it
+    had never established -- so deleting the whole ranking out of a bundle with 45 deployable
+    candidates passed, and the tool volunteered a quotable explanation of a fact that was not
+    true. A vacuous pass is bad; a vacuous pass that explains itself is worse.
+
+    The conditions mirror `corruption_reporting._candidate_metrics`' gate exactly, and the
+    per-severity coverage is taken from `finite_counts` -- recomputed from the raw rows -- rather
+    than from the candidate's own published counts, so this is a second opinion and not a
+    restatement. `image_count` is deliberately *not* among them, because the producer's gate does
+    not test it either; adding a condition the producer does not have would manufacture
+    disagreements on correct bundles.
+    """
+    qualified = set()
+    for _, row in bundle.candidate_metrics.iterrows():
+        if any(row[field] != required for field, required in DEPLOYABLE_GATES.items()):
+            continue
+        if _cell(row["measured_count"]) != FULL_TUNING_IMAGE_COUNT:
+            continue
+        if _cell(row["orientation"]) not in (-1, 1):
+            continue
+        key = _candidate_id(row)
+        if any(
+            bundle.finite_counts.get((key, severity), 0) != FULL_TUNING_IMAGE_COUNT
+            for severity in EXPECTED_SEVERITIES
+        ):
+            continue
+        qualified.add(key)
+    return qualified
 
 
 def _ranking_sort_key(candidate: dict):
@@ -439,9 +485,8 @@ def check_ranking_gates(bundle) -> CheckResult:
                 "deployable"
             )
         return CheckResult(examined, failures)
-    examined = f"{len(ranking)} ranked candidates"
-    if not ranking:
-        examined += "; empty on a full run means no candidate passed every gate"
+    qualified = _gate_qualified(bundle)
+    examined = f"{len(ranking)} ranked candidates against {len(qualified)} that qualify"
     finite_by_candidate = bundle.finite_counts
     for position, candidate in enumerate(ranking):
         missing = [field for field in CANDIDATE_KEY if field not in candidate]
@@ -469,6 +514,20 @@ def check_ranking_gates(bundle) -> CheckResult:
             failures.append(f"ranked candidate {key} has incomplete severities {thin}")
     if len(ranking) != bundle.summary["validation"]["deployable_candidate_count"]:
         failures.append("summary.json deployable_candidate_count disagrees with the ranking")
+
+    # The other direction, and the one an all-clear cannot be given without: a candidate that
+    # passes every gate and is missing from the ranking. Without this, deleting the ranking
+    # wholesale is indistinguishable from a run where nothing qualified.
+    ranked = {
+        _candidate_id(candidate) for candidate in ranking
+        if all(field in candidate for field in CANDIDATE_KEY)
+    }
+    unranked = sorted(qualified - ranked)
+    if unranked:
+        failures.append(
+            f"{len(unranked)} candidate(s) pass every gate in candidate_metrics.csv but are "
+            f"absent from the ranking, e.g. {unranked[:3]}"
+        )
 
     # Built last, and built so that it cannot throw away everything above it. See
     # `_ranking_sort_key` for why a missing metric is reported here rather than raised.
@@ -742,11 +801,16 @@ def _read_csv(path: Path, required: tuple[str, ...]) -> pd.DataFrame:
 class Bundle:
     """The eight files, read once, plus the derived table the ranking check would rebuild.
 
-    Every read here is guarded and every key a check will later index is proved present *now*,
-    so a malformed bundle becomes one refusal naming the file and the reason instead of a
-    traceback out of whichever check happened to touch the missing thing first. The alternative
-    was tried and is what the review of this file found: four realistic malformed bundles, four
-    raw tracebacks, zero check lines printed.
+    Every read here is guarded, every key a check will later index is proved present *now*, and
+    every field a check will later coerce is coerced *now* -- so a malformed bundle becomes one
+    refusal naming the file and the reason instead of a traceback out of whichever check happened
+    to touch the bad thing first. The alternative was tried and is what two rounds of review
+    found: first four malformed bundles giving four raw tracebacks and zero check lines, then a
+    `severity` column that passed the presence test and blew up on `int()` two statements later.
+
+    Presence and parseability are different claims and the second one is the one that bites.
+    `main` backstops this constructor with a catch-all for exactly that reason -- see the module
+    docstring -- so a case nobody enumerated is a refusal rather than a traceback.
     """
 
     def __init__(self, directory: Path):
@@ -763,13 +827,21 @@ class Bundle:
         absent = [key for key in SUMMARY_VALIDATION_KEYS if key not in validation]
         if absent:
             raise BundleUnreadable(f"summary.json validation is missing the key(s) {absent}")
-        try:
-            self.expected_image_count = int(validation["expected_image_count"])
-        except (TypeError, ValueError) as error:
+        # Integrality, not merely coercibility. `int(4.9)` is `4`, silently, and every row
+        # budget below would then be computed against an image count the bundle never claimed --
+        # a whole run audited green against the wrong denominator. A count of images is a whole
+        # number or it is a defect in the thing that wrote it.
+        images = validation["expected_image_count"]
+        if isinstance(images, bool) or not isinstance(images, (int, float)):
             raise BundleUnreadable(
-                "summary.json validation.expected_image_count is not an integer: "
-                f"{validation['expected_image_count']!r}"
-            ) from error
+                f"summary.json validation.expected_image_count is not a number: {images!r}"
+            )
+        if isinstance(images, float) and not images.is_integer():
+            raise BundleUnreadable(
+                f"summary.json validation.expected_image_count is {images!r}, which is not a "
+                "whole number of images"
+            )
+        self.expected_image_count = int(images)
         # A bundle claiming zero images is not a small run, it is not a run. Refused here rather
         # than audited, because `0 == 0 x 3060` makes the row budget vacuously true and several
         # checks below would then pass over an empty table.
@@ -783,6 +855,31 @@ class Bundle:
         self.candidate_metrics = _read_csv(
             directory / "candidate_metrics.csv", CANDIDATE_METRIC_COLUMNS
         )
+        # `severity` is coerced here rather than at each `int()` downstream. The column having
+        # survived the presence test says nothing about its cells: a producer that started
+        # writing `sev_0 .. sev_5` -- exactly the encoding drift this file exists to catch --
+        # leaves every other column valid and makes `int()` raise ten frames later. Out-of-range
+        # integers are deliberately *not* refused here; a severity 7 row is a finding for the
+        # checks to report, not a parse failure.
+        severities, spoiled = _numeric(self.per_scene["severity"])
+        bad = spoiled | severities.isna()
+        if bad.any():
+            examples = sorted({str(value) for value in self.per_scene.loc[bad, "severity"]})[:3]
+            raise BundleUnreadable(
+                f"per_scene.csv has {int(bad.sum())} severity cell(s) that are not numbers, "
+                f"e.g. {examples}"
+            )
+        fractional = severities != severities.round()
+        if fractional.any():
+            examples = sorted(
+                {str(value) for value in self.per_scene.loc[fractional, "severity"]}
+            )[:3]
+            raise BundleUnreadable(
+                f"per_scene.csv has {int(fractional.sum())} severity cell(s) that are not whole "
+                f"numbers, e.g. {examples}"
+            )
+        self.per_scene["severity"] = severities.astype(int)
+
         scores, _ = _numeric(self.per_scene["score"])
         finite = self.per_scene[np.isfinite(scores)]
         counts = (
@@ -824,6 +921,19 @@ def main(argv: list[str] | None = None) -> int:
         bundle = Bundle(directory)
     except BundleUnreadable as error:
         print(f"{directory} cannot be audited -- {error}", file=sys.stderr)
+        print("nothing was audited (exit 2)", file=sys.stderr)
+        return 2
+    except Exception as error:  # noqa: BLE001 - the backstop, not a handler
+        # Deliberately broad. `Bundle` enumerates the malformations it can name, and twice now a
+        # case it did not enumerate has escaped as a traceback at exit 1 -- which this file
+        # defines as "the bundle was read and a check failed", so the tool asserted an opinion
+        # about a bundle it had never read. Every route out of the load lands on the same
+        # refusal; the enumerated cases exist to produce a better message, not to be exhaustive.
+        print(
+            f"{directory} cannot be audited -- reading it raised "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
         print("nothing was audited (exit 2)", file=sys.stderr)
         return 2
 
