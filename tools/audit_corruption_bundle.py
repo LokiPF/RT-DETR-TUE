@@ -23,8 +23,8 @@ then for being parseable, then for holding the columns and keys every check belo
 the fields a check will later coerce are coerced *here*, because a column that exists is not a
 column that parses. A bundle that gets past all of that is one where the checks can be trusted
 to be examining something; one that does not is refused with an exit `2` naming the file and the
-reason. What is never allowed is a run that prints nine PASS lines because each check found
-nothing to look at -- see `_STARVED` below.
+reason. What is never allowed is a run that prints a PASS line per check because each check
+found nothing to look at -- see `_STARVED` below.
 
 That guarantee is made by construction rather than by enumeration: `main` maps *any* exception
 escaping the load to the same refusal, not only the `BundleUnreadable` ones raised deliberately.
@@ -865,6 +865,106 @@ def check_spearman_pairs(bundle) -> CheckResult:
     return CheckResult(examined, failures)
 
 
+def check_orientation(bundle) -> CheckResult:
+    """Every published orientation re-derived from that candidate's own per-image trends.
+
+    The one input the ranking check had to take on trust. `_gate_qualified`'s docstring says so
+    in as many words -- orientation "is a median over the per-image signed trends that this file
+    does not recompute" -- and everything it compares *around* orientation is a second opinion,
+    which made orientation the one place a producer bug could travel undetected. A sign error in
+    `choose_orientation` writes the same wrong direction into `summary.json` and into
+    `candidate_metrics.csv`, leaves every AUROC computed the other way, and contradicts nothing:
+    a consistently flipped 250-image bundle audited 9 of 9 at exit 0, which is precisely the
+    false green `_STARVED` exists to make impossible. `per_scene.csv` carries `signed_spearman`
+    on every row and is already loaded, so the median that decided the direction can be taken
+    again.
+
+    The rule is `corruption_metrics.choose_orientation`'s, restated rather than imported for the
+    reason the module docstring gives. Non-finite trends are dropped rather than read as zero --
+    they are the unmeasured images, and counting them as no-trend would pull the median towards
+    a `None` in proportion to how often the candidate failed to produce a curve -- and a median
+    of exactly zero is `None`, which is not a third direction but the absence of one, so `None`
+    against `+1` is as much a disagreement as `-1` against `+1`.
+
+    One trend per (candidate, image), because `per_scene.csv` repeats an image's trend on all
+    six of its severity rows. That repetition is itself an invariant rather than an assumption,
+    so a pair whose rows disagree is reported: taking the first of six contradictory values
+    would re-derive a direction from a table that does not hold one, and would do it silently.
+
+    Only candidates named by both files are compared, and how many that was is what the check
+    reports. Which candidates *should* exist is `check_candidate_key_unique`'s question, and
+    answering it here as well would publish one defect as two.
+    """
+    scene = bundle.per_scene
+    metrics = bundle.candidate_metrics
+    if not len(metrics):
+        return CheckResult(
+            "0 candidates", [_STARVED, "candidate_metrics.csv holds a header and no rows"]
+        )
+    if not len(scene):
+        return CheckResult(
+            "0 candidates", [_STARVED, "per_scene.csv holds a header and no rows"]
+        )
+
+    failures = []
+    signed, spoiled = _numeric(scene["signed_spearman"])
+    if spoiled.any():
+        values = sorted({str(value) for value in scene.loc[spoiled, "signed_spearman"]})[:3]
+        failures.append(
+            f"{int(spoiled.sum())} row(s) carry a non-numeric signed_spearman, e.g. {values}; "
+            "no direction can be re-derived from them"
+        )
+
+    frame = scene[[*CANDIDATE_KEY, "image_id"]].copy()
+    frame["signed"] = signed
+    grouped = frame.groupby([*CANDIDATE_KEY, "image_id"], sort=False)["signed"]
+    split = grouped.nunique(dropna=True)
+    split = split[split > 1]
+    if len(split):
+        failures.append(
+            f"{len(split)} (candidate, image) pair(s) publish more than one signed_spearman "
+            f"across their six severity rows, e.g. {[tuple(key) for key in split.index[:3]]}"
+        )
+
+    trends: dict[tuple, list] = {}
+    for key, value in grouped.first().items():
+        trends.setdefault(tuple(key[:len(CANDIDATE_KEY)]), []).append(value)
+    published = {_candidate_id(row): _cell(row["orientation"]) for _, row in metrics.iterrows()}
+    shared = sorted(set(published) & set(trends))
+    examined = f"{len(shared)} candidates re-oriented from {len(frame)} scene rows"
+    if not shared:
+        return CheckResult(
+            examined,
+            failures + [
+                _STARVED,
+                "no candidate is named by both candidate_metrics.csv and per_scene.csv",
+            ],
+        )
+
+    mismatched = []
+    for key in shared:
+        finite = [
+            float(value) for value in trends[key]
+            if _number(value) is not None and not math.isnan(float(value))
+        ]
+        derived = None
+        if finite:
+            median = float(np.median(finite))
+            derived = 1 if median > 0 else -1 if median < 0 else None
+        recorded = published[key]
+        number = _number(recorded)
+        if derived is None or number is None or float(number) != float(derived):
+            if not (derived is None and recorded is None):
+                mismatched.append((key, recorded, derived))
+    if mismatched:
+        failures.append(
+            f"{len(mismatched)} candidate(s) publish an orientation that is not the one their "
+            f"own per-image signed trends imply (published, re-derived), e.g. "
+            f"{mismatched[:3]}"
+        )
+    return CheckResult(examined, failures)
+
+
 def check_severity_statistics(bundle) -> CheckResult:
     """Every per-severity statistic re-derived from the raw scores matches the saved value.
 
@@ -1009,6 +1109,7 @@ CHECKS = (
     ("the deployable ranking passes every gate, in order", check_ranking_gates),
     ("macro AUROC is the mean of its five per-severity AUROCs", check_macro_auroc),
     ("absolute Spearman is |signed Spearman| on the same row", check_spearman_pairs),
+    ("orientation is the median of its own per-image trends", check_orientation),
     ("severity statistics recompute from the raw scores", check_severity_statistics),
     ("one recomputed y-range per signal in axis_limits", check_axis_limits),
 )

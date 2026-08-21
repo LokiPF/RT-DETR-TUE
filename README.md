@@ -428,9 +428,18 @@ would agree with any change to them and call the result correct. It checks the f
 `image_count x 3060` row budget and its decomposition, per-candidate image and severity
 coverage, candidate-key uniqueness, every deployability gate on the ranking and its sort order,
 each macro AUROC against the mean of its five per-severity AUROCs, each row's absolute Spearman
-against the absolute value of its own signed Spearman, all six per-severity statistics --
-including the *population* variance -- recomputed from the raw scores, and the recorded
-`axis_limits` against a recomputation of the y-range rule.
+against the absolute value of its own signed Spearman, each candidate's published orientation
+against the median of that candidate's own per-image signed trends, all six per-severity
+statistics -- including the *population* variance -- recomputed from the raw scores, and the
+recorded `axis_limits` against a recomputation of the y-range rule.
+
+Orientation is re-derived rather than read because it was the one input to the gate that the
+ranking cross-check could only restate. A sign error in `choose_orientation` writes the same
+wrong direction into `summary.json` and into `candidate_metrics.csv` and leaves every AUROC
+computed the other way, so nothing in the bundle contradicts anything else and every other check
+agrees with it. `per_scene.csv` carries `signed_spearman` on every row, so the median that
+decided the direction is taken again -- dropping non-finite trends rather than reading them as
+zero, and treating a median of exactly zero as no direction rather than as a third one.
 
 The ranking is checked against two other statements of the same fact, in every direction.
 Three sources name the candidates that passed every gate: the ranking in `summary.json`, the
