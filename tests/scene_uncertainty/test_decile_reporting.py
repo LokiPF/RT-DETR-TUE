@@ -10,7 +10,7 @@ The writer tests cluster around three more, all of them failures a reader cannot
 **figure that silently drops the bins it has no rows for** looks like a complete ten-bin
 measurement drawn on whatever subset happened to exist. A **sentence that outruns its
 numbers** -- "beat", "affected by padding", "80 percent likely" -- is the failure spec:111
-and spec:230 name outright, and prose is the one artifact no schema check reaches. And a
+and spec:231 name outright, and prose is the one artifact no schema check reaches. And a
 **paired rate published with one denominator** inverts the reading, which is why the report
 is checked for both.
 """
@@ -51,7 +51,7 @@ from src.scene_uncertainty.decile_reporting import (
     RANKABLE_MEMBERSHIP_MODES,
     ROW_KEYS,
     SIGNALS,
-    SPEC_172_QUESTIONS,
+    SPEC_173_QUESTIONS,
     rank_deployable_groups,
     summarize_decile_rows,
     summary_frame,
@@ -149,7 +149,7 @@ def rows_with_incomplete_group():
                 confidence_bin="decile_10_20",
             ))
             # The all-300-query benchmark lives under `unfiltered` and keeps the padded
-            # decoder placeholders (spec:71); it is what the candidates are measured against,
+            # decoder placeholders (spec:69); it is what the candidates are measured against,
             # never a candidate.
             rows.append(row(
                 image_id, severity, "persistence", PRIMARY_SCORE_SCOPE, severity,
@@ -468,7 +468,7 @@ def test_a_group_missing_a_severity_outright_is_not_full_coverage():
 
 def test_the_ranking_holds_exactly_the_groups_that_survive_every_gate():
     """Four decoys, all of them stronger than the two survivors: the frozen diagnostic
-    (spec:230), the under-covered group (spec:159), the unfiltered benchmark (spec:71) and the
+    (spec:231), the under-covered group (spec:159), the unfiltered benchmark (spec:69) and the
     secondary decoder scope (spec:123)."""
     summary = summarize_decile_rows(rows_with_incomplete_group(), {})
     assert ranked_keys(summary) == [
@@ -547,7 +547,7 @@ def test_a_group_whose_trend_is_unmeasurable_ranks_last_rather_than_raising():
     assert [entry["confidence_bin"] for entry in ranked] == ["decile_00_10", "decile_90_100"]
 
 
-# --- spec:230, dynamic and frozen ---------------------------------------------------------------
+# --- spec:231, dynamic and frozen ---------------------------------------------------------------
 
 
 def test_frozen_groups_are_never_ranked_deployable():
@@ -1675,7 +1675,7 @@ def test_the_easy_report_leads_with_the_four_questions_in_spec_order(tmp_path):
     assert report.startswith("# Confidence-Decile Blur Experiment")
     assert re.search(r"^## ", report, flags=re.MULTILINE).start() == report.index("## Short answer")
     short = section(report, "Short answer")
-    positions = [short.index(question) for question in SPEC_172_QUESTIONS]
+    positions = [short.index(question) for question in SPEC_173_QUESTIONS]
     assert positions == sorted(positions)
 
 
@@ -2175,7 +2175,7 @@ def test_a_selection_with_no_frozen_twin_falls_back_and_still_claims_nothing():
 
 
 def test_the_report_uses_the_paired_family_for_the_bin_movement_question(tmp_path):
-    """The real answer to spec:172's fourth question is now a paired one, in the lead."""
+    """The real answer to spec:173's fourth question is now a paired one, in the lead."""
     summary = grid_summary()
     winner = summary[RANKED_GROUPS_KEY][0]
     entry = next(
@@ -2222,7 +2222,7 @@ def test_every_dynamic_selection_is_paired_against_its_own_frozen_twin():
     """One entry per dynamic selection that has a frozen twin -- no more, no fewer.
 
     Kills a family that pairs only the ranked candidates (which would omit every bin the
-    ranking dropped, and spec:172's question is about the winner's bin whether or not it wins)
+    ranking dropped, and spec:173's question is about the winner's bin whether or not it wins)
     and one that pairs across confidence bins.
     """
     summary = grid_summary()
@@ -2280,7 +2280,7 @@ MEMBERSHIP_COMPARISON_KEYS = {
 }
 """Exactly what a `membership_comparisons` row publishes. Two separate medians, their
 difference, one paired triple with both denominators, and the movement the comparison is about
--- and nothing on the score's own scale that covers both memberships (spec:230)."""
+-- and nothing on the score's own scale that covers both memberships (spec:231)."""
 
 
 def test_the_membership_family_compares_and_never_combines(tmp_path):
@@ -3653,7 +3653,7 @@ def test_the_document_discloses_the_scopes_it_did_not_rank(tmp_path):
     assert "| `layer_0` | -0.4286 |" in body
     assert "| `layer_2` | +1.0000 |" in body
     assert ("At `layer_0` the winning selection's median has the opposite sign: the score "
-            "there moves against blur rather than with it") in body
+            "there moves against blur where at `layer_2` it moves with blur") in body
 
 
 def test_the_scope_section_says_the_primary_scope_was_not_chosen_here(tmp_path):
@@ -3760,3 +3760,250 @@ def test_the_clearest_control_case_ignores_rows_outside_the_published_slice():
     ]}
     clearest = reporting_module._clearest_control_case(summary)
     assert clearest is not None and "`decile_30_40`" in clearest
+
+
+# --- final wave: the second half of a sentence whose first half is derived --------------------
+
+
+def padding_summary(image_count: int, padded: int, identical: int, **rollup) -> dict:
+    """A summary carrying only what `_padding_section`'s opening sentence reads."""
+    return {
+        "padding": {
+            "image_count": image_count, "images_with_padding": padded,
+            "padded_images_with_identical_tails": identical,
+            "total_union_padded_count": rollup.get("total", 2 * padded),
+            "max_union_padded_count": rollup.get("largest", 2),
+        },
+        "padding_sensitivity": rollup.get("sensitivity", []),
+    }
+
+
+@pytest.mark.parametrize(("images", "padded", "identical", "expected", "forbidden"), [
+    # The repo's own default fixture: one image, padded at every severity with the same tail.
+    (1, 1, 1,
+     ["1 has the same detected tail at all six severities",
+      "the tail is the same at every severity on every padded image here",
+      "Every image in this table carries padding, so the control is a real comparison on all "
+      "1 of them"],
+     ["the tail wanders with blur rather than growing",
+      "there is nothing to remove", "is diluted by them"]),
+    # The pilot: 66 padded, none of them stable, 184 with nothing to remove.
+    (250, 66, 0,
+     ["0 have the same detected tail at all six severities",
+      "the tail differs across severities on all 66 of them, wandering with blur rather "
+      "than growing",
+      "On the remaining 184 images there is nothing to remove",
+      "any median taken over all 250 images is diluted by them"],
+     ["the tail is the same at every severity"]),
+    # Mixed, which neither of the two above can distinguish.
+    (100, 40, 15,
+     ["15 have the same detected tail at all six severities",
+      "the tail differs across severities on the other 25 of them"],
+     ["on all 40 of them", "the tail is the same at every severity on every padded image"]),
+    (10, 0, 0,
+     ["0 of 10 images carry a repeated decoder tail",
+      "On the remaining 10 images there is nothing to remove"],
+     ["the tail wanders", "the tail is the same at every severity"]),
+])
+def test_the_padding_opening_never_asserts_what_its_own_counts_deny(
+    images, padded, identical, expected, forbidden
+):
+    """Run the repo's own `write_decile_artifacts(tmp_path)` fixture through the generator and
+    the shipped sentence reads:
+
+        "Of those 1 padded images, 1 have the same detected tail at all six severities -- the
+        tail wanders with blur rather than growing … On the remaining 0 images there is nothing
+        to remove, so the control is a no-op there and any median taken over all 1 images is
+        diluted by them."
+
+    Two false clauses in one sentence, on data `analyze_deciles` produces today: the tail does
+    not wander on that fixture, and there are no remaining images to dilute anything.
+    """
+    lines = "\n".join(reporting_module._padding_section(
+        padding_summary(images, padded, identical)
+    ))
+    for sentence in expected:
+        assert sentence in lines
+    for sentence in forbidden:
+        assert sentence not in lines
+
+
+def sensitivity_row(name: str, aggregation: str, changed: int, scope: str = None) -> dict:
+    return {
+        "signal": "persistence", "membership_mode": DYNAMIC_MEMBERSHIP_MODE,
+        "confidence_bin": name, "aggregation": aggregation,
+        "score_scope": scope or PRIMARY_SCORE_SCOPE,
+        "filtered_median_spearman": 0.5, "unfiltered_median_spearman": 0.4,
+        "unfiltered_minus_filtered_spearman": -0.1,
+        "score_changed_image_count": changed,
+        "score_changed_image_decided_win_rate": 0.5,
+        "score_changed_image_decided_image_count": changed,
+    }
+
+
+@pytest.mark.parametrize(("rows", "expected", "forbidden"), [
+    # A selection pair whose count moves between summaries: the evidence exists, so it is cited
+    # with the numbers a reader can check it against.
+    ([sensitivity_row("decile_00_10", "mean", 64), sensitivity_row("decile_00_10", "q90", 66)],
+     ["`decile_00_10` under `dynamic` at scope `layer_2` reports 64 and 66 under different scene "
+      "summaries, which a set of images a mask reached could not do"],
+     []),
+    # The repo's default fixture: every published count is 1, so there is no such evidence and
+    # the clause that offers it must not be printed.
+    ([sensitivity_row("decile_00_10", "mean", 1), sensitivity_row("decile_00_10", "q90", 1)],
+     ["It counts the images whose scene score moved"],
+     ["which a set of images a mask reached could not do", "under different scene summaries"]),
+])
+def test_the_lower_bound_evidence_is_cited_only_when_the_table_carries_it(rows, expected,
+                                                                          forbidden):
+    """"the same selection pair reports different counts under different summaries, which a set
+    of images a mask reached could not do" is the *evidence* offered for the lower-bound claim,
+    and it was a literal. On the default fixture all published `score changed on` values are 1
+    and the sentence was emitted unchanged."""
+    lines = "\n".join(reporting_module._padding_section(
+        padding_summary(2, 1, 0, sensitivity=rows)
+    ))
+    for sentence in expected:
+        assert sentence in lines
+    for sentence in forbidden:
+        assert sentence not in lines
+
+
+def test_the_padding_prose_survives_the_repos_own_default_fixture(tmp_path):
+    """End to end through `analyze_deciles`, on the fixture two other test modules already run:
+    no clause in the padding section may contradict the counts printed beside it."""
+    from tests.scene_uncertainty.decile_test_utils import write_decile_artifacts
+    from src.scene_uncertainty.decile_analysis import analyze_deciles, load_decile_inputs
+
+    artifacts = write_decile_artifacts(tmp_path)
+    inputs = load_decile_inputs(artifacts["cache"], artifacts["results"])
+    rows, diagnostics = analyze_deciles(inputs)
+    output = tmp_path / "report"
+    write_decile_report(rows, output, inputs.run_metadata, diagnostics)
+    body = section((output / "easy-report.md").read_text(), "Effect of padded queries")
+    assert "the tail wanders with blur rather than growing" not in body
+    assert "is diluted by them" not in body
+    assert "there is nothing to remove" not in body
+    assert "which a set of images a mask reached could not do" not in body
+
+
+@pytest.mark.parametrize(("primary", "other", "expected"), [
+    (1.0, -0.5, "the score there moves against blur where at `layer_2` it moves with blur"),
+    # The regime this run actually shows at layers 0 and 1: a negative primary median. The
+    # clause used to assert "moves against blur" whichever way round the two signs ran.
+    (-0.6286, 0.3143, "the score there moves with blur where at `layer_2` it moves against blur"),
+])
+def test_the_opposite_sign_clause_reads_the_direction_off_both_signs(primary, other, expected):
+    """This is last round's fix reproducing the pattern it fixed: the branch is chosen from the
+    numbers and the clause explaining it was a literal that assumed a positive primary median.
+
+    `test_the_document_discloses_the_scopes_it_did_not_rank` pins `layer_2` at +1.0000, so the
+    fixture avoided the boundary the assertion exists to pin.
+    """
+    summary = grid_summary()
+    winner = summary[RANKED_GROUPS_KEY][0]
+    for group in summary["groups"]:
+        if (group["signal"] == "persistence"
+                and group["membership_mode"] == winner["membership_mode"]
+                and group["confidence_bin"] == winner["confidence_bin"]
+                and group["aggregation"] == winner["aggregation"]
+                and group["padding_mode"] == winner["padding_mode"]):
+            if group["score_scope"] == PRIMARY_SCORE_SCOPE:
+                group["median_spearman"] = primary
+            elif group["score_scope"] == "layer_0":
+                group["median_spearman"] = other
+    ranked = [{**winner, "median_spearman": primary}, *summary[RANKED_GROUPS_KEY][1:]]
+    body = "\n".join(reporting_module._scope_section(summary, ranked, ranked[0]))
+    assert "`layer_0` the winning selection's median has the opposite sign" in body
+    assert expected in body
+
+
+@pytest.mark.parametrize("primary", [1.0, -0.6286])
+def test_a_scope_with_no_sign_is_not_called_opposite(primary):
+    """A median of exactly 0.0000 has no sign to oppose, and `1 if value >= 0 else -1` files it
+    silently with the positives.
+
+    **Both signs of the primary median are needed here and the first version had only one.** With
+    the primary positive the mutant agrees with the correct code by accident -- zero and positive
+    are on the same side either way -- and it survived all 773 tests. It is the *negative*
+    primary that separates them: there the mutant calls a flat column "the opposite sign" and
+    prints a direction for a score that has none. That is the second fixture of mine in two waves
+    that avoided the boundary its own assertion existed to pin.
+    """
+    summary = grid_summary()
+    winner = summary[RANKED_GROUPS_KEY][0]
+    for group in summary["groups"]:
+        if (group["signal"] == "persistence"
+                and group["confidence_bin"] == winner["confidence_bin"]
+                and group["membership_mode"] == winner["membership_mode"]
+                and group["aggregation"] == winner["aggregation"]
+                and group["padding_mode"] == winner["padding_mode"]):
+            if group["score_scope"] == "layer_0":
+                group["median_spearman"] = 0.0
+            elif group["score_scope"] == PRIMARY_SCORE_SCOPE:
+                group["median_spearman"] = primary
+    ranked = [{**winner, "median_spearman": primary}, *summary[RANKED_GROUPS_KEY][1:]]
+    body = "\n".join(reporting_module._scope_section(summary, ranked, ranked[0]))
+    assert "| `layer_0` | +0.0000 |" in body
+    assert "opposite sign" not in body
+    assert "the same sign at every scope" in body
+
+
+@pytest.mark.parametrize(("win", "loss", "expected", "forbidden"), [
+    (130, 100, "out-trends", "does not out-trend"),
+    # The branch nothing asserted. `decile_90_100` runs 26 to 219 on the published run, so a
+    # candidate losing to its control is not exotic -- and "does not out-trend" is the
+    # strongest thing `_verdict`'s own docstring allows it to say about a loss.
+    (26, 219, "does not out-trend", None),
+    (107, 107, "splits evenly with", "out-trends"),
+    (None, 3, "cannot be compared image by image with", "out-trend"),
+])
+def test_the_verdict_verb_is_the_one_the_counts_support(win, loss, expected, forbidden):
+    """Flipping the losing branch to "out-trends" passed all 756 tests, and
+    `grep -rn "does not out-trend" tests/` returned nothing. The verb is the report's headline
+    claim and it had no assertion at all."""
+    verdict = reporting_module._verdict(win, loss)
+    assert verdict == expected
+    if forbidden is not None:
+        assert forbidden not in verdict
+
+
+def test_no_verdict_verb_claims_more_than_the_counts(tmp_path):
+    """And the vocabulary is closed: nothing here says "beat", "significant" or "better"."""
+    report = (written(tmp_path) / "easy-report.md").read_text().lower()
+    # Two words are deliberately NOT forbidden. "beat" is spec:173's own wording for the three
+    # questions and is quoted as such; and "does better than" is `_freezing_reading`'s
+    # `win > loss` branch, which prints the W/T/L counts in the same sentence -- a comparative
+    # the counts carry. What is forbidden is the vocabulary the module's own rule names: a
+    # verdict that outruns the counts it was derived from.
+    for word in (" beats ", " significantly ", "outperform"):
+        assert word not in report
+
+
+@pytest.mark.parametrize(("overlap", "finding", "phrase"), [
+    (2 / (2 * 10 - 1) - 1e-9, "reselected", "almost entirely reselected at every blur level"),
+    (2 / (2 * 10 - 1) + 1e-9, "survives", "a substantial part of its membership survives blur"),
+])
+def test_the_settled_overlap_ceiling_is_one_threshold_read_twice(overlap, finding, phrase):
+    """`2 * RANDOM_BIN_OVERLAP` was written out at two sites, and widening one of them to
+    `20 *` passed all 756 tests while producing adjacent self-contradicting clauses: "bin
+    movement **is part of what this selection is measuring** … so its queries are **almost
+    entirely reselected at every blur level**".
+
+    The two sentences read one constant now, and this pins them to the same side of it.
+    """
+    assert reporting_module.SETTLED_OVERLAP_CEILING == 2 * reporting_module.RANDOM_BIN_OVERLAP
+    winner = {"clean_overlap_is_definitional": False,
+              "mean_clean_overlap_from_severity_1": overlap}
+    assert reporting_module._membership_finding(winner, None) == finding
+
+    summary = grid_summary()
+    ranked_winner = {**summary[RANKED_GROUPS_KEY][0],
+                     "mean_clean_overlap_from_severity_1": overlap}
+    answer = reporting_module._movement_sentence(summary, ranked_winner)
+    assert phrase in answer
+    # The verdict and the sentence under it must land on the same side of the one threshold.
+    if finding == "survives":
+        assert "bin movement is part of what this selection is measuring" in answer
+    else:
+        assert "bin movement is not shown to explain it" in answer

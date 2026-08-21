@@ -29,7 +29,7 @@ Against the all-query benchmark, one row per scene summary the candidate was sco
 | `top20_mean` | `q90` | +0.6286 | +0.6000 | +0.0286 | 127/39/84 | 0.508 | 0.602 (211) |
 
 Across the ranked field the paired comparison against the benchmark comes out in the candidate's favour 5 times, against it 28 times, and exactly even 0 times, so it is not a procedure that favours whatever it is handed.
-The clearest counter-example is `decile_40_50` at `mean`, which matches or beats the benchmark's median (+0.6000 against +0.6000) and still comes out 103 wins to 112 losses with 35 ties -- 0.479 of the 215 images it decided. At counts that close the comparison is **undecided**: it has not established the candidate, and it has not established the benchmark either.
+The clearest counter-example is `decile_40_50` at `mean`, whose median is at or above the benchmark's (+0.6000 against +0.6000) and that still comes out 103 wins to 112 losses with 35 ties -- 0.479 of the 215 images it decided. At counts that close the comparison is **undecided**: it has not established the candidate, and it has not established the benchmark either.
 
 The deployable ranking, best first. Only candidates with the padding union removed, at `layer_2`, on a membership a single image can rebuild, and at full coverage, appear in it at all.
 
@@ -66,7 +66,7 @@ The winning selection is `decile_50_60` under `dynamic` at `top20_mean`; the ben
 | `layer_1` | -0.2857 | -0.6000 | 70 |
 | `layer_2` | +0.6286 | +0.6000 | 70 |
 
-At `layer_0` and `layer_1` the winning selection's median has the opposite sign: the score there moves against blur rather than with it. So what this report establishes is about `layer_2` and not about persistence in general, and a reader carrying any of it forward is carrying a statement about one decoder layer.
+At `layer_0` and `layer_1` the winning selection's median has the opposite sign: the score there moves against blur where at `layer_2` it moves with blur. So what this report establishes is about `layer_2` and not about persistence in general, and a reader carrying any of it forward is carrying a statement about one decoder layer.
 
 `layer_2` is a constant of this analysis and not a value chosen from these rows: the deployable ranking admits it alone, so all 33 ranked candidates are at it and no candidate could be promoted here by scoring better at another layer.
 
@@ -201,7 +201,7 @@ Two unrelated decile memberships would overlap at 0.0526, so a bin sitting close
 
 ## Effect of padded queries
 
-66 of 250 images carry a repeated decoder tail; together they contribute 6586 padded query slots, and the largest single image loses 257 of them. Of those 66 padded images, 0 have the same detected tail at all six severities -- the tail wanders with blur rather than growing, which is why one mask is taken per image and reused at every severity instead of one per severity. On the remaining 184 images there is nothing to remove, so the control is a no-op there by construction and any median taken over all 250 images is diluted by them.
+66 of 250 images carry a repeated decoder tail; together they contribute 6586 padded query slots, and the largest single image loses 257 of them. Of those 66 padded images, 0 have the same detected tail at all six severities -- the tail differs across severities on all 66 of them, wandering with blur rather than growing, which is why one mask is taken per image and reused at every severity instead of one per severity. On the remaining 184 images there is nothing to remove, so the control is a no-op there by construction and any median taken over all 250 images is diluted by them.
 
 Every scene summary the control was scored at. Persistence rows are at `layer_2`; the confidence control has no decoder-layer scope.
 
@@ -221,7 +221,7 @@ Every scene summary the control was scored at. Persistence rows are at `layer_2`
 | `decile_00_10` | `frozen` (diagnostic) | `persistence` | `q90` | +0.4857 | +0.5429 | +0.0571 | 65 | 0.696 (56) |
 | `decile_00_10` | `frozen` (diagnostic) | `persistence` | `top20_mean` | +0.5429 | +0.6000 | +0.0571 | 65 | 0.768 (56) |
 
-The `score changed on` column is a **lower bound** on the images the padding mask reached. It counts the images whose scene score moved, and a changed selection can still produce a bit-identical score because a scene summary is a many-to-one map -- the same selection pair reports different counts under different summaries, which a set of images a mask reached could not do. It must not be read as the images the padding changed.
+The `score changed on` column is a **lower bound** on the images the padding mask reached. It counts the images whose scene score moved, and a changed selection can still produce a bit-identical score because a scene summary is a many-to-one map -- `decile_00_10` under `dynamic` at scope `confidence` reports 64, 65 and 66 under different scene summaries, which a set of images a mask reached could not do. It must not be read as the images the padding changed.
 
 ## Metrics in plain language
 

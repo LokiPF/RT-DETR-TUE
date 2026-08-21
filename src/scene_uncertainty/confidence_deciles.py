@@ -107,8 +107,10 @@ def union_query_ids(id_tensors: Iterable[Tensor]) -> Tensor:
     This is the rule the design states -- "take the union of padded query IDs detected across
     its six severities" -- expressed over the IDs themselves, so the one caller that streams
     the feature cache and keeps only the detected masks can apply it without holding six
-    severities of fingerprints in memory. `union_padded_query_ids` is the same rule reached
-    from whole records.
+    severities of fingerprints in memory. That caller -- `decile_analysis` -- is the only
+    production one, and it calls this function. `union_padded_query_ids` is the same rule
+    reached from whole records, kept as the record-level entry point and exercised by the
+    tests; nothing in the pipeline reaches the union that way today.
 
     Unioning IDs is not the same as taking the longest mask, and the pilot is the reason to
     care. Padded tails happen to be nested suffixes there, so the two agree today; but the
@@ -152,10 +154,11 @@ def union_padded_query_ids(records: Iterable[dict]) -> Tensor:
     first fixes the mask once per image, so severity moves the features and never the
     population.
 
-    This is the entry point for a caller that still holds whole records. `union_query_ids`
-    carries the actual rule and is the one to call once the fingerprints have been streamed
-    away and only the detected masks remain; both go through the same implementation so the
-    union cannot drift between the two call sites.
+    This is the entry point for a caller that still holds whole records, and **no production
+    caller does**: `decile_analysis` streams the cache and keeps only the detected masks, so it
+    calls `union_query_ids` directly. This one stays because the record-level rule is the one
+    the design states and a later loader may need it, and because both go through the same
+    implementation so the union cannot drift between the two call sites.
 
     Severity is not read. This unions whatever records it is handed and does not check that
     they are the six expected blur levels, or that a severity appears once; establishing that
@@ -338,7 +341,8 @@ def memberships_by_severity(records_by_severity: dict[int, dict], padded: Tensor
     function takes it as a single argument precisely so it cannot be anything else. The tail
     wanders with severity rather than growing, so per-severity masking would change the valid
     population between severities and move bin membership for a reason that has nothing to do
-    with blur; `union_padded_query_ids` is what produces the argument this wants.
+    with blur; `union_query_ids` over the per-severity masks is what produces the argument this
+    wants, and `union_padded_query_ids` is the same rule for a caller that still holds records.
 
     `all_valid` is that same union-masked set, and it is the direct comparison with the
     existing all-query method -- every non-padded query, not all 300 and not a re-derivation

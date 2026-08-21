@@ -546,12 +546,20 @@ def _padding_diagnostics(records: dict[int, dict], padded: torch.Tensor) -> dict
 
     The third fact is the one that looks redundant and is not. Padding *wanders* with severity
     rather than growing: on the pilot, 66 of 250 tuning images carry padding and the detected
-    tail differs across severities in all 66, and the image that moves furthest runs 159, 165,
-    170, 63, 8, 79 padded queries across the six levels. So `union_padded_count` is routinely
-    larger than any single severity's count, `tail_identical_across_severities` is routinely
-    `False`, and the two together are what tell a later reader that the union in
-    `union_padded_query_ids` was a decision rather than a formality -- masking per severity
-    would have swung that image's valid population between 141 and 292.
+    tail differs across severities in all 66, and the image that moves furthest is 173044, which
+    runs 251, 255, 257, 239, 0, 0 padded queries across the six levels. Masking per severity
+    would have swung its valid population between 43 and 300 of the 300 queries; image 7888,
+    which runs 159, 165, 170, 63, 8, 79, would have swung between 130 and 292.
+
+    What this does *not* say, because the data does not: `union_padded_count` is **not** larger
+    than the longest single severity's count here. Measured over all 66 padded images it is
+    equal to it in every one, because `detect_padded_tail` returns `arange(start, query_count)`
+    and suffixes of one tensor nest. The union is a safeguard against a detector that emits a
+    mask which is not a suffix, and `confidence_deciles.union_query_ids` says so in those terms;
+    an earlier version of this paragraph sold it as an observed effect, which would have let a
+    reader check the claim and find it false. `tail_identical_across_severities` is routinely
+    `False`, and that -- not a larger union -- is what tells a later reader the union mask was a
+    decision rather than a formality.
 
     Keys are strings and values are plain lists, ints and bools, because this dictionary is
     written into `summary.json`; an int-keyed severity would come back from JSON as a string
@@ -589,8 +597,10 @@ def analyze_deciles(inputs: DecileInputs) -> tuple[list[dict], dict]:
     before the float16 cast and moves decile membership on 535 of the pilot's 1,500 records, so
     reaching for it here is a `KeyError` rather than a slightly different result.
 
-    Four kinds of selection per severity -- 23 in all, 349 rows -- covering the design's five
-    benchmark rows (spec 127-138):
+    Four kinds of selection per severity -- 24 in all, 349 rows -- covering the design's five
+    benchmark rows (spec 127-138). The row count is 23 x 15 + 1 x 4: twenty-three selections
+    scored at three scene summaries across four persistence scopes and one confidence scope,
+    and benchmark 1 at `q90` and persistence alone across the four scopes:
 
     * the ten `dynamic` bins and the ten `frozen` bins, filtered -- the experiment, and
       benchmark 4's matched confidence control comes free with each of them;

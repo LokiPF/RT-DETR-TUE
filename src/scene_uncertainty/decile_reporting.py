@@ -4,7 +4,7 @@ Every hazard this module is built against has the same shape: a summary that is 
 internally consistent, and describes a population nobody chose.
 
 * A **group key that stops separating two selections** pools them. Dynamic and frozen
-  membership answer different questions and must never combine into one score (spec:230); the
+  membership answer different questions and must never combine into one score (spec:231); the
   design's own numbers make the cost concrete -- the pilot's bottom decile scores -0.029
   dynamic and +0.486 frozen, so one group covering both publishes something around 0.2 that
   describes neither. `GROUP_KEYS` carries all six labels for that reason, and
@@ -45,7 +45,7 @@ come with them -- all of them invisible to a reader of the output:
 * A **sentence that outruns its numbers**, which is the one artifact no schema check reaches.
   Three specific sentences are forbidden outright and the generator cannot produce them: a
   score described as a probability of corruption (spec:111), a dynamic and a frozen result
-  combined into one recommendation (spec:230), and a paired rate quoted with one denominator.
+  combined into one recommendation (spec:231), and a paired rate quoted with one denominator.
   Every verdict word `_easy_report` emits is chosen from the win and loss *counts* and is
   followed by both denominators, and no verdict claims significance -- the candidate was
   selected best-of-N on the images it is reported over, so the counts describe this run and
@@ -174,7 +174,7 @@ UNFILTERED_PADDING_MODE = "unfiltered"
 
 MEMBERSHIP_COMPARISON_PAIR = ("dynamic", "frozen")
 """The two memberships `membership_comparisons` pairs, and why that is a comparison and not the
-combination spec:230 forbids.
+combination spec:231 forbids.
 
 Spec:230 says dynamic and frozen "must not be combined into one score". Nothing here combines
 them: no sum, no mean, no difference of raw scores, no single ranked figure covering both. What
@@ -230,6 +230,21 @@ the pilot, nine of the ten dynamic bins sit at 0.057-0.078 from severity 1 onwar
 above this line -- and only `decile_90_100` reaches 0.248. Without the line, nine numbers
 within 0.02 of each other read as "membership was reasonably stable"."""
 
+SETTLED_OVERLAP_CEILING = 2 * RANDOM_BIN_OVERLAP
+"""The overlap above which a bin's membership is read as partly surviving blur.
+
+Twice the unrelated-membership line, and one constant rather than two spellings of it. The
+factor was written out at both places that use it -- the verdict that opens spec:173's fourth
+answer and the sentence beneath it -- and widening one of them to `20 *` passed all 756 tests
+while printing two clauses that contradict each other in the same paragraph: "bin movement is
+part of what this selection is measuring ... so its queries are almost entirely reselected at
+every blur level". Derived here for the same reason `SELECTION_KEYS` is derived from
+`GROUP_KEYS`: two copies of a rule are two things to drift.
+
+Two is a judgement and not a derivation -- it is the point at which "barely above the line" stops
+being a fair description -- so it is stated once, where a reader can find it and argue with it.
+"""
+
 EASY_REPORT_TITLE = "# Confidence-Decile Blur Experiment"
 
 EASY_REPORT_FINAL_SENTENCE = "The held-out test images were not used."
@@ -241,7 +256,7 @@ enforced twice. It is last because it is the sentence that decides what any numb
 is worth: spec:224-225 makes the tuning run a *selection* and the held-out run the
 confirmation, and a reader who stops early should still meet it."""
 
-SPEC_172_QUESTIONS = (
+SPEC_173_QUESTIONS = (
     "Which confidence range worked best",
     "Did it beat confidence alone",
     "Did it beat the existing all-query benchmark",
@@ -511,7 +526,7 @@ def rank_deployable_groups(groups: list[dict]) -> list[dict]:
     * `filtered` only -- the unfiltered rows are the padding *sensitivity control* (spec:69),
       and the all-300-query row among them is the benchmark being measured against, not a
       candidate;
-    * `RANKABLE_MEMBERSHIP_MODES` only -- spec:230, frozen is diagnostic;
+    * `RANKABLE_MEMBERSHIP_MODES` only -- spec:231, frozen is diagnostic;
     * full coverage -- spec:159 makes it a requirement, so an under-covered group is absent
       from the list and not merely flagged inside it.
     """
@@ -537,7 +552,7 @@ comes from `decile_analysis.ALL_QUERY_BENCHMARK` rather than being re-spelled, b
 an encoding decision recorded there and a second copy here would be a second thing to drift.
 
 It is *not* a deployable candidate itself -- it is `unfiltered`, so it scores the padded
-decoder placeholders that spec:71 removes from the primary analysis. It is the bar, not a
+decoder placeholders that spec:69 removes from the primary analysis. It is the bar, not a
 runner.
 """
 
@@ -630,8 +645,11 @@ def _score_changed_images(left_arrays, right_arrays) -> set[int]:
     before the DataFrame conversion, and buying exactness back at that price is the wrong
     trade for a diagnostic. What this rules out is the far larger error it replaced: reading
     the set off the per-image *Spearman*, which takes only 36 distinct values over six
-    severities and reported 50 to 56 of 250 -- a tie-excluding sign test wearing the label
-    "the images the control could reach".
+    severities. Recomputed over the published `per_scene.csv` -- per-image Spearman under
+    `filtered` against `unfiltered`, counting the images whose value differs -- that rule
+    reports 38 to 61 of 250 across the thirty sensitivity rows, against 64 to 66 for the column
+    published here: a tie-excluding sign test wearing the label "the images the control could
+    reach".
 
     An image scored on one side and absent from the other counts as changed, and two `nan`
     scores count as unchanged -- both severities were unscored under either rule, which is the
@@ -731,7 +749,7 @@ def summarize_decile_rows(
       the images the mask reached and varies with the scene summary; `_score_changed_images`
       says why, and why buying the exact set back is the wrong trade.
     * `membership_comparisons` -- each dynamic selection against its own frozen twin, paired
-      per image (spec:172's fourth question). Freezing the membership at severity zero is the
+      per image (spec:173's fourth question). Freezing the membership at severity zero is the
       only manipulation in the design that removes query movement and leaves everything else,
       so the paired outcome between the two is what says whether the movement explains a
       result. Two medians one grid step apart cannot say it: this plan has a candidate whose
@@ -951,7 +969,7 @@ def summarize_decile_rows(
     # bins were rebuilt at this severity or reused from severity zero, which is what makes the
     # comparison a measurement of query movement and nothing else. See
     # `MEMBERSHIP_COMPARISON_PAIR` for why this is a comparison and not the combination
-    # spec:230 forbids.
+    # spec:231 forbids.
     dynamic_mode, frozen_mode = MEMBERSHIP_COMPARISON_PAIR
     membership_comparisons = []
     for key, group in by_key.items():
@@ -1111,16 +1129,6 @@ def _decile_group(summary: dict, membership: str, confidence_bin: str,
     )
 
 
-def _benchmark_group(summary: dict) -> dict | None:
-    """The published all-300-query row, matched on the producer's own label tuple (spec:137)."""
-    signal, membership, confidence_bin, scope, padding = BENCHMARK_SELECTION
-    return _lookup(
-        summary["groups"], signal=signal, membership_mode=membership,
-        confidence_bin=confidence_bin, score_scope=scope, padding_mode=padding,
-        aggregation=BENCHMARK_AGGREGATION,
-    )
-
-
 def _group_key(group: dict) -> dict:
     return {key: group[key] for key in GROUP_KEYS if key != "signal"}
 
@@ -1201,7 +1209,7 @@ def _outcome(entry: dict | None, prefix: str, total_key: str = "paired_image_cou
 
 
 def _membership_cell(membership: str) -> str:
-    """A membership label that carries its own status (spec:230).
+    """A membership label that carries its own status (spec:231).
 
     `frozen` prints as a diagnostic wherever it appears in a table, and not only in the table
     named after it. On the pilot the frozen bottom bin publishes the single most impressive
@@ -1718,7 +1726,7 @@ def _freezing_reading(dynamic_median, frozen_median, paired: dict | None) -> str
 
     Freezing the membership at severity zero removes the query movement and leaves the
     fingerprint motion, so the comparison between a bin and its frozen twin is the design's only
-    direct handle on spec:172's fourth question. It used to be answered here by subtracting two
+    direct handle on spec:173's fourth question. It used to be answered here by subtracting two
     marginal medians, and that is the one comparison this plan has already proved blind at this
     resolution: the leading candidate's median difference against the all-query benchmark is
     exactly 0.000 while the same pair runs 122 images to 92. A gap of one `1/35` step and a gap
@@ -1812,7 +1820,7 @@ def _membership_finding(winner: dict, paired: dict | None) -> str:
     overlap = winner.get("mean_clean_overlap_from_severity_1")
     if overlap is None:
         return "unmeasured"
-    if float(overlap) > 2 * RANDOM_BIN_OVERLAP:
+    if float(overlap) > SETTLED_OVERLAP_CEILING:
         return "survives"
     decided = None if paired is None else paired.get("dynamic_image_decided_win_rate")
     if decided is not None and float(decided) < 0.5:
@@ -1886,7 +1894,7 @@ def _movement_sentence(summary: dict, winner: dict | None) -> str:
         settled = (
             "so its queries are almost entirely reselected at every blur level: whatever the "
             "trend is, it belongs to the confidence range and not to any particular queries"
-            if float(overlap) <= 2 * RANDOM_BIN_OVERLAP else
+            if float(overlap) <= SETTLED_OVERLAP_CEILING else
             "so a substantial part of its membership survives blur, and the trend is partly a "
             "property of the queries themselves"
         )
@@ -1957,7 +1965,7 @@ def _short_answer(summary: dict, ranked: list[dict], winner: dict | None) -> lis
         _movement_sentence(summary, winner),
     )
     lines = ["## Short answer", ""]
-    for question, answer in zip(SPEC_172_QUESTIONS, answers):
+    for question, answer in zip(SPEC_173_QUESTIONS, answers):
         lines.extend([f"**{question}?** {answer}", ""])
     return lines
 
@@ -2032,8 +2040,12 @@ def _benchmark_counterexample(summary: dict, ranked: list[dict]) -> list[str]:
     A paired win rate that favoured every candidate would be a property of the comparison
     rather than of the candidates, and the leading candidate's numbers would be worth nothing.
     So the counts are published for the whole ranked field, and the strongest counter-example
-    is named -- a candidate that matches or beats the benchmark on the primary metric and
-    still does not take the per-image comparison.
+    is named -- a candidate whose median is at or above the benchmark's and that still does not
+    take the per-image comparison.
+
+    The verb matters. This module's own rule is that nothing here "beats" anything, and this
+    sentence said "matches or beats the benchmark's median" until a test went looking for the
+    word: a stated vocabulary with one sentence outside it.
 
     That counter-example is reported as *undecided*, never as a defeat. On the pilot it is
     `decile_40_50` at `mean`: 103 wins against 112 losses with 35 ties, which separates
@@ -2074,10 +2086,11 @@ def _benchmark_counterexample(summary: dict, ranked: list[dict]) -> list[str]:
         )
         lines.append(
             f"The clearest counter-example is `{group['confidence_bin']}` at "
-            f"`{group['aggregation']}`, which matches or beats the benchmark's median "
+            f"`{group['aggregation']}`, whose median is at or above the benchmark's "
             f"({_signed(entry['candidate_median_spearman'])} against "
-            f"{_signed(entry['benchmark_median_spearman'])}) and still comes out {win} wins to "
-            f"{loss} losses with {tie} ties -- {tail}. At counts that close the comparison is "
+            f"{_signed(entry['benchmark_median_spearman'])}) and that still comes out {win} "
+            f"wins to {loss} losses with {tie} ties -- {tail}. At counts that close the "
+            "comparison is "
             "**undecided**: it has not established the candidate, and it has not established "
             "the benchmark either."
         )
@@ -2274,6 +2287,18 @@ def _clearest_control_case(summary: dict) -> str | None:
     )
 
 
+def _sign_of(value) -> int:
+    """`1`, `-1` or `0` -- with zero its own answer rather than filed with the positives."""
+    if value is None:
+        return 0
+    value = float(value)
+    return 1 if value > 0 else -1 if value < 0 else 0
+
+
+def _trend_direction(sign: int) -> str:
+    """How a median of that sign moves against blur, in the words the report uses."""
+    return "with blur" if sign > 0 else "against blur" if sign < 0 else "flat"
+
 def _scope_section(summary: dict, ranked: list[dict], winner: dict | None) -> list[str]:
     """Which decoder layer every headline number is about, and which ones it is not.
 
@@ -2347,18 +2372,25 @@ def _scope_section(summary: dict, ranked: list[dict], winner: dict | None) -> li
     lines.append("")
     primary = winner_medians.get(PRIMARY_SCORE_SCOPE)
     primary_median = None if primary is None else primary["median_spearman"]
+    primary_sign = _sign_of(primary_median)
+    # Both directions are read off both signs. The clause used to say "moves against blur"
+    # whichever way round the two ran, which is backwards the moment the primary median is
+    # negative -- and layers 0 and 1 on this run are exactly that regime. A median of exactly
+    # zero has no sign to oppose, and a bare `< 0` test files it silently with the positives.
     opposed = [
         scope for scope in others
-        if winner_medians[scope] is not None and primary_median is not None
-        and (float(winner_medians[scope]["median_spearman"]) < 0) != (float(primary_median) < 0)
+        if winner_medians[scope] is not None and primary_sign
+        and _sign_of(winner_medians[scope]["median_spearman"])
+        and _sign_of(winner_medians[scope]["median_spearman"]) != primary_sign
     ]
     if opposed:
         lines.append(
             f"At {_and_list([f'`{scope}`' for scope in opposed])} the winning selection's "
-            "median has the opposite sign: the score there moves against blur rather than with "
-            f"it. So what this report establishes is about `{PRIMARY_SCORE_SCOPE}` and not "
-            "about persistence in general, and a reader carrying any of it forward is carrying "
-            "a statement about one decoder layer."
+            "median has the opposite sign: the score there moves "
+            f"{_trend_direction(-primary_sign)} where at `{PRIMARY_SCORE_SCOPE}` it moves "
+            f"{_trend_direction(primary_sign)}. So what this report establishes is about "
+            f"`{PRIMARY_SCORE_SCOPE}` and not about persistence in general, and a reader "
+            "carrying any of it forward is carrying a statement about one decoder layer."
         )
     else:
         lines.append(
@@ -3054,23 +3086,89 @@ def _ranked_field_paragraph(ranked: list[dict], winner: dict) -> list[str]:
     return [paragraph, ""]
 
 
+def _lower_bound_evidence(entries: list[dict]) -> str | None:
+    """One selection pair whose `score changed on` count moves between scene summaries, or none.
+
+    This is the *evidence* the lower-bound claim rests on: a set of images a mask reached is one
+    set, so a count that changes with the summary cannot be that set. It was a literal, and on
+    the repo's own default fixture every published count is 1 -- there is no such pair, and the
+    sentence claimed one anyway. Named with its numbers so a reader can find the two rows.
+    """
+    by_selection: dict[tuple, dict] = {}
+    for entry in entries:
+        key = (entry["signal"], entry["membership_mode"], entry["confidence_bin"],
+               entry["score_scope"])
+        by_selection.setdefault(key, {})[entry["aggregation"]] = (
+            entry["score_changed_image_count"]
+        )
+    for key in sorted(by_selection):
+        counts = sorted({
+            int(value) for value in by_selection[key].values() if value is not None
+        })
+        if len(counts) > 1:
+            _, membership, name, scope = key
+            return (
+                f"`{name}` under `{membership}` at scope `{scope}` reports "
+                f"{_and_list([str(count) for count in counts])} under different scene "
+                "summaries, which a set of images a mask reached could not do"
+            )
+    return None
+
+
 def _padding_section(summary: dict) -> list[str]:
     padding = summary.get("padding") or {}
     lines = ["## Effect of padded queries", ""]
     padded_images = padding.get("images_with_padding", 0)
     image_count = padding.get("image_count", 0)
-    lines.append(
+    identical = padding.get("padded_images_with_identical_tails", 0)
+    differing = max(padded_images - identical, 0)
+    remaining = max(image_count - padded_images, 0)
+    opening = (
         f"{padded_images} of {image_count} images carry a repeated decoder tail; together they "
         f"contribute {padding.get('total_union_padded_count', 0)} padded query slots, and the "
-        f"largest single image loses {padding.get('max_union_padded_count', 0)} of them. Of "
-        f"those {padded_images} padded images, "
-        f"{padding.get('padded_images_with_identical_tails', 0)} have the same detected tail "
-        "at all six severities -- the tail wanders with blur rather than growing, which is why "
-        "one mask is taken per image and reused at every severity instead of one per severity. "
-        f"On the remaining {max(image_count - padded_images, 0)} images there is nothing to "
-        "remove, so the control is a no-op there by construction and any median taken over all "
-        f"{image_count} images is diluted by them."
+        f"largest single image loses {padding.get('max_union_padded_count', 0)} of them."
     )
+    if padded_images:
+        # Whether the tail wanders is a *measurement*, and it was asserted. On the repo's own
+        # default fixture -- the same two queries padded at every severity -- the shipped
+        # sentence read "1 have the same detected tail at all six severities -- the tail
+        # wanders with blur rather than growing", which its own count denies.
+        opening += (
+            f" Of {'the' if padded_images == 1 else 'those'} {padded_images} padded "
+            f"image{'' if padded_images == 1 else 's'}, {identical} "
+            f"{'has' if identical == 1 else 'have'} the same detected tail at all six "
+            "severities"
+        )
+        if differing == 0:
+            opening += (
+                " -- the tail is the same at every severity on every padded image here. One "
+                "mask is still taken per image and reused at every severity: the union is the "
+                "rule the design states, not a description of this table."
+            )
+        elif identical == 0:
+            opening += (
+                f" -- the tail differs across severities on all {differing} of them, wandering "
+                "with blur rather than growing, which is why one mask is taken per image and "
+                "reused at every severity instead of one per severity."
+            )
+        else:
+            opening += (
+                f" -- the tail differs across severities on the other {differing} of them, "
+                "which is why one mask is taken per image and reused at every severity "
+                "instead of one per severity."
+            )
+    if remaining:
+        opening += (
+            f" On the remaining {remaining} image{'' if remaining == 1 else 's'} there is "
+            "nothing to remove, so the control is a no-op there by construction and any median "
+            f"taken over all {image_count} images is diluted by them."
+        )
+    elif image_count:
+        opening += (
+            f" Every image in this table carries padding, so the control is a real comparison "
+            f"on all {image_count} of them."
+        )
+    lines.append(opening)
     lines.append("")
     entries = sorted(
         (
@@ -3106,13 +3204,13 @@ def _padding_section(summary: dict) -> list[str]:
         lines.append("")
     else:
         lines.extend(["No unfiltered control was scored in this table.", ""])
+    evidence = _lower_bound_evidence(entries)
     lines.append(
         "The `score changed on` column is a **lower bound** on the images the padding mask "
         "reached. It counts the images whose scene score moved, and a changed selection can "
-        "still produce a bit-identical score because a scene summary is a many-to-one map -- "
-        "the same selection pair reports different counts under different summaries, which a "
-        "set of images a mask reached could not do. It must not be read as the images the "
-        "padding changed."
+        "still produce a bit-identical score because a scene summary is a many-to-one map"
+        + (f" -- {evidence}." if evidence else ".")
+        + " It must not be read as the images the padding changed."
     )
     lines.append("")
     return lines
@@ -3219,16 +3317,16 @@ def _easy_report(summary: dict) -> str:
     produce the same file and a reader can check any claim against `summary.json`. Nothing is
     quoted from a previous run.
 
-    The opening section is fixed by spec:172 -- which confidence range worked best, whether it
+    The opening section is fixed by spec:173 -- which confidence range worked best, whether it
     beat confidence alone, whether it beat the existing all-query benchmark, and whether
-    padding or bin movement explains the result, in that order. `SPEC_172_QUESTIONS` is the
+    padding or bin movement explains the result, in that order. `SPEC_173_QUESTIONS` is the
     order, so it is asserted rather than typed.
 
     Three sentences this generator cannot produce, each because the design forbids it:
 
     * a score described as a probability of corruption (spec:111) -- the confidence control is
       `1 - confidence`, which reverses direction and calibrates nothing;
-    * a dynamic and a frozen result merged into one recommendation (spec:230) -- frozen rows
+    * a dynamic and a frozen result merged into one recommendation (spec:231) -- frozen rows
       are absent from the ranking and are labelled diagnostic wherever they appear;
     * a paired rate quoted with one denominator -- `_outcome` publishes both, because on the
       pilot the two framings put the same candidate on opposite sides of 0.5.

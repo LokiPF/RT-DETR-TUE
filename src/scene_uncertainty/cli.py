@@ -261,3 +261,7 @@ def main(argv=None) -> int:
         print(f"scene_uncertainty {args.command}: error: {error}", file=sys.stderr)
         return 2
     return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - exercised through tools/scene_uncertainty.py
+    raise SystemExit(main())
