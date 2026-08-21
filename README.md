@@ -171,8 +171,8 @@ If you use `RTDETR` or `RTDETRv2` in your work, please use the following BibTeX 
 
 Class-independent persistence scene uncertainty: a scene is scored by how far its decoder
 queries sit from a bank of queries drawn from clean reference images, and the study asks
-whether that score rises as the scene is blurred. One entry point, six subcommands, run in
-order.
+whether that score rises as the scene is blurred. One entry point, seven subcommands, run in
+order -- six that build the artifacts, and one cache-only analysis over what they wrote.
 
 **A raw kNN score is not a corruption probability.** It is a mean distance to the *k*
 nearest bank vectors, divided by the inter-quartile spread of the same distance measured on
@@ -247,6 +247,93 @@ $UE_PY tools/scene_uncertainty.py report \
   --results $OUT/results/final_raw_k5.csv \
   --output $OUT/reports/final_raw_k5
 ```
+
+### Confidence deciles over the artifacts that already exist
+
+Which queries carry a scene's trend? `analyze-confidence-deciles` splits each image's queries
+into ten bins by the detector's own confidence and scores every bin twice -- once with the
+persistence distance and once with `1 - confidence`, over the same queries and through the
+same scene summary -- so the two signals are compared as trends and never as magnitudes. The
+bins are built both `dynamic` (re-ranked at every severity) and `frozen` (severity zero's
+membership reused), which separates queries changing bin from fingerprints moving.
+
+```bash
+$UE_PY tools/scene_uncertainty.py analyze-confidence-deciles \
+  --cache $OUT/blur_cache \
+  --results $OUT/results/raw_k5.csv \
+  --output $OUT/reports/confidence_deciles_raw_k5
+```
+
+**Nothing is recomputed.** `--cache` supplies the cached logits, boxes and per-layer
+persistence fingerprints; `--results` supplies the saved per-query distances, the fitted layer
+score scales and the run provenance, read from the `.query_distances.pt`, `.normalizers.pt`
+and `.manifest.json` siblings named beside that CSV. There is no detector forward pass, no
+bank build, no kNN search, no training and no re-fitting of a normalizer or any other
+calibration: every score is a summary of the saved per-query distances, or of `1 - confidence`,
+over one selection. Only the `combined` scope uses the layer scales the result artifact already
+carries; a per-layer scope such as `layer_2` -- the primary one, and the one the ranking and
+the figures use -- is the summarised distance itself, divided by nothing. So the command costs
+minutes on a CPU rather than GPU hours, and it can be rerun against a different result set over
+the same cache. (Confidence itself is recomputed from the cached logits as each query's largest
+sigmoid class score, and is deliberately *not* the cache's own `confidence` field, which was
+reduced before the float16 cast and is wrong by ~1e-5 -- invisible to a threshold, decisive for
+a rank.)
+
+**Tuning results only.** There is deliberately no `--partition` flag. A result manifest whose
+`source_partition` is `test` or `all` is refused, as is any individual saved-distance row
+labelled that way, so the held-out half cannot be spent from this command line. The blur cache
+holds both partitions by design, so *its* test records are skipped rather than refused -- the
+gate is on the result artifact, not on the cache. The join is proved before anything is scored:
+both manifests by content address, then key, layer set and query count for every record. An
+image missing any of the six severities, or left with fewer than ten non-padded queries, stops
+the run rather than being scored in part.
+
+`--output` is refused when it already holds a finished report, which means a directory
+containing `summary.json`; a finished report is never overwritten. A directory left by a run
+that died part-way *is* written into, because there is nothing in it worth preserving: the
+seven artifacts below are published together or not at all, and a run that fails leaves at most
+an empty directory, never a readable report of six files. (The seven publications are seven
+renames rather than one transaction, so a process *killed* inside that loop can still leave a
+prefix; what is ruled out is a failure of the analysis itself.)
+
+* **`per_scene.csv`** -- every scored row, in twelve columns: `image_id`, `severity`,
+  `source_partition`, `membership_mode`, `confidence_bin`, `padding_mode`, `selected_count`,
+  `clean_overlap`, `signal`, `score_scope`, `aggregation`, `score`. The per-row
+  `selected_query_ids` lists are held in memory and deliberately kept out of the file.
+* **`summary.json`** -- the grouped metrics; each persistence group beside its matched
+  confidence control; each dynamic bin against its frozen twin; the lowest bin with and without
+  the padding filter; every candidate against the published all-query benchmark; and a ranking
+  restricted to the deployable ones -- persistence only, primary scope, padding-filtered,
+  non-frozen membership, full severity coverage. Paired image counts sit next to every rate,
+  and wins, ties and losses are reported separately, because a per-image Spearman over six
+  severities takes only 36 distinct values and exact ties are common.
+* **`easy-report.md`** -- the same summary in prose, generated from that summary and nothing
+  else, so every sentence in it can be checked against `summary.json`.
+
+Each of the four figures is a slice of that table, not a view of all of it, and each prints its
+own slice in its title. All four fix the scene summary at `q90`, the only summary the published
+all-query benchmark exists at, and every persistence panel or bar is at `layer_2`:
+
+* **`blur_curves.png`** -- median clean-relative score against severity, per decile bin, with
+  each image's own severity-0 score subtracted so the curve shows the rise rather than the
+  level. Persistence and confidence get separate panels because the two share no unit. Dynamic
+  membership and filtered queries only.
+* **`confidence_decile_heatmap.png`** -- median Spearman by confidence bin and signal over that
+  same dynamic, filtered slice; always all ten bins, with an empty one drawn as `n/a` rather
+  than omitted.
+* **`dynamic_vs_frozen.png`** -- two panels. The upper one puts each bin's dynamic result
+  beside its frozen twin, side by side and never averaged into one number. The lower one is why
+  they differ: how much of each bin's membership survives blur, as the mean Jaccard against
+  severity 0 over severities 1-5, against a line for what two unrelated memberships would
+  score. Dynamic bins only there -- a frozen bin is 1.0 by construction, which is arithmetic
+  and not stability.
+* **`padding_sensitivity.png`** -- the lowest bin only, repeated with the padded-query union
+  removed and kept, under both memberships and for persistence and its confidence control.
+  Each pair is annotated with a lower bound on the images the mask actually reached.
+
+As with `report`, nothing here is fitted against a corruption label. Every statistic published
+about a score is invariant under a positive affine rescale of it, which is the only sense in
+which a persistence distance and `1 - confidence` can be compared at all.
 
 ### Reading the artifacts
 
