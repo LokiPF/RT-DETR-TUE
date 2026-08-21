@@ -1,14 +1,15 @@
 """The one entry point for the class-independent persistence scene-uncertainty study.
 
-Seven subcommands, run in this order:
+Eight subcommands, run in this order:
 
-    select                     -> reference.json + evaluation.json (which COCO images are used)
-    extract-reference          -> a feature cache over the clean reference images
-    extract-blur               -> a feature cache over the evaluation images, all six blur levels
-    build-bank                 -> a class-independent query bank per decoder layer
-    evaluate-knn               -> scored rows + per-query distances + a result manifest
-    report                     -> summary.json and the trend plots
-    analyze-confidence-deciles -> the confidence-decile experiment, re-reading the two artifacts
+    select                         -> reference.json + evaluation.json (which COCO images are used)
+    extract-reference              -> a feature cache over the clean reference images
+    extract-blur                   -> a feature cache over the evaluation images, six blur levels
+    build-bank                     -> a class-independent query bank per decoder layer
+    evaluate-knn                   -> scored rows + per-query distances + a result manifest
+    report                         -> summary.json and the trend plots
+    analyze-confidence-deciles     -> the confidence-decile experiment over the two artifacts
+    analyze-corruption-sensitivity -> that experiment re-cut into quintiles too, and compared
 
 Argument validation lives here rather than in `pipeline`, so a typo in a policy name,
 an unreadable checkpoint, or a negative batch size fails at parse time instead of an
@@ -19,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 
 _SELECT_EPILOG = """\
@@ -94,6 +96,35 @@ spent from the command line.
 containing `summary.json`. Nothing is overwritten. A directory left behind by a run that died
 part-way is written into, because the seven artifacts are published together or not at all and
 there is nothing in such a directory to preserve.
+"""
+
+_CORRUPTION_EPILOG = """\
+The confidence-decile experiment re-cut, and nothing measured that was not measured already.
+Each image's valid queries are split into ten confidence bins and into five, from one confidence
+ranking, and both cuts are scored by the same code over the same saved artifacts -- so the two
+results differ in bin width and in nothing else, which is what makes it possible to say whether
+the published ten-way cut was load-bearing or incidental.
+
+Like `analyze-confidence-deciles`, and through the same loader: this command runs no detector
+forward pass, builds no bank and searches no bank. `--cache` supplies the cached logits, boxes
+and per-layer persistence fingerprints; `--results` supplies the saved per-query distances, the
+layer score scales and the run provenance, taken from the `.query_distances.pt`,
+`.normalizers.pt` and `.manifest.json` siblings named beside it.
+
+Persistence is the candidate and the detector's own confidence is the matched control, scored
+over the same queries in the same call so that the two are trends over one population. Each
+candidate is published as its curve across the six blur severities and as the AUROC separating
+clean scenes from each corrupted severity -- a ranking statistic, not a calibrated corruption
+probability, and nothing here is fitted against a corruption label.
+
+Tuning results only. There is deliberately no `--partition` switch, and a result manifest whose
+`source_partition` is `test` or `all` is refused, so the held-out test images cannot be spent
+from the command line.
+
+`--output` must not already exist. The eight artifacts are written into a staging directory
+beside it and renamed into place in one step, so a run that fails leaves no `--output` at all --
+not a partial bundle and not an empty directory -- and a directory that does exist is a finished
+report, which is never overwritten.
 """
 
 
@@ -240,6 +271,18 @@ def build_parser() -> argparse.ArgumentParser:
     deciles.add_argument("--cache", required=True, help="six-severity evaluation feature cache")
     deciles.add_argument("--results", required=True, help="tuning CSV written by evaluate-knn")
     deciles.add_argument("--output", required=True, help="new confidence-decile report directory")
+
+    corruption = add(
+        "analyze-corruption-sensitivity",
+        "Compare decile/quintile persistence and confidence corruption signals.",
+        _CORRUPTION_EPILOG,
+    )
+    corruption.add_argument("--cache", required=True, type=Path,
+                            help="six-severity evaluation feature cache")
+    corruption.add_argument("--results", required=True, type=Path,
+                            help="tuning CSV written by evaluate-knn")
+    corruption.add_argument("--output", required=True, type=Path,
+                            help="corruption-sensitivity report directory; must not exist")
     return parser
 
 

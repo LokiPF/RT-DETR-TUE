@@ -171,8 +171,8 @@ If you use `RTDETR` or `RTDETRv2` in your work, please use the following BibTeX 
 
 Class-independent persistence scene uncertainty: a scene is scored by how far its decoder
 queries sit from a bank of queries drawn from clean reference images, and the study asks
-whether that score rises as the scene is blurred. One entry point, seven subcommands, run in
-order -- six that build the artifacts, and one cache-only analysis over what they wrote.
+whether that score rises as the scene is blurred. One entry point, eight subcommands, run in
+order -- six that build the artifacts, and two cache-only analyses over what they wrote.
 
 **A raw kNN score is not a corruption probability.** It is a mean distance to the *k*
 nearest bank vectors, divided by the inter-quartile spread of the same distance measured on
@@ -334,6 +334,69 @@ all-query benchmark exists at, and every persistence panel or bar is at `layer_2
 As with `report`, nothing here is fitted against a corruption label. Every statistic published
 about a score is invariant under a positive affine rescale of it, which is the only sense in
 which a persistence distance and `1 - confidence` can be compared at all.
+
+### The same experiment at two bucket widths
+
+Was the ten-way cut load-bearing, or incidental? `analyze-corruption-sensitivity` runs the
+experiment above again at two resolutions -- ten confidence bins per image and five -- cut from
+one confidence ranking of one union-filtered valid query set and scored by the same code over
+the same saved artifacts, so the two results differ in bin width and in nothing else. If both
+schemes rank the signals the same way the resolution was incidental and the coarser bucket is
+the safer one to deploy; if they do not, the decile result depended on a bin width nobody chose
+for a reason.
+
+```bash
+$UE_PY tools/scene_uncertainty.py analyze-corruption-sensitivity \
+  --cache $OUT/blur_cache \
+  --results $OUT/results/raw_k5.csv \
+  --output $OUT/reports/corruption_sensitivity_raw_k5
+```
+
+**Nothing is recomputed here either.** It reads the same two artifacts as
+`analyze-confidence-deciles` and through the same loader, under the same rules: the saved tuning
+per-query distances from the `.query_distances.pt` sibling of `--results`, the fitted layer score
+scales from `.normalizers.pt` and the provenance from `.manifest.json`, joined to the cached
+logits, boxes and per-layer persistence fingerprints in `--cache`. No detector forward pass, no
+bank build, no kNN search, no re-fitted normalizer -- every score is a summary of the distances
+`evaluate-knn` searched once, and both bucket schemes read that one set, which is what makes
+them comparable at all. Tuning results only: there is deliberately no `--partition` flag, and a
+result manifest built for `test` or `all` is refused, so the held-out half stays unspendable
+from this command line.
+
+**Confidence is the matched control, not a second contestant.** Persistence and `1 - confidence`
+are summarised over the same selected queries, in the same call, for every bucket of both
+schemes -- so the two are compared as trends over one population and never as magnitudes. The
+control is published in full and every persistence candidate is reported beside it; what it
+stays out of is the deployable ranking, which is persistence only.
+
+**What is published is a ranking statistic, never a calibrated probability.** Each candidate
+carries its curve across the six severities and an AUROC separating the clean scenes from each
+of severities 1-5, published per severity (`auroc_by_severity`) and as their equally weighted
+mean (`macro_auroc`) -- how well the score *orders* clean scenes against blurred ones, nothing
+more. As everywhere else in this pipeline nothing is fitted against a corruption label, so no
+number here is the probability that a scene is corrupted. Those two statistics are rank-based
+and a positive affine rescale of the score cannot move either; the per-severity means, medians
+and quartiles published beside them describe the raw distances and are not invariant, which is
+why they are reported per candidate and never compared across signals.
+
+Four of the eight published files are figures, and they draw the actual distances rather than a
+derived statistic: `persistence_actual_distance_deciles.png` and
+`persistence_actual_distance_quintiles.png` put the raw scene score against severity, one panel
+per confidence bucket -- ten panels for the decile cut, five for the quintile cut -- as a median
+with an interquartile band, and `confidence_actual_distance_deciles.png` and
+`confidence_actual_distance_quintiles.png` do the same for the control. The values are
+un-oriented, so a candidate whose distance *falls* as blur rises is drawn falling. All panels of
+one signal share a single y-range and the two signals never share one, because a persistence
+distance and `1 - confidence` have no common unit. Everything except the confidence bucket is
+held fixed across the panels: dynamic membership, padding-filtered queries, the `q90` scene
+summary and persistence at `layer_2`. The other four files are `per_scene.csv` (every scored
+row), `candidate_metrics.csv` (one row per candidate, with `bucket_scheme` telling the two cuts
+apart), `summary.json` and `easy-report.md`.
+
+Unlike `analyze-confidence-deciles`, `--output` must not exist at all. The eight files are
+written into a staging directory beside it and renamed into place in one step, so a run that
+fails leaves neither a partial bundle nor an empty directory, and a directory that does exist is
+a finished report that is never overwritten.
 
 ### Reading the artifacts
 
