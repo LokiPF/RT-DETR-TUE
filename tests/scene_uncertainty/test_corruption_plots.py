@@ -1,4 +1,4 @@
-"""Four small multiples, and the six ways a comparable figure quietly stops being comparable.
+"""Four small multiples, and the seven ways a comparable figure quietly stops being comparable.
 
 `corruption_plots` draws one panel per confidence bucket and, across four figures, exactly two
 y-ranges. Every failure this file is written against produces a complete, well-labelled set of
@@ -18,9 +18,15 @@ PNGs that a reader would not question:
   `test_the_shared_range_reaches_the_extremes_of_both_schemes` pins the exact numbers;
 * **orienting the plotted values.** A candidate whose distance falls as blur rises is a finding.
   `decile_30_40` falls from 27 to 22 and its panel must fall; multiplying by the candidate's
-  orientation would draw it rising and the reader would never know;
+  orientation would draw it rising and the reader would never know. Every synthetic candidate
+  carries a real `orientation` key for this reason -- without one the requirement is enforced
+  by `KeyError` alone, and `candidate.get("orientation", 1)` walks past that. The one test on
+  real reporter rows checks the confidence control too, which is the candidate the reporter
+  actually locks at `-1`;
+* **a layout left on the default margins.** `tight_layout` cannot be seen by comparing a saved
+  file against a re-render of the same code, so it is read off the axes geometry instead;
 * **a layout that is not the one specified.** Ten axes in a row is still ten axes, so the
-  geometry is read off the gridspec rather than counted;
+  row and column counts are read off the gridspec rather than counted;
 * **a bucket silently dropped.** Nine drawn panels in a ten-panel grid look like a complete
   ten-bucket measurement if the tenth is simply not there. The absent bucket keeps its own
   position and says why it is empty.
@@ -98,7 +104,11 @@ def candidate(
     reading, and `test_the_figures_read_real_candidate_metrics` covers the real shape.
 
     `mean` and `variance` are present and deliberately disagree with `median` and the
-    quartiles, because they are the two fields this figure is defined by *not* drawing.
+    quartiles, because they are the two fields this figure is defined by *not* drawing. So is
+    `orientation`, for the same reason and more sharply: a fixture without it protects the
+    anti-orientation requirement by `KeyError` alone, which an implementation spelled
+    `candidate.get("orientation", 1)` walks straight past. It is set the way
+    `corruption_metrics.choose_orientation` would set it, `None` included for a zero median.
     """
     statistics = {
         str(severity): {
@@ -123,6 +133,7 @@ def candidate(
         **RECIPE,
         "severity_statistics": statistics,
         "median_signed_spearman": trend,
+        "orientation": None if not trend else (1 if trend > 0 else -1),
         "measured_count": measured_count,
         "flat_count": flat_count,
         **overrides,
@@ -205,6 +216,18 @@ def panels(figure):
     return list(figure.axes)
 
 
+def drawn_panels(figure):
+    """The panels that got a curve, which are the only ones a y-range is a claim about.
+
+    A bucket with nothing to draw never receives `set_ylim`, so it keeps matplotlib's default
+    `(0.0, 1.0)` -- which is correct, since it carries no curve and no ticks, but it means
+    "every axis of this figure reports one range" is an invariant that quietly stops holding
+    the first time a run is missing a bucket. The shared-range tests are scoped to the drawn
+    panels and assert how many they expected, so the scoping cannot pass by drawing nothing.
+    """
+    return [axis for axis in figure.axes if axis.get_lines()]
+
+
 def band_bounds(axis):
     """The interquartile band's lower and upper edge at each severity, read off the polygon.
 
@@ -272,9 +295,39 @@ def test_the_figures_are_saved_at_the_declared_dpi(tmp_path):
             )
 
 
+def test_the_panels_are_laid_out_to_fit_rather_than_left_on_the_default_margins():
+    """`tight_layout` is what stops ten two-line titles and the suptitle overwriting each other.
+
+    Not visible in a file-against-file comparison, since both sides re-render the same code, so
+    it is read off the geometry: the default left margin is `0.125` of the figure and the
+    default top of the axes is `0.88`, and a laid-out figure has pulled the panels out into the
+    first and down out of the second to make room for the suptitle.
+    """
+    with drawn(full_candidates()) as (figures, _):
+        for figure in figures.values():
+            first = figure.axes[0].get_position()
+            assert first.x0 < 0.125
+            assert first.y1 < 0.88
+
+
 def test_writing_the_figures_leaves_none_of_them_open(tmp_path):
     before = plt.get_fignums()
     write_corruption_plots(tmp_path, full_candidates())
+
+    assert plt.get_fignums() == before
+
+
+def test_a_failed_write_closes_the_figures_it_had_already_built(tmp_path):
+    """The four figures exist before the first `savefig`, and one of them can still fail.
+
+    Nothing here creates the directory, so an absent one raises part-way through the loop. If
+    the remaining figures were left open, a caller that retried -- or a test session that ran
+    several of these -- would walk into matplotlib's too-many-open-figures warning, whose whole
+    point is that it fires long after the code that caused it.
+    """
+    before = plt.get_fignums()
+    with pytest.raises(FileNotFoundError):
+        write_corruption_plots(tmp_path / "not-created", full_candidates())
 
     assert plt.get_fignums() == before
 
@@ -307,28 +360,23 @@ def test_the_panels_run_in_ascending_confidence_order(scheme, names):
 # --- one range per signal, shared across both of that signal's figures -------------------------
 
 
-def test_both_persistence_figures_share_one_numeric_y_range():
+@pytest.mark.parametrize(
+    "signal, expected",
+    [("persistence", PERSISTENCE_LIMITS), ("confidence", CONFIDENCE_LIMITS)],
+)
+def test_both_figures_of_one_signal_share_one_numeric_y_range(signal, expected):
     with drawn(full_candidates()) as (figures, limits):
-        applied = {
-            axis.get_ylim()
+        curves = [
+            axis
             for scheme in ("decile", "quintile")
-            for axis in panels(figures[("persistence", scheme)])
-        }
-        assert len(applied) == 1
-        assert applied.pop() == pytest.approx(PERSISTENCE_LIMITS)
-        assert limits["persistence"] == pytest.approx(PERSISTENCE_LIMITS)
+            for axis in drawn_panels(figures[(signal, scheme)])
+        ]
+        applied = {axis.get_ylim() for axis in curves}
 
-
-def test_both_confidence_figures_share_a_range_of_their_own():
-    with drawn(full_candidates()) as (figures, limits):
-        applied = {
-            axis.get_ylim()
-            for scheme in ("decile", "quintile")
-            for axis in panels(figures[("confidence", scheme)])
-        }
+        assert len(curves) == len(DECILE_NAMES) + len(QUINTILE_NAMES)
         assert len(applied) == 1
-        assert applied.pop() == pytest.approx(CONFIDENCE_LIMITS)
-        assert limits["confidence"] == pytest.approx(CONFIDENCE_LIMITS)
+        assert applied.pop() == pytest.approx(expected)
+        assert limits[signal] == pytest.approx(expected)
 
 
 def test_the_two_signals_never_share_a_scale():
@@ -531,6 +579,17 @@ def test_a_bucket_with_no_candidate_keeps_its_place_and_says_it_is_empty():
         assert [axis.get_title().splitlines()[0] for axis in axes] == list(DECILE_NAMES)
         assert len(axes[DECILE_NAMES.index(missing) + 1].get_lines()) == 1
 
+        # The nine that remain are still on the one range, and the range is still the one the
+        # full table produces -- a missing bucket must not rescale the buckets around it.
+        assert len(drawn_panels(figures[("persistence", "decile")])) == len(DECILE_NAMES) - 1
+        applied = {
+            axis.get_ylim()
+            for scheme in ("decile", "quintile")
+            for axis in drawn_panels(figures[("persistence", scheme)])
+        }
+        assert len(applied) == 1
+        assert applied.pop() == pytest.approx(PERSISTENCE_LIMITS)
+
 
 def test_a_candidate_missing_a_severity_is_neither_drawn_nor_scaled_to():
     """A `None` statistic is `corruption_reporting` saying no image scored that severity.
@@ -629,7 +688,25 @@ def test_the_figures_read_real_candidate_metrics(tmp_path):
             [published["severity_statistics"][str(s)]["median"] for s in range(6)]
         )
         assert "increasing" in axis.get_title()
-        assert "decreasing" in panels(figures[("confidence", "decile")])[0].get_title()
+
+        # The candidate the anti-orientation requirement actually turns on: the reporter locks
+        # `-1` here, and every published median is positive, so a drawn value that had been
+        # multiplied by the orientation would be the negation of the one below.
+        control = next(
+            row for row in candidates
+            if row["signal"] == "confidence" and row["bucket_scheme"] == "decile"
+            and row["confidence_bin"] == DECILE_NAMES[0]
+        )
+        control_axis = panels(figures[("confidence", "decile")])[0]
+        assert control["orientation"] == -1
+        published_medians = [
+            control["severity_statistics"][str(s)]["median"] for s in range(6)
+        ]
+        assert min(published_medians) > 0
+        assert list(control_axis.get_lines()[0].get_ydata()) == pytest.approx(
+            published_medians
+        )
+        assert "decreasing" in control_axis.get_title()
     assert min(limits["confidence"]) < 0.9
     assert min(limits["persistence"]) > 0.9
 

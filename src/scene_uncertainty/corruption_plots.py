@@ -383,7 +383,14 @@ def write_corruption_plots(
     """
     directory = Path(directory)
     figures, limits = _corruption_figures(candidates)
-    for key, figure in figures.items():
-        figure.savefig(directory / PLOT_FILENAMES[key], format="png", dpi=PLOT_DPI)
-        plt.close(figure)
+    # `finally`, not a close after each `savefig`: the whole set is open before the first file
+    # is written, so a write that fails part-way -- an unwritable or absent directory is the
+    # obvious one -- would otherwise leave the untried figures open. Matplotlib reports that as
+    # a too-many-open-figures warning much later, in whatever code happens to be running then.
+    try:
+        for key, figure in figures.items():
+            figure.savefig(directory / PLOT_FILENAMES[key], format="png", dpi=PLOT_DPI)
+    finally:
+        for figure in figures.values():
+            plt.close(figure)
     return limits
