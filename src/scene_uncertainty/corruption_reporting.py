@@ -1,12 +1,16 @@
-"""One row per candidate out of the corruption score table, and one ranking out of the rows.
+"""One row per candidate out of the corruption score table, and one bundle out of the rows.
 
 `analyze_corruption_sensitivity` emits 3,060 rows an image -- 34 selections, 15 signal/scope/
 summary rows each, at six severities -- so a 250-image tuning run is 765,000 rows. This module
 collapses that twice: first to one curve per candidate and image, then to one row per candidate,
-and finally it sorts the candidates that pass every deployment gate. Nothing here reads a file
-or writes one; `summarize_candidates` takes the rows and hands back three lists, and the bundle
-writer that turns them into `per_scene.csv`, `candidate_metrics.csv` and `summary.json` is a
-separate concern layered on top of this one.
+and finally it sorts the candidates that pass every deployment gate and publishes the whole run
+as one directory of eight files.
+
+Those are two layers and they stay separable. `summarize_candidates` reads no file and writes
+none: it takes the rows and hands back three lists, which is what makes every collapse below
+testable without a directory. `write_corruption_report` is the only function here that touches
+the filesystem, and it computes nothing of its own -- it lays out what the collapse produced,
+what `corruption_plots` drew, and what `render_easy_report` said about both.
 
 Every collapse below has a plausible wrong version that still produces a complete, internally
 consistent table. The reasons the right versions are the right ones:
@@ -61,6 +65,18 @@ candidate's orientation, was selected on the same 250 tuning images that were th
 describe it. `deployable` means "passed every gate on the tuning run", and nothing here
 supports a claim about held-out data.
 
+**A bundle is eight files or it is nothing.** `write_corruption_report` stages the whole
+directory beside its destination and renames it into place only after every table, figure,
+summary and paragraph exists and the file set has been checked; a failure removes the staging
+directory and leaves no output. The alternative -- eight files published as they are produced
+-- has a state in which the report describes a figure that is not there, and nothing in the
+directory says which of the eight are missing.
+
+**An empty ranking is an outcome, not an error.** Fewer than `FULL_TUNING_IMAGE_COUNT` images
+is every synthetic and every diagnostic run, and each of them still gets its eight files, its
+four figures and a report that says plainly that no candidate passed the coverage gate. What
+never happens is the gate widening to fit the run it is given.
+
 Three implementation decisions that look arbitrary and are not:
 
 *Candidates are grouped on the recorded `bucket_scheme`* (it is in `ROW_KEY` and in
@@ -90,7 +106,14 @@ cannot invent a column name of its own.
 
 from __future__ import annotations
 
+import json
+import os
+import shutil
+import tempfile
+from pathlib import Path
+
 import numpy as np
+import pandas as pd
 
 from .corruption_metrics import (
     EXPECTED_SEVERITIES,
@@ -99,7 +122,7 @@ from .corruption_metrics import (
     oriented_curve_metrics,
     severity_aurocs,
 )
-from .decile_scoring import PRIMARY_SCORE_SCOPE
+from .decile_scoring import CONFIDENCE_SCOPE, PRIMARY_SCORE_SCOPE
 
 
 ROW_KEY = (
@@ -158,6 +181,14 @@ smaller one, and the gate excludes it rather than annotating it."""
 DEPLOYABLE_SIGNAL = "persistence"
 """The confidence control is the thing persistence is measured against, not a second runner.
 It is summarised and published in full; it is only the *ranking* it stays out of."""
+
+CONTROL_SIGNAL = "confidence"
+"""The signal name `score_selection` writes for the matched confidence control.
+
+Spelled here rather than reused from `decile_scoring.CONFIDENCE_SCOPE`, which happens to be the
+same string for a different reason: the control has no decoder layer to be scoped to, so its
+*scope* field carries its signal name. `corruption_plots.CONFIDENCE_SIGNAL` says the same thing
+for the figures and is not imported here, because that module imports this one."""
 
 DEPLOYABLE_MEMBERSHIP_MODE = "dynamic"
 """Frozen membership reuses severity zero's bins, and a naturally corrupted image has no paired
@@ -674,3 +705,710 @@ def summarize_candidates(
     }
     _pair_padding_modes(by_key, grouped)
     return per_scene, candidates, rank_deployable_candidates(candidates)
+
+
+# --- the published bundle ---------------------------------------------------------------------
+
+
+FIGURE_FILES = {
+    DEPLOYABLE_SIGNAL: (
+        "persistence_actual_distance_deciles.png",
+        "persistence_actual_distance_quintiles.png",
+    ),
+    CONTROL_SIGNAL: (
+        "confidence_actual_distance_deciles.png",
+        "confidence_actual_distance_quintiles.png",
+    ),
+}
+"""The four figures, grouped by the signal each one draws.
+
+Grouped rather than listed flat because the report has to say which pair shares which y-range,
+and the alternative -- recovering the signal from the start of the filename -- would make the
+name a second definition of what the figure holds. `corruption_plots.PLOT_FILENAMES` is where
+these strings are turned into files; they are spelled again here because that module imports
+this one, so this one cannot import it at module scope, and
+`test_the_writer_and_the_figures_agree_on_the_names_they_share` fails the moment the two lists
+stop matching.
+"""
+
+DATA_FILES = ("per_scene.csv", "candidate_metrics.csv", "summary.json", "easy-report.md")
+
+EXPECTED_FILES = frozenset(
+    {*DATA_FILES, *(name for names in FIGURE_FILES.values() for name in names)}
+)
+"""Every file a published bundle holds, and the only files it may hold.
+
+Checked against the staging directory *before* the directory is renamed into place, so a run
+that produced seven files or nine never becomes a readable result. Both directions matter and
+neither is hypothetical: a missing figure is a bundle whose report describes a picture that is
+not there, and an extra file is a figure or a table nothing in `summary.json` accounts for.
+"""
+
+
+def _scalar_projection(candidate: dict) -> dict:
+    """One candidate row with its nested per-severity maps dropped.
+
+    This is the whole of `candidate_metrics.csv`'s column selection, and it is a projection
+    rather than a transformation: `_candidate_metrics` publishes every nested map a second time
+    as scalar columns, so dropping the dictionaries loses no number and invents no column name.
+    Writing the raw candidate instead puts `{'0': {'count': 250, ...}}` into five cells, which
+    is a string no reader can filter, join or sum, and which no row count would notice.
+    """
+    return {name: value for name, value in candidate.items() if not isinstance(value, dict)}
+
+
+def _padding_summary(diagnostics: dict) -> dict:
+    """The run's padded-query record, rolled up and then carried through whole.
+
+    The per-image detail is kept rather than summarised away, because the rollup alone cannot
+    answer the question the padding control exists for: an image with no padded tail selects the
+    identical queries with the mask and without it, so the control is a no-op on it by
+    construction, and a reader who sees only a run-wide number reads that dilution as a null
+    result.
+
+    `padded_images_with_identical_tails` counts only the images that carry padding, which is
+    the restriction that makes it readable. Every image without a tail has six identical empty
+    tails and would count as "identical" in an unrestricted total, so that total would report
+    stability that is really absence -- and instability is the fact the union mask exists for.
+    See `decile_analysis._padding_diagnostics` for what each per-image field means and for the
+    measurement behind that restriction.
+    """
+    images = dict((diagnostics or {}).get("images") or {})
+    counts = {key: int(image["union_padded_count"]) for key, image in images.items()}
+    padded = [key for key, count in counts.items() if count > 0]
+    return {
+        "image_count": len(images),
+        "images_with_padding": len(padded),
+        "total_union_padded_count": sum(counts.values()),
+        "max_union_padded_count": max(counts.values()) if counts else None,
+        "padded_images_with_identical_tails": sum(
+            1 for key in padded if images[key]["tail_identical_across_severities"]
+        ),
+        "images": images,
+    }
+
+
+def build_summary(
+    diagnostics: dict,
+    candidates: list[dict],
+    ranking: list[dict],
+    *,
+    axis_limits: dict,
+    scored_row_count: int,
+    per_scene_row_count: int,
+) -> dict:
+    """Everything `summary.json` holds: where the rows came from and what became of them.
+
+    `axis_limits` is recorded exactly as `corruption_plots.write_corruption_plots` returned it,
+    and is never recomputed here. That function returns the limits it *applied* to the fifteen
+    panels of each signal; a second computation from the same candidates would agree today and
+    would stop agreeing the moment either side changed its mind about which candidates are
+    drawable -- and nothing in the bundle would say which of the two the pictures used.
+
+    The two row counts are arguments rather than measurements of `candidates`, and that is the
+    point of publishing both. `scored_row_count` is the table that was handed in and
+    `per_scene_row_count` is the table that came out; they are equal on every run this module
+    can produce, because `summarize_candidates` keeps every row, so a bundle where they differ
+    is a bundle whose collapse dropped something. A count derived from the candidate rows would
+    be a number checked against itself.
+
+    `duplicate_row_key_count` is `0` in every bundle that exists, and it is published anyway so
+    that `summary.json` records which checks ran rather than only what they found:
+    `validate_rows` refuses a table with a repeated row key before any directory is staged, so
+    a duplicate never reaches this function and this field can never be anything else.
+
+    Coverage is published as `expected_image_count` against the range of candidate
+    `image_count`s, never as `measured_fraction`. That fraction is over the images a candidate
+    *has rows for*, so a candidate holding 200 images of a 250-image run reports `1.0` when
+    every curve it has is complete -- true, and not a statement about the run at all.
+
+    `labels` is what the run turned out to contain, one sorted list per `CANDIDATE_KEY` field,
+    while `configuration` is what the ranking required of it. They are separate keys because
+    they answer different questions, and a reader comparing them can see at once whether a gate
+    excluded everything by finding nothing to admit.
+    """
+    run = dict(diagnostics["run"])
+    image_counts = [candidate["image_count"] for candidate in candidates]
+    measured_counts = [candidate["measured_count"] for candidate in candidates]
+    return {
+        "run": run,
+        "configuration": {
+            "full_tuning_image_count": FULL_TUNING_IMAGE_COUNT,
+            "deployable_signal": DEPLOYABLE_SIGNAL,
+            "deployable_membership_mode": DEPLOYABLE_MEMBERSHIP_MODE,
+            "deployable_padding_mode": FILTERED_PADDING_MODE,
+            "deployable_score_scope": DEPLOYABLE_SCORE_SCOPE,
+            "severities": list(EXPECTED_SEVERITIES),
+        },
+        "labels": {
+            field: sorted({candidate[field] for candidate in candidates})
+            for field in CANDIDATE_KEY
+        },
+        "validation": {
+            "scored_row_count": int(scored_row_count),
+            "per_scene_row_count": int(per_scene_row_count),
+            "duplicate_row_key_count": 0,
+            "candidate_count": len(candidates),
+            "deployable_candidate_count": len(ranking),
+            "expected_image_count": int(run["image_count"]),
+            "candidate_image_count_range": [min(image_counts), max(image_counts)],
+            "candidate_measured_count_range": [min(measured_counts), max(measured_counts)],
+        },
+        "padding": _padding_summary(diagnostics),
+        "axis_limits": axis_limits,
+        "candidates": candidates,
+        "deployable_ranking": ranking,
+    }
+
+
+# --- the plain-language report -----------------------------------------------------------------
+
+
+EASY_REPORT_TITLE = "# Which score notices blur, and can we deploy it?"
+
+SECTION_TITLES = (
+    "What should we deploy?",
+    "Does it react steadily to blur?",
+    "Did 20% buckets help?",
+    "Did persistence beat model confidence?",
+    "What the files contain",
+    "What this does not prove",
+)
+"""The six questions the report answers, in order. Written as a tuple so the order is one
+decision made once: the recommendation has to come before the evidence that qualifies it, and
+the two sections that say what the bundle cannot support have to come last rather than be
+optional reading."""
+
+AUROC_MEANING = (
+    "An AUROC of 0.80 means that when we randomly pick one clean image and one blurred image, "
+    "the score puts the blurred image higher about 80 times out of 100. It does not mean the "
+    "image has an 80% chance of being corrupted. Half of the pairs coming out in the right "
+    "order -- 0.500 -- is what a coin toss scores. A number below 0.500 means that blur level "
+    "comes out *lower* than clean when the score is read in the one direction this candidate "
+    "was locked into, which is a real finding about the candidate and is printed as it was "
+    "measured rather than flipped the right way up."
+)
+"""The one paragraph the whole report rests on, printed whether or not a candidate was ranked.
+
+AUROC is an ordering statistic and reads like a percentage, which is the confusion this
+paragraph exists to prevent: nothing in this pipeline is fitted or calibrated, so no number in
+the bundle is a probability that an image is corrupted, and a reader who takes 0.80 for one has
+read the report backwards.
+"""
+
+
+def _plain(value, digits: int = 3) -> str:
+    """A number as the report prints it, or the words for one that was never measured."""
+    return "not measured" if value is None else f"{float(value):.{digits}f}"
+
+
+def _signed(value, digits: int = 3) -> str:
+    return "not measured" if value is None else f"{float(value):+.{digits}f}"
+
+
+def _ahead(left: str, left_value, right: str, right_value) -> str:
+    """Which of two numbers is larger, as a clause, with no threshold in it.
+
+    Read from the two values every time. The comparison this sentence carries can come out
+    either way on a real run -- the matched confidence control outranking persistence is a
+    result the design has to be able to publish -- so the verb is never a constant.
+    """
+    if left_value is None or right_value is None:
+        return "one of the two was not measured, so they cannot be compared"
+    if float(left_value) > float(right_value):
+        return f"{left} comes out ahead"
+    if float(left_value) < float(right_value):
+        return f"{right} comes out ahead"
+    return "the two come out level"
+
+
+CONTROL_KEY_FIELDS = {"signal": CONTROL_SIGNAL, "score_scope": CONFIDENCE_SCOPE}
+"""What the matched control changes about the winner's candidate key, and all it changes.
+
+Two fields, because those are the two the control is: the signal `score_selection` writes for
+it, and the scope field that carries that name for want of a decoder layer to hold. Everything
+else -- scheme, bucket, membership, padding, scene summary -- has to be identical, which is the
+whole claim the comparison rests on.
+"""
+
+
+def _matched_control(summary: dict, winner: dict) -> dict | None:
+    """The confidence row of the winner's own selection, or `None` if it was not scored.
+
+    The match is on the whole of `CANDIDATE_KEY` with the two control fields substituted, so it
+    identifies exactly one candidate or none at all. A looser match -- the confidence bin alone,
+    or every field but the membership mode -- has more than one candidate to choose from on a
+    real run, where every bucket carries a frozen twin of its control as well as a dynamic one,
+    and it would pick whichever came first in the list.
+    """
+    key = tuple(
+        CONTROL_KEY_FIELDS.get(field, winner[field]) for field in CANDIDATE_KEY
+    )
+    for candidate in summary["candidates"]:
+        if tuple(candidate[field] for field in CANDIDATE_KEY) == key:
+            return candidate
+    return None
+
+
+def _preamble(summary: dict) -> list[str]:
+    run = summary["run"]
+    validation = summary["validation"]
+    padding = summary["padding"]
+    return [
+        EASY_REPORT_TITLE,
+        "",
+        "Every number below was recomputed from artifacts that were already on disk: the blur "
+        "feature cache and the saved query distances. No detector was run and no "
+        "nearest-neighbour search was performed, so nothing here is a new measurement of the "
+        "images -- it is a new reading of measurements that already existed.",
+        "",
+        f"This run covered {validation['expected_image_count']} images of the "
+        f"`{run.get('source_partition', 'unknown')}` partition at "
+        f"{len(summary['configuration']['severities'])} blur levels, "
+        f"{run.get('query_count', 'unknown')} queries an image. Feature cache "
+        f"`{run.get('feature_cache_id', 'unknown')}`, kNN results "
+        f"`{run.get('source_result_id', 'unknown')}`, clean bank "
+        f"`{run.get('bank_id', 'unknown')}`, k={run.get('k', 'unknown')}, normalization "
+        f"`{run.get('normalization', 'unknown')}`.",
+        "",
+        f"{validation['scored_row_count']} scored rows became "
+        f"{validation['candidate_count']} candidates, "
+        f"{validation['deployable_candidate_count']} of which passed every deployment gate. "
+        f"{padding['images_with_padding']} of {padding['image_count']} images carried repeated "
+        "decoder placeholder queries, which the ranked rows leave out.",
+        "",
+    ]
+
+
+def _nothing_ranked_lines(summary: dict) -> list[str]:
+    """Why an empty ranking is the honest outcome of a run this size, in the reader's words.
+
+    This is the branch every synthetic and every diagnostic run takes, so it says what was
+    required, what this run had, and where the numbers it did produce live -- rather than
+    stopping at "nothing qualified", which reads as a broken run.
+    """
+    configuration = summary["configuration"]
+    validation = summary["validation"]
+    expected = validation["expected_image_count"]
+    full = configuration["full_tuning_image_count"]
+    lines = [
+        "No candidate passed the full tuning-coverage gate, so nothing here is a "
+        "recommendation and the deployment ranking in `summary.json` is empty.",
+        "",
+        f"To be ranked at all, a candidate has to be the `{configuration['deployable_signal']}` "
+        f"score at `{configuration['deployable_score_scope']}`, built with "
+        f"`{configuration['deployable_membership_mode']}` membership on "
+        f"`{configuration['deployable_padding_mode']}` queries, and measured on all {full} "
+        f"images of the full tuning run at all {len(configuration['severities'])} blur levels.",
+        "",
+    ]
+    if expected < full:
+        lines.extend([
+            f"This run declared {expected} images, fewer than {full}, so no candidate in it "
+            "could pass however well it scored. The gate is not widened to fit a smaller run: "
+            f"a candidate measured on {expected} images is a different measurement, not a "
+            "slightly smaller one, and calling it deployable would be the one mistake this "
+            "gate exists to prevent.",
+            "",
+        ])
+    else:
+        lines.extend([
+            f"This run declared {expected} images, so its size is not what excluded them: each "
+            f"of the {validation['candidate_count']} candidates it measured failed at least one "
+            "of the other requirements above.",
+            "",
+        ])
+    lines.extend([
+        f"All {validation['candidate_count']} candidates the run did measure are published in "
+        "full in `candidate_metrics.csv` and in `summary.json`, and the four pictures are drawn "
+        "from them. A run like this is a diagnostic, not an empty result.",
+        "",
+    ])
+    return lines
+
+
+def _winner_lines(summary: dict, winner: dict) -> list[str]:
+    aurocs = winner["auroc_by_severity"]
+    selected = winner["selected_count_by_severity"]
+    severities = [str(severity) for severity in summary["configuration"]["severities"][1:]]
+    weakest = min(severities, key=lambda severity: aurocs[severity])
+    smallest = min(entry["min"] for entry in selected.values())
+    largest = max(entry["max"] for entry in selected.values())
+    return [
+        f"The one to take forward is the `{winner['confidence_bin']}` bucket of the "
+        f"`{winner['bucket_scheme']}` cut: the `{winner['signal']}` score at "
+        f"`{winner['score_scope']}`, with `{winner['membership_mode']}` membership rebuilt at "
+        f"every blur level, `{winner['padding_mode']}` queries -- the repeated decoder "
+        f"placeholders taken out -- and each scene summarised by `{winner['aggregation']}`. It "
+        f"came first of {summary['validation']['deployable_candidate_count']} candidates that "
+        f"passed every gate, out of the {summary['validation']['candidate_count']} this run "
+        "measured. It was chosen on the same images every number below describes, so this is a "
+        "proposal to check on images that took no part in choosing it, not a result about "
+        "them.",
+        "",
+        f"Every scene in that bucket was scored over between {smallest} and {largest} selected "
+        "queries, so each number below summarises a few dozen queries an image rather than the "
+        "whole image.",
+        "",
+        "How often it puts a blurred image above a clean one, blur level by blur level:",
+        "",
+        "| blur level | " + " | ".join(severities) + " | all five (macro) |",
+        "| --- |" + " --- |" * (len(severities) + 1),
+        "| AUROC | "
+        + " | ".join(_plain(aurocs[severity]) for severity in severities)
+        + f" | {_plain(winner['macro_auroc'])} |",
+        "",
+        f"The blur level it handles worst is {weakest}, at {_plain(aurocs[weakest])}; a coin "
+        "toss would score 0.500. All five are printed because blur strength is where a "
+        "corruption check is most likely to be uneven, and one average can hide a level that "
+        "does nothing.",
+        "",
+    ]
+
+
+def _deploy_section(summary: dict) -> list[str]:
+    ranking = summary["deployable_ranking"]
+    lines = [f"## {SECTION_TITLES[0]}", ""]
+    if ranking:
+        lines.extend(_winner_lines(summary, ranking[0]))
+    else:
+        lines.extend(_nothing_ranked_lines(summary))
+    lines.extend([AUROC_MEANING, ""])
+    return lines
+
+
+def _steady_section(summary: dict) -> list[str]:
+    lines = [f"## {SECTION_TITLES[1]}", ""]
+    ranking = summary["deployable_ranking"]
+    if not ranking:
+        return lines + [
+            "No candidate was ranked, so there is nothing to answer this for. The numbers the "
+            "answer is made of -- the absolute and the signed rank correlation, the three "
+            "direction counts, the adjacent-step rate and the maximum-blur rate -- are "
+            "published for every candidate the run measured in `candidate_metrics.csv`.",
+            "",
+        ]
+    winner = ranking[0]
+    measured = winner["measured_count"]
+    return lines + [
+        f"Inside a single scene, blur moves this score by a median absolute rank correlation "
+        f"of {_plain(winner['median_absolute_spearman'])}, over the {measured} images that "
+        "produced a complete six-level curve. Absolute means the direction is thrown away "
+        "first: it says how *hard* blur moves the score, not which way it moves it.",
+        "",
+        f"Which way is a separate number, and here it is "
+        f"{_signed(winner['median_signed_spearman'])} -- the same correlations with their signs "
+        "kept, so the score rises as blur gets worse. Neither number is derived from the other: "
+        "images that move in opposite directions cancel out in the signed median and do not "
+        "cancel in the absolute one, so a candidate can be strong on one and say nothing on the "
+        "other.",
+        "",
+        f"Counted image by image, {winner['positive_count']} of the {measured} measured images "
+        f"rose with blur, {winner['negative_count']} fell, and {winner['flat_count']} were flat "
+        "-- a complete curve of six identical scores, which is a measurement that found no "
+        "movement and not a measurement that failed. That puts "
+        f"{_plain(winner['dominant_direction_fraction'])} of the measured images in the "
+        "direction the candidate is read in.",
+        "",
+        f"Step by step, {_plain(winner['oriented_adjacent_consistency'])} of the five steps "
+        "between neighbouring blur levels do not move against that direction, averaged over the "
+        f"measured images; and on {_plain(winner['max_blur_above_clean_rate'])} of those images "
+        "the worst blur level scores above the clean one, which is the weakest thing a usable "
+        "signal has to do.",
+        "",
+    ]
+
+
+def _buckets_section(summary: dict) -> list[str]:
+    """The two bucket resolutions against each other, under the ranking's own order.
+
+    "Best" here means first in the deployment ranking, not best on any single metric: the
+    ranking is the rule the run was tuned with, and a second rule invented for this paragraph
+    could name a different winner than the section above it.
+    """
+    lines = [f"## {SECTION_TITLES[2]}", ""]
+    best: dict[str, dict] = {}
+    for candidate in summary["deployable_ranking"]:
+        best.setdefault(candidate["bucket_scheme"], candidate)
+    if not best:
+        return lines + [
+            "No candidate was ranked, so the two bucket resolutions cannot be compared on this "
+            "run. Both are measured in full in `candidate_metrics.csv`.",
+            "",
+        ]
+    if len(best) == 1:
+        (only,) = best.values()
+        return lines + [
+            f"Only the `{only['bucket_scheme']}` cut has a candidate that passed every gate -- "
+            f"`{only['confidence_bin']}`, at a macro AUROC of {_plain(only['macro_auroc'])} -- "
+            "so there is no ranked candidate at the other resolution to compare it against.",
+            "",
+        ]
+    # The ranking is macro AUROC descending before anything else, and `best` keeps its order,
+    # so the first scheme's candidate is never behind the second's and the gap is never signed.
+    first, second = list(best.values())[:2]
+    difference = float(first["macro_auroc"]) - float(second["macro_auroc"])
+    return lines + [
+        f"Under the same ranking rule, the `{first['bucket_scheme']}` cut comes first: "
+        f"`{first['confidence_bin']}` at a macro AUROC of {_plain(first['macro_auroc'])}. The "
+        f"best `{second['bucket_scheme']}` candidate is `{second['confidence_bin']}` at "
+        f"{_plain(second['macro_auroc'])}, a gap of {_plain(difference)}.",
+        "",
+        "Both cuts were made on the same confidence ordering over the same queries, so this is "
+        "one measurement seen at two resolutions and not two independent experiments. That is "
+        "also what makes the comparison worth making: if the two resolutions agree, the "
+        "ten-way split was incidental and the wider bucket -- twice as many queries in it, so "
+        "a steadier summary of them -- is the safer one to run.",
+        "",
+    ]
+
+
+def _control_section(summary: dict) -> list[str]:
+    lines = [f"## {SECTION_TITLES[3]}", ""]
+    ranking = summary["deployable_ranking"]
+    if not ranking:
+        return lines + [
+            "No candidate was ranked, so there is no matched comparison to report. Every "
+            "confidence control the run scored is in `candidate_metrics.csv` beside the "
+            "persistence rows it was scored with.",
+            "",
+        ]
+    winner = ranking[0]
+    control = _matched_control(summary, winner)
+    if control is None:
+        return lines + [
+            "This selection was scored for persistence only, so it has no matched confidence "
+            "control and nothing here answers the question for it.",
+            "",
+        ]
+    return lines + [
+        f"The control is the same selection read a different way: the same "
+        f"`{winner['bucket_scheme']}` scheme, the same `{winner['confidence_bin']}` bucket, the "
+        f"same `{winner['membership_mode']}` membership, the same `{winner['padding_mode']}` "
+        f"queries and the same `{winner['aggregation']}` scene summary. Every row of one "
+        "selection is checked to report the same selected queries before anything is "
+        "summarised, so the two describe one population of queries and not two populations that "
+        "resemble each other.",
+        "",
+        f"Only the score differs. Persistence is how far this image's decoder fingerprints sit "
+        f"from the nearest clean ones at `{winner['score_scope']}`; the control is one minus "
+        "the detector's own confidence in what it found.",
+        "",
+        "Putting blurred images above clean ones across scenes, "
+        + _ahead(
+            "the control", control["macro_auroc"], "persistence", winner["macro_auroc"]
+        )
+        + f": macro AUROC {_plain(control['macro_auroc'])} for the control against "
+        f"{_plain(winner['macro_auroc'])} for persistence. Moving with blur inside one scene, "
+        + _ahead(
+            "the control",
+            control["median_absolute_spearman"],
+            "persistence",
+            winner["median_absolute_spearman"],
+        )
+        + f": median absolute rank correlation "
+        f"{_plain(control['median_absolute_spearman'])} against "
+        f"{_plain(winner['median_absolute_spearman'])}.",
+        "",
+        "Those two comparisons are the only ones made. A distance to clean fingerprints and a "
+        "`1 - confidence` share no unit, so their raw sizes are never compared, never "
+        "subtracted and never drawn on one axis -- only the shapes they trace and the orders "
+        "they produce.",
+        "",
+    ]
+
+
+def _files_section(summary: dict) -> list[str]:
+    limits = summary["axis_limits"]
+    lines = [
+        f"## {SECTION_TITLES[4]}",
+        "",
+        "- `per_scene.csv` -- one row per candidate, image and blur level: the raw score, how "
+        "many queries it was taken over, and that image's own trend repeated on all six of its "
+        "rows, so a single row reads on its own without a join.",
+        f"- `candidate_metrics.csv` -- one row per candidate, "
+        f"{summary['validation']['candidate_count']} of them here, with every per-blur-level "
+        "number flattened into a plain column. Every candidate the run measured is in it, "
+        "including the ones the deployment ranking leaves out.",
+        "- `summary.json` -- the same numbers with the per-blur-level detail nested, plus where "
+        "the inputs came from, what was counted, the padded-query record, and the exact axis "
+        "ranges the four pictures were drawn on.",
+        "- Four pictures of the score as it was measured, one panel per confidence bucket, each "
+        "panel drawing the middle value across the scenes and the middle half of them at every "
+        "blur level:",
+    ]
+    for signal, names in FIGURE_FILES.items():
+        lower, upper = (limits.get(signal) or [None, None])[:2]
+        lines.append(
+            f"  - `{names[0]}` and `{names[1]}` -- the two {signal} pictures, sharing one "
+            f"y-axis from {_plain(lower)} to {_plain(upper)}."
+        )
+    lines.extend([
+        "",
+        "The shared axis is what makes the panels comparable: fitted to its own bucket, every "
+        "panel would look equally busy and the one thing varying between them would be the "
+        "axis. The two signals never share one, because a distance and a `1 - confidence` are "
+        "unrelated quantities and a single range covering both would flatten the smaller of "
+        "them onto the floor of its panels.",
+        "",
+        "The curves are drawn exactly as they were measured. They are never flipped into the "
+        "direction a candidate is read in, so a bucket whose score falls as blur rises is drawn "
+        "falling -- which is a real finding about that bucket, and one a flipped picture would "
+        "hide.",
+        "",
+    ])
+    return lines
+
+
+def _limits_section(summary: dict) -> list[str]:
+    run = summary["run"]
+    validation = summary["validation"]
+    return [
+        f"## {SECTION_TITLES[5]}",
+        "",
+        "- **No probability that an image is corrupted.** AUROC counts how often a blurred "
+        "image is put above a clean one; it is an ordering, and nothing in this bundle is "
+        "fitted or calibrated to anything, so no number here is a probability.",
+        "- **No threshold.** Nothing here was calibrated against anything, so a recommendation "
+        "in this report is a bucket and a recipe and never a value to raise an alarm at. "
+        "Choosing one needs a decision about how often a false alarm is acceptable, which no "
+        "number here supplies.",
+        f"- **No held-out evaluation.** Every candidate here was measured on the same "
+        f"{validation['expected_image_count']} `{run.get('source_partition', 'unknown')}` "
+        "images that any recommendation above was chosen from, and the single direction each "
+        "candidate is read in was chosen there too. `deployable` means \"passed every gate on "
+        "this tuning run\" and nothing more; what any of this does on images that took no part "
+        "in choosing it is untested here, and every count above is conditioned on the choice it "
+        "was used to make.",
+        "- **A frozen membership and an unfiltered selection are diagnostics, not methods.** A "
+        "frozen bucket needs a paired clean version of the image to freeze against, which a "
+        "naturally corrupted image does not have; an unfiltered selection keeps the repeated "
+        "decoder placeholders on purpose, to measure what removing them does. Both are "
+        "measured and published in full, and neither is ever ranked or merged with a ranked "
+        "result.",
+        "- **The gates exclude, they do not annotate.** A candidate that lost images is absent "
+        "from the ranking rather than ranked with a footnote, because a median over the images "
+        "a candidate survived looks exactly like a median over all of them.",
+        "",
+    ]
+
+
+def render_easy_report(summary: dict) -> str:
+    """The whole report, built from `summary` and from nothing else.
+
+    Every sentence carrying a number is written from the summary the bundle publishes, so any
+    claim in the report can be checked against `summary.json` beside it, and two runs over the
+    same rows produce the same file. Nothing is quoted from a previous run and nothing is
+    rounded twice.
+
+    Three sentences this generator cannot produce, each because the design forbids it:
+
+    * a score described as a probability that an image is corrupted. `AUROC_MEANING` is printed
+      whether or not anything was ranked, and it says what the number is and what it is not;
+    * a magnitude compared across the two signals. A persistence distance and a
+      `1 - confidence` share no unit, so the matched comparison is made on AUROC and on rank
+      correlation and never on how large the two scores are;
+    * a recommendation out of a run that did not earn one. With an empty ranking every section
+      says so in its own terms, and the coverage gate is restated rather than relaxed.
+
+    And one word that appears only in a heading. `SECTION_TITLES` asks "Did persistence beat
+    model confidence?" because that is the question a reader arrives with; no answer below it
+    uses that verb. The verdict comes from `_ahead`, which reads the two values every time it
+    is called and has no threshold in it, and it is always followed by the two numbers it was
+    read from -- so a comparison that comes out against persistence, which is a result this
+    design has to be able to publish, is printed as plainly as one that comes out for it.
+    """
+    lines = [
+        *_preamble(summary),
+        *_deploy_section(summary),
+        *_steady_section(summary),
+        *_buckets_section(summary),
+        *_control_section(summary),
+        *_files_section(summary),
+        *_limits_section(summary),
+    ]
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_corruption_report(
+    output_value: str | Path,
+    *,
+    score_rows: list[dict],
+    diagnostics: dict,
+) -> dict:
+    """Publish the run as one directory of eight files, or leave nothing behind at all.
+
+    The directory appears in one step. Every table, figure, summary and paragraph is written
+    into a staging directory beside the destination, the file set is checked against
+    `EXPECTED_FILES`, and only then is the staging directory renamed into place -- so a reader
+    never meets a bundle whose report describes a figure that is missing, and a failed run
+    leaves neither the output directory nor the staging directory behind. `os.replace` on a
+    directory within one filesystem is atomic, and the staging directory is created next to the
+    destination rather than in the system temporary area so that it is on the same one.
+
+    The checks are in this order for a reason. An existing output directory is refused before
+    anything is computed, because merging a new run into an old one produces a directory that
+    is internally inconsistent and says nothing about it. The file-set check comes before the
+    rename rather than after it, because a check that runs after publication has already
+    published. And the cleanup catches `BaseException`, not `Exception`: a `KeyboardInterrupt`
+    part-way through leaves the same half-written staging directory as a `ValueError` does.
+
+    What this does not claim: it is not crash-proof. A process killed outright runs no cleanup,
+    so it leaves the staging directory on disk under its `.<name>.<random>` name -- rubbish
+    beside the destination, and never something a reader could mistake for a finished bundle,
+    which is the property being protected. A machine that dies inside `os.replace` itself is
+    beyond what any of this can promise.
+
+    `corruption_plots` is imported inside this function on purpose. That module imports this
+    one for the gate constants its figures are sliced on, so an import at module scope here
+    would be a cycle that fails at interpreter start-up; deferring it to the one function that
+    draws anything also keeps `import corruption_reporting` free of matplotlib.
+    """
+    from .corruption_plots import write_corruption_plots
+
+    output = Path(output_value)
+    if output.exists():
+        raise FileExistsError(f"output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent))
+    try:
+        per_scene, candidates, ranking = summarize_candidates(
+            score_rows,
+            expected_image_count=int(diagnostics["run"]["image_count"]),
+        )
+        # `PER_SCENE_KEYS` is the documented column list, so it is the one that produces the
+        # columns rather than a second description of what a row happens to hold.
+        pd.DataFrame(per_scene, columns=list(PER_SCENE_KEYS)).to_csv(
+            staging / "per_scene.csv", index=False
+        )
+        pd.DataFrame(
+            [_scalar_projection(candidate) for candidate in candidates]
+        ).to_csv(staging / "candidate_metrics.csv", index=False)
+        axis_limits = write_corruption_plots(staging, candidates)
+        summary = build_summary(
+            diagnostics,
+            candidates,
+            ranking,
+            axis_limits=axis_limits,
+            scored_row_count=len(score_rows),
+            per_scene_row_count=len(per_scene),
+        )
+        # `allow_nan=False`: `json.dumps` would otherwise write the bare token `NaN`, which no
+        # strict JSON reader accepts, and the file would fail somewhere far from this run.
+        (staging / "summary.json").write_text(
+            json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n",
+            encoding="utf-8",
+        )
+        (staging / "easy-report.md").write_text(
+            render_easy_report(summary), encoding="utf-8"
+        )
+        actual = {path.name for path in staging.iterdir()}
+        if actual != EXPECTED_FILES:
+            raise RuntimeError(
+                f"report bundle contains {sorted(actual)}, expected {sorted(EXPECTED_FILES)}"
+            )
+        os.replace(staging, output)
+        return summary
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise

@@ -34,23 +34,58 @@ versions rather than to restate the right one:
 The 250-image tests build real tables (250 images x 6 severities per candidate) rather than
 stub candidate dictionaries, because the `FULL_TUNING_IMAGE_COUNT` gates are the part of this
 module a smaller fixture cannot exercise at all.
+The bundle writer at the bottom of this file is tested against a different family of failures,
+all of which produce a directory a reader would accept:
+
+* **a bundle published before it was checked.** Two tests hand the writer a plot step that
+  leaves nine files, and one that leaves seven, and assert the *output directory does not
+  exist* afterwards. A test that only walked the happy path would pass against a writer that
+  renamed the staging directory into place and complained afterwards;
+* **a staging directory left behind.** Every failure test asserts the output's parent is
+  completely empty, not merely that the bundle is absent -- a `.corruption.XXXX` directory
+  beside it is exactly what a half-written run looks like, and it is invisible to `not
+  output.exists()`;
+* **nested dictionaries in CSV cells.** `candidate_metrics.csv` is written from the scalar
+  projection of the candidate rows, so the test asserts no `{` appears anywhere in the file and
+  that all 120 columns come out in one pinned order. `pd.DataFrame(candidates)` writes five
+  columns of `{'0': {...}}` and passes any assertion that only counts rows;
+* **axis limits recomputed instead of recorded.** The figures return the limits they applied.
+  One test replaces the plot writer with one that returns a sentinel pair and asserts
+  `summary.json` carries *that* pair, which no recomputation can produce;
+* **a report that answers from a constant.** The fixture is built so the honest answers are the
+  surprising ones: the confidence control outranks persistence, the ten-way cut outranks the
+  five-way cut, one of the winner's five severities ranks the *other* way at 0.039, and the
+  winner is neither first nor last in candidate-key order. A report that hard-coded "persistence
+  wins" or printed the macro AUROC five times fails;
+* **a probability claim.** Every sentence of the report that mentions a probability or a chance
+  is checked for a negation, so the one sentence allowed to use those words is the one that
+  denies them.
 """
 
+import csv
 import json
+import re
 
 import pytest
 
+from src.scene_uncertainty import corruption_plots as plots_module
+from src.scene_uncertainty import corruption_reporting as reporting_module
+from src.scene_uncertainty.corruption_plots import PLOT_FILENAMES
 from src.scene_uncertainty.corruption_reporting import (
     CANDIDATE_KEY,
     DEPLOYABLE_SCORE_SCOPE,
+    EXPECTED_FILES,
     FULL_TUNING_IMAGE_COUNT,
     PER_SCENE_KEYS,
     ROW_KEY,
     SELECTION_KEY,
+    build_summary,
     rank_deployable_candidates,
+    render_easy_report,
     summarize_candidates,
     validate_rows,
     validate_selected_queries,
+    write_corruption_report,
 )
 
 
@@ -732,3 +767,714 @@ def test_a_row_without_its_selected_query_ids_is_rejected_rather_than_skipped():
 def test_an_empty_results_table_is_refused_rather_than_summarised_into_nothing():
     with pytest.raises(ValueError, match="at least one scored row"):
         summarize_candidates([], expected_image_count=1)
+
+
+# --- the published bundle ------------------------------------------------------------------
+
+
+BUNDLE_SELECTED_COUNTS = {0: 30, 1: 29, 2: 28, 3: 27, 4: 26, 5: 25}
+"""One selection size per severity, all six different, so the query-count range the report
+prints (25 to 30) cannot come out right by reading a single severity or a constant."""
+
+WINNER_CURVE = (0.0, 10.0, 20.0, -5.0, 40.0, 50.0)
+"""The deployable winner's curve. Severity 3 sits *below* clean, so its AUROC is near zero
+while the other four are near one: five distinct numbers, which is what makes "prints all five"
+distinguishable from "prints the macro five times"."""
+
+WEAK_DECILE_CURVE = (0.0, 10.0, 20.0, -5.0, -6.0, 50.0)
+QUINTILE_CURVE = (0.0, -5.0, -6.0, 30.0, 40.0, 50.0)
+CONTROL_CURVE = tuple(0.9 - 0.05 * severity for severity in range(6))
+CONTROL_QUINTILE_CURVE = tuple(0.5 - 0.05 * severity for severity in range(6))
+"""The matched confidence control falls perfectly, so the reporter locks it at `-1` and it
+earns a macro AUROC of 1.000 -- ahead of the persistence winner's 0.807. The comparison the
+report has to make therefore comes out *against* persistence on this fixture, which is the only
+way to tell a real comparison from a sentence that says persistence won.
+
+The quintile control sits a long way below the decile one on purpose. The two are drawn on one
+shared y-range and the two persistence figures on another, so a fixture whose two confidence
+buckets overlapped would make a figure drawn on the wrong range look right."""
+
+FLAT_IMAGES = frozenset(range(240, 250))
+FLAT_SCORE = 5.0
+"""Ten of the winner's 250 images are a complete curve of six identical scores: measured, and
+found no movement. They are what makes the direction counts 240 / 0 / 10 rather than 250 / 0 /
+0, so a report that printed the measured count where the flat count belongs is visible.
+`5.0` sits above every clean score and below every severity-1 score, so in each AUROC those ten
+images tie only with themselves -- which is what puts the four strong severities at 0.999
+instead of 1.000."""
+
+
+def spread_curves(curve, *, count=FULL_TUNING_IMAGE_COUNT, step=0.001, flat_images=frozenset()):
+    """One curve per image, each lifted onto its own baseline, plus the flat images.
+
+    The lift is what makes these 250 different scenes rather than 250 copies of one: AUROC
+    ranks scores from unrelated images against each other, and identical scenes would make
+    every pair a tie. At most 0.249 over a 250-image run at the default step, and smaller than
+    any gap in the curves it is added to, so the AUROC each severity earns is decided by the
+    curve and not by the offsets.
+    """
+    curves = {}
+    for image in range(count):
+        if image in flat_images:
+            curves[image] = [FLAT_SCORE] * 6
+        else:
+            curves[image] = [value + image * step for value in curve]
+    return curves
+
+
+def bundle_rows(count=FULL_TUNING_IMAGE_COUNT):
+    """Seven candidates over one run: three deployable, and four measured and excluded.
+
+    The winner is `decile_00_10`, which is neither the first nor the last candidate in
+    `CANDIDATE_KEY` order -- the confidence control sorts before it and the quintile after it --
+    so a report that led with `candidates[0]` or with the last row would name the wrong one.
+    The frozen twin carries the winner's confidence bin and every one of its numbers under a
+    different membership mode, so a section that identified the winner by its bin alone would
+    be free to describe the twin instead -- and the twin is not deployable.
+    """
+    short_count = count * 4 // 5
+    rows = candidate_rows(
+        spread_curves(WINNER_CURVE, count=count, flat_images=FLAT_IMAGES),
+        selected_count=BUNDLE_SELECTED_COUNTS,
+    )
+    rows += candidate_rows(
+        spread_curves(WEAK_DECILE_CURVE, count=count),
+        selected_count=BUNDLE_SELECTED_COUNTS, confidence_bin="decile_10_20",
+    )
+    rows += candidate_rows(
+        spread_curves(QUINTILE_CURVE, count=count),
+        selected_count=BUNDLE_SELECTED_COUNTS,
+        bucket_scheme="quintile", confidence_bin="quintile_00_20",
+    )
+    rows += candidate_rows(
+        spread_curves(CONTROL_CURVE, count=count, step=0.0001),
+        selected_count=BUNDLE_SELECTED_COUNTS,
+        signal="confidence", score_scope="confidence",
+    )
+    rows += candidate_rows(
+        spread_curves(CONTROL_QUINTILE_CURVE, count=count, step=0.0001),
+        selected_count=BUNDLE_SELECTED_COUNTS,
+        bucket_scheme="quintile", confidence_bin="quintile_00_20",
+        signal="confidence", score_scope="confidence",
+    )
+    rows += candidate_rows(
+        spread_curves(WINNER_CURVE, count=count, flat_images=FLAT_IMAGES),
+        selected_count=BUNDLE_SELECTED_COUNTS, membership_mode="frozen",
+    )
+    # A candidate that never reached part of the run: 200 images of 250, and one of those 200
+    # missing its worst blur level. Its three coverage numbers are therefore three different
+    # numbers -- 250 expected, 200 with rows, 199 with a complete curve -- so a range taken
+    # from the wrong one shows, and `measured_fraction` reads 0.995 rather than the 1.0 it
+    # would read if every image it has were complete.
+    short = spread_curves(WEAK_DECILE_CURVE, count=short_count)
+    short[0][5] = None
+    rows += candidate_rows(
+        short, selected_count=BUNDLE_SELECTED_COUNTS, confidence_bin="decile_20_30",
+    )
+    return rows
+
+
+BUNDLE_ROW_COUNT = 6 * FULL_TUNING_IMAGE_COUNT * 6 + (FULL_TUNING_IMAGE_COUNT * 4 // 5) * 6 - 1
+
+
+def bundle_diagnostics(count=FULL_TUNING_IMAGE_COUNT):
+    """What `analyze_corruption_sensitivity` hands the writer: run metadata and padding.
+
+    Two of the images carry padding and they differ from each other in both published ways --
+    one detected a different tail at different severities and one did not -- so every number in
+    the padding rollup is a different number: 2 padded images of `count`, 5 padded queries in
+    total, 3 at most, and 1 padded image whose tail held still.
+    """
+    images = {}
+    for image in range(count):
+        if image == 0:
+            tails = {
+                str(severity): [297, 298, 299][: 2 + severity % 2] for severity in range(6)
+            }
+        elif image == 1:
+            tails = {str(severity): [298, 299] for severity in range(6)}
+        else:
+            tails = {str(severity): [] for severity in range(6)}
+        union = sorted({query for ids in tails.values() for query in ids})
+        images[str(image)] = {
+            "union_padded_query_ids": union,
+            "union_padded_count": len(union),
+            "padded_query_ids_by_severity": tails,
+            "padded_count_by_severity": {
+                key: len(value) for key, value in tails.items()
+            },
+            "tail_identical_across_severities": (
+                len({tuple(value) for value in tails.values()}) == 1
+            ),
+        }
+    return {
+        "run": {
+            "artifact_type": "scene_corruption_sensitivity_inputs",
+            "feature_cache_id": "cache-df79fddf",
+            "source_result_id": "result-353a5992",
+            "bank_id": "bank-5dfd6e50",
+            "normalization": "l2_row",
+            "k": 5,
+            "source_partition": "tuning",
+            "severities": [0, 1, 2, 3, 4, 5],
+            "decoder_layers": [0, 1, 2],
+            "query_count": 300,
+            "image_count": count,
+            "record_count": count * 6,
+        },
+        "images": images,
+    }
+
+
+FIXED_LIMITS = {"persistence": [-1.5, 52.0], "confidence": [0.14, 0.91]}
+"""Stand-in axis limits for the report tests, which do not need the figures drawn. Deliberately
+not the limits this fixture's candidates would produce, so a report that recomputed them rather
+than reading the summary would print different numbers."""
+
+
+def report_summary(count=FULL_TUNING_IMAGE_COUNT, rows=None):
+    """The summary the writer builds, without spending the four figures to get it."""
+    rows = bundle_rows(count=count) if rows is None else rows
+    per_scene, candidates, ranking = summarize_candidates(rows, expected_image_count=count)
+    return build_summary(
+        bundle_diagnostics(count=count),
+        candidates,
+        ranking,
+        axis_limits=FIXED_LIMITS,
+        scored_row_count=len(rows),
+        per_scene_row_count=len(per_scene),
+    )
+
+
+def flat(text):
+    """The report with its line wrapping removed, so an assertion is about the words."""
+    return " ".join(text.split())
+
+
+def section(report, title):
+    """One `## ` section, flattened -- so a claim asserted about the lead cannot be satisfied
+    by a sentence three sections further down."""
+    heading = f"## {title}"
+    assert heading in report, f"no section titled {title!r}"
+    return flat(report.split(heading, 1)[1].split("\n## ", 1)[0])
+
+
+def sentences(text):
+    return [part for part in re.split(r"(?<=[.!?])\s+", flat(text)) if part]
+
+
+def read_csv(path):
+    with path.open(newline="", encoding="utf-8") as handle:
+        return list(csv.reader(handle))
+
+
+@pytest.fixture(scope="module")
+def bundle(tmp_path_factory):
+    """One published bundle, written once: the four figures are the slow part of this file."""
+    output = tmp_path_factory.mktemp("published") / "corruption"
+    summary = write_corruption_report(
+        output, score_rows=bundle_rows(), diagnostics=bundle_diagnostics()
+    )
+    return output, summary
+
+
+def test_the_writer_and_the_figures_agree_on_the_names_they_share():
+    """Three strings each module spells for itself, because the plots import the reporter.
+
+    The eight filenames are pinned as literals -- the bundle's contract with whoever reads it --
+    and then the four figure names and the control's signal are checked against the module that
+    actually writes and draws them. Without the second half, `FIGURE_FILES` could name a file
+    `corruption_plots` never writes and only the file-set check at the end of a real run would
+    notice.
+    """
+    assert reporting_module.CONTROL_SIGNAL == plots_module.CONFIDENCE_SIGNAL
+    assert EXPECTED_FILES == {
+        "per_scene.csv",
+        "candidate_metrics.csv",
+        "summary.json",
+        "persistence_actual_distance_deciles.png",
+        "persistence_actual_distance_quintiles.png",
+        "confidence_actual_distance_deciles.png",
+        "confidence_actual_distance_quintiles.png",
+        "easy-report.md",
+    }
+    assert set(PLOT_FILENAMES.values()) < EXPECTED_FILES
+
+
+def test_a_published_bundle_holds_exactly_the_eight_expected_files(bundle):
+    output, _ = bundle
+
+    assert {path.name for path in output.iterdir()} == EXPECTED_FILES
+    for name in PLOT_FILENAMES.values():
+        assert (output / name).read_bytes()[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_the_per_scene_table_is_every_scored_row_in_the_documented_column_order(bundle):
+    output, _ = bundle
+    table = read_csv(output / "per_scene.csv")
+
+    assert table[0] == list(PER_SCENE_KEYS)
+    assert len(table) == 1 + BUNDLE_ROW_COUNT
+
+
+def test_no_nested_dictionary_reaches_a_cell_of_the_candidate_table(bundle):
+    """Ruling 1: the CSV is the scalar projection, `summary.json` keeps the nested view.
+
+    `pd.DataFrame(candidates).to_csv(...)` writes five columns of `{'0': {'count': 250, ...}}`
+    and produces a file with the right number of rows in it, so the row count is not the check
+    -- the absence of a brace anywhere in the file is.
+    """
+    output, summary = bundle
+    path = output / "candidate_metrics.csv"
+    header, *body = read_csv(path)
+
+    assert "{" not in path.read_text(encoding="utf-8")
+    assert len(body) == len(summary["candidates"]) == 7
+    for nested in (
+        "auroc_by_severity", "severity_statistics", "coverage_by_severity",
+        "selected_count_by_severity", "median_clean_overlap_by_severity",
+    ):
+        assert nested not in header
+        assert nested in summary["candidates"][0]
+
+
+def test_the_candidate_columns_are_the_scalar_projection_in_one_fixed_order(bundle):
+    """Pinned as a literal rather than derived from a candidate row.
+
+    A header compared against "the non-dictionary keys of this candidate" is a comparison of
+    the projection with itself: it passes whatever order the reporter happens to build, which
+    is the property being asserted.
+    """
+    output, _ = bundle
+    header, *_ = read_csv(output / "candidate_metrics.csv")
+
+    assert header == [
+        "signal", "bucket_scheme", "confidence_bin", "membership_mode", "padding_mode",
+        "aggregation", "score_scope",
+        "expected_image_count", "image_count", "measured_count", "missing_count",
+        "positive_count", "negative_count", "flat_count",
+        "measured_fraction", "missing_fraction", "positive_fraction", "negative_fraction",
+        "flat_fraction", "dominant_direction_fraction",
+        "median_signed_spearman", "median_absolute_spearman", "orientation",
+        "oriented_adjacent_consistency", "max_blur_above_clean_rate", "macro_auroc",
+        "deployable",
+        "padding_counterpart_padding_mode", "padding_paired_score_count",
+        "padding_changed_score_count", "padding_median_unfiltered_minus_filtered_score",
+        *(f"auroc_severity_{severity}" for severity in range(1, 6)),
+        *(f"score_count_severity_{severity}" for severity in range(6)),
+        *(f"score_mean_severity_{severity}" for severity in range(6)),
+        *(f"score_variance_severity_{severity}" for severity in range(6)),
+        *(f"score_median_severity_{severity}" for severity in range(6)),
+        *(f"score_q25_severity_{severity}" for severity in range(6)),
+        *(f"score_q75_severity_{severity}" for severity in range(6)),
+        *(f"image_count_severity_{severity}" for severity in range(6)),
+        *(f"finite_count_severity_{severity}" for severity in range(6)),
+        *(f"clean_count_severity_{severity}" for severity in range(6)),
+        *(f"corrupted_count_severity_{severity}" for severity in range(6)),
+        *(f"selected_count_min_severity_{severity}" for severity in range(6)),
+        *(f"selected_count_median_severity_{severity}" for severity in range(6)),
+        *(f"selected_count_max_severity_{severity}" for severity in range(6)),
+        *(f"median_clean_overlap_severity_{severity}" for severity in range(6)),
+    ]
+    assert len(header) == 120
+
+
+def test_each_candidate_row_of_the_csv_holds_what_summary_json_publishes(bundle):
+    """The two files are two views of one list, not two computations over the same rows."""
+    output, summary = bundle
+    with (output / "candidate_metrics.csv").open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    winner = summary["deployable_ranking"][0]
+    published = next(
+        row for row in rows
+        if all(row[field] == str(winner[field]) for field in CANDIDATE_KEY)
+    )
+
+    assert float(published["macro_auroc"]) == pytest.approx(winner["macro_auroc"])
+    assert float(published["auroc_severity_3"]) == pytest.approx(winner["auroc_severity_3"])
+    assert int(published["flat_count"]) == winner["flat_count"] == 10
+    assert published["deployable"] == "True"
+    assert float(published["score_q75_severity_5"]) == pytest.approx(
+        winner["severity_statistics"]["5"]["q75"]
+    )
+
+
+def test_summary_json_is_written_with_its_keys_sorted(bundle):
+    """Insertion order would put `run` first; sorted order puts `axis_limits` first."""
+    output, summary = bundle
+    text = (output / "summary.json").read_text(encoding="utf-8")
+    top_level = [
+        line.split('"')[1] for line in text.splitlines() if line.startswith('  "')
+    ]
+
+    assert top_level == [
+        "axis_limits", "candidates", "configuration", "deployable_ranking", "labels",
+        "padding", "run", "validation",
+    ]
+    assert text == json.dumps(json.loads(text), indent=2, sort_keys=True) + "\n"
+    assert json.loads(text) == summary
+
+
+def test_the_summary_carries_the_run_provenance_exactly_as_the_analysis_recorded_it(bundle):
+    _, summary = bundle
+
+    assert summary["run"] == bundle_diagnostics()["run"]
+
+
+def test_the_summary_counts_what_was_read_against_what_came_out(bundle):
+    _, summary = bundle
+    validation = summary["validation"]
+
+    assert validation["scored_row_count"] == BUNDLE_ROW_COUNT
+    assert validation["per_scene_row_count"] == BUNDLE_ROW_COUNT
+    assert validation["duplicate_row_key_count"] == 0
+    assert validation["candidate_count"] == 7
+    assert validation["deployable_candidate_count"] == 3
+    assert validation["expected_image_count"] == FULL_TUNING_IMAGE_COUNT
+    # From `image_count` and `measured_count` against `expected_image_count`, never from
+    # `measured_fraction`, which is over the images a candidate has rows for and says nothing
+    # about the 50 the short candidate never reached.
+    assert validation["candidate_image_count_range"] == [200, 250]
+    assert validation["candidate_measured_count_range"] == [199, 250]
+
+
+def test_the_summary_rolls_the_padding_record_up_and_still_carries_it_whole(bundle):
+    _, summary = bundle
+    padding = summary["padding"]
+
+    assert padding["image_count"] == FULL_TUNING_IMAGE_COUNT
+    assert padding["images_with_padding"] == 2
+    assert padding["total_union_padded_count"] == 5
+    assert padding["max_union_padded_count"] == 3
+    assert padding["padded_images_with_identical_tails"] == 1
+    assert padding["images"]["0"] == bundle_diagnostics()["images"]["0"]
+
+
+def test_the_summary_records_the_gates_it_applied_and_the_labels_the_run_carried(bundle):
+    _, summary = bundle
+
+    assert summary["configuration"] == {
+        "full_tuning_image_count": FULL_TUNING_IMAGE_COUNT,
+        "deployable_signal": "persistence",
+        "deployable_membership_mode": "dynamic",
+        "deployable_padding_mode": "filtered",
+        "deployable_score_scope": DEPLOYABLE_SCORE_SCOPE,
+        "severities": [0, 1, 2, 3, 4, 5],
+    }
+    assert summary["labels"] == {
+        "signal": ["confidence", "persistence"],
+        "bucket_scheme": ["decile", "quintile"],
+        "confidence_bin": [
+            "decile_00_10", "decile_10_20", "decile_20_30", "quintile_00_20"
+        ],
+        "membership_mode": ["dynamic", "frozen"],
+        "padding_mode": ["filtered"],
+        "aggregation": ["q90"],
+        "score_scope": ["confidence", "layer_2"],
+    }
+
+
+def test_the_summary_records_the_limits_the_figures_used_rather_than_computing_its_own(
+    tmp_path, monkeypatch
+):
+    """Ruling 6: the figures return what they applied, and the summary carries that object.
+
+    The sentinel is a pair no computation over these candidates produces, so a `build_summary`
+    that called `shared_limits` again -- and drifted from the figures the moment either side
+    changed -- cannot pass.
+    """
+    drawn = plots_module.write_corruption_plots
+    sentinel = {"persistence": [-11.0, 111.0], "confidence": [-0.25, 0.75]}
+
+    def stamped(directory, candidates):
+        drawn(directory, candidates)
+        return sentinel
+
+    monkeypatch.setattr(plots_module, "write_corruption_plots", stamped)
+    output = tmp_path / "corruption"
+    summary = write_corruption_report(
+        output, score_rows=bundle_rows(count=4), diagnostics=bundle_diagnostics(count=4)
+    )
+
+    assert summary["axis_limits"] == sentinel
+    assert json.loads((output / "summary.json").read_text())["axis_limits"] == sentinel
+
+
+# --- refusing to publish half a bundle ------------------------------------------------------
+
+
+def test_an_existing_output_directory_is_refused_and_left_alone(tmp_path):
+    output = tmp_path / "corruption"
+    output.mkdir()
+    (output / "keep.txt").write_text("an earlier run", encoding="utf-8")
+
+    with pytest.raises(FileExistsError, match="output already exists"):
+        write_corruption_report(
+            output, score_rows=bundle_rows(count=3), diagnostics=bundle_diagnostics(count=3)
+        )
+
+    assert [path.name for path in output.iterdir()] == ["keep.txt"]
+    assert {path.name for path in tmp_path.iterdir()} == {"corruption"}
+
+
+def test_a_write_that_fails_part_way_leaves_neither_the_bundle_nor_a_staging_directory(
+    tmp_path
+):
+    """The figures refuse a run with no drawable confidence control -- after two CSVs exist.
+
+    The parent is asserted empty rather than the output absent: a staging directory left
+    beside it is what a half-written run looks like, and it is named `.corruption.<random>`,
+    which nothing about `output.exists()` can see.
+    """
+    output = tmp_path / "corruption"
+    rows = [row for row in bundle_rows(count=3) if row["signal"] != "confidence"]
+
+    with pytest.raises(ValueError, match="no drawable confidence candidate"):
+        write_corruption_report(
+            output, score_rows=rows, diagnostics=bundle_diagnostics(count=3)
+        )
+
+    assert not output.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_ninth_file_in_the_staging_directory_stops_the_bundle_being_published(
+    tmp_path, monkeypatch
+):
+    """The file set is checked *before* the rename, which only a failing check can show."""
+    drawn = plots_module.write_corruption_plots
+
+    def with_an_extra_figure(directory, candidates):
+        limits = drawn(directory, candidates)
+        (directory / "persistence_actual_distance_thirds.png").write_bytes(b"")
+        return limits
+
+    monkeypatch.setattr(plots_module, "write_corruption_plots", with_an_extra_figure)
+    output = tmp_path / "corruption"
+
+    with pytest.raises(RuntimeError, match="report bundle contains"):
+        write_corruption_report(
+            output, score_rows=bundle_rows(count=3), diagnostics=bundle_diagnostics(count=3)
+        )
+
+    assert not output.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_missing_figure_stops_the_bundle_being_published(tmp_path, monkeypatch):
+    drawn = plots_module.write_corruption_plots
+
+    def without_one_figure(directory, candidates):
+        limits = drawn(directory, candidates)
+        (directory / "confidence_actual_distance_quintiles.png").unlink()
+        return limits
+
+    monkeypatch.setattr(plots_module, "write_corruption_plots", without_one_figure)
+    output = tmp_path / "corruption"
+
+    with pytest.raises(RuntimeError, match="report bundle contains"):
+        write_corruption_report(
+            output, score_rows=bundle_rows(count=3), diagnostics=bundle_diagnostics(count=3)
+        )
+
+    assert not output.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_a_summary_that_is_not_valid_json_fails_the_write_rather_than_the_reader(
+    tmp_path, monkeypatch
+):
+    """`NaN` is not JSON. Written anyway it lands in the file and breaks a reader long after
+    the run; refused, it fails the write and the bundle never appears."""
+    monkeypatch.setattr(
+        reporting_module, "build_summary", lambda *args, **kwargs: {"broken": float("nan")}
+    )
+    output = tmp_path / "corruption"
+
+    with pytest.raises(ValueError, match="not JSON compliant"):
+        write_corruption_report(
+            output, score_rows=bundle_rows(count=3), diagnostics=bundle_diagnostics(count=3)
+        )
+
+    assert not output.exists()
+    assert list(tmp_path.iterdir()) == []
+
+
+# --- the plain-language report --------------------------------------------------------------
+
+
+def test_the_published_report_is_the_rendered_summary(bundle):
+    """Licenses every test below to render from a summary instead of publishing a bundle."""
+    output, summary = bundle
+    published = (output / "easy-report.md").read_text(encoding="utf-8")
+
+    assert published == render_easy_report(summary)
+    assert "decile_00_10" in published
+
+
+def test_the_report_asks_the_six_questions_in_order():
+    report = render_easy_report(report_summary())
+
+    assert [line for line in report.splitlines() if line.startswith("## ")] == [
+        "## What should we deploy?",
+        "## Does it react steadily to blur?",
+        "## Did 20% buckets help?",
+        "## Did persistence beat model confidence?",
+        "## What the files contain",
+        "## What this does not prove",
+    ]
+
+
+def test_the_report_leads_with_the_best_deployable_layer_2_candidate():
+    """Not `candidates[0]`, which is the confidence control, and not the frozen twin, which
+    carries the winner's bin and every one of its numbers."""
+    deploy = section(render_easy_report(report_summary()), "What should we deploy?")
+
+    assert "`decile_00_10`" in deploy
+    assert "`decile_10_20`" not in deploy
+    assert "`quintile_00_20`" not in deploy
+    assert "frozen" not in deploy
+    for label in ("`persistence`", "`layer_2`", "`dynamic`", "`filtered`", "`q90`"):
+        assert label in deploy
+    assert "first of 3 candidates" in deploy
+    assert "between 25 and 30 selected queries" in deploy
+
+
+def test_the_report_gives_all_five_severity_aurocs_beside_the_macro():
+    """Four severities at 0.999 and one at 0.039: printing the macro five times fails."""
+    deploy = section(render_easy_report(report_summary()), "What should we deploy?")
+
+    assert deploy.count("0.999") == 4
+    assert "0.039" in deploy
+    assert "0.807" in deploy
+
+
+def test_the_report_explains_auroc_as_an_ordering_and_never_as_a_probability():
+    report = flat(render_easy_report(report_summary()))
+
+    assert (
+        "An AUROC of 0.80 means that when we randomly pick one clean image and one blurred "
+        "image, the score puts the blurred image higher about 80 times out of 100. It does not "
+        "mean the image has an 80% chance of being corrupted."
+    ) in report
+    spoken = [
+        sentence for sentence in sentences(report)
+        if "probab" in sentence.lower() or "chance" in sentence.lower()
+    ]
+    assert spoken
+    for sentence in spoken:
+        assert re.search(r"\b(not|never|no|nothing)\b", sentence.lower()), sentence
+
+
+def test_the_report_reads_the_strength_number_beside_the_direction_counts():
+    """Absolute Spearman on its own says nothing about which way; the counts are the other
+    half of the sentence, and 240 / 0 / 10 are three different numbers."""
+    steady = section(
+        render_easy_report(report_summary()), "Does it react steadily to blur?"
+    )
+
+    assert "0.657" in steady
+    assert "+0.657" in steady
+    assert "240 of the 250 measured images rose with blur, 0 fell, and 10 were flat" in steady
+    assert "0.808" in steady
+    assert "0.960" in steady
+
+
+def test_the_report_compares_the_ten_way_cut_with_the_five_way_cut():
+    buckets = section(render_easy_report(report_summary()), "Did 20% buckets help?")
+
+    assert "`decile_00_10`" in buckets and "0.807" in buckets
+    assert "`quintile_00_20`" in buckets and "0.600" in buckets
+
+
+def test_the_report_compares_persistence_with_the_control_that_shares_its_selection():
+    """On this fixture the control wins, so a sentence that says persistence did cannot pass."""
+    control = section(
+        render_easy_report(report_summary()), "Did persistence beat model confidence?"
+    )
+
+    assert "the control comes out ahead" in control
+    assert "1.000" in control and "0.807" in control and "0.657" in control
+    for label in ("`decile`", "`decile_00_10`", "`dynamic`", "`filtered`", "`q90`"):
+        assert label in control
+    assert "same selected queries" in control
+    assert "share no unit" in control
+
+
+def test_a_winner_with_no_matched_control_says_so_rather_than_pairing_a_stranger():
+    """The control is one candidate or none: the winner's own frozen twin is not a control.
+
+    Every confidence row is taken out, leaving the winner, its frozen twin and the other
+    persistence candidates. A lookup that matched on the confidence bin, or on everything but
+    the membership mode, has something to return here and would report the twin's numbers as a
+    comparison between two signals.
+    """
+    rows = [row for row in bundle_rows() if row["signal"] != "confidence"]
+    control = section(
+        render_easy_report(report_summary(rows=rows)),
+        "Did persistence beat model confidence?",
+    )
+
+    assert "scored for persistence only" in control
+    assert "0.807" not in control
+
+
+def test_one_scheme_with_a_ranked_candidate_is_reported_as_uncomparable():
+    """A comparison of one is not a comparison, and the quintile row would supply the number."""
+    rows = [row for row in bundle_rows() if row["bucket_scheme"] != "quintile"]
+    buckets = section(render_easy_report(report_summary(rows=rows)), "Did 20% buckets help?")
+
+    assert "Only the `decile` cut" in buckets
+    assert "`decile_00_10`" in buckets and "0.807" in buckets
+    assert "quintile" not in buckets
+
+
+def test_the_report_says_what_each_file_holds_and_which_axes_are_shared():
+    files = section(render_easy_report(report_summary()), "What the files contain")
+
+    for name in (*PLOT_FILENAMES.values(), "per_scene.csv", "candidate_metrics.csv",
+                 "summary.json"):
+        assert name in files
+    assert "-1.500" in files and "52.000" in files
+    assert "0.140" in files and "0.910" in files
+
+
+def test_the_report_says_nothing_was_calibrated_and_no_held_out_data_was_used():
+    limits = section(render_easy_report(report_summary()), "What this does not prove")
+
+    assert "calibrat" in limits
+    assert "held-out" in limits
+    assert "250" in limits
+
+
+def test_the_report_carries_no_latex_and_no_terminal_unfriendly_notation():
+    report = render_easy_report(report_summary())
+
+    assert report.isascii()
+    for token in ("$", "\\", "^", "_{", "~"):
+        assert token not in report
+
+
+def test_a_run_smaller_than_the_full_tuning_set_publishes_an_empty_ranking_and_says_so(
+    tmp_path
+):
+    """The path every synthetic and diagnostic run takes: eight files, no recommendation.
+
+    The output's parent does not exist either, which is the other half of what the writer
+    promises about a directory nobody has created yet.
+    """
+    output = tmp_path / "runs" / "corruption"
+    summary = write_corruption_report(
+        output, score_rows=bundle_rows(count=3), diagnostics=bundle_diagnostics(count=3)
+    )
+    report = (output / "easy-report.md").read_text(encoding="utf-8")
+    deploy = section(report, "What should we deploy?")
+
+    assert {path.name for path in output.iterdir()} == EXPECTED_FILES
+    assert summary["deployable_ranking"] == []
+    assert summary["validation"]["deployable_candidate_count"] == 0
+    assert [candidate["deployable"] for candidate in summary["candidates"]] == [False] * 7
+    assert "No candidate passed the full tuning-coverage gate" in deploy
+    assert "all 250 images" in deploy
+    assert "This run declared 3 images, fewer than 250" in deploy
+    assert "`decile_00_10`" not in deploy
