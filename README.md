@@ -399,12 +399,23 @@ fails leaves neither a partial bundle nor an empty directory, and a directory th
 a finished report that is never overwritten.
 
 **Auditing a published bundle.** `tools/audit_corruption_bundle.py` re-derives the bundle's
-claims from the bundle's own eight files and prints one PASS/FAIL line per check, exiting
-non-zero if any of them failed:
+claims from the bundle's own eight files and prints one PASS/FAIL line per check, each stating
+the size of the population it examined:
 
 ```bash
 $UE_PY tools/audit_corruption_bundle.py $OUT/reports/corruption_sensitivity_raw_k5
 ```
+
+**It has three exit statuses and the third is not a failure.** `0` means every check ran against
+a non-empty population and passed; `1` means the bundle was read and at least one check failed;
+`2` means **nothing was audited** -- the path is not a directory, is missing one of the four data
+files, or holds files that cannot be parsed as themselves, so no check ran at all. Scripting
+this as a gate on `!= 0` is right; treating a `2` as "checks failed" is wrong, and treating it
+as "not a failure, carry on" is worse. A check that was handed an empty population -- a
+`per_scene.csv` with a header and no rows, say -- fails rather than passing vacuously, because
+every element of an empty set satisfies every predicate and PASS is the line a reader quotes.
+The one exception is the deployable ranking, where an empty population is a documented outcome
+and is reported as one.
 
 It is read-only and it deliberately imports nothing from `src/scene_uncertainty`: every
 constant and formula in it is restated from the design, so the two spellings can disagree. An

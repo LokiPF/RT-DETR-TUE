@@ -4,8 +4,25 @@
     python tools/audit_corruption_bundle.py <report directory>
 
 Read-only: it opens the eight published files, recomputes what can be recomputed, and prints
-one PASS or FAIL line per check. Exit status is 0 when every check passed and 1 otherwise, so
-this is usable as a gate on a real run.
+one PASS or FAIL line per check, each stating the size of the population it examined.
+
+**Three exit statuses, and the third is not a failure.**
+
+* `0` -- every check ran against a non-empty population and passed.
+* `1` -- the bundle was read and at least one check failed.
+* `2` -- **nothing was audited.** The path is not a directory, is missing one of the four data
+  files, or holds files that cannot be parsed as themselves. No check ran, so no check can have
+  passed or failed.
+
+The distinction matters to anyone scripting this as a gate: `2` means "I have no opinion about
+this bundle", which is the opposite of `1`. Treating a `2` as "checks failed" is wrong, and
+treating it as "not a failure, carry on" is worse.
+
+**A load failure is a refusal, not a green audit.** The four data files are checked for presence
+and then for being parseable, with the columns and keys every check below reads. A bundle that
+gets past that is one where the checks can be trusted to be examining something; one that does
+not is refused with an exit `2` naming the file and the reason. What is never allowed is a run
+that prints nine PASS lines because each check found nothing to look at -- see `_STARVED` below.
 
 **Why it does not import `scene_uncertainty`.** Every constant and every formula below is
 restated here from the design rather than imported from the code that wrote the bundle. An
@@ -38,6 +55,7 @@ import json
 import math
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import numpy as np
 import pandas as pd
@@ -74,6 +92,47 @@ SELECTION_KEY = (
     "membership_mode", "padding_mode",
 )
 
+SEVERITY_STATISTICS = (
+    "score_count", "score_mean", "score_variance", "score_median", "score_q25", "score_q75",
+)
+
+RANKING_METRICS = (
+    "macro_auroc",
+    "median_absolute_spearman",
+    "dominant_direction_fraction",
+    "oriented_adjacent_consistency",
+)
+"""The four descending terms of the documented ranking sort key, in order."""
+
+PER_SCENE_COLUMNS = (
+    "image_id", "severity", *CANDIDATE_KEY,
+    "score", "signed_spearman", "absolute_spearman",
+)
+"""Every column a check below reads out of `per_scene.csv`.
+
+Checked at load rather than where each is first indexed, so a table missing one is refused by
+name instead of raising a `KeyError` out of whichever check happened to touch it first. This is
+deliberately a subset of the published schema: an auditor that demanded every column would
+refuse a bundle it could in fact audit."""
+
+CANDIDATE_METRIC_COLUMNS = (
+    *CANDIDATE_KEY,
+    "macro_auroc",
+    *(f"auroc_severity_{severity}" for severity in EXPECTED_SEVERITIES[1:]),
+    *(
+        f"{statistic}_severity_{severity}"
+        for statistic in SEVERITY_STATISTICS
+        for severity in EXPECTED_SEVERITIES
+    ),
+)
+
+SUMMARY_VALIDATION_KEYS = (
+    "expected_image_count", "per_scene_row_count", "scored_row_count",
+    "candidate_count", "deployable_candidate_count",
+)
+
+SUMMARY_KEYS = ("validation", "candidates", "deployable_ranking", "axis_limits")
+
 SELECTIONS_PER_SEVERITY = 34
 """Eleven decile selections and six quintile selections under each of two membership modes.
 `corruption_analysis.analyze_corruption_sensitivity` derives the eleven and the six."""
@@ -103,8 +162,38 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 RTOL = 1e-9
 ATOL = 1e-12
 
+_STARVED = "the check was handed an empty population, so it compared nothing"
+"""The failure a check reports when it was starved rather than satisfied.
+
+This is the distinction the whole tool exists to make. A `per_scene.csv` with a header and no
+rows, or a `candidate_metrics.csv` with none, makes most of the checks below trivially true:
+every element of an empty set satisfies every predicate. Printing PASS there is worse than
+printing nothing, because PASS is the line a reader quotes into a report -- so a check that
+examined nothing says so and fails.
+
+The one check exempt from this is the deployable ranking, where an empty population is a
+documented outcome rather than a starved check: fewer than 250 images admits nothing by design,
+and a full run in which no candidate passed every gate is a real and reportable result. That
+check states its population and explains the zero instead."""
+
 
 # --- helpers ------------------------------------------------------------------------------
+
+
+class CheckResult(NamedTuple):
+    """What one check examined, and what was wrong with it.
+
+    `examined` is printed beside the PASS or FAIL line because a check's verdict is unreadable
+    without the size of what it looked at. "PASS, 765,000 rows" and "PASS, 0 rows" are the same
+    word about two completely different situations, and only one of them is evidence.
+    """
+
+    examined: str
+    failures: list[str]
+
+
+class BundleUnreadable(Exception):
+    """A file in the bundle is present but is not the thing it is named after."""
 
 
 def _close(left, right) -> bool:
@@ -129,20 +218,63 @@ def _cell(value):
     return value
 
 
+def _numeric(series: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """A column as numbers, and a mask of the cells that were never numbers at all.
+
+    `pd.to_numeric(errors="coerce")` turns `banana` into `NaN`, and every check below reads a
+    `NaN` as "unmeasured" -- which is right for a blank cell and catastrophically wrong for a
+    garbage one. Absorbed that way, a table nobody could have produced audits green, and a false
+    green is the worst thing this file can do.
+
+    So the coercion is kept, because a blank really does mean unmeasured, and the cells it
+    silently changed come back beside it for a check to report. The emptiness test reads the
+    original text rather than the coerced value, because the point is what the *file* said.
+    """
+    values = pd.to_numeric(series, errors="coerce")
+    spoiled = series.notna() & values.isna() & (series.astype(str).str.strip() != "")
+    return values, spoiled
+
+
 def _candidate_id(row) -> tuple:
     return tuple(row[field] for field in CANDIDATE_KEY)
 
 
+def _ranking_sort_key(candidate: dict):
+    """The documented four-metric-plus-key sort key, or `None` when it cannot be built.
+
+    `None` rather than a raise, and that is the whole point of this function existing. Building
+    the keys is the *last* thing `check_ranking_gates` does, after it has already accumulated
+    every gate violation it found. A `None` among the four metrics makes `-value` raise
+    `TypeError`, which propagates out of the check and replaces that entire accumulated list
+    with one line about a unary minus -- so the most broken bundle in the suite would get the
+    least actionable message of any of them, which is exactly backwards.
+
+    `bool` is excluded explicitly because `isinstance(True, int)` is true in Python, and a
+    `True` where a macro AUROC belongs would otherwise sort as `1`.
+    """
+    metrics = []
+    for field in RANKING_METRICS:
+        value = candidate.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        if math.isnan(float(value)):
+            return None
+        metrics.append(-float(value))
+    if any(field not in candidate for field in CANDIDATE_KEY):
+        return None
+    return (*metrics, *(candidate[field] for field in CANDIDATE_KEY))
+
+
 # --- the checks ---------------------------------------------------------------------------
 #
-# Every check takes the loaded bundle and returns a list of failure strings; an empty list is a
-# pass. Returning the failures rather than raising is what lets one run report every broken
-# invariant instead of only the first, which matters when the thing being audited is a run that
-# took GPU hours to produce.
+# Every check takes the loaded bundle and returns a `CheckResult`: what it examined, and a list
+# of failure strings that is empty on a pass. Returning the failures rather than raising is what
+# lets one run report every broken invariant instead of only the first, which matters when the
+# thing being audited is a run that took GPU hours to produce.
 
 
-def check_file_set(bundle) -> list[str]:
-    """Exactly eight files, no more and no fewer."""
+def check_file_set(bundle) -> CheckResult:
+    """Exactly eight files, no more and no fewer, and the four figures are really PNGs."""
     present = {path.name for path in bundle.directory.iterdir()}
     missing = sorted(EXPECTED_FILES - present)
     extra = sorted(present - EXPECTED_FILES)
@@ -156,10 +288,10 @@ def check_file_set(bundle) -> list[str]:
             path = bundle.directory / name
             if path.exists() and path.read_bytes()[:8] != PNG_MAGIC:
                 failures.append(f"{name} is not a PNG")
-    return failures
+    return CheckResult(f"{len(present)} files", failures)
 
 
-def check_raw_row_count(bundle) -> list[str]:
+def check_raw_row_count(bundle) -> CheckResult:
     """`per_scene.csv` holds `image_count x 3060` rows, and its decomposition is the design's.
 
     The decomposition is checked as well as the total because two errors multiply back to the
@@ -169,6 +301,9 @@ def check_raw_row_count(bundle) -> list[str]:
     scene = bundle.per_scene
     image_count = bundle.expected_image_count
     expected = image_count * ROWS_PER_IMAGE
+    examined = f"{len(scene)} rows"
+    if not len(scene):
+        return CheckResult(examined, [_STARVED, "per_scene.csv holds a header and no rows"])
     failures = []
     if len(scene) != expected:
         failures.append(
@@ -201,10 +336,10 @@ def check_raw_row_count(bundle) -> list[str]:
             f"summary.json per_scene_row_count {counts['per_scene_row_count']} != the "
             f"{len(scene)} rows in per_scene.csv"
         )
-    return failures
+    return CheckResult(examined, failures)
 
 
-def check_candidate_coverage(bundle) -> list[str]:
+def check_candidate_coverage(bundle) -> CheckResult:
     """Every candidate covers the run's images, and every image it covers holds severities 0-5.
 
     The severity check is an exact set comparison rather than a count: six rows of which two are
@@ -216,14 +351,19 @@ def check_candidate_coverage(bundle) -> list[str]:
     expected_severities = set(EXPECTED_SEVERITIES)
     bad_image_counts = []
     bad_severities = []
+    pairs = 0
     for candidate, frame in grouped:
         images = frame.groupby("image_id", sort=False)["severity"]
         if images.ngroups != bundle.expected_image_count:
             bad_image_counts.append((candidate, images.ngroups))
         for image_id, severities in images:
+            pairs += 1
             observed = set(int(value) for value in severities)
             if observed != expected_severities or len(severities) != len(expected_severities):
                 bad_severities.append((candidate, image_id, sorted(severities)))
+    examined = f"{pairs} (candidate, image) pairs"
+    if not pairs:
+        return CheckResult(examined, [_STARVED, "per_scene.csv contains no candidate at all"])
     if bad_image_counts:
         failures.append(
             f"{len(bad_image_counts)} candidate(s) do not cover all "
@@ -234,14 +374,19 @@ def check_candidate_coverage(bundle) -> list[str]:
             f"{len(bad_severities)} (candidate, image) pair(s) are not exactly severities "
             f"{list(EXPECTED_SEVERITIES)}, e.g. {bad_severities[:3]}"
         )
-    return failures
+    return CheckResult(examined, failures)
 
 
-def check_candidate_key_unique(bundle) -> list[str]:
-    """`candidate_metrics.csv` holds one row per candidate."""
+def check_candidate_key_unique(bundle) -> CheckResult:
+    """`candidate_metrics.csv` holds one row per candidate, and the set `per_scene.csv` does."""
     metrics = bundle.candidate_metrics
-    duplicated = metrics[metrics.duplicated(list(CANDIDATE_KEY), keep=False)]
+    examined = f"{len(metrics)} candidate rows"
+    if not len(metrics):
+        return CheckResult(
+            examined, [_STARVED, "candidate_metrics.csv holds a header and no rows"]
+        )
     failures = []
+    duplicated = metrics[metrics.duplicated(list(CANDIDATE_KEY), keep=False)]
     if len(duplicated):
         keys = sorted({_candidate_id(row) for _, row in duplicated.iterrows()})
         failures.append(f"{len(keys)} duplicated candidate key(s): {keys[:3]}")
@@ -261,10 +406,10 @@ def check_candidate_key_unique(bundle) -> list[str]:
             f"summary.json candidate_count {bundle.summary['validation']['candidate_count']} "
             f"!= the {len(metrics)} rows in candidate_metrics.csv"
         )
-    return failures
+    return CheckResult(examined, failures)
 
 
-def check_ranking_gates(bundle) -> list[str]:
+def check_ranking_gates(bundle) -> CheckResult:
     """Every ranked candidate is dynamic, filtered, persistence, layer 2, covered, orientable.
 
     Coverage is re-derived from the raw rows rather than read from the candidate: a ranked
@@ -275,34 +420,45 @@ def check_ranking_gates(bundle) -> list[str]:
     On a run over fewer images the gate can admit nothing, so the check becomes "the ranking is
     empty". That is the gate holding, and it is asserted rather than skipped -- a widened gate
     would otherwise pass this audit silently.
+
+    This is the one check exempt from `_STARVED`: an empty ranking is a documented outcome here
+    and not a starved check, both on a short run and on a full one where nothing passed. The
+    population is stated and the zero is explained rather than failed.
     """
     ranking = bundle.summary["deployable_ranking"]
     failures = []
     if bundle.expected_image_count != FULL_TUNING_IMAGE_COUNT:
+        examined = (
+            f"{len(ranking)} ranked candidates; the gate admits none below "
+            f"{FULL_TUNING_IMAGE_COUNT} images, so empty is the expected result"
+        )
         if ranking:
             failures.append(
                 f"the run measured {bundle.expected_image_count} images, not "
                 f"{FULL_TUNING_IMAGE_COUNT}, yet {len(ranking)} candidate(s) were ranked "
                 "deployable"
             )
-        return failures
+        return CheckResult(examined, failures)
+    examined = f"{len(ranking)} ranked candidates"
+    if not ranking:
+        examined += "; empty on a full run means no candidate passed every gate"
     finite_by_candidate = bundle.finite_counts
-    for candidate in ranking:
+    for position, candidate in enumerate(ranking):
+        missing = [field for field in CANDIDATE_KEY if field not in candidate]
+        if missing:
+            failures.append(f"ranked candidate at position {position} is missing {missing}")
+            continue
         key = _candidate_id(candidate)
         for field, required in DEPLOYABLE_GATES.items():
             if candidate[field] != required:
                 failures.append(f"ranked candidate {key} has {field}={candidate[field]!r}")
-        if candidate["measured_count"] != FULL_TUNING_IMAGE_COUNT:
+        for field in ("measured_count", "image_count"):
+            value = candidate.get(field)
+            if value != FULL_TUNING_IMAGE_COUNT:
+                failures.append(f"ranked candidate {key} has {field}={value!r}")
+        if candidate.get("orientation") not in (-1, 1):
             failures.append(
-                f"ranked candidate {key} measured {candidate['measured_count']} images"
-            )
-        if candidate["image_count"] != FULL_TUNING_IMAGE_COUNT:
-            failures.append(
-                f"ranked candidate {key} has rows for {candidate['image_count']} images"
-            )
-        if candidate["orientation"] not in (-1, 1):
-            failures.append(
-                f"ranked candidate {key} has orientation {candidate['orientation']!r}"
+                f"ranked candidate {key} has orientation {candidate.get('orientation')!r}"
             )
         thin = {
             severity: finite_by_candidate.get((key, severity), 0)
@@ -313,30 +469,42 @@ def check_ranking_gates(bundle) -> list[str]:
             failures.append(f"ranked candidate {key} has incomplete severities {thin}")
     if len(ranking) != bundle.summary["validation"]["deployable_candidate_count"]:
         failures.append("summary.json deployable_candidate_count disagrees with the ranking")
-    keys = [
-        (
-            -candidate["macro_auroc"],
-            -candidate["median_absolute_spearman"],
-            -candidate["dominant_direction_fraction"],
-            -candidate["oriented_adjacent_consistency"],
-            *(candidate[field] for field in CANDIDATE_KEY),
+
+    # Built last, and built so that it cannot throw away everything above it. See
+    # `_ranking_sort_key` for why a missing metric is reported here rather than raised.
+    keys = [_ranking_sort_key(candidate) for candidate in ranking]
+    unsortable = [index for index, key in enumerate(keys) if key is None]
+    if unsortable:
+        failures.append(
+            f"{len(unsortable)} ranked candidate(s) carry a missing or non-numeric ranking "
+            f"metric, so the sort order could not be checked: positions {unsortable[:5]}"
         )
-        for candidate in ranking
-    ]
-    if keys != sorted(keys):
-        failures.append("the deployable ranking is not sorted by its documented key")
-    return failures
+    else:
+        try:
+            ordered = sorted(keys)
+        except TypeError as error:
+            failures.append(f"the ranking's sort keys are not mutually comparable: {error}")
+        else:
+            if keys != ordered:
+                failures.append("the deployable ranking is not sorted by its documented key")
+    return CheckResult(examined, failures)
 
 
-def check_macro_auroc(bundle) -> list[str]:
+def check_macro_auroc(bundle) -> CheckResult:
     """Each macro AUROC is the mean of that candidate's five per-severity AUROCs.
 
     Both directions are checked, because the failure that hides is the asymmetric one: a macro
     published beside five `None`s is a number computed from nothing, and five AUROCs with no
     macro is a candidate that cannot be ranked but looks measurable.
     """
+    metrics = bundle.candidate_metrics
+    examined = f"{len(metrics)} candidate rows"
+    if not len(metrics):
+        return CheckResult(
+            examined, [_STARVED, "candidate_metrics.csv holds a header and no rows"]
+        )
     failures = []
-    for _, row in bundle.candidate_metrics.iterrows():
+    for _, row in metrics.iterrows():
         per_severity = [
             _cell(row[f"auroc_severity_{severity}"]) for severity in EXPECTED_SEVERITIES[1:]
         ]
@@ -354,10 +522,10 @@ def check_macro_auroc(bundle) -> list[str]:
         expected = float(np.mean([float(value) for value in per_severity]))
         if not _close(macro, expected):
             failures.append(f"{key} macro_auroc {macro} != mean of severities {expected}")
-    return failures
+    return CheckResult(examined, failures)
 
 
-def check_spearman_pairs(bundle) -> list[str]:
+def check_spearman_pairs(bundle) -> CheckResult:
     """Each row's absolute Spearman is non-negative and is `abs()` of its own signed Spearman.
 
     Row-wise and never candidate-wise: the median of the absolute values is not the absolute
@@ -365,9 +533,21 @@ def check_spearman_pairs(bundle) -> list[str]:
     correct data and pass on a table where a single image's pair had been crossed.
     """
     scene = bundle.per_scene
+    examined = f"{len(scene)} rows"
+    if not len(scene):
+        return CheckResult(examined, [_STARVED, "per_scene.csv holds a header and no rows"])
     failures = []
-    signed = pd.to_numeric(scene["signed_spearman"], errors="coerce")
-    absolute = pd.to_numeric(scene["absolute_spearman"], errors="coerce")
+    signed, signed_spoiled = _numeric(scene["signed_spearman"])
+    absolute, absolute_spoiled = _numeric(scene["absolute_spearman"])
+    for column, spoiled in (
+        ("signed_spearman", signed_spoiled), ("absolute_spearman", absolute_spoiled)
+    ):
+        if spoiled.any():
+            values = sorted({str(value) for value in scene.loc[spoiled, column]})[:3]
+            failures.append(
+                f"{int(spoiled.sum())} row(s) carry a non-numeric {column}, e.g. {values}; "
+                "these are unreadable rows, not unmeasured ones"
+            )
     negative = absolute[absolute < 0]
     if len(negative):
         failures.append(f"{len(negative)} row(s) carry a negative absolute_spearman")
@@ -379,17 +559,17 @@ def check_spearman_pairs(bundle) -> list[str]:
             f"{int(mismatched.sum())} row(s) have absolute_spearman != |signed_spearman|, "
             f"e.g. {rows.to_dict('records')}"
         )
-        return failures
+        return CheckResult(examined, failures)
     lonely = signed.isna() ^ absolute.isna()
     if lonely.any():
         failures.append(
             f"{int(lonely.sum())} row(s) publish one Spearman and not the other; unmeasured "
             "must leave both empty"
         )
-    return failures
+    return CheckResult(examined, failures)
 
 
-def check_severity_statistics(bundle) -> list[str]:
+def check_severity_statistics(bundle) -> CheckResult:
     """Every per-severity statistic re-derived from the raw scores matches the saved value.
 
     Population variance (`ddof=0`) because the values are every image the candidate scored at
@@ -409,11 +589,26 @@ def check_severity_statistics(bundle) -> list[str]:
         list(CANDIDATE_KEY), keep="first"
     ).set_index(list(CANDIDATE_KEY))
     grouped = bundle.per_scene.groupby(list(CANDIDATE_KEY) + ["severity"], sort=False)["score"]
+    compared = 0
+    unmatched = set()
+    spoiled_total = 0
+    spoiled_examples: set[str] = set()
     for key, scores in grouped:
         candidate, severity = key[:-1], int(key[-1])
-        if severity not in EXPECTED_SEVERITIES or candidate not in metrics.index:
+        if severity not in EXPECTED_SEVERITIES:
             continue
-        values = pd.to_numeric(scores, errors="coerce").to_numpy(dtype=float)
+        # Counted rather than silently skipped: a candidate in `per_scene.csv` with no row in
+        # `candidate_metrics.csv` used to `continue` here, so a metrics table missing half its
+        # candidates shrank this check's population with nothing saying so.
+        if candidate not in metrics.index:
+            unmatched.add(candidate)
+            continue
+        compared += 1
+        values, spoiled = _numeric(scores)
+        if spoiled.any():
+            spoiled_total += int(spoiled.sum())
+            spoiled_examples.update(str(value) for value in scores[spoiled][:2])
+        values = values.to_numpy(dtype=float)
         values = values[np.isfinite(values)]
         row = metrics.loc[candidate]
         expected = {
@@ -430,10 +625,26 @@ def check_severity_statistics(bundle) -> list[str]:
                 failures.append(
                     f"{candidate} severity {severity}: {column} is {got}, recomputed {want}"
                 )
-    return failures
+    examined = f"{compared} (candidate, severity) groups"
+    if not compared:
+        return CheckResult(
+            examined,
+            [_STARVED, "no (candidate, severity) group had a row in candidate_metrics.csv"],
+        )
+    if unmatched:
+        failures.append(
+            f"{len(unmatched)} candidate(s) in per_scene.csv have no candidate_metrics.csv "
+            f"row and were not compared, e.g. {sorted(unmatched)[:3]}"
+        )
+    if spoiled_total:
+        failures.append(
+            f"{spoiled_total} score cell(s) are non-numeric, e.g. "
+            f"{sorted(spoiled_examples)[:3]}; these are unreadable, not unmeasured"
+        )
+    return CheckResult(examined, failures)
 
 
-def check_axis_limits(bundle) -> list[str]:
+def check_axis_limits(bundle) -> CheckResult:
     """One recorded y-range per signal, and it is the range the design's rule produces.
 
     Recomputed from `summary.json`'s own candidate list over the slice the figures draw --
@@ -448,11 +659,14 @@ def check_axis_limits(bundle) -> list[str]:
     recorded = bundle.summary["axis_limits"]
     failures = []
     if set(recorded) != set(PLOT_SCOPES):
-        failures.append(
-            f"axis_limits names {sorted(recorded)}, expected one range per signal "
-            f"{sorted(PLOT_SCOPES)}"
+        return CheckResult(
+            f"{len(recorded)} recorded ranges",
+            [
+                f"axis_limits names {sorted(recorded)}, expected one range per signal "
+                f"{sorted(PLOT_SCOPES)}"
+            ],
         )
-        return failures
+    drawn_total = 0
     for signal, scope in PLOT_SCOPES.items():
         drawn = [
             candidate for candidate in bundle.summary["candidates"]
@@ -467,6 +681,7 @@ def check_axis_limits(bundle) -> list[str]:
                 for field in ("median", "q25", "q75")
             )
         ]
+        drawn_total += len(drawn)
         if not drawn:
             failures.append(f"no drawable {signal} candidate, yet a {signal} range is recorded")
             continue
@@ -484,7 +699,10 @@ def check_axis_limits(bundle) -> list[str]:
             failures.append(f"{signal} axis_limits {got}, recomputed {list(want)}")
         elif not got[0] < got[1]:
             failures.append(f"{signal} axis_limits {got} is not an interval")
-    return failures
+    examined = f"{len(recorded)} ranges over {drawn_total} drawn candidates"
+    if not drawn_total:
+        failures.insert(0, _STARVED)
+    return CheckResult(examined, failures)
 
 
 CHECKS = (
@@ -503,26 +721,75 @@ CHECKS = (
 # --- loading and reporting ------------------------------------------------------------------
 
 
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as error:
+        raise BundleUnreadable(f"{path.name}: {type(error).__name__}: {error}") from error
+
+
+def _read_csv(path: Path, required: tuple[str, ...]) -> pd.DataFrame:
+    try:
+        frame = pd.read_csv(path)
+    except Exception as error:
+        raise BundleUnreadable(f"{path.name}: {type(error).__name__}: {error}") from error
+    absent = [column for column in required if column not in frame.columns]
+    if absent:
+        raise BundleUnreadable(f"{path.name} is missing the column(s) {absent}")
+    return frame
+
+
 class Bundle:
-    """The eight files, read once, plus the two derived tables every check would rebuild."""
+    """The eight files, read once, plus the derived table the ranking check would rebuild.
+
+    Every read here is guarded and every key a check will later index is proved present *now*,
+    so a malformed bundle becomes one refusal naming the file and the reason instead of a
+    traceback out of whichever check happened to touch the missing thing first. The alternative
+    was tried and is what the review of this file found: four realistic malformed bundles, four
+    raw tracebacks, zero check lines printed.
+    """
 
     def __init__(self, directory: Path):
         self.directory = directory
-        self.summary = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
-        self.per_scene = pd.read_csv(directory / "per_scene.csv")
-        self.candidate_metrics = pd.read_csv(directory / "candidate_metrics.csv")
-        self.expected_image_count = int(
-            self.summary["validation"]["expected_image_count"]
+        self.summary = _read_json(directory / "summary.json")
+        if not isinstance(self.summary, dict):
+            raise BundleUnreadable("summary.json is not a JSON object")
+        absent = [key for key in SUMMARY_KEYS if key not in self.summary]
+        if absent:
+            raise BundleUnreadable(f"summary.json is missing the key(s) {absent}")
+        validation = self.summary["validation"]
+        if not isinstance(validation, dict):
+            raise BundleUnreadable("summary.json 'validation' is not an object")
+        absent = [key for key in SUMMARY_VALIDATION_KEYS if key not in validation]
+        if absent:
+            raise BundleUnreadable(f"summary.json validation is missing the key(s) {absent}")
+        try:
+            self.expected_image_count = int(validation["expected_image_count"])
+        except (TypeError, ValueError) as error:
+            raise BundleUnreadable(
+                "summary.json validation.expected_image_count is not an integer: "
+                f"{validation['expected_image_count']!r}"
+            ) from error
+        # A bundle claiming zero images is not a small run, it is not a run. Refused here rather
+        # than audited, because `0 == 0 x 3060` makes the row budget vacuously true and several
+        # checks below would then pass over an empty table.
+        if self.expected_image_count < 1:
+            raise BundleUnreadable(
+                "summary.json validation.expected_image_count is "
+                f"{self.expected_image_count}; a bundle over no images is not auditable"
+            )
+
+        self.per_scene = _read_csv(directory / "per_scene.csv", PER_SCENE_COLUMNS)
+        self.candidate_metrics = _read_csv(
+            directory / "candidate_metrics.csv", CANDIDATE_METRIC_COLUMNS
         )
-        scores = pd.to_numeric(self.per_scene["score"], errors="coerce")
+        scores, _ = _numeric(self.per_scene["score"])
         finite = self.per_scene[np.isfinite(scores)]
-        self.finite_counts = (
-            finite.groupby(list(CANDIDATE_KEY) + ["severity"], sort=False)
-            .size()
-            .to_dict()
+        counts = (
+            finite.groupby(list(CANDIDATE_KEY) + ["severity"], sort=False).size().to_dict()
         )
         self.finite_counts = {
-            (key[:-1], int(key[-1])): value for key, value in self.finite_counts.items()
+            (key[:-1], int(key[-1])): value for key, value in counts.items()
         }
 
 
@@ -533,6 +800,7 @@ def main(argv: list[str] | None = None) -> int:
     directory = arguments.directory
     if not directory.is_dir():
         print(f"not a directory: {directory}", file=sys.stderr)
+        print("nothing was audited (exit 2)", file=sys.stderr)
         return 2
 
     # Checked before anything is parsed, because the likeliest way to misuse this is to aim it
@@ -546,9 +814,19 @@ def main(argv: list[str] | None = None) -> int:
             f"{absent}",
             file=sys.stderr,
         )
+        print("nothing was audited (exit 2)", file=sys.stderr)
         return 2
 
-    bundle = Bundle(directory)
+    # Loading is guarded separately from the checks, and it refuses rather than reports: a check
+    # cannot say anything about a bundle that never loaded, and nine PASS lines over a table that
+    # was never read would be the worst output this file could produce.
+    try:
+        bundle = Bundle(directory)
+    except BundleUnreadable as error:
+        print(f"{directory} cannot be audited -- {error}", file=sys.stderr)
+        print("nothing was audited (exit 2)", file=sys.stderr)
+        return 2
+
     validation = bundle.summary["validation"]
     print(f"bundle:            {directory}")
     print(f"manifest images:   {bundle.expected_image_count}")
@@ -565,22 +843,22 @@ def main(argv: list[str] | None = None) -> int:
         )
     print()
 
+    width = max(len(description) for description, _ in CHECKS)
     failed = 0
     for description, check in CHECKS:
         # An exception is a failed check, not a failed audit. A bundle broken enough to raise is
         # exactly the bundle whose remaining eight checks a reader most needs to see, and a
         # traceback out of check three would replace them with nothing.
         try:
-            failures = check(bundle)
+            examined, failures = check(bundle)
         except Exception as error:  # noqa: BLE001 - reported, not handled
+            examined = "unknown; the check did not finish"
             failures = [f"the check raised {type(error).__name__}: {error}"]
-        if failures:
-            failed += 1
-            print(f"FAIL  {description}")
-            for failure in failures:
-                print(f"        {failure}")
-        else:
-            print(f"PASS  {description}")
+        status = "FAIL" if failures else "PASS"
+        failed += bool(failures)
+        print(f"{status}  {description.ljust(width)}  {examined}")
+        for failure in failures:
+            print(f"        {failure}")
     print()
     print(f"{len(CHECKS) - failed} of {len(CHECKS)} checks passed")
     return 1 if failed else 0
