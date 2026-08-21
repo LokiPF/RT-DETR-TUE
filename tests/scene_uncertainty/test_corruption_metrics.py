@@ -342,6 +342,47 @@ def test_severity_aurocs_pass_the_locked_orientation_through():
     assert macro == pytest.approx(0.15)
 
 
+UNEVEN_COVERAGE_SCORES = {
+    0: [0.0, 1.0, 2.0, 3.0, 4.0],
+    1: [-10.0],
+    2: [10.0, 11.0, 12.0, 13.0, 14.0],
+    3: [10.0, 11.0, 12.0, 13.0, 14.0],
+    4: [10.0, 11.0, 12.0, 13.0, 14.0],
+    5: [10.0, 11.0, 12.0, 13.0, 14.0],
+}
+"""One thinly covered severity that reads the *other* way, and four fully covered perfect ones.
+
+`_candidate_metrics` drops a non-finite score from its severity's group and keeps the rest of
+that image's curve, so the five comparisons are routinely made over groups of different sizes
+and this shape is reachable in published output rather than hypothetical. Severity 1 holds one
+image against five clean ones and ranks below all of them, so its AUROC is `0.0` while the
+other four are `1.0` -- the widest gap a weighting can move.
+"""
+
+
+def test_the_macro_average_weights_the_five_severities_equally():
+    """The docstring's own claim, which every equal-coverage fixture leaves unpinned.
+
+    "Weighting by group size would let whichever severity happened to retain the most scored
+    images dominate the ranking." Every other fixture in this module gives all six severities
+    the same number of scores, so a group-size-weighted average is numerically identical to the
+    plain mean in all of them and the sentence is unenforced. Here the thin severity is the one
+    holding the macro down: the plain mean is 0.8, weighting by the corrupted group sizes reads
+    0.952 and weighting by clean-plus-corrupted reads 0.870, so a candidate that fails at mild
+    blur would be published as a near-perfect detector.
+    """
+    values, macro = severity_aurocs(UNEVEN_COVERAGE_SCORES, orientation=1)
+
+    assert values == {1: 0.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0}
+    assert macro == pytest.approx(0.8)
+    assert macro == pytest.approx(sum(values.values()) / 5)
+    sizes = [len(UNEVEN_COVERAGE_SCORES[severity]) for severity in range(1, 6)]
+    assert len(set(sizes)) > 1, "the fixture must actually have uneven coverage"
+    assert macro != pytest.approx(
+        sum(value * size for value, size in zip(values.values(), sizes)) / sum(sizes)
+    )
+
+
 @pytest.mark.parametrize("severity", [0, 1, 5])
 def test_severity_aurocs_require_every_severity_zero_through_five(severity):
     incomplete = {key: value for key, value in SEPARATING_SCORES.items() if key != severity}

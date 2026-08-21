@@ -565,6 +565,39 @@ def test_coverage_names_both_sides_of_every_severity_comparison():
     assert candidate["finite_count_severity_3"] == 1
 
 
+def test_a_published_macro_auroc_weights_its_five_severities_equally():
+    """Uneven coverage is reachable, and it must not tilt the number that orders candidates.
+
+    A non-finite score is dropped from its own severity's group and the rest of that image's
+    curve is kept, so the five comparisons behind `macro_auroc` are routinely made over groups
+    of different sizes -- and `macro_auroc` is published for every candidate, ranked or not,
+    and read by the report's control comparison. Here eight of ten images lose severity 3, and
+    severity 3 is the one that ranks the *other* way: the equal-weighted macro is 0.8, while
+    weighting by the corrupted group sizes reads 40/42 and weighting by clean-plus-corrupted
+    reads 80/92, either of which would publish a candidate that fails at one blur level as a
+    near-perfect detector. Every other fixture in this module covers all six severities
+    equally, which makes the three readings identical and the choice unpinned.
+    """
+    curves = {}
+    for image_id in range(10):
+        offset = image_id * 0.1
+        curve = [offset, 10 + offset, 20 + offset, -5 + offset, 40 + offset, 50 + offset]
+        if image_id >= 2:
+            curve[3] = NAN
+        curves[image_id] = curve
+    candidate = one_candidate(candidate_rows(curves))
+
+    assert candidate["finite_count_severity_3"] == 2
+    assert [candidate[f"finite_count_severity_{severity}"] for severity in (0, 1, 2, 4, 5)] == [
+        10, 10, 10, 10, 10
+    ]
+    assert candidate["orientation"] == 1
+    assert candidate["auroc_by_severity"] == {"1": 1.0, "2": 1.0, "3": 0.0, "4": 1.0, "5": 1.0}
+    assert candidate["macro_auroc"] == pytest.approx(0.8)
+    assert candidate["macro_auroc"] != pytest.approx(40 / 42)
+    assert candidate["macro_auroc"] != pytest.approx(80 / 92)
+
+
 def test_selected_counts_and_clean_overlap_are_summarised_by_severity():
     rows = candidate_rows(
         {1: RISING},
@@ -1423,6 +1456,68 @@ def test_the_report_leads_with_the_best_deployable_layer_2_candidate():
         assert label in deploy
     assert "first of 3 candidates" in deploy
     assert "between 25 and 30 selected queries" in deploy
+
+
+def test_the_selection_size_sentence_is_read_from_the_data_in_both_shapes():
+    """No invented magnitude, and no "between 4 and 4" when the two ends coincide.
+
+    Two defects in one sentence, and the same defect class as the hard-coded "rises" this
+    section used to carry: it ended "summarises a few dozen queries an image", a number never
+    read from anything, which on a small run printed beside "between 4 and 4 selected queries".
+    A few dozen is right for the pilot's 300-query images and wrong for every diagnostic run,
+    and neither half of it was checkable by a reader.
+
+    Both shapes are asserted from one candidate set that differs only in `selected_count`, so a
+    renderer that formatted the equal case correctly by dropping the range entirely fails the
+    first half, and one that kept "a few dozen" beside either fails both.
+    """
+    varying = section(
+        render_easy_report(
+            report_summary(rows=candidate_rows(
+                winner_curves(), selected_count=BUNDLE_SELECTED_COUNTS
+            ))
+        ),
+        "What should we deploy?",
+    )
+    constant = section(
+        render_easy_report(
+            report_summary(rows=candidate_rows(winner_curves(), selected_count=4))
+        ),
+        "What should we deploy?",
+    )
+
+    assert "scored over between 25 and 30 selected queries" in varying
+    assert "scored over exactly 4 selected queries" in constant
+    assert "between 4 and 4" not in constant
+    for report in (varying, constant):
+        assert "few dozen" not in report
+        assert "summarises those queries rather than the whole image" in report
+
+
+def test_a_one_image_run_reads_in_the_singular_wherever_it_counts_images():
+    """The small-run branch on the smallest run there is, where every plural is wrong.
+
+    `analyze-corruption-sensitivity` is run on tiny caches as a diagnostic -- that is the whole
+    reason `_nothing_ranked_lines` exists -- so "a candidate measured on 1 images" and "1 of 1
+    images carried" are sentences this command really prints, in the report written for the
+    reader least able to discount them. `_count` already existed for exactly this and two call
+    sites were not using it.
+    """
+    rows = candidate_rows({0: RISING}, selected_count=4)
+    per_scene, candidates, ranking = summarize_candidates(rows, expected_image_count=1)
+    summary = build_summary(
+        bundle_diagnostics(count=1), candidates, ranking, axis_limits=FIXED_LIMITS,
+        scored_row_count=len(rows), per_scene_row_count=len(per_scene),
+    )
+    report = flat(render_easy_report(summary))
+
+    assert ranking == []
+    assert summary["padding"] == {**summary["padding"], "image_count": 1}
+    assert "This run covered 1 image of the" in report
+    assert "1 of 1 image carried repeated decoder placeholder queries" in report
+    assert "This run declared 1 image, fewer than 250" in report
+    assert "a candidate measured on 1 image is a different measurement" in report
+    assert "1 images" not in report
 
 
 def test_the_report_gives_all_five_severity_aurocs_beside_the_macro():

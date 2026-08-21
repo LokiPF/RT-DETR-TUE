@@ -1043,8 +1043,8 @@ def _preamble(summary: dict) -> list[str]:
         f"{validation['scored_row_count']} scored rows became "
         f"{_count(validation['candidate_count'], 'candidate')}, "
         f"{validation['deployable_candidate_count']} of which passed every deployment gate. "
-        f"{padding['images_with_padding']} of {padding['image_count']} images carried repeated "
-        "decoder placeholder queries, which the ranked rows leave out.",
+        f"{padding['images_with_padding']} of {_count(padding['image_count'], 'image')} "
+        "carried repeated decoder placeholder queries, which the ranked rows leave out.",
         "",
     ]
 
@@ -1074,11 +1074,10 @@ def _nothing_ranked_lines(summary: dict) -> list[str]:
     if expected < full:
         lines.extend([
             f"This run declared {_count(expected, 'image')}, fewer than {full}, so no "
-            "candidate in it "
-            "could pass however well it scored. The gate is not widened to fit a smaller run: "
-            f"a candidate measured on {expected} images is a different measurement, not a "
-            "slightly smaller one, and calling it deployable would be the one mistake this "
-            "gate exists to prevent.",
+            "candidate in it could pass however well it scored. The gate is not widened to "
+            f"fit a smaller run: a candidate measured on {_count(expected, 'image')} is a "
+            "different measurement, not a slightly smaller one, and calling it deployable "
+            "would be the one mistake this gate exists to prevent.",
             "",
         ])
     else:
@@ -1090,10 +1089,9 @@ def _nothing_ranked_lines(summary: dict) -> list[str]:
             "",
         ])
     lines.extend([
-        f"All {_count(validation['candidate_count'], 'candidate')} the run did measure are "
-        "published in "
-        "full in `candidate_metrics.csv` and in `summary.json`, and the four pictures are drawn "
-        "from them. A run like this is a diagnostic, not an empty result.",
+        f"The full numbers for all {_count(validation['candidate_count'], 'candidate')} the "
+        "run did measure are in `candidate_metrics.csv` and in `summary.json`, and the four "
+        "pictures are drawn from them. A run like this is a diagnostic, not an empty result.",
         "",
     ])
     return lines
@@ -1111,6 +1109,17 @@ def _winner_lines(summary: dict, winner: dict) -> list[str]:
     measured_candidates = _count(summary["validation"]["candidate_count"], "candidate")
     smallest = min(entry["min"] for entry in selected.values())
     largest = max(entry["max"] for entry in selected.values())
+    # "between 4 and 4" is not a range, and a report that prints one has stopped reading its own
+    # numbers. The two coincide whenever every severity selected the same count, which is the
+    # ordinary case on a small run and reachable on a large one, so both wordings are built here
+    # rather than left to the reader to interpret.
+    # Spelled out rather than routed through `_count`, whose rule is to append an `s`: it turns
+    # "query" into "querys", which is why it takes the noun it is given rather than guessing.
+    span = (
+        f"exactly {smallest} selected {'query' if smallest == 1 else 'queries'}"
+        if smallest == largest
+        else f"between {smallest} and {largest} selected queries"
+    )
     return [
         f"The one to take forward is the `{winner['confidence_bin']}` bucket of the "
         f"`{winner['bucket_scheme']}` cut: the `{winner['signal']}` score at "
@@ -1118,9 +1127,9 @@ def _winner_lines(summary: dict, winner: dict) -> list[str]:
         f"every blur level, `{winner['padding_mode']}` queries -- the repeated decoder "
         f"placeholders taken out -- and each scene summarised by `{winner['aggregation']}`. It "
         f"came first of {ranked_candidates} that passed every gate, out of the "
-        f"{measured_candidates} this run measured. It was chosen on the same images every number below describes, so this is a "
-        "proposal to check on images that took no part in choosing it, not a result about "
-        "them.",
+        f"{measured_candidates} this run measured. It was chosen on the same images every "
+        "number below describes, so this is a proposal to check on images that took no part "
+        "in choosing it, not a result about them.",
         "",
         f"It is read {words['reading']}: the {words['flagged']} score is the more corrupted "
         "one. That direction was chosen once, from this candidate's own images, and every "
@@ -1128,9 +1137,12 @@ def _winner_lines(summary: dict, winner: dict) -> list[str]:
         "through it. A candidate read the other way is not a worse candidate; the pictures draw "
         "the score as measured so that a signal which falls with blur stays visibly falling.",
         "",
-        f"Every scene in that bucket was scored over between {smallest} and {largest} selected "
-        "queries, so each number below summarises a few dozen queries an image rather than the "
-        "whole image.",
+        # The magnitude is the range this run measured and nothing else. An earlier version
+        # ended "summarises a few dozen queries an image", which was true of the pilot's
+        # 300-query images and printed unchanged beside "between 4 and 4 selected queries" on a
+        # small run -- the same defect as the hard-coded direction word this section carried.
+        f"Every scene in that bucket was scored over {span}, so each number below summarises "
+        "those queries rather than the whole image.",
         "",
         "How often it puts a blurred image above a clean one, blur level by blur level:",
         "",

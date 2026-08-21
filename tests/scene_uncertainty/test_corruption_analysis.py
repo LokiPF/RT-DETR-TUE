@@ -278,6 +278,64 @@ def test_every_decile_row_matches_the_published_analyzer(tmp_path, rotate):
     assert after == before
 
 
+# --- the padding union, and not one severity's mask ---------------------------------------
+
+
+WANDERING_TAILS = {0: 2, 1: 5, 2: 3, 3: 2, 4: 4, 5: 2}
+"""Padding that moves rather than grows, as it does on 66 of 66 padded pilot images.
+
+The default fixture pads the same two queries at every severity, which makes the image-level
+union numerically identical to any single severity's mask -- so every assertion in this module
+that reads a filtered selection passes just as well against a loop that masked with severity
+zero's tail alone. These six lengths are what separate the two: the union is queries 15 to 19
+and severity zero's own mask is queries 18 and 19.
+"""
+
+
+def test_the_padding_union_and_not_severity_zero_fixes_the_valid_population(tmp_path):
+    """Spec 65 in this module's loop: one image-level mask, built across all six severities.
+
+    `analyze_corruption_sensitivity` masks once per image and reuses that mask at every
+    severity, and the mask has to be the *union* because the detected tail wanders rather than
+    growing. Taking severity zero's mask instead is a three-line simplification that leaves
+    every row well-formed and every count self-consistent -- on the pilot's image 173044, whose
+    tails run 251, 255, 257, 239, 0, 0, it would swing the valid population between 43 and 300
+    of 300 queries with nothing in the bundle able to say so.
+
+    Three assertions carry that, and each one reads a different number under the union than
+    under severity zero's mask: the recorded union is five queries rather than two; no filtered
+    selection at any severity touches a query that any severity padded (15, 16 and 17 are
+    ordinary at severity zero and placeholders at severity one, so a severity-zero mask scores
+    them); and every scheme, severity and membership mode covers the same fifteen valid
+    queries rather than eighteen.
+    """
+    artifacts = write_decile_artifacts(tmp_path, padded_tails=WANDERING_TAILS)
+    rows, diagnostics = analyze(artifacts)
+    image = diagnostics["images"][str(IMAGE_ID)]
+    by_severity = image["padded_query_ids_by_severity"]
+
+    assert image["padded_count_by_severity"] == {
+        str(severity): length for severity, length in WANDERING_TAILS.items()
+    }
+    assert len({len(ids) for ids in by_severity.values()}) > 1  # the fixture really wanders
+    assert by_severity["0"] == [18, 19]
+    assert image["union_padded_query_ids"] == list(range(15, 20))
+    assert image["union_padded_count"] == 5
+    assert image["tail_identical_across_severities"] is False
+
+    ever_padded = {int(query) for ids in by_severity.values() for query in ids}
+    filtered = [row for row in rows if row["padding_mode"] == "filtered"]
+    assert len(filtered) == 2700  # 2 schemes x (10 + 5) bins x 2 modes x 15 rows x 6 severities
+    assert all(not ever_padded.intersection(row["selected_query_ids"]) for row in filtered)
+
+    populations: dict[tuple, set] = {}
+    for row in filtered:
+        key = (row["bucket_scheme"], row["severity"], row["membership_mode"])
+        populations.setdefault(key, set()).update(row["selected_query_ids"])
+    assert len(populations) == 24  # 2 schemes x 6 severities x 2 membership modes
+    assert all(population == set(range(15)) for population in populations.values())
+
+
 # --- one ordering, two resolutions -------------------------------------------------------
 
 
