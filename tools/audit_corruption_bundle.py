@@ -128,8 +128,11 @@ refuse a bundle it could in fact audit."""
 CANDIDATE_METRIC_COLUMNS = (
     *CANDIDATE_KEY,
     "macro_auroc",
-    # Read by `_gate_qualified`, which re-derives who the deployable ranking should contain.
-    "orientation", "measured_count", "image_count",
+    # `orientation` and `deployable` are read by `_gate_qualified` and by the three-way
+    # agreement check beside it; `measured_count` and `image_count` are read where the ranking
+    # in `summary.json` is compared against this table's row for the same candidate. All four
+    # are load-bearing, which is why `_validate_candidate_domains` proves they can be read.
+    "orientation", "deployable", "measured_count", "image_count",
     *(f"auroc_severity_{severity}" for severity in EXPECTED_SEVERITIES[1:]),
     *(
         f"{statistic}_severity_{severity}"
@@ -183,10 +186,11 @@ every element of an empty set satisfies every predicate. Printing PASS there is 
 printing nothing, because PASS is the line a reader quotes into a report -- so a check that
 examined nothing says so and fails.
 
-The one check exempt from this is the deployable ranking, where an empty population is a
-documented outcome rather than a starved check: fewer than 250 images admits nothing by design,
-and a full run in which no candidate passed every gate is a real and reportable result. That
-check states its population and explains the zero instead."""
+The one check partly exempt from this is the deployable ranking, and only on a run of fewer
+than 250 images, where an empty ranking is admitted by design rather than by starvation. On a
+full run the exemption does not apply: that check states all three of its populations -- ranked,
+re-derived, and marked deployable -- and a zero it cannot corroborate is a failure like any
+other. It states its populations; it does not explain them."""
 
 
 # --- helpers ------------------------------------------------------------------------------
@@ -224,7 +228,14 @@ def _close(left, right) -> bool:
 
 
 def _cell(value):
-    """One CSV cell as a number or `None`, so a blank and a `0.0` stay different facts."""
+    """One CSV cell as a plain Python number or `None`, so a blank and a `0.0` stay different.
+
+    The numpy scalar is unwrapped rather than passed through, because these values end up
+    interpolated into failure messages and `np.int64(17)` names pandas' storage where the reader
+    needs the number the file holds.
+    """
+    if isinstance(value, np.generic):
+        value = value.item()
     if value is None or (isinstance(value, float) and math.isnan(value)):
         return None
     return value
@@ -251,6 +262,66 @@ def _candidate_id(row) -> tuple:
     return tuple(row[field] for field in CANDIDATE_KEY)
 
 
+def _validate_candidate_domains(frame: pd.DataFrame) -> None:
+    """Refuse a `candidate_metrics.csv` whose gate columns cannot be read as what they are.
+
+    These four columns became load-bearing when the ranking gained a re-derived cross-check, and
+    a load-bearing column that nothing validates is a fail-open input: every cell
+    `_gate_qualified` could not parse used to *silently exclude* that candidate, so an
+    `orientation` column re-encoded as `up`/`down` -- a producer-side encoding change, which is
+    the whole class this file exists to catch -- collapsed the re-derived set to zero and the
+    check went green against it. One `banana` in `measured_count` did the same by flipping the
+    entire column to object dtype.
+
+    The split is the one the severity column already uses, and it is deliberate. *Unparseable*
+    is refused here: nothing downstream can say anything true about a bundle whose gate columns
+    are in an encoding nobody agreed to. *Readable but wrong* -- an orientation of `5`, a
+    `measured_count` that contradicts the raw rows -- is left to the checks, because that is a
+    finding about the run rather than a failure to read it, and refusing it would suppress the
+    other eight checks over a defect they could have reported.
+
+    A table with no rows is not validated and not refused. "No cells" is not "cells in an
+    encoding nobody agreed to" -- an empty column has nothing to be in the wrong domain, and
+    `pandas` gives it `object` dtype whatever it would have held. Refusing here would take a
+    header-only `candidate_metrics.csv` away from the three checks that exist to report exactly
+    that, and turn their `_STARVED` failures into "nothing was audited".
+    """
+    if not len(frame):
+        return
+    orientation, spoiled = _numeric(frame["orientation"])
+    if spoiled.any():
+        examples = sorted({str(value) for value in frame.loc[spoiled, "orientation"]})[:3]
+        raise BundleUnreadable(
+            f"candidate_metrics.csv has {int(spoiled.sum())} orientation cell(s) that are not "
+            f"numbers, e.g. {examples}; an orientation is -1, +1 or blank"
+        )
+    for column in ("measured_count", "image_count"):
+        values, spoiled = _numeric(frame[column])
+        unreadable = spoiled | values.isna()
+        if unreadable.any():
+            examples = sorted({str(value) for value in frame.loc[unreadable, column]})[:3]
+            raise BundleUnreadable(
+                f"candidate_metrics.csv has {int(unreadable.sum())} {column} cell(s) that are "
+                f"not numbers, e.g. {examples}"
+            )
+        ragged = (values != values.round()) | (values < 0)
+        if ragged.any():
+            examples = sorted({str(value) for value in frame.loc[ragged, column]})[:3]
+            raise BundleUnreadable(
+                f"candidate_metrics.csv has {int(ragged.sum())} {column} cell(s) that are not "
+                f"whole non-negative counts, e.g. {examples}"
+            )
+    # `pandas` gives a clean `True`/`False` column `bool` dtype; anything else in it -- `yes`,
+    # `1`, a blank -- lands as `object` or a number, and `bool("False")` is `True`, so an
+    # unvalidated column here would read every candidate as deployable.
+    if not pd.api.types.is_bool_dtype(frame["deployable"]):
+        tokens = sorted({str(value) for value in frame["deployable"]})[:5]
+        raise BundleUnreadable(
+            "candidate_metrics.csv 'deployable' is not a boolean column; it holds "
+            f"{tokens}"
+        )
+
+
 def _gate_qualified(bundle) -> set[tuple]:
     """Which candidates the deployable ranking *should* hold, re-derived from the tables.
 
@@ -260,18 +331,26 @@ def _gate_qualified(bundle) -> set[tuple]:
     candidates passed, and the tool volunteered a quotable explanation of a fact that was not
     true. A vacuous pass is bad; a vacuous pass that explains itself is worse.
 
-    The conditions mirror `corruption_reporting._candidate_metrics`' gate exactly, and the
-    per-severity coverage is taken from `finite_counts` -- recomputed from the raw rows -- rather
-    than from the candidate's own published counts, so this is a second opinion and not a
-    restatement. `image_count` is deliberately *not* among them, because the producer's gate does
-    not test it either; adding a condition the producer does not have would manufacture
-    disagreements on correct bundles.
+    The conditions mirror `corruption_reporting._candidate_metrics`' gate, and every one of them
+    that *can* come from the raw rows does. Coverage is taken from `finite_counts` -- recomputed
+    from `per_scene.csv` -- and `measured_count` is deliberately not read at all, even though the
+    producer's gate names it: 250 finite scores at each of six severities over 250 images already
+    means 250 fully measured images, so reading the published count would be asking the table
+    under audit to confirm itself, and a single bad cell in it would silently drop a candidate
+    out of this set. `image_count` is not among the conditions either, because the producer's
+    gate does not test it and a condition the producer lacks would manufacture disagreements on
+    correct bundles.
+
+    `orientation` is the one input that has to come from the table, since it is a median over the
+    per-image signed trends that this file does not recompute. That is why
+    `_validate_candidate_domains` proves the column readable at load: an unreadable orientation
+    used to exclude its candidate silently, which is how this whole set could collapse to zero
+    while the check that reads it reported a pass. The published `deployable` column is compared
+    against this set rather than consulted for it -- see `check_ranking_gates`.
     """
     qualified = set()
     for _, row in bundle.candidate_metrics.iterrows():
         if any(row[field] != required for field, required in DEPLOYABLE_GATES.items()):
-            continue
-        if _cell(row["measured_count"]) != FULL_TUNING_IMAGE_COUNT:
             continue
         if _cell(row["orientation"]) not in (-1, 1):
             continue
@@ -473,6 +552,17 @@ def check_ranking_gates(bundle) -> CheckResult:
     """
     ranking = bundle.summary["deployable_ranking"]
     failures = []
+    # Readable but outside the domain, so it is reported rather than refused -- and reported on
+    # every run, before the short-run return, because an orientation of `5` is a defect whatever
+    # size the run was.
+    orientations, _ = _numeric(bundle.candidate_metrics["orientation"])
+    stray = orientations.notna() & ~orientations.isin([-1, 1])
+    if stray.any():
+        examples = sorted({str(value) for value in orientations[stray]})[:3]
+        failures.append(
+            f"{int(stray.sum())} candidate(s) publish an orientation outside "
+            f"{{-1, +1}} or blank, e.g. {examples}"
+        )
     if bundle.expected_image_count != FULL_TUNING_IMAGE_COUNT:
         examined = (
             f"{len(ranking)} ranked candidates; the gate admits none below "
@@ -486,38 +576,87 @@ def check_ranking_gates(bundle) -> CheckResult:
             )
         return CheckResult(examined, failures)
     qualified = _gate_qualified(bundle)
-    examined = f"{len(ranking)} ranked candidates against {len(qualified)} that qualify"
+    published = {
+        _candidate_id(row) for _, row in bundle.candidate_metrics.iterrows()
+        if bool(row["deployable"])
+    }
+    examined = (
+        f"{len(ranking)} ranked candidates against {len(qualified)} that qualify and "
+        f"{len(published)} marked deployable"
+    )
     finite_by_candidate = bundle.finite_counts
+
+    # Grouped rather than one line per candidate. Every other message in this file caps its
+    # examples at three, and a ranking is 45 candidates on a real run: an unbounded loop turns
+    # one defect -- a blanked orientation column, an inverted `deployable` -- into 45 near
+    # identical lines that bury the eight other checks. The count is the finding; three keys are
+    # enough to act on.
+    problems: dict[str, list] = {}
+
+    def note(reason: str, example) -> None:
+        problems.setdefault(reason, []).append(example)
+
+    table = bundle.candidate_metrics.drop_duplicates(
+        list(CANDIDATE_KEY), keep="first"
+    ).set_index(list(CANDIDATE_KEY))
+
     for position, candidate in enumerate(ranking):
         missing = [field for field in CANDIDATE_KEY if field not in candidate]
         if missing:
-            failures.append(f"ranked candidate at position {position} is missing {missing}")
+            note("are missing candidate-key fields", (position, missing))
             continue
         key = _candidate_id(candidate)
         for field, required in DEPLOYABLE_GATES.items():
             if candidate[field] != required:
-                failures.append(f"ranked candidate {key} has {field}={candidate[field]!r}")
+                note(f"have a {field} other than {required!r}", (key, candidate[field]))
         for field in ("measured_count", "image_count"):
             value = candidate.get(field)
             if value != FULL_TUNING_IMAGE_COUNT:
-                failures.append(f"ranked candidate {key} has {field}={value!r}")
+                note(f"have a {field} other than {FULL_TUNING_IMAGE_COUNT}", (key, value))
         if candidate.get("orientation") not in (-1, 1):
-            failures.append(
-                f"ranked candidate {key} has orientation {candidate.get('orientation')!r}"
-            )
+            note("have no locked orientation", (key, candidate.get("orientation")))
         thin = {
             severity: finite_by_candidate.get((key, severity), 0)
             for severity in EXPECTED_SEVERITIES
             if finite_by_candidate.get((key, severity), 0) != FULL_TUNING_IMAGE_COUNT
         }
         if thin:
-            failures.append(f"ranked candidate {key} has incomplete severities {thin}")
+            note("have severities the raw rows do not fully cover", (key, thin))
+
+        # Two published files describing the same candidate. The gate fields above are read out
+        # of `summary.json`'s ranking dicts, so a `candidate_metrics.csv` that contradicts them
+        # -- 17 measured images for a candidate the ranking calls fully covered -- is invisible
+        # to every other check here.
+        if key not in table.index:
+            note("have no row in candidate_metrics.csv", key)
+            continue
+        row = table.loc[key]
+        for field in ("measured_count", "image_count", "orientation", "macro_auroc"):
+            if not _close(_cell(row[field]), candidate.get(field)):
+                note(
+                    f"disagree between summary.json and candidate_metrics.csv on {field}",
+                    (key, candidate.get(field), _cell(row[field])),
+                )
+        if not bool(row["deployable"]):
+            note("are marked deployable=False in candidate_metrics.csv", key)
+
+    for reason, examples in problems.items():
+        failures.append(
+            f"{len(examples)} ranked candidate(s) {reason}, e.g. {examples[:3]}"
+        )
     if len(ranking) != bundle.summary["validation"]["deployable_candidate_count"]:
         failures.append("summary.json deployable_candidate_count disagrees with the ranking")
 
-    # The other direction, and the one an all-clear cannot be given without: a candidate that
-    # passes every gate and is missing from the ranking. Without this, deleting the ranking
-    # wholesale is indistinguishable from a run where nothing qualified.
+    # Three statements about one set, compared in every direction rather than one. The ranking
+    # in `summary.json`, the `deployable` column of `candidate_metrics.csv`, and this file's own
+    # re-derivation from the raw rows all name the candidates that passed every gate; any two of
+    # them disagreeing is a finding, and which two says what kind.
+    #
+    # One direction is not enough, and that is not hypothetical: when only `qualified - ranked`
+    # could fail, anything that collapsed `qualified` to zero -- one unreadable cell in a column
+    # nothing validated -- made the whole cross-check vacuous, and a 250-image bundle with its
+    # entire ranking deleted audited green. `_STARVED` is the doctrine this check was missing:
+    # a population that came out empty is a thing to report, not a thing to pass over.
     ranked = {
         _candidate_id(candidate) for candidate in ranking
         if all(field in candidate for field in CANDIDATE_KEY)
@@ -527,6 +666,25 @@ def check_ranking_gates(bundle) -> CheckResult:
         failures.append(
             f"{len(unranked)} candidate(s) pass every gate in candidate_metrics.csv but are "
             f"absent from the ranking, e.g. {unranked[:3]}"
+        )
+    unqualified = sorted(ranked - qualified)
+    if unqualified:
+        failures.append(
+            f"{len(unqualified)} ranked candidate(s) do not pass the gate when it is re-derived "
+            f"from the raw rows, e.g. {unqualified[:3]}"
+        )
+    if published != qualified:
+        failures.append(
+            f"candidate_metrics.csv marks {len(published)} candidate(s) deployable but "
+            f"{len(qualified)} pass the re-derived gate: "
+            f"{len(published - qualified)} marked and not qualifying, "
+            f"{len(qualified - published)} qualifying and not marked"
+        )
+    if ranking and not qualified:
+        failures.append(
+            f"the ranking holds {len(ranking)} candidate(s) while nothing at all passes the "
+            "re-derived gate; the cross-check examined an empty population and cannot support "
+            "the ranking either way"
         )
 
     # Built last, and built so that it cannot throw away everything above it. See
@@ -855,6 +1013,7 @@ class Bundle:
         self.candidate_metrics = _read_csv(
             directory / "candidate_metrics.csv", CANDIDATE_METRIC_COLUMNS
         )
+        _validate_candidate_domains(self.candidate_metrics)
         # `severity` is coerced here rather than at each `int()` downstream. The column having
         # survived the presence test says nothing about its cells: a producer that started
         # writing `sev_0 .. sev_5` -- exactly the encoding drift this file exists to catch --

@@ -415,7 +415,10 @@ load and any exception escaping the load lands on the same refusal. Scripting th
 `!= 0` is right; treating a `2` as "checks failed" is wrong, and treating it as "not a failure,
 carry on" is worse. A check that was handed an empty population -- a `per_scene.csv` with a
 header and no rows, say -- fails rather than passing vacuously, because every element of an empty
-set satisfies every predicate and PASS is the line a reader quotes.
+set satisfies every predicate and PASS is the line a reader quotes. The one exception is the
+deployable ranking on a run of **fewer than 250 images**, where an empty ranking is admitted by
+design rather than by starvation; on a full run the exemption does not apply, and a zero the
+check cannot corroborate is a failure like any other.
 
 It is read-only and it deliberately imports nothing from `src/scene_uncertainty`: every
 constant and formula in it is restated from the design, so the two spellings can disagree. An
@@ -428,11 +431,20 @@ against the absolute value of its own signed Spearman, all six per-severity stat
 including the *population* variance -- recomputed from the raw scores, and the recorded
 `axis_limits` against a recomputation of the y-range rule.
 
-The ranking is checked in both directions. Which candidates *should* be ranked is re-derived
-from `candidate_metrics.csv` and the raw rows rather than read off the ranking, so a candidate
-that passes every gate and is missing from it is a finding -- without that, deleting the ranking
-wholesale is indistinguishable from a run where nothing qualified, and an empty ranking would be
-a vacuous pass that explains itself. On a run over fewer than 250 images the gate can admit
+The ranking is checked against two other statements of the same fact, in every direction.
+Three sources name the candidates that passed every gate: the ranking in `summary.json`, the
+`deployable` column of `candidate_metrics.csv`, and the auditor's own re-derivation of the gate
+from the raw rows. Any two of them disagreeing is a finding, and which two says what kind -- a
+qualifying candidate absent from the ranking, a ranked candidate that does not qualify, a
+`deployable` column that disagrees with the re-derived set, or a ranking whose re-derived
+population came out empty and so cannot support it either way. One direction is not enough:
+with only "qualifying but unranked" able to fail, anything that collapsed the re-derived set to
+zero made the whole cross-check vacuous, and the two published files were free to contradict
+each other on a PASS line.
+
+The columns that cross-check depends on -- `orientation`, `deployable`, `measured_count`,
+`image_count` -- have their domains proved at load for the same reason, so an unreadable cell is
+a refusal rather than a silent exclusion. On a run over fewer than 250 images the gate can admit
 nothing, so it reports the manifest count and asserts the ranking is empty; it never rescales
 the deployability gate to fit the run it was given. It does not inspect PNG pixels -- that claim
 belongs to `tests/scene_uncertainty/test_corruption_plots.py`, which asserts it against the
