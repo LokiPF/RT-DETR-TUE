@@ -126,21 +126,39 @@ def test_the_command_publishes_every_confidence_decile_artifact(tmp_path: Path, 
     )
 
 
-# Everything in `pipeline` that needs a GPU, a checkpoint, a COCO tree or a bank. The list is
-# the module's own expensive surface rather than a guess: if a name is added to it that this
-# command legitimately needs, the failure names which one and why.
+FORBIDDEN_MODULE_TAILS = (
+    ".knn", ".evaluate", ".extractor", ".bank", ".dataset", ".runtime", ".normalization",
+)
+"""Where a detector pass, a bank build, a kNN search or a re-fitted normalizer can come from.
+
+`pipeline` imports all seven legitimately for the other six commands, which is why the
+module-level scan `test_decile_analysis.py:308` runs over `decile_analysis` cannot be run over
+this module -- and why the scan below is scoped to one function body instead. `.normalization`
+belongs here for the same reason as `.knn`: this command reads the layer score scales the
+result artifact already carries, and re-fitting them would relabel every score with a scale the
+saved distances were never divided by.
+"""
+
 EXPENSIVE_PIPELINE_NAMES = (
     "load_frozen_detector", "make_coco_loader", "streaming_coverage_bank",
     "deterministic_reservoir", "compute_query_distances", "score_cached_record",
-    "fit_clean_distance_scale", "fit_normalizer", "_device",
+    "fit_clean_distance_scale", "fit_normalizer",
 )
+"""Everything in `pipeline` that needs a GPU, a checkpoint, a COCO tree or a bank, and that
+`pipeline` imports from somewhere else. Every one of these must have an origin in
+`FORBIDDEN_MODULE_TAILS`, and the scan below asserts exactly that rather than trusting it: two
+lists naming the same rule are two lists that drift, and the drift is silent in the direction
+that matters -- a name declared expensive here whose module is missing from the tails above is
+caught by neither guard on any branch."""
 
+PIPELINE_LOCAL_GPU_NAMES = ("_device",)
+"""The exception that makes the name check necessary rather than redundant.
 
-FORBIDDEN_MODULE_TAILS = (".knn", ".evaluate", ".extractor", ".bank", ".dataset", ".runtime")
-"""Where a detector pass, a bank build or a kNN search can come from. `pipeline` imports all of
-them legitimately for the other six commands, which is why the module-level scan
-`test_decile_analysis.py` runs over `decile_analysis` cannot be run over this module -- and why
-the scan below is scoped to one function body instead."""
+`_device` validates a CUDA request; this command has no `--device` and must never ask for one.
+But it is defined in `pipeline` itself, so it has no foreign origin for the tail check to
+recognise, and only its *name* identifies it."""
+
+DETONATED_NAMES = EXPENSIVE_PIPELINE_NAMES + PIPELINE_LOCAL_GPU_NAMES
 
 
 def _wrapper_syntax_tree() -> ast.FunctionDef:
@@ -152,69 +170,96 @@ def _wrapper_syntax_tree() -> ast.FunctionDef:
     )
 
 
-def test_the_wrapper_names_no_detector_or_knn_path_anywhere_in_its_body():
-    """The static half of the no-inference guard, closing what monkeypatching cannot see.
+def _origin(value) -> str:
+    return getattr(value, "__module__", "") or getattr(value, "__name__", "")
 
-    `monkeypatch.setattr(pipeline, name, ...)` rebinds module globals, so it is blind in two
-    directions that both matter. A name resolved another way never passes through those
-    globals -- `from .knn import fit_clean_distance_scale` written *inside* the function is the
-    obvious one, and it is the shape someone reintroducing a computation reaches for as readily
-    as a global. And a global reached only on a branch the detonator fixture does not execute,
-    such as the `except` handler, is never called while the detonators are installed at all.
 
-    So two assertions over the wrapper's own syntax tree, which has neither blind spot:
+def test_the_wrapper_body_holds_no_import_and_no_expensive_global_name():
+    """A static scan of the wrapper's own syntax tree. Named for its mechanism, not its hope.
 
-    * it contains no `import` statement of any kind. Not a blocklist -- a blocklist is dodged
-      by a module name nobody thought of, whereas this function has no legitimate reason to
-      import anything at run time, its three analysis entry points being module-level imports
-      that the scan below then vouches for;
-    * every free name it mentions that resolves to a `pipeline` global comes from somewhere
-      other than the detector, bank, dataset, extraction, scoring and kNN modules -- the
-      `vars(module)` idiom `test_decile_analysis.py:308` uses, narrowed from the module to the
-      names this one function actually mentions, which is what makes it applicable here.
+    Three assertions, in the order they earn their place:
 
-    Together with the runtime detonators this is genuinely two-sided: the detonators catch a
-    reach made *indirectly*, through a helper the wrapper calls, which no scan of this one
-    function body can see.
+    * **the two name lists cannot drift apart.** Every `EXPENSIVE_PIPELINE_NAMES` entry must
+      have an origin in `FORBIDDEN_MODULE_TAILS`. Without this the detonator list could grow a
+      name from a module the tails do not mention -- `fit_normalizer` was exactly that -- and
+      the resulting hole is invisible from either list read alone;
+    * **no `import` statement of any kind in the body.** Not a blocklist of module names, which
+      is dodged by a module nobody thought of. This function has no legitimate reason to import
+      anything at run time, so the absolute rule is both simpler and stronger;
+    * **no free name that is expensive by name or foreign by origin.** The `vars(module)` idiom
+      from `test_decile_analysis.py:308`, narrowed from a module to the names one function
+      mentions, which is what makes it applicable to a module that legitimately imports all
+      seven forbidden ones. The name half covers `PIPELINE_LOCAL_GPU_NAMES`, which has no
+      foreign origin; the origin half covers a name nobody enumerated.
+
+    What this mechanism does **not** see, stated because an unstated limit is a false claim:
+    `importlib.import_module("...")` and `exec` carry no import node and bind no free name that
+    resolves in `pipeline`; a `functools.partial` alias carries no `__module__`; and raw
+    `torch.cdist(...).topk(...)` reaches no project module at all, so nothing here objects to
+    it. It also says nothing about code outside this one function body -- for which see the
+    runtime detonators below, which walk every path instead of every line.
     """
-    wrapper = _wrapper_syntax_tree()
+    origins = {name: _origin(vars(pipeline)[name]) for name in EXPENSIVE_PIPELINE_NAMES}
+    assert not {
+        name for name, origin in origins.items()
+        if not origin.endswith(FORBIDDEN_MODULE_TAILS)
+    }, origins
 
+    wrapper = _wrapper_syntax_tree()
     imports = [
         node for node in ast.walk(wrapper)
         if isinstance(node, (ast.Import, ast.ImportFrom))
     ]
     assert imports == [], [ast.unparse(node) for node in imports]
 
-    reached = {}
-    for node in ast.walk(wrapper):
-        if isinstance(node, ast.Name):
-            value = vars(pipeline).get(node.id)
-            if value is not None:
-                origin = getattr(value, "__module__", "") or getattr(value, "__name__", "")
-                reached[node.id] = origin
+    mentioned = {node.id for node in ast.walk(wrapper) if isinstance(node, ast.Name)}
+    assert not mentioned & set(DETONATED_NAMES), sorted(mentioned & set(DETONATED_NAMES))
+
+    reached = {
+        name: _origin(vars(pipeline)[name]) for name in mentioned if name in vars(pipeline)
+    }
     assert reached, "the wrapper mentions no module global at all, so this scan proves nothing"
     assert not {
         name for name, origin in reached.items() if origin.endswith(FORBIDDEN_MODULE_TAILS)
     }, reached
 
 
-def test_the_command_reaches_for_no_detector_and_no_knn(tmp_path: Path, monkeypatch):
-    """The help's central claim, checked instead of only written down.
+# The five paths through `command_analyze_confidence_deciles`. Enumerated rather than sampled:
+# detonators only fire on code that runs, so a fixture exercising one path says nothing about
+# the other four, and the four that refuse are precisely the ones a happy-path fixture misses.
+WRAPPER_PATHS = (
+    "cache_refused",      # `_existing_artifact` rejects --cache
+    "results_refused",    # `_existing_path` rejects --results
+    "already_complete",   # the finished-report guard raises FileExistsError
+    "published",          # the try body succeeds
+    "analysis_refused",   # the except ValueError handler runs
+)
 
-    "Runs no detector forward pass and no kNN search" is why this command is worth having:
-    it is minutes on a CPU against artifacts someone else spent GPU hours producing, and it
-    can be rerun against a second result set over the same cache. A rewrite that recomputed
-    the distances rather than reading the saved ones would still publish seven plausible
-    files, and every other assertion in this module would still hold.
 
-    The limit is about *name binding*, not about module boundaries, and it is narrower than it
-    looks: these detonators sit in `pipeline`'s module globals, so they fire for any reach
-    resolved through those globals -- including one made indirectly by a helper the wrapper
-    calls, which is the case the static scan above cannot see -- and for nothing else. A local
-    import inside the wrapper, or a global touched only on a branch this fixture does not
-    execute, passes straight through. `test_the_wrapper_names_no_detector_or_knn_path_anywhere
-    _in_its_body` exists for exactly those two, and neither test subsumes the other.
+@pytest.mark.parametrize("path", WRAPPER_PATHS)
+def test_no_path_through_the_command_reaches_an_expensive_entry_point(
+    tmp_path: Path, monkeypatch, path,
+):
+    """The help's central claim, checked on every branch instead of only written down.
 
+    "Runs no detector forward pass and no kNN search" is why this command is worth having: it
+    is minutes on a CPU against artifacts someone else spent GPU hours producing. A rewrite
+    that recomputed the distances rather than reading the saved ones would still publish seven
+    plausible files, and every other assertion in this module would still hold.
+
+    Detonators in `pipeline`'s module globals fire for any reach resolved through those
+    globals -- including one made *indirectly*, by a helper the wrapper calls, which no scan of
+    the wrapper's own body can see. That is the half the static test above cannot cover, and it
+    is why the two do not subsume each other.
+
+    Parametrized over all five paths because a detonator is only as wide as the code that runs
+    under it. A single happy-path fixture leaves four branches uncovered, and they are not
+    exotic: the `except` handler and the finished-report guard both run on ordinary operator
+    mistakes, and a computation reintroduced on either is invisible to a test that never
+    reaches it.
+
+    The remaining limit is name binding: a name resolved outside `pipeline`'s globals -- a
+    local import, `importlib` -- passes straight through, which is the static scan's half.
     Neither says anything about `decile_analysis`, which does plenty of arithmetic of its own
     on tensors already in memory.
     """
@@ -223,16 +268,33 @@ def test_the_command_reaches_for_no_detector_and_no_knn(tmp_path: Path, monkeypa
             raise AssertionError(f"analyze-confidence-deciles called {name}")
         return explode
 
-    for name in EXPENSIVE_PIPELINE_NAMES:
+    for name in DETONATED_NAMES:
         assert hasattr(pipeline, name), name
         monkeypatch.setattr(pipeline, name, detonator(name))
 
     artifacts = write_decile_artifacts(tmp_path)
     output = tmp_path / "report"
+    results = artifacts["results"]
+    if path == "cache_refused":
+        (artifacts["cache"] / "manifest.json").unlink()
+    elif path == "results_refused":
+        results = tmp_path / "absent.csv"
+    elif path == "already_complete":
+        output.mkdir()
+        (output / "summary.json").write_text("{}", encoding="utf-8")
+    elif path == "analysis_refused":
+        mutate_decile_artifacts(artifacts, "drop_severity")
 
-    assert _analyze(artifacts, output) == 0
+    status = main([
+        "analyze-confidence-deciles",
+        "--cache", str(artifacts["cache"]),
+        "--results", str(results),
+        "--output", str(output),
+    ])
 
-    assert sorted(path.name for path in output.iterdir()) == list(DECILE_REPORT_FILES)
+    assert status == (0 if path == "published" else 2)
+    if path == "published":
+        assert sorted(entry.name for entry in output.iterdir()) == list(DECILE_REPORT_FILES)
 
 
 LEFTOVER = b"a half-published run left this behind\n"
