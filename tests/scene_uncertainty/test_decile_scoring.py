@@ -399,3 +399,72 @@ def test_the_shared_membership_mode_is_recognised():
     rows = call(membership_mode="shared", confidence_bin="all_valid")
     assert {row["membership_mode"] for row in rows} == {"shared"}
     assert set(MEMBERSHIP_MODES) == {"dynamic", "frozen", "shared"}
+
+
+# --- bucket scheme provenance --------------------------------------------------------
+
+
+LEGACY_ROW_KEYS = frozenset(
+    {
+        "image_id",
+        "severity",
+        "source_partition",
+        "membership_mode",
+        "confidence_bin",
+        "padding_mode",
+        "selected_count",
+        "clean_overlap",
+        "selected_query_ids",
+        "signal",
+        "score_scope",
+        "aggregation",
+        "score",
+    }
+)
+"""Every key the published decile command's rows carry, spelled out rather than derived.
+
+Deriving the set from a call would make the test agree with whatever the scorer currently
+emits, which is the one thing it is here to refuse."""
+
+
+def test_a_caller_that_omits_the_bucket_scheme_gets_the_legacy_row_unchanged():
+    """The published results artifact was written by callers that never named a scheme.
+
+    The whole key set is asserted, not merely the absence of `bucket_scheme`: the boundary
+    being defended is that the legacy path emits the dictionaries it always has, and a later
+    field arriving by the same route would be the identical failure under a new name.
+    """
+    rows = call(aggregations=DECILE_AGGREGATIONS)
+    assert {frozenset(row) for row in rows} == {LEGACY_ROW_KEYS}
+
+
+@pytest.mark.parametrize(
+    ("scheme", "name"),
+    [("decile", "decile_00_10"), ("quintile", "quintile_00_20")],
+)
+def test_an_explicit_bucket_scheme_is_recorded_on_every_row(scheme, name):
+    """The scheme is read back off the row, never inferred by parsing the bin name."""
+    rows = call(confidence_bin=name, bucket_scheme=scheme)
+    assert {row["bucket_scheme"] for row in rows} == {scheme}
+    assert {frozenset(row) for row in rows} == {LEGACY_ROW_KEYS | {"bucket_scheme"}}
+
+
+@pytest.mark.parametrize(
+    ("scheme", "name"),
+    [
+        ("decile", "quintile_00_20"),
+        ("quintile", "decile_00_10"),
+        ("quartile", "x"),
+        ("decile", "all_valid"),
+        ("quintile", "all_valid"),
+    ],
+)
+def test_a_bin_from_another_bucket_scheme_is_rejected(scheme, name):
+    """A named scheme is a claim about how the bin was cut, and the pair has to hold.
+
+    `all_valid` belongs to neither scheme: it is the whole valid record rather than a bucket
+    of it, so a row filing it under deciles or quintiles would record a partition that never
+    happened. It stays legal on the legacy path, where no scheme was claimed at all.
+    """
+    with pytest.raises(ValueError, match="bucket scheme"):
+        call(confidence_bin=name, bucket_scheme=scheme)
