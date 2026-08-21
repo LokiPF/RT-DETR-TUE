@@ -55,7 +55,10 @@ It does not prove matplotlib honoured it. `test_corruption_plots.py` asserts tha
 a candidate deployable, and a run over fewer images is a run with an empty ranking. On such a
 run this asserts that the ranking *is* empty -- the gate holding is the check -- and prints the
 manifest's actual image count. It never rescales the gate to whatever the run happened to
-contain.
+contain, and it exempts the ranking only: the `deployable` column, the re-derived gate and
+`deployable_candidate_count` are cross-checked at every run size, because below that image count
+the gate admits nobody, so a candidate marked deployable there is a disagreement rather than a
+smaller result.
 """
 
 from __future__ import annotations
@@ -186,11 +189,11 @@ every element of an empty set satisfies every predicate. Printing PASS there is 
 printing nothing, because PASS is the line a reader quotes into a report -- so a check that
 examined nothing says so and fails.
 
-The one check partly exempt from this is the deployable ranking, and only on a run of fewer
-than 250 images, where an empty ranking is admitted by design rather than by starvation. On a
-full run the exemption does not apply: that check states all three of its populations -- ranked,
-re-derived, and marked deployable -- and a zero it cannot corroborate is a failure like any
-other. It states its populations; it does not explain them."""
+The one check partly exempt from this is the deployable ranking, and only the ranking: an empty
+ranking on a run of fewer than 250 images is admitted by design rather than by starvation.
+Everything else that check compares is compared at every run size -- it states all three of its
+populations, ranked, re-derived and marked deployable, and on a full run a zero it cannot
+corroborate is a failure like any other. It states its populations; it does not explain them."""
 
 
 # --- helpers ------------------------------------------------------------------------------
@@ -212,19 +215,48 @@ class BundleUnreadable(Exception):
     """A file in the bundle is present but is not the thing it is named after."""
 
 
+def _number(value):
+    """`value` read as a `float`, or `None` when it is not a number at all.
+
+    Separate from `_cell` because the two answer different questions: `_cell` keeps a blank
+    distinct from a `0.0`, this one keeps a number distinct from `banana`.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _close(left, right) -> bool:
     """Whether two published numbers agree, with `None` equal only to `None`.
 
     A tolerance rather than `==` because both sides made a round trip through text -- one
     through `to_csv`, one through `json.dump` -- and `nan` is folded in as its own case so that
     a missing measurement never compares equal to a number.
+
+    **It never raises, and that is a property of this function rather than of its callers.**
+    Every call site is a comparison made inside a loop that has *already accumulated findings*:
+    the ranking cross-check has gathered gate violations, `check_macro_auroc` has gathered
+    mismatched candidates, `check_severity_statistics` has gathered recomputed statistics. A
+    bare `float()` here raises on the first unreadable cell, propagates out of the check, and
+    `main` replaces the entire accumulated list with one line about a `ValueError` -- so the
+    most broken bundle in the suite gets the least actionable message of any of them, which is
+    exactly backwards, and is the same defect `_ranking_sort_key` exists to avoid. Guarding the
+    four fields the ranking cross-check happens to name would be the enumeration this file has
+    been burnt by twice; the guarantee belongs to the comparison itself.
+
+    A value that cannot be read as a number is therefore compared as itself: two identical
+    unreadable cells agree, because they do, and anything else disagrees and is reported by its
+    caller as the disagreement it is.
     """
     if left is None or right is None:
         return left is None and right is None
-    left, right = float(left), float(right)
-    if math.isnan(left) or math.isnan(right):
-        return math.isnan(left) and math.isnan(right)
-    return math.isclose(left, right, rel_tol=RTOL, abs_tol=ATOL)
+    left_number, right_number = _number(left), _number(right)
+    if left_number is None or right_number is None:
+        return left == right
+    if math.isnan(left_number) or math.isnan(right_number):
+        return math.isnan(left_number) and math.isnan(right_number)
+    return math.isclose(left_number, right_number, rel_tol=RTOL, abs_tol=ATOL)
 
 
 def _cell(value):
@@ -260,6 +292,21 @@ def _numeric(series: pd.Series) -> tuple[pd.Series, pd.Series]:
 
 def _candidate_id(row) -> tuple:
     return tuple(row[field] for field in CANDIDATE_KEY)
+
+
+def _ranked_key(candidate) -> tuple | None:
+    """A `summary.json` ranking entry's candidate key as seven strings, or `None`.
+
+    Both published files spell every field of a candidate key as a string. An entry that puts
+    anything else there -- a number, a list, a missing field -- has to be *reported* rather than
+    raised on, for the same reason `_close` never raises: the key is hashed into a set, looked
+    up in an index and sorted for display a few lines later, and each of those three raises on
+    the wrong type, taking every gate violation the loop had already accumulated with it.
+    """
+    if not isinstance(candidate, dict):
+        return None
+    key = tuple(candidate.get(field) for field in CANDIDATE_KEY)
+    return key if all(isinstance(field, str) for field in key) else None
 
 
 def _validate_candidate_domains(frame: pd.DataFrame) -> None:
@@ -376,7 +423,12 @@ def _ranking_sort_key(candidate: dict):
 
     `bool` is excluded explicitly because `isinstance(True, int)` is true in Python, and a
     `True` where a macro AUROC belongs would otherwise sort as `1`.
+
+    A ranking entry that is not an object at all is `None` for the same reason: `.get` on a bare
+    string raises, and a function whose whole purpose is not to raise has to mean it.
     """
+    if not isinstance(candidate, dict):
+        return None
     metrics = []
     for field in RANKING_METRICS:
         value = candidate.get(field)
@@ -513,7 +565,7 @@ def check_candidate_key_unique(bundle) -> CheckResult:
     failures = []
     duplicated = metrics[metrics.duplicated(list(CANDIDATE_KEY), keep=False)]
     if len(duplicated):
-        keys = sorted({_candidate_id(row) for _, row in duplicated.iterrows()})
+        keys = sorted({_candidate_id(row) for _, row in duplicated.iterrows()}, key=str)
         failures.append(f"{len(keys)} duplicated candidate key(s): {keys[:3]}")
     scene_candidates = {
         tuple(key) for key in
@@ -546,9 +598,11 @@ def check_ranking_gates(bundle) -> CheckResult:
     empty". That is the gate holding, and it is asserted rather than skipped -- a widened gate
     would otherwise pass this audit silently.
 
-    This is the one check exempt from `_STARVED`: an empty ranking is a documented outcome here
-    and not a starved check, both on a short run and on a full one where nothing passed. The
-    population is stated and the zero is explained rather than failed.
+    This is the one check exempt from `_STARVED`, and the exemption covers the ranking alone: an
+    empty ranking below `FULL_TUNING_IMAGE_COUNT` images is a documented outcome rather than a
+    starved check. Everything else here is compared at every run size, including the agreement
+    between the ranking, the `deployable` column and the re-derived gate. It states its
+    populations; it does not explain them.
     """
     ranking = bundle.summary["deployable_ranking"]
     failures = []
@@ -563,18 +617,20 @@ def check_ranking_gates(bundle) -> CheckResult:
             f"{int(stray.sum())} candidate(s) publish an orientation outside "
             f"{{-1, +1}} or blank, e.g. {examples}"
         )
-    if bundle.expected_image_count != FULL_TUNING_IMAGE_COUNT:
-        examined = (
-            f"{len(ranking)} ranked candidates; the gate admits none below "
-            f"{FULL_TUNING_IMAGE_COUNT} images, so empty is the expected result"
+    # The short run is an exemption for the *ranking*, and for nothing else. Returning here --
+    # before the re-derived gate, the `deployable` column and `deployable_candidate_count` were
+    # ever compared -- made all three unaudited on the only bundle size a host without the real
+    # cache can produce: a `candidate_metrics.csv` marking 45 candidates deployable on a 4-image
+    # run, and a `deployable_candidate_count` of 45 beside an empty ranking, both audited 9 of 9.
+    # Below `FULL_TUNING_IMAGE_COUNT` images the gate's own definition admits nobody, so the
+    # re-derived set is empty *by that definition* rather than by starvation, and a candidate
+    # marked deployable against it is a disagreement at any run size.
+    short_run = bundle.expected_image_count != FULL_TUNING_IMAGE_COUNT
+    if short_run and ranking:
+        failures.append(
+            f"the run measured {bundle.expected_image_count} images, not "
+            f"{FULL_TUNING_IMAGE_COUNT}, yet {len(ranking)} candidate(s) were ranked deployable"
         )
-        if ranking:
-            failures.append(
-                f"the run measured {bundle.expected_image_count} images, not "
-                f"{FULL_TUNING_IMAGE_COUNT}, yet {len(ranking)} candidate(s) were ranked "
-                "deployable"
-            )
-        return CheckResult(examined, failures)
     qualified = _gate_qualified(bundle)
     published = {
         _candidate_id(row) for _, row in bundle.candidate_metrics.iterrows()
@@ -584,6 +640,11 @@ def check_ranking_gates(bundle) -> CheckResult:
         f"{len(ranking)} ranked candidates against {len(qualified)} that qualify and "
         f"{len(published)} marked deployable"
     )
+    if short_run:
+        examined += (
+            f"; the gate admits none below {FULL_TUNING_IMAGE_COUNT} images, so all three "
+            "must be empty"
+        )
     finite_by_candidate = bundle.finite_counts
 
     # Grouped rather than one line per candidate. Every other message in this file caps its
@@ -601,11 +662,14 @@ def check_ranking_gates(bundle) -> CheckResult:
     ).set_index(list(CANDIDATE_KEY))
 
     for position, candidate in enumerate(ranking):
-        missing = [field for field in CANDIDATE_KEY if field not in candidate]
-        if missing:
-            note("are missing candidate-key fields", (position, missing))
+        key = _ranked_key(candidate)
+        if key is None:
+            shown = (
+                {field: candidate.get(field) for field in CANDIDATE_KEY}
+                if isinstance(candidate, dict) else candidate
+            )
+            note("do not carry a candidate key of seven strings", (position, shown))
             continue
-        key = _candidate_id(candidate)
         for field, required in DEPLOYABLE_GATES.items():
             if candidate[field] != required:
                 note(f"have a {field} other than {required!r}", (key, candidate[field]))
@@ -657,17 +721,18 @@ def check_ranking_gates(bundle) -> CheckResult:
     # nothing validated -- made the whole cross-check vacuous, and a 250-image bundle with its
     # entire ranking deleted audited green. `_STARVED` is the doctrine this check was missing:
     # a population that came out empty is a thing to report, not a thing to pass over.
-    ranked = {
-        _candidate_id(candidate) for candidate in ranking
-        if all(field in candidate for field in CANDIDATE_KEY)
-    }
-    unranked = sorted(qualified - ranked)
+    ranked = {key for key in map(_ranked_key, ranking) if key is not None}
+    # `key=str` wherever candidate keys are sorted only to be shown. Sorting tuples compares
+    # their fields, which raises the moment two keys disagree on a field's type -- and this sort
+    # runs *after* the loop above has accumulated its findings, so a single numeric field in one
+    # ranking entry would discard all of them. Ordering three examples is not worth a raise.
+    unranked = sorted(qualified - ranked, key=str)
     if unranked:
         failures.append(
             f"{len(unranked)} candidate(s) pass every gate in candidate_metrics.csv but are "
             f"absent from the ranking, e.g. {unranked[:3]}"
         )
-    unqualified = sorted(ranked - qualified)
+    unqualified = sorted(ranked - qualified, key=str)
     if unqualified:
         failures.append(
             f"{len(unqualified)} ranked candidate(s) do not pass the gate when it is re-derived "
@@ -727,6 +792,20 @@ def check_macro_auroc(bundle) -> CheckResult:
         ]
         macro = _cell(row["macro_auroc"])
         key = _candidate_id(row)
+        # One `banana` anywhere in a numeric column flips the whole column to `object` dtype, so
+        # every cell of it arrives here as text and the readable ones still have to be compared.
+        # Reported rather than coerced, and reported rather than raised on: `float()` on the bad
+        # cell would discard every mismatched candidate found before it.
+        unreadable = sorted(
+            {str(value) for value in (*per_severity, macro)
+             if value is not None and _number(value) is None}
+        )
+        if unreadable:
+            failures.append(
+                f"{key} publishes a non-numeric AUROC, e.g. {unreadable[:3]}; these are "
+                "unreadable cells, not unmeasured ones"
+            )
+            continue
         if any(value is None for value in per_severity):
             if not all(value is None for value in per_severity):
                 failures.append(f"{key} publishes a partial set of per-severity AUROCs")
@@ -851,7 +930,7 @@ def check_severity_statistics(bundle) -> CheckResult:
     if unmatched:
         failures.append(
             f"{len(unmatched)} candidate(s) in per_scene.csv have no candidate_metrics.csv "
-            f"row and were not compared, e.g. {sorted(unmatched)[:3]}"
+            f"row and were not compared, e.g. {sorted(unmatched, key=str)[:3]}"
         )
     if spoiled_total:
         failures.append(

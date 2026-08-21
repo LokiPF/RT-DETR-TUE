@@ -417,8 +417,9 @@ carry on" is worse. A check that was handed an empty population -- a `per_scene.
 header and no rows, say -- fails rather than passing vacuously, because every element of an empty
 set satisfies every predicate and PASS is the line a reader quotes. The one exception is the
 deployable ranking on a run of **fewer than 250 images**, where an empty ranking is admitted by
-design rather than by starvation; on a full run the exemption does not apply, and a zero the
-check cannot corroborate is a failure like any other.
+design rather than by starvation -- and it exempts the ranking alone, not the rest of that
+check; on a full run the exemption does not apply at all, and a zero the check cannot
+corroborate is a failure like any other.
 
 It is read-only and it deliberately imports nothing from `src/scene_uncertainty`: every
 constant and formula in it is restated from the design, so the two spellings can disagree. An
@@ -446,9 +447,12 @@ The columns that cross-check depends on -- `orientation`, `deployable`, `measure
 `image_count` -- have their domains proved at load for the same reason, so an unreadable cell is
 a refusal rather than a silent exclusion. On a run over fewer than 250 images the gate can admit
 nothing, so it reports the manifest count and asserts the ranking is empty; it never rescales
-the deployability gate to fit the run it was given. It does not inspect PNG pixels -- that claim
-belongs to `tests/scene_uncertainty/test_corruption_plots.py`, which asserts it against the
-`Axes` objects.
+the deployability gate to fit the run it was given. The three-way agreement is checked at every
+run size and not only at 250, because below that count nothing can qualify: a `deployable`
+column marking candidates, or a non-zero `deployable_candidate_count`, disagrees with a
+re-derived set that is empty by the gate's own definition. It does not inspect PNG pixels --
+that claim belongs to `tests/scene_uncertainty/test_corruption_plots.py`, which asserts it
+against the `Axes` objects.
 
 ### Reading the artifacts
 
