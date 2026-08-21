@@ -310,6 +310,30 @@ def mutate_decile_artifacts(artifacts: dict[str, Path], mutation: str) -> None:
             records[0]["boxes"] = records[0]["boxes"][:-1]
             return records
         _edit_cache_records(cache, truncate_boxes)
+    elif mutation == "zero_layer_scale":
+        # Not a provenance forgery: a fit that collapsed. `_load_layer_score_scales` documents
+        # that it deliberately does not range-check the centre and scale, leaving that to
+        # `decile_scoring` at the point of division -- which raises a *plain* `ValueError`, not
+        # a `DecileAnalysisError`. So this is the reachable input that separates a wrapper
+        # catching `ValueError` from one narrowed to the loader's own error type.
+        normalizer_path = results.with_suffix(".normalizers.pt")
+        state = torch.load(normalizer_path, map_location="cpu", weights_only=True)
+        state["layer_score_scales"][2]["scale"] = torch.tensor(0.0)
+        torch.save(state, normalizer_path)
+    elif mutation in ("result_partition_test", "result_partition_all"):
+        # Relabelled *and re-sealed*, which is the only version of this that tests the rule it
+        # aims at. Editing `source_partition` without recomputing the address leaves a manifest
+        # that fails the content-address check too, and a loader whose partition rule had been
+        # narrowed or deleted would still refuse it -- for the wrong reason, with no test able
+        # to tell. `"all"` matters as much as `"test"`: a run scored with `--partition all`
+        # holds every held-out image, so the rule is `!= "tuning"` and not `== "test"`.
+        partition = mutation.rsplit("_", 1)[-1]
+
+        def relabel(manifest, partition=partition):
+            manifest["source_partition"] = partition
+            manifest["artifact_id"] = result_content_address(manifest)
+
+        _edit_result_manifest(results, relabel)
     elif mutation == "cache_source_kind":
         _edit_cache_manifest(cache, {"source_kind": "reference"}, reseal=True)
     elif mutation == "cache_manifest_forged":

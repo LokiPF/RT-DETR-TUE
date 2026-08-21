@@ -72,19 +72,24 @@ def test_top_level_help_lists_every_subcommand(capsys):
 SUBCOMMAND_COUNT_WORDS = {5: "Five", 6: "Six", 7: "Seven", 8: "Eight"}
 
 
-def test_the_pipeline_overview_counts_and_names_every_subcommand():
-    """`--help`'s overview must list what the parser actually accepts, and say how many.
+def test_the_pipeline_overview_counts_names_and_orders_every_subcommand():
+    """`--help`'s overview must list what the parser accepts, how many, and in what order.
 
     `test_top_level_help_lists_every_subcommand` is satisfied by argparse's own generated
     listing of subparser names, so it passes whether or not the overview above it mentions the
     command at all -- and it says nothing about the count sentence, which is the part that goes
     stale silently.
+
+    One equality rather than a membership loop, because the overview's own promise is "run in
+    this order" and a loop cannot check it. The order is the whole content of the list: moving
+    `analyze-confidence-deciles` to the top would tell an operator to analyse a feature cache
+    and a results CSV that the commands below it have not produced yet. The equality also
+    refuses a row for a command the parser does not have.
     """
     subcommands = list(build_parser()._subparsers._group_actions[0].choices)
     overview = cli.__doc__
-    assert f"{SUBCOMMAND_COUNT_WORDS[len(subcommands)]} subcommands" in overview
-    for name in subcommands:
-        assert re.search(rf"^    {re.escape(name)} +-> ", overview, re.MULTILINE), name
+    assert f"{SUBCOMMAND_COUNT_WORDS[len(subcommands)]} subcommands, run in this order:" in overview
+    assert re.findall(r"^    (\S+) +-> ", overview, re.MULTILINE) == subcommands
 
 
 def test_confidence_decile_command_has_only_cache_results_and_output():
@@ -103,6 +108,31 @@ def test_confidence_decile_command_has_only_cache_results_and_output():
         "command": "analyze-confidence-deciles",
         "cache": "cache", "results": "raw_k5.csv", "output": "report",
     }
+
+
+def test_the_confidence_decile_command_refuses_a_partition_flag(capsys):
+    """What the namespace equality above cannot say, and the difference is not academic.
+
+    `vars(args)` pins "no argument with a materialised default". An argument declared
+    `default=argparse.SUPPRESS` never lands in the namespace at all, so the equality still
+    holds while the parser happily accepts `--partition test` and binds it -- an inert flag
+    today, and the seam a later edit widens. What actually keeps the held-out test images
+    unspendable from the command line is that argparse rejects the flag outright, so that is
+    what is asserted here, against the parser's behaviour rather than against the shape of its
+    result.
+
+    This is the outermost of several layers, not the only one: `_load_result_manifest` refuses
+    any manifest not built for the tuning partition and `_load_distance_index` re-checks it per
+    row. Both are exercised through `main` in `test_decile_integration.py`.
+    """
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args([
+            "analyze-confidence-deciles",
+            "--cache", "c", "--results", "r", "--output", "o",
+            "--partition", "test",
+        ])
+    assert exit_info.value.code == 2
+    assert "unrecognized arguments: --partition test" in capsys.readouterr().err
 
 
 def test_missing_required_argument_is_refused_at_parse_time(capsys):

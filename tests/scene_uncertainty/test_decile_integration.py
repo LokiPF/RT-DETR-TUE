@@ -24,6 +24,7 @@ mutant that a looser assertion would let through:
 
 from __future__ import annotations
 
+import ast
 import json
 from pathlib import Path
 
@@ -135,6 +136,68 @@ EXPENSIVE_PIPELINE_NAMES = (
 )
 
 
+FORBIDDEN_MODULE_TAILS = (".knn", ".evaluate", ".extractor", ".bank", ".dataset", ".runtime")
+"""Where a detector pass, a bank build or a kNN search can come from. `pipeline` imports all of
+them legitimately for the other six commands, which is why the module-level scan
+`test_decile_analysis.py` runs over `decile_analysis` cannot be run over this module -- and why
+the scan below is scoped to one function body instead."""
+
+
+def _wrapper_syntax_tree() -> ast.FunctionDef:
+    source = Path(pipeline.__file__).read_text(encoding="utf-8")
+    return next(
+        node for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "command_analyze_confidence_deciles"
+    )
+
+
+def test_the_wrapper_names_no_detector_or_knn_path_anywhere_in_its_body():
+    """The static half of the no-inference guard, closing what monkeypatching cannot see.
+
+    `monkeypatch.setattr(pipeline, name, ...)` rebinds module globals, so it is blind in two
+    directions that both matter. A name resolved another way never passes through those
+    globals -- `from .knn import fit_clean_distance_scale` written *inside* the function is the
+    obvious one, and it is the shape someone reintroducing a computation reaches for as readily
+    as a global. And a global reached only on a branch the detonator fixture does not execute,
+    such as the `except` handler, is never called while the detonators are installed at all.
+
+    So two assertions over the wrapper's own syntax tree, which has neither blind spot:
+
+    * it contains no `import` statement of any kind. Not a blocklist -- a blocklist is dodged
+      by a module name nobody thought of, whereas this function has no legitimate reason to
+      import anything at run time, its three analysis entry points being module-level imports
+      that the scan below then vouches for;
+    * every free name it mentions that resolves to a `pipeline` global comes from somewhere
+      other than the detector, bank, dataset, extraction, scoring and kNN modules -- the
+      `vars(module)` idiom `test_decile_analysis.py:308` uses, narrowed from the module to the
+      names this one function actually mentions, which is what makes it applicable here.
+
+    Together with the runtime detonators this is genuinely two-sided: the detonators catch a
+    reach made *indirectly*, through a helper the wrapper calls, which no scan of this one
+    function body can see.
+    """
+    wrapper = _wrapper_syntax_tree()
+
+    imports = [
+        node for node in ast.walk(wrapper)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    assert imports == [], [ast.unparse(node) for node in imports]
+
+    reached = {}
+    for node in ast.walk(wrapper):
+        if isinstance(node, ast.Name):
+            value = vars(pipeline).get(node.id)
+            if value is not None:
+                origin = getattr(value, "__module__", "") or getattr(value, "__name__", "")
+                reached[node.id] = origin
+    assert reached, "the wrapper mentions no module global at all, so this scan proves nothing"
+    assert not {
+        name for name, origin in reached.items() if origin.endswith(FORBIDDEN_MODULE_TAILS)
+    }, reached
+
+
 def test_the_command_reaches_for_no_detector_and_no_knn(tmp_path: Path, monkeypatch):
     """The help's central claim, checked instead of only written down.
 
@@ -144,9 +207,16 @@ def test_the_command_reaches_for_no_detector_and_no_knn(tmp_path: Path, monkeypa
     the distances rather than reading the saved ones would still publish seven plausible
     files, and every other assertion in this module would still hold.
 
-    Scoped honestly: the detonators are installed in `pipeline`'s namespace, so what this
-    proves is that `command_analyze_confidence_deciles` reaches for none of them -- not that
-    `decile_analysis` contains no arithmetic of its own, which it does.
+    The limit is about *name binding*, not about module boundaries, and it is narrower than it
+    looks: these detonators sit in `pipeline`'s module globals, so they fire for any reach
+    resolved through those globals -- including one made indirectly by a helper the wrapper
+    calls, which is the case the static scan above cannot see -- and for nothing else. A local
+    import inside the wrapper, or a global touched only on a branch this fixture does not
+    execute, passes straight through. `test_the_wrapper_names_no_detector_or_knn_path_anywhere
+    _in_its_body` exists for exactly those two, and neither test subsumes the other.
+
+    Neither says anything about `decile_analysis`, which does plenty of arithmetic of its own
+    on tensors already in memory.
     """
     def detonator(name):
         def explode(*args, **kwargs):
@@ -165,6 +235,9 @@ def test_the_command_reaches_for_no_detector_and_no_knn(tmp_path: Path, monkeypa
     assert sorted(path.name for path in output.iterdir()) == list(DECILE_REPORT_FILES)
 
 
+LEFTOVER = b"a half-published run left this behind\n"
+
+
 def test_an_unfinished_output_directory_is_completed_rather_than_refused(tmp_path: Path):
     """The refusal is `summary.json`, not the directory: an interrupted run must be rerunnable.
 
@@ -173,19 +246,50 @@ def test_an_unfinished_output_directory_is_completed_rather_than_refused(tmp_pat
     the same path. A guard on `output.exists()` would pass every other test in this file --
     they all point at a path that does not exist yet -- and would leave that state unrecoverable
     without a manual `rm -rf`.
+
+    All six of the other artifacts are staged, not just one. The epilog documents the guard as
+    "a directory containing `summary.json`", and a guard keyed on any *other* one of the seven
+    is equally consistent with a single stale file and with the finished-report test below,
+    which publishes all seven. Six here and one there pin the file's identity between them.
     """
     artifacts = write_decile_artifacts(tmp_path)
     output = tmp_path / "report"
     output.mkdir()
-    leftover = "a half-published run left this behind\n"
-    (output / "per_scene.csv").write_text(leftover, encoding="utf-8")
+    unfinished = [name for name in DECILE_REPORT_FILES if name != "summary.json"]
+    for name in unfinished:
+        (output / name).write_bytes(LEFTOVER)
 
     assert _analyze(artifacts, output) == 0
 
     assert sorted(path.name for path in output.iterdir()) == list(DECILE_REPORT_FILES)
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     assert summary["run_metadata"]["source_partition"] == "tuning"
-    assert (output / "per_scene.csv").read_text(encoding="utf-8") != leftover
+    assert [name for name in unfinished if (output / name).read_bytes() == LEFTOVER] == []
+
+
+def test_the_finished_report_guard_reads_summary_json_and_does_not_parse_it(
+    tmp_path: Path, capsys,
+):
+    """The other half of the file's identity, on a directory holding nothing else.
+
+    `summary.json` is the last thing a reader of a finished report would want silently
+    replaced, and it is the file the epilog names. Its content is deliberately `{}`: the guard
+    is an existence check on the finished run's marker, not a validity check on it, so a
+    corrupt summary must still be refused rather than parsed and overwritten.
+    """
+    artifacts = write_decile_artifacts(tmp_path)
+    output = tmp_path / "report"
+    output.mkdir()
+    (output / "summary.json").write_text("{}", encoding="utf-8")
+
+    assert _analyze(artifacts, output) == 2
+
+    assert _stderr_line(capsys) == (
+        "scene_uncertainty analyze-confidence-deciles: error: "
+        f"Confidence-decile report is already complete: {output}"
+    )
+    assert [path.name for path in output.iterdir()] == ["summary.json"]
+    assert (output / "summary.json").read_text(encoding="utf-8") == "{}"
 
 
 # --------------------------------------------------------------------------------------
@@ -213,6 +317,18 @@ def test_a_finished_report_is_refused_and_left_byte_identical(tmp_path: Path, ca
     ("test_partition_row", "is in the 'test' partition"),
     ("forged_result_manifest", "does not match its own content address"),
     ("drop_severity", "does not contain all six blur severities"),
+    # The tuning-only rule at the manifest, re-sealed so the content address cannot mask it,
+    # and under both names a non-tuning run can carry. `"all"` is the one that matters most:
+    # it is what `evaluate-knn --partition all` writes, it holds every held-out image, and the
+    # rule that refuses it is `!= "tuning"` -- which nothing else in the suite distinguishes
+    # from `== "test"`.
+    ("result_partition_test", "was built for the 'test' partition"),
+    ("result_partition_all", "was built for the 'all' partition"),
+    # Not provenance at all, and that is the point: `decile_scoring` refuses a collapsed
+    # clean-distance fit with a plain `ValueError`, from inside the `try`. It is the reachable
+    # input that separates `except ValueError` from `except DecileAnalysisError` -- narrowed,
+    # this one escapes `main` as a traceback while the five above still give exit 2.
+    ("zero_layer_scale", "clean-distance scale must be positive"),
 ])
 def test_artifacts_that_cannot_be_proved_leave_no_report_directory(
     tmp_path: Path, capsys, mutation, expected,
