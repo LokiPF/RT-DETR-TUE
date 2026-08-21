@@ -59,11 +59,21 @@ all of which produce a directory a reader would accept:
   wins" or printed the macro AUROC five times fails;
 * **a probability claim.** Every sentence of the report that mentions a probability or a chance
   is checked for a negation, so the one sentence allowed to use those words is the one that
-  denies them.
+  denies them;
+* **a direction stated as a constant.** The deployment gate requires an orientation and never a
+  `+1` one, so a candidate whose score falls as blur rises ranks like any other.
+  `test_a_winner_that_falls_with_blur_is_reported_as_falling` builds one and reads the clauses
+  that state a direction: a report that hard-coded "rises" prints that word beside a signed
+  correlation of -0.657;
+* **a recommendation the reader cannot reconcile.** The fixture's confidence control outranks
+  the persistence candidate the report recommends, so the report has to say why the control is
+  a yardstick rather than a second thing to deploy. Without that sentence a reader who does not
+  know this codebase closes the file believing the worse option was recommended.
 """
 
 import csv
 import json
+import os
 import re
 
 import pytest
@@ -777,9 +787,26 @@ BUNDLE_SELECTED_COUNTS = {0: 30, 1: 29, 2: 28, 3: 27, 4: 26, 5: 25}
 prints (25 to 30) cannot come out right by reading a single severity or a constant."""
 
 WINNER_CURVE = (0.0, 10.0, 20.0, -5.0, 40.0, 50.0)
-"""The deployable winner's curve. Severity 3 sits *below* clean, so its AUROC is near zero
-while the other four are near one: five distinct numbers, which is what makes "prints all five"
-distinguishable from "prints the macro five times"."""
+"""The bulk of the winner's images: rising overall, dipping below clean at severity 3, and
+ending well above clean. Severity 3 is what drags one of the five AUROCs down to a value a
+coin toss would beat, so the five are not one number printed five times."""
+
+DIP_CURVE = (1.0, 11.0, 21.0, 31.0, 41.0, -1.0)
+"""Rises for four steps and then ends *below* its clean score: a positive trend that fails the
+maximum-blur check. That combination is what pulls `dominant_direction_fraction` and
+`max_blur_above_clean_rate` apart, and there is no single curve that has it.
+
+Offset by one unit from `WINNER_CURVE` at every severity, so no two of the winner's populations
+ever hold the same score at the same severity and every AUROC is decided by the curves rather
+than by which image id happened to draw the larger lift."""
+
+FALLING_CURVE = (60.0, 40.0, -5.0, 20.0, 10.0, -2.0)
+"""The winner's only negative-trending images, at a rank correlation of -0.657 -- a larger
+magnitude than the dip's +0.143. Taking absolute values therefore moves them past the dip
+images in the ordering, which moves the median onto the other side of the boundary between the
+two magnitudes: the signed median reads +0.143 and the absolute median 0.657. Without a
+population like this the two are arithmetically equal on any fixture, because the median of
+non-negative values is the value at the same position either way."""
 
 WEAK_DECILE_CURVE = (0.0, 10.0, 20.0, -5.0, -6.0, 50.0)
 QUINTILE_CURVE = (0.0, -5.0, -6.0, 30.0, 40.0, 50.0)
@@ -794,31 +821,64 @@ The quintile control sits a long way below the decile one on purpose. The two ar
 shared y-range and the two persistence figures on another, so a fixture whose two confidence
 buckets overlapped would make a figure drawn on the wrong range look right."""
 
-FLAT_IMAGES = frozenset(range(240, 250))
 FLAT_SCORE = 5.0
-"""Ten of the winner's 250 images are a complete curve of six identical scores: measured, and
-found no movement. They are what makes the direction counts 240 / 0 / 10 rather than 250 / 0 /
-0, so a report that printed the measured count where the flat count belongs is visible.
-`5.0` sits above every clean score and below every severity-1 score, so in each AUROC those ten
-images tie only with themselves -- which is what puts the four strong severities at 0.999
-instead of 1.000."""
+"""A flat image's score at every severity: a complete curve that found no movement, which is a
+measurement and not a missing one. `5.0` collides with no other population's value at any
+severity, so those images tie only with themselves."""
+
+WINNER_POPULATION = (
+    (118, WINNER_CURVE),
+    (110, DIP_CURVE),
+    (12, FALLING_CURVE),
+    (10, None),
+)
+"""The winner's 250 images in four populations, sized so that no two numbers the report's second
+section prints come out equal.
+
+That section prints six: two rank correlations, three counts and three rates. On a fixture where
+every image follows one curve, four of them collide in pairs -- the absolute and signed medians
+are arithmetically the same number, and the dominant-direction fraction and the maximum-blur
+rate are both "the share of images that rose". A renderer that read the wrong field would pass.
+Each population breaks one collision, and the sizes are what decide the two medians:
+
+* 118 on `WINNER_CURVE`, rising and ending above clean;
+* 110 on `DIP_CURVE`, rising but ending below clean, which separates the dominant direction
+  (228/250 = 0.912) from the maximum-blur rate (118/250 = 0.472);
+* 12 on `FALLING_CURVE`, the only negative trends, and the strongest magnitudes in the run;
+* 10 flat, so the three direction counts are 228 / 12 / 10 and not 250 / 0 / 0.
+
+The 22 negative and flat images are what move the median: signed, position 125.5 of 250 sits
+inside the 110 dip images at +0.143; taking absolute values lifts those 22 out from under it and
+the same position lands among the 0.657 magnitudes instead.
+"""
+
+WINNER_CURVES = [curve for size, curve in WINNER_POPULATION for _ in range(size)]
+assert len(WINNER_CURVES) == FULL_TUNING_IMAGE_COUNT
 
 
-def spread_curves(curve, *, count=FULL_TUNING_IMAGE_COUNT, step=0.001, flat_images=frozenset()):
-    """One curve per image, each lifted onto its own baseline, plus the flat images.
+def spread_curves(curve, *, count=FULL_TUNING_IMAGE_COUNT, step=0.001):
+    """One curve per image, each lifted onto its own baseline.
 
     The lift is what makes these 250 different scenes rather than 250 copies of one: AUROC
     ranks scores from unrelated images against each other, and identical scenes would make
     every pair a tie. At most 0.249 over a 250-image run at the default step, and smaller than
-    any gap in the curves it is added to, so the AUROC each severity earns is decided by the
-    curve and not by the offsets.
+    any gap between two populations' scores at one severity, so the AUROC each severity earns
+    is decided by the curves and not by the offsets.
     """
+    return {
+        image: [value + image * step for value in curve] for image in range(count)
+    }
+
+
+def winner_curves(count=FULL_TUNING_IMAGE_COUNT, step=0.001):
+    """The deployable winner's images: `WINNER_POPULATION`, in that order, lifted as above."""
     curves = {}
     for image in range(count):
-        if image in flat_images:
-            curves[image] = [FLAT_SCORE] * 6
-        else:
-            curves[image] = [value + image * step for value in curve]
+        curve = WINNER_CURVES[image]
+        curves[image] = (
+            [FLAT_SCORE] * 6 if curve is None
+            else [value + image * step for value in curve]
+        )
     return curves
 
 
@@ -834,8 +894,7 @@ def bundle_rows(count=FULL_TUNING_IMAGE_COUNT):
     """
     short_count = count * 4 // 5
     rows = candidate_rows(
-        spread_curves(WINNER_CURVE, count=count, flat_images=FLAT_IMAGES),
-        selected_count=BUNDLE_SELECTED_COUNTS,
+        winner_curves(count=count), selected_count=BUNDLE_SELECTED_COUNTS,
     )
     rows += candidate_rows(
         spread_curves(WEAK_DECILE_CURVE, count=count),
@@ -858,7 +917,7 @@ def bundle_rows(count=FULL_TUNING_IMAGE_COUNT):
         signal="confidence", score_scope="confidence",
     )
     rows += candidate_rows(
-        spread_curves(WINNER_CURVE, count=count, flat_images=FLAT_IMAGES),
+        winner_curves(count=count),
         selected_count=BUNDLE_SELECTED_COUNTS, membership_mode="frozen",
     )
     # A candidate that never reached part of the run: 200 images of 250, and one of those 200
@@ -982,12 +1041,13 @@ def test_the_writer_and_the_figures_agree_on_the_names_they_share():
     """Three strings each module spells for itself, because the plots import the reporter.
 
     The eight filenames are pinned as literals -- the bundle's contract with whoever reads it --
-    and then the four figure names and the control's signal are checked against the module that
-    actually writes and draws them. Without the second half, `FIGURE_FILES` could name a file
-    `corruption_plots` never writes and only the file-set check at the end of a real run would
-    notice.
+    and then the four figure names, the control's signal and the name of the wider bucket scheme
+    are checked against the module that actually writes and draws them. Without the second half,
+    `FIGURE_FILES` could name a file `corruption_plots` never writes and only the file-set check
+    at the end of a real run would notice.
     """
     assert reporting_module.CONTROL_SIGNAL == plots_module.CONFIDENCE_SIGNAL
+    assert reporting_module.WIDER_BUCKET_SCHEME in plots_module.SCHEME_BUCKET_NAMES
     assert EXPECTED_FILES == {
         "per_scene.csv",
         "candidate_metrics.csv",
@@ -1203,6 +1263,31 @@ def test_the_summary_records_the_limits_the_figures_used_rather_than_computing_i
 # --- refusing to publish half a bundle ------------------------------------------------------
 
 
+def test_a_published_bundle_is_no_less_readable_than_a_directory_made_beside_it(tmp_path):
+    """`mkdtemp` makes its directory `0o700` and `os.replace` carries that mode onto the bundle.
+
+    The result is a results directory nobody but the owner can list, holding eight files the
+    umask made group-readable -- and Task 9 hands this directory to an operator. The umask is
+    pinned for the duration so the assertion cannot pass by accident on a machine whose own
+    umask is `0o077`, where a `0o700` bundle and a correct one are the same number.
+    """
+    previous = os.umask(0o022)
+    try:
+        reference = tmp_path / "reference"
+        reference.mkdir()
+        output = tmp_path / "corruption"
+        write_corruption_report(
+            output, score_rows=bundle_rows(count=3), diagnostics=bundle_diagnostics(count=3)
+        )
+        published = output.stat().st_mode & 0o777
+        expected = reference.stat().st_mode & 0o777
+    finally:
+        os.umask(previous)
+
+    assert published == expected == 0o755
+    assert {path.name for path in output.iterdir()} == EXPECTED_FILES
+
+
 def test_an_existing_output_directory_is_refused_and_left_alone(tmp_path):
     output = tmp_path / "corruption"
     output.mkdir()
@@ -1341,12 +1426,17 @@ def test_the_report_leads_with_the_best_deployable_layer_2_candidate():
 
 
 def test_the_report_gives_all_five_severity_aurocs_beside_the_macro():
-    """Four severities at 0.999 and one at 0.039: printing the macro five times fails."""
+    """The whole row, pinned in position: five severities and the macro they average to.
+
+    Pinned as the rendered row rather than as six separate substrings, so a renderer that
+    printed the macro in every cell, or the five in the wrong order, fails on the assertion
+    rather than on a count that four identical values would satisfy.
+    """
     deploy = section(render_easy_report(report_summary()), "What should we deploy?")
 
-    assert deploy.count("0.999") == 4
-    assert "0.039" in deploy
-    assert "0.807" in deploy
+    assert "| AUROC | 0.951 | 0.906 | 0.502 | 0.951 | 0.487 | 0.759 |" in deploy
+    # Severity 5 is the one a coin toss would beat, and the sentence under the table says so.
+    assert "worst is 5, at 0.487" in deploy
 
 
 def test_the_report_explains_auroc_as_an_ordering_and_never_as_a_probability():
@@ -1367,24 +1457,35 @@ def test_the_report_explains_auroc_as_an_ordering_and_never_as_a_probability():
 
 
 def test_the_report_reads_the_strength_number_beside_the_direction_counts():
-    """Absolute Spearman on its own says nothing about which way; the counts are the other
-    half of the sentence, and 240 / 0 / 10 are three different numbers."""
+    """Six numbers, six different values, so reading the wrong field is visible.
+
+    Absolute rank correlation says how hard blur moves the score and the signed median says
+    which way; the counts are the other half of the sentence. `WINNER_POPULATION` is built so
+    that the absolute median (0.657) differs from the signed one (+0.143), the direction counts
+    (228 / 12 / 10) differ from each other, and the dominant-direction fraction (0.912), the
+    adjacent-step rate (0.779) and the maximum-blur rate (0.472) are three separate values.
+    """
     steady = section(
         render_easy_report(report_summary()), "Does it react steadily to blur?"
     )
 
-    assert "0.657" in steady
-    assert "+0.657" in steady
-    assert "240 of the 250 measured images rose with blur, 0 fell, and 10 were flat" in steady
-    assert "0.808" in steady
-    assert "0.960" in steady
+    assert "correlation of 0.657" in steady
+    assert "here it is +0.143" in steady
+    assert "228 of the 250 measured images rose with blur, 12 fell, and 10 were flat" in steady
+    assert "That puts 0.912 of the measured images" in steady
+    assert "0.779 of the five steps" in steady
+    assert "on 0.472 of those images" in steady
+    assert "A flat image is a complete curve of six identical scores" in steady
 
 
 def test_the_report_compares_the_ten_way_cut_with_the_five_way_cut():
+    """And answers its own question: on this fixture the wider buckets rank behind."""
     buckets = section(render_easy_report(report_summary()), "Did 20% buckets help?")
 
-    assert "`decile_00_10`" in buckets and "0.807" in buckets
+    assert buckets.startswith("On this run they did not help.")
+    assert "`decile_00_10`" in buckets and "0.759" in buckets
     assert "`quintile_00_20`" in buckets and "0.600" in buckets
+    assert "a gap of 0.159" in buckets
 
 
 def test_the_report_compares_persistence_with_the_control_that_shares_its_selection():
@@ -1394,11 +1495,15 @@ def test_the_report_compares_persistence_with_the_control_that_shares_its_select
     )
 
     assert "the control comes out ahead" in control
-    assert "1.000" in control and "0.807" in control and "0.657" in control
+    assert "1.000" in control and "0.759" in control and "0.657" in control
     for label in ("`decile`", "`decile_00_10`", "`dynamic`", "`filtered`", "`q90`"):
         assert label in control
     assert "same selected queries" in control
     assert "share no unit" in control
+    # The reader is told, in the section that shows the control winning, why that is not a
+    # recommendation to deploy the control.
+    assert "yardstick and not a second thing to deploy" in control
+    assert "never selected and never ranked" in control
 
 
 def test_a_winner_with_no_matched_control_says_so_rather_than_pairing_a_stranger():
@@ -1416,7 +1521,31 @@ def test_a_winner_with_no_matched_control_says_so_rather_than_pairing_a_stranger
     )
 
     assert "scored for persistence only" in control
-    assert "0.807" not in control
+    assert "0.759" not in control
+
+
+def test_the_report_says_the_wider_buckets_did_help_when_they_come_out_ahead():
+    """The other side of the same sentence, which a constant answer cannot produce.
+
+    Dropping the winning decile candidate leaves the quintile candidate at the head of the
+    ranking -- it ties the remaining decile on macro AUROC and takes the first tie-break -- so
+    the honest answer flips. Without this, "On this run they did not help" is a string that
+    happens to be right on one fixture.
+    """
+    rows = [
+        row for row in bundle_rows()
+        if not (
+            row["signal"] == "persistence"
+            and row["confidence_bin"] == "decile_00_10"
+            and row["membership_mode"] == "dynamic"
+        )
+    ]
+    summary = report_summary(rows=rows)
+    buckets = section(render_easy_report(summary), "Did 20% buckets help?")
+
+    assert summary["deployable_ranking"][0]["bucket_scheme"] == "quintile"
+    assert buckets.startswith("On this run they did help.")
+    assert "did not help" not in buckets
 
 
 def test_one_scheme_with_a_ranked_candidate_is_reported_as_uncomparable():
@@ -1425,8 +1554,60 @@ def test_one_scheme_with_a_ranked_candidate_is_reported_as_uncomparable():
     buckets = section(render_easy_report(report_summary(rows=rows)), "Did 20% buckets help?")
 
     assert "Only the `decile` cut" in buckets
-    assert "`decile_00_10`" in buckets and "0.807" in buckets
+    assert "`decile_00_10`" in buckets and "0.759" in buckets
     assert "quintile" not in buckets
+
+FALLING_WINNER_CURVE = tuple(reversed(WINNER_CURVE))
+"""A deployable candidate whose score falls as blur rises, which the gate allows.
+
+`_candidate_metrics` requires an orientation, never a `+1` one, so a candidate read downward
+passes every gate a candidate read upward passes -- and the design keeps the figures un-oriented
+precisely so that a useful decreasing signal stays visibly decreasing. Reversing the winner's
+curve keeps its magnitudes and flips only its direction, so the two fixtures differ in the one
+thing the report has to read rather than assume.
+"""
+
+
+def falling_winner_rows(count=FULL_TUNING_IMAGE_COUNT):
+    """One candidate, ranked first, read downward: `orientation` is `-1` on every image."""
+    return candidate_rows(
+        spread_curves(FALLING_WINNER_CURVE, count=count),
+        selected_count=BUNDLE_SELECTED_COUNTS,
+    )
+
+
+def test_a_winner_that_falls_with_blur_is_reported_as_falling():
+    """Every clause that states a direction is read from the orientation, not assumed.
+
+    The gate at `_candidate_metrics` requires an orientation and not a `+1` one, so this
+    candidate -- 250 images, complete coverage, `persistence` at `layer_2` -- ranks first with
+    `orientation: -1`. A report that stated the direction as a constant prints "the score rises
+    as blur gets worse" directly beside a signed correlation of -0.657, and tells a reader the
+    opposite of what was measured. The flat gloss is checked here too: this fixture has no flat
+    image, so the sentence defining one has nothing to define.
+    """
+    summary = report_summary(rows=falling_winner_rows())
+    winner = summary["deployable_ranking"][0]
+    report = render_easy_report(summary)
+    deploy = section(report, "What should we deploy?")
+    steady = section(report, "Does it react steadily to blur?")
+
+    assert winner["orientation"] == -1
+    assert winner["median_signed_spearman"] == pytest.approx(-0.6571428571428573)
+    assert winner["flat_count"] == 0
+
+    assert "read downward" in deploy
+    assert "upward" not in deploy
+    assert "-0.657" in steady
+    assert "so the score falls as blur gets worse" in steady
+    assert "rises as blur gets worse" not in steady
+    assert "ends below its clean score" in steady
+    assert "ends above its clean score" not in steady
+    assert "A flat image is" not in steady
+    # One candidate, so the counts and their nouns have to agree: this is the run shape whose
+    # report most needs to read like prose, and the only one where the `s` is wrong.
+    assert "first of 1 candidate that passed every gate" in deploy
+    assert "1 candidates" not in report
 
 
 def test_the_report_says_what_each_file_holds_and_which_axes_are_shared():

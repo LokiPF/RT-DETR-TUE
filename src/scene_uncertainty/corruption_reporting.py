@@ -745,6 +745,25 @@ not there, and an extra file is a figure or a table nothing in `summary.json` ac
 """
 
 
+def _umask_directory_mode(inside: Path) -> int:
+    """The mode a plain `mkdir` would give a directory here, without touching the process umask.
+
+    `tempfile.mkdtemp` creates its directory `0o700`. That is right for a temporary nobody else
+    should read and wrong for a published result: `os.replace` carries the mode onto the bundle,
+    and an operator who is not the owner is left unable to list a directory whose eight files
+    the umask made group-readable.
+
+    Read by creating a directory and asking what mode it came out with, rather than through
+    `os.umask`, which is a setter: reading it means setting it and setting it back, and any
+    concurrent thread that creates a file in that window gets the wrong permissions instead.
+    """
+    probe = inside / ".mode-probe"
+    probe.mkdir()
+    mode = probe.stat().st_mode & 0o777
+    probe.rmdir()
+    return mode
+
+
 def _scalar_projection(candidate: dict) -> dict:
     """One candidate row with its nested per-severity maps dropped.
 
@@ -897,6 +916,56 @@ read the report backwards.
 """
 
 
+ORIENTATION_WORDS = {
+    1: {
+        "reading": "upward",
+        "flagged": "higher",
+        "moves": "rises",
+        "endpoint": "ends above its clean score",
+    },
+    -1: {
+        "reading": "downward",
+        "flagged": "lower",
+        "moves": "falls",
+        "endpoint": "ends below its clean score",
+    },
+}
+"""Every clause in the report that states a direction, keyed by the orientation it belongs to.
+
+Not one of them may be a constant. `_candidate_metrics`' gate requires an orientation and never
+a `+1` one, so a candidate whose distance *falls* as blur rises is exactly as deployable as one
+that rises -- that is the whole reason `corruption_plots` draws the raw un-oriented score, so a
+useful decreasing signal stays visibly decreasing. A report that hard-coded "rises" would print
+that word beside a negative signed correlation and tell a non-specialist the opposite of what
+was measured.
+
+`endpoint` is worded from the raw score for the same reason. `max_blur_above_clean_rate` is
+measured *after* the orientation is applied (`corruption_metrics.oriented_curve_metrics`), so
+on a candidate read downward the images it counts are the ones whose raw worst-blur score came
+out below their clean one.
+"""
+
+WIDER_BUCKET_SCHEME = "quintile"
+"""The five-way cut -- the "20% buckets" the report's third question asks about.
+
+Named here because that question has an answer and the answer depends on which of the two
+resolutions came first, which no generic "the winning scheme" phrasing can say. It is the string
+`corruption_plots.SCHEME_BUCKET_NAMES` keys its five-bucket entry with -- pinned against that
+module by the test that pins the other names the two share -- and the one
+`corruption_analysis.SCHEMES` writes into every quintile row.
+"""
+
+
+def _count(number: int, noun: str) -> str:
+    """`1 candidate`, `3 candidates` -- a count and its noun, agreeing.
+
+    Not decoration. A full tuning run counts candidates in the hundreds and reads the same
+    either way, but a run with one candidate is a diagnostic run, and a diagnostic run's report
+    is the one a reader most needs to be able to take seriously.
+    """
+    return f"{number} {noun}" if number == 1 else f"{number} {noun}s"
+
+
 def _plain(value, digits: int = 3) -> str:
     """A number as the report prints it, or the words for one that was never measured."""
     return "not measured" if value is None else f"{float(value):.{digits}f}"
@@ -962,7 +1031,7 @@ def _preamble(summary: dict) -> list[str]:
         "nearest-neighbour search was performed, so nothing here is a new measurement of the "
         "images -- it is a new reading of measurements that already existed.",
         "",
-        f"This run covered {validation['expected_image_count']} images of the "
+        f"This run covered {_count(validation['expected_image_count'], 'image')} of the "
         f"`{run.get('source_partition', 'unknown')}` partition at "
         f"{len(summary['configuration']['severities'])} blur levels, "
         f"{run.get('query_count', 'unknown')} queries an image. Feature cache "
@@ -972,7 +1041,7 @@ def _preamble(summary: dict) -> list[str]:
         f"`{run.get('normalization', 'unknown')}`.",
         "",
         f"{validation['scored_row_count']} scored rows became "
-        f"{validation['candidate_count']} candidates, "
+        f"{_count(validation['candidate_count'], 'candidate')}, "
         f"{validation['deployable_candidate_count']} of which passed every deployment gate. "
         f"{padding['images_with_padding']} of {padding['image_count']} images carried repeated "
         "decoder placeholder queries, which the ranked rows leave out.",
@@ -1004,7 +1073,8 @@ def _nothing_ranked_lines(summary: dict) -> list[str]:
     ]
     if expected < full:
         lines.extend([
-            f"This run declared {expected} images, fewer than {full}, so no candidate in it "
+            f"This run declared {_count(expected, 'image')}, fewer than {full}, so no "
+            "candidate in it "
             "could pass however well it scored. The gate is not widened to fit a smaller run: "
             f"a candidate measured on {expected} images is a different measurement, not a "
             "slightly smaller one, and calling it deployable would be the one mistake this "
@@ -1013,13 +1083,15 @@ def _nothing_ranked_lines(summary: dict) -> list[str]:
         ])
     else:
         lines.extend([
-            f"This run declared {expected} images, so its size is not what excluded them: each "
-            f"of the {validation['candidate_count']} candidates it measured failed at least one "
-            "of the other requirements above.",
+            f"This run declared {_count(expected, 'image')}, so its size is not what excluded "
+            "them: each "
+            f"of the {_count(validation['candidate_count'], 'candidate')} it measured failed at "
+            "least one of the other requirements above.",
             "",
         ])
     lines.extend([
-        f"All {validation['candidate_count']} candidates the run did measure are published in "
+        f"All {_count(validation['candidate_count'], 'candidate')} the run did measure are "
+        "published in "
         "full in `candidate_metrics.csv` and in `summary.json`, and the four pictures are drawn "
         "from them. A run like this is a diagnostic, not an empty result.",
         "",
@@ -1032,6 +1104,11 @@ def _winner_lines(summary: dict, winner: dict) -> list[str]:
     selected = winner["selected_count_by_severity"]
     severities = [str(severity) for severity in summary["configuration"]["severities"][1:]]
     weakest = min(severities, key=lambda severity: aurocs[severity])
+    words = ORIENTATION_WORDS[winner["orientation"]]
+    ranked_candidates = _count(
+        summary["validation"]["deployable_candidate_count"], "candidate"
+    )
+    measured_candidates = _count(summary["validation"]["candidate_count"], "candidate")
     smallest = min(entry["min"] for entry in selected.values())
     largest = max(entry["max"] for entry in selected.values())
     return [
@@ -1040,11 +1117,16 @@ def _winner_lines(summary: dict, winner: dict) -> list[str]:
         f"`{winner['score_scope']}`, with `{winner['membership_mode']}` membership rebuilt at "
         f"every blur level, `{winner['padding_mode']}` queries -- the repeated decoder "
         f"placeholders taken out -- and each scene summarised by `{winner['aggregation']}`. It "
-        f"came first of {summary['validation']['deployable_candidate_count']} candidates that "
-        f"passed every gate, out of the {summary['validation']['candidate_count']} this run "
-        "measured. It was chosen on the same images every number below describes, so this is a "
+        f"came first of {ranked_candidates} that passed every gate, out of the "
+        f"{measured_candidates} this run measured. It was chosen on the same images every number below describes, so this is a "
         "proposal to check on images that took no part in choosing it, not a result about "
         "them.",
+        "",
+        f"It is read {words['reading']}: the {words['flagged']} score is the more corrupted "
+        "one. That direction was chosen once, from this candidate's own images, and every "
+        "number below -- the five AUROCs, the step counts, the worst-blur rate -- is counted "
+        "through it. A candidate read the other way is not a worse candidate; the pictures draw "
+        "the score as measured so that a signal which falls with blur stays visibly falling.",
         "",
         f"Every scene in that bucket was scored over between {smallest} and {largest} selected "
         "queries, so each number below summarises a few dozen queries an image rather than the "
@@ -1090,31 +1172,41 @@ def _steady_section(summary: dict) -> list[str]:
         ]
     winner = ranking[0]
     measured = winner["measured_count"]
+    words = ORIENTATION_WORDS[winner["orientation"]]
+    # The gloss defines a word the sentence before it just used. With no flat image there is
+    # nothing to define, and the definition read as though it described the images that fell.
+    flat_gloss = (
+        " A flat image is a complete curve of six identical scores: a measurement that found "
+        "no movement, and not a measurement that failed."
+        if winner["flat_count"] else ""
+    )
     return lines + [
         f"Inside a single scene, blur moves this score by a median absolute rank correlation "
-        f"of {_plain(winner['median_absolute_spearman'])}, over the {measured} images that "
-        "produced a complete six-level curve. Absolute means the direction is thrown away "
-        "first: it says how *hard* blur moves the score, not which way it moves it.",
+        f"of {_plain(winner['median_absolute_spearman'])}, over the "
+        f"{_count(measured, 'image')} that produced a complete six-level curve. Absolute "
+        "means the direction is thrown away first: it says how *hard* blur moves the score, "
+        "not which way it moves it.",
         "",
         f"Which way is a separate number, and here it is "
         f"{_signed(winner['median_signed_spearman'])} -- the same correlations with their signs "
-        "kept, so the score rises as blur gets worse. Neither number is derived from the other: "
-        "images that move in opposite directions cancel out in the signed median and do not "
-        "cancel in the absolute one, so a candidate can be strong on one and say nothing on the "
-        "other.",
+        f"kept, so the score {words['moves']} as blur gets worse. Neither number is derived "
+        "from the other: images that move in opposite directions cancel out in the signed "
+        "median and do not cancel in the absolute one, so a candidate can be strong on one and "
+        "say nothing on the other.",
         "",
         f"Counted image by image, {winner['positive_count']} of the {measured} measured images "
-        f"rose with blur, {winner['negative_count']} fell, and {winner['flat_count']} were flat "
-        "-- a complete curve of six identical scores, which is a measurement that found no "
-        "movement and not a measurement that failed. That puts "
+        f"rose with blur, {winner['negative_count']} fell, and {winner['flat_count']} were "
+        f"flat.{flat_gloss} That puts "
         f"{_plain(winner['dominant_direction_fraction'])} of the measured images in the "
         "direction the candidate is read in.",
         "",
         f"Step by step, {_plain(winner['oriented_adjacent_consistency'])} of the five steps "
         "between neighbouring blur levels do not move against that direction, averaged over the "
         f"measured images; and on {_plain(winner['max_blur_above_clean_rate'])} of those images "
-        "the worst blur level scores above the clean one, which is the weakest thing a usable "
-        "signal has to do.",
+        f"the worst blur level {words['endpoint']}, which is the weakest thing a usable signal "
+        "has to do. Both are read in the candidate's own direction: the first asks whether a "
+        "step moved against it, the second whether the worst blur level ended further along it "
+        "than the clean image did.",
         "",
     ]
 
@@ -1148,11 +1240,18 @@ def _buckets_section(summary: dict) -> list[str]:
     # so the first scheme's candidate is never behind the second's and the gap is never signed.
     first, second = list(best.values())[:2]
     difference = float(first["macro_auroc"]) - float(second["macro_auroc"])
+    # The question in the heading is about the wider cut, so the answer has to name it. Either
+    # way round it is read from which scheme the ranking put first, never assumed.
+    answer = (
+        "On this run they did help" if first["bucket_scheme"] == WIDER_BUCKET_SCHEME
+        else "On this run they did not help"
+    )
     return lines + [
-        f"Under the same ranking rule, the `{first['bucket_scheme']}` cut comes first: "
-        f"`{first['confidence_bin']}` at a macro AUROC of {_plain(first['macro_auroc'])}. The "
-        f"best `{second['bucket_scheme']}` candidate is `{second['confidence_bin']}` at "
-        f"{_plain(second['macro_auroc'])}, a gap of {_plain(difference)}.",
+        f"{answer}. Under the same ranking rule that produced the deployment order, the "
+        f"`{first['bucket_scheme']}` cut comes first: `{first['confidence_bin']}` at a macro "
+        f"AUROC of {_plain(first['macro_auroc'])}. The best `{second['bucket_scheme']}` "
+        f"candidate is `{second['confidence_bin']}` at {_plain(second['macro_auroc'])}, a gap "
+        f"of {_plain(difference)}.",
         "",
         "Both cuts were made on the same confidence ordering over the same queries, so this is "
         "one measurement seen at two resolutions and not two independent experiments. That is "
@@ -1194,6 +1293,15 @@ def _control_section(summary: dict) -> list[str]:
         f"from the nearest clean ones at `{winner['score_scope']}`; the control is one minus "
         "the detector's own confidence in what it found.",
         "",
+        "The control is a yardstick and not a second thing to deploy, whichever way the "
+        f"comparison below comes out. This run gates and ranks `{DEPLOYABLE_SIGNAL}` alone -- "
+        "`summary.json` records that gate under `configuration` -- so the control is measured "
+        "against, never selected and never ranked. A control that comes out ahead is therefore "
+        "a finding *about* persistence: it says how much of the separation was already "
+        "available from the detector's own confidence, and it is a reason to question the "
+        "persistence result rather than a recommendation to deploy the control, which nothing "
+        "here tuned or gated as a method of its own.",
+        "",
         "Putting blurred images above clean ones across scenes, "
         + _ahead(
             "the control", control["macro_auroc"], "persistence", winner["macro_auroc"]
@@ -1227,7 +1335,8 @@ def _files_section(summary: dict) -> list[str]:
         "many queries it was taken over, and that image's own trend repeated on all six of its "
         "rows, so a single row reads on its own without a join.",
         f"- `candidate_metrics.csv` -- one row per candidate, "
-        f"{summary['validation']['candidate_count']} of them here, with every per-blur-level "
+        f"{_count(summary['validation']['candidate_count'], 'row')} here, with every "
+        "per-blur-level "
         "number flattened into a plain column. Every candidate the run measured is in it, "
         "including the ones the deployment ranking leaves out.",
         "- `summary.json` -- the same numbers with the per-blur-level detail nested, plus where "
@@ -1346,6 +1455,11 @@ def write_corruption_report(
     directory within one filesystem is atomic, and the staging directory is created next to the
     destination rather than in the system temporary area so that it is on the same one.
 
+    That staging directory is `mkdtemp`'s `0o700` until the `chmod` below, which is the one
+    property of a temporary directory the published bundle must not inherit: the rename carries
+    the mode across, and the result would be a directory only its owner can enter holding eight
+    files the umask made group-readable. See `_umask_directory_mode`.
+
     The checks are in this order for a reason. An existing output directory is refused before
     anything is computed, because merging a new run into an old one produces a directory that
     is internally inconsistent and says nothing about it. The file-set check comes before the
@@ -1372,6 +1486,7 @@ def write_corruption_report(
     output.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix=f".{output.name}.", dir=output.parent))
     try:
+        os.chmod(staging, _umask_directory_mode(staging))
         per_scene, candidates, ranking = summarize_candidates(
             score_rows,
             expected_image_count=int(diagnostics["run"]["image_count"]),
