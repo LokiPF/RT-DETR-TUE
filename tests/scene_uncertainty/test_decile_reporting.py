@@ -41,7 +41,9 @@ from src.scene_uncertainty.decile_analysis import (
 )
 from src.scene_uncertainty.decile_reporting import (
     BENCHMARK_SELECTION,
+    DYNAMIC_MEMBERSHIP_MODE,
     FILTERED_PADDING_MODE,
+    FROZEN_MEMBERSHIP_MODE,
     EASY_REPORT_FINAL_SENTENCE,
     GROUP_KEYS,
     RANDOM_BIN_OVERLAP,
@@ -1681,7 +1683,8 @@ def test_the_easy_report_carries_every_heading_the_brief_names(tmp_path):
     report = (written(tmp_path) / "easy-report.md").read_text()
     headings = re.findall(r"^## (.+)$", report, flags=re.MULTILINE)
     assert headings == [
-        "Short answer", "Best confidence range", "Persistence versus confidence alone",
+        "Short answer", "Best confidence range", "Which decoder layer this is about",
+        "Persistence versus confidence alone",
         "Dynamic versus frozen queries", "Effect of padded queries",
         "Metrics in plain language", "What this does not prove", "Next decision",
     ]
@@ -1885,21 +1888,37 @@ def test_the_frozen_twin_is_read_by_its_gap_and_not_by_its_sign(tmp_path):
     assert f"{twin['median_spearman']:+.4f}" in short.split("Does padding")[1]
 
 
-def test_a_confidence_control_that_rises_with_blur_is_read_the_other_way(tmp_path):
-    """The other half of the branch above: a control that moves the right way is not a
-    reason to discount the difference, and the report must not say it is."""
-    summary = grid_summary()
+def _flip_control(summary: dict, medians: dict) -> dict:
     for group in summary["groups"]:
         if (group["signal"], group["membership_mode"], group["confidence_bin"],
-                group["aggregation"], group["padding_mode"]) == (
+                group["padding_mode"]) == (
                     "confidence", ALL_VALID_BENCHMARK[0], ALL_VALID_BENCHMARK[1],
-                    "q90", ALL_VALID_BENCHMARK[2]):
-            group["median_spearman"] = 0.4
-    text = "\n".join(
-        reporting_module._confidence_section(summary, summary[RANKED_GROUPS_KEY][0])
-    )
+                    ALL_VALID_BENCHMARK[2]) and group["aggregation"] in medians:
+            group["median_spearman"] = medians[group["aggregation"]]
+    return summary
+
+
+def test_a_confidence_control_that_rises_with_blur_is_read_the_other_way(tmp_path):
+    """The other half of the branch above: a control that moves the right way is not a
+    reason to discount the difference, and the report must not say it is.
+
+    It has to rise at *every* summary for that reading. Flipping one and leaving two is the
+    published run's own shape, and it gets the split reading instead -- which is the defect
+    this pair of assertions exists to keep separated.
+    """
+    text = "\n".join(reporting_module._confidence_section(
+        _flip_control(grid_summary(), {"mean": 0.4, "q90": 0.4, "top20_mean": 0.4}),
+        grid_summary()[RANKED_GROUPS_KEY][0],
+    ))
     assert "both move with blur" in text
     assert "anti-correlated" not in text
+
+    split = "\n".join(reporting_module._confidence_section(
+        _flip_control(grid_summary(), {"q90": 0.4}),
+        grid_summary()[RANKED_GROUPS_KEY][0],
+    ))
+    assert "a different answer at different scene summaries" in split
+    assert "both move with blur" not in split
 
 
 def test_a_missing_heatmap_cell_cannot_be_mistaken_for_a_score_of_zero(tmp_path):
@@ -3509,3 +3528,235 @@ def test_a_column_that_cannot_be_read_does_not_delete_the_ranking_paragraphs(dro
     assert "At the ranking's one scene summary the same selection holds the top median" in note
     # The shape claim itself is withheld, because the column it is about is incomplete.
     assert "one peak with no second rise" not in note
+
+
+# --- publication wave: numbers published without the slice they came from ---------------------
+
+
+def control_summary(medians: dict) -> dict:
+    """A `groups` list holding the all-valid confidence control at chosen scene summaries."""
+    return {"groups": [
+        {"signal": "confidence", "score_scope": CONFIDENCE_SCOPE,
+         "membership_mode": ALL_VALID_BENCHMARK[0], "confidence_bin": ALL_VALID_BENCHMARK[1],
+         "aggregation": aggregation, "padding_mode": ALL_VALID_BENCHMARK[2],
+         "median_spearman": median}
+        for aggregation, median in medians.items()
+    ], "comparisons": []}
+
+
+@pytest.mark.parametrize(("medians", "expected", "forbidden"), [
+    # The published run: the sign reverses between scene summaries, and the sentence quoted one.
+    ({"mean": 0.1143, "q90": -0.6286, "top20_mean": -0.6},
+     ["trends +0.1143 at `mean`, -0.6286 at `q90` and -0.6000 at `top20_mean`",
+      "*falls* as blur rises at `q90` and `top20_mean` and *rises* at `mean`",
+      "how much of a positive difference belongs to the control is a different answer at "
+      "different scene summaries"],
+     ["so the control is strongly anti-correlated in its own right"]),
+    ({"mean": -0.4, "q90": -0.6286, "top20_mean": -0.6},
+     ["trends -0.4000 at `mean`, -0.6286 at `q90` and -0.6000 at `top20_mean`",
+      "*falls* as blur rises at every scene summary"],
+     ["a different answer at different scene summaries"]),
+    ({"mean": 0.4, "q90": 0.2, "top20_mean": 0.6},
+     ["trends +0.4000 at `mean`, +0.2000 at `q90` and +0.6000 at `top20_mean`",
+      "*rises* with blur at every scene summary"],
+     ["*falls* as blur rises"]),
+    # One summary scored: it still has to be named.
+    ({"q90": -0.6286},
+     ["trends -0.6286 at `q90`", "*falls* as blur rises at every scene summary"],
+     ["and -0.6000 at"]),
+])
+def test_the_control_trend_names_every_summary_it_was_measured_at(medians, expected, forbidden):
+    """Line 62 of the published document read "Over every valid query the confidence control
+    itself trends -0.6286: `1 - confidence` *falls* as blur rises". That is the **q90** row. The
+    same slice is **+0.1143 at `mean`** -- the sign reverses and `1 - confidence` *rises* with
+    blur -- and -0.6000 at `top20_mean`.
+
+    `_confidence_section` looked the control up at a hard-coded `BENCHMARK_AGGREGATION` and
+    branched on `median < 0`, and neither branch named the summary. The bias was self-critical
+    here -- q90 is the slice that most deflates the headline -- which is exactly why nothing
+    caught it.
+    """
+    note = "\n".join(reporting_module._control_trend_note(control_summary(medians)))
+    for sentence in expected:
+        assert sentence in note
+    for sentence in forbidden:
+        assert sentence not in note
+
+
+def test_the_control_trend_note_is_silent_when_the_control_was_not_scored():
+    assert reporting_module._control_trend_note({"groups": [], "comparisons": []}) == []
+
+
+def test_the_published_control_sentence_names_its_slice(tmp_path):
+    """End to end, on the shared fixture: every summary the control was scored at is in the
+    sentence, and no reading is offered for a slice that is not named."""
+    body = section((written(tmp_path) / "easy-report.md").read_text(),
+                   "Persistence versus confidence alone")
+    assert "trends -0.4286 at `mean`, -0.4286 at `q90` and -0.4286 at `top20_mean`" in body
+    assert "*falls* as blur rises at every scene summary" in body
+
+
+def test_the_benchmark_table_labels_the_benchmarks_own_summary(tmp_path):
+    """The `summary` column labelled the *candidate's* summary while the benchmark column held
+    a row at the benchmark's own -- and because only a `q90` benchmark exists on this run, the
+    constant +0.6000 column read as "the benchmark was evaluated at three summaries and scored
+    the same each time". It was one measurement printed three times."""
+    body = section((written(tmp_path) / "easy-report.md").read_text(), "Best confidence range")
+    assert "| candidate summary | benchmark summary | candidate | benchmark |" in body
+    assert "| `mean` | `q90` |" in body
+    assert "| `top20_mean` | `q90` |" in body
+    assert ("The benchmark is published at `q90` alone here, so its column below is one "
+            "measurement repeated rather than three") in body
+
+
+def test_the_benchmark_caption_does_not_claim_one_summary_when_there_are_several():
+    """And the other side: a run that published the benchmark at more than one summary must not
+    be told its benchmark column is a single measurement."""
+    summary = grid_summary()
+    extra = [
+        {**entry, "benchmark_aggregation": "mean"}
+        for entry in summary["benchmark_comparisons"]
+        if entry["benchmark_aggregation"] == "q90"
+    ]
+    summary["benchmark_comparisons"] = summary["benchmark_comparisons"] + extra
+    winner = summary[RANKED_GROUPS_KEY][0]
+    lines = "\n".join(reporting_module._bin_versus_benchmark(summary, [winner]))
+    assert "one measurement repeated" not in lines
+    assert "| `mean` |" in lines
+    assert "| `q90` |" in lines
+
+
+# --- publication wave: the three scopes the document never mentioned --------------------------
+
+
+def falling_layer_zero_rows():
+    """The grid table with `layer_0` trending *against* blur, as layers 0 and 1 do on the real
+    run. The shared fixture has `layer_0` rising perfectly in every bin, so it cannot show a
+    scope whose sign disagrees with the primary one -- which is the whole disclosure."""
+    return [
+        {**scored, "score": swap_curve(5)[scored["severity"]]}
+        if scored["signal"] == "persistence" and scored["score_scope"] == "layer_0"
+        else scored
+        for scored in full_grid_rows()
+    ]
+
+
+def test_the_document_discloses_the_scopes_it_did_not_rank(tmp_path):
+    """Persistence was scored at `layer_0`, `layer_1`, `layer_2` and `combined`, and at layers 0
+    and 1 the real run's signal tracks blur *backwards*: the winning selection is -0.3143 and
+    -0.2857 there against +0.6286 at `layer_2`. A reader of the published document could not
+    know that any of it existed."""
+    body = section((written(tmp_path, rows=falling_layer_zero_rows()) / "easy-report.md").read_text(),
+                   "Which decoder layer this is about")
+    assert "Every number above is persistence scored at `layer_2`." in body
+    assert "| scope | winning selection" in body
+    assert "| `layer_0` | -0.4286 |" in body
+    assert "| `layer_2` | +1.0000 |" in body
+    assert ("At `layer_0` the winning selection's median has the opposite sign: the score "
+            "there moves against blur rather than with it") in body
+
+
+def test_the_scope_section_says_the_primary_scope_was_not_chosen_here(tmp_path):
+    """The reassuring half. `layer_2` is a constant of this analysis and the scope the published
+    benchmark is quoted at; the ranking gates on it, so no candidate could have been promoted by
+    scoring better at another layer. Without that, the section above reads as a scope search."""
+    body = section((written(tmp_path) / "easy-report.md").read_text(),
+                   "Which decoder layer this is about")
+    assert ("`layer_2` is a constant of this analysis and not a value chosen from these rows: "
+            "the deployable ranking admits it alone, so all 33 ranked candidates are at it and "
+            "no candidate could be promoted here by scoring better at another layer.") in body
+
+
+def test_the_scope_section_agrees_when_the_other_scopes_agree(tmp_path):
+    """The shared fixture's `layer_0` rises perfectly, so nothing disagrees and the section must
+    say so rather than reaching for the warning."""
+    body = section((written(tmp_path) / "easy-report.md").read_text(),
+                   "Which decoder layer this is about")
+    assert ("The winning selection's median has the same sign at every scope it was scored at, "
+            "so the primary scope is not carrying the direction on its own.") in body
+    assert "moves against blur rather than with it" not in body
+
+
+def test_the_scope_section_says_so_when_there_is_only_one_scope(tmp_path):
+    """A run scored at the primary scope alone has nothing to disclose, and must not print an
+    empty table implying it did."""
+    rows = [scored for scored in full_grid_rows()
+            if scored["score_scope"] in (PRIMARY_SCORE_SCOPE, CONFIDENCE_SCOPE)]
+    body = section((written(tmp_path, rows=rows) / "easy-report.md").read_text(),
+                   "Which decoder layer this is about")
+    assert ("Persistence was scored at `layer_2` alone on this run, so there is no other scope "
+            "here to compare it against.") in body
+    assert "| scope |" not in body
+
+
+def test_the_frozen_plateau_names_the_summary_it_was_read_at():
+    """The sibling of the control-trend defect: "identical at +0.6000 across 6 neighbouring
+    bins" is the `top20_mean` column -- five bins at `q90` and three at `mean`. The direction
+    does not change with the slice but the strength does, and the paragraph never said which
+    slice it was."""
+    note = "\n".join(reporting_module._movement_profile_note(
+        profile_rows(UNIMODAL, FLAT_FROZEN, aggregation="top20_mean"),
+        profile_ranked("decile_50_60", [22 / 35] * 10, aggregation="top20_mean"),
+    ))
+    assert ("At `top20_mean` the frozen medians are identical at +0.6000 across 6 neighbouring "
+            "bins") in note
+
+
+def comparison_row(name: str, aggregation: str, persistence: float, control: float) -> dict:
+    return {
+        "signal": "persistence", "score_scope": PRIMARY_SCORE_SCOPE,
+        "padding_mode": FILTERED_PADDING_MODE, "membership_mode": DYNAMIC_MEMBERSHIP_MODE,
+        "confidence_bin": name, "aggregation": aggregation,
+        "persistence_median_spearman": persistence,
+        "confidence_median_spearman": control,
+        "persistence_minus_confidence_spearman": persistence - control,
+    }
+
+
+def test_the_clearest_control_case_is_the_one_that_barely_trends(tmp_path):
+    """"The bottom bin is the clearest case: it out-trends its control while barely trending
+    itself" was a literal about one run sitting inside a sentence every other clause of which is
+    computed. Deriving it is only worth anything if the derivation is pinned: a first version
+    picked the row with the *largest* trend instead, which is the opposite claim, and 293 tests
+    passed.
+
+    "Clearest" is the row that most separates the two facts -- a large difference over its
+    control while its own median sits nearest zero -- so the fixture puts a big trender and a
+    barely-trending one in the same table and the sentence has to name the second.
+    """
+    summary = {"groups": [], "comparisons": [
+        comparison_row("decile_90_100", "q90", 0.9143, -0.2000),
+        comparison_row("decile_00_10", "q90", -0.0286, -0.5429),
+        comparison_row("decile_50_60", "mean", 0.6286, 0.1000),
+    ]}
+    clearest = reporting_module._clearest_control_case(summary)
+    assert clearest == (
+        "The clearest case is `decile_00_10` at `q90`: it out-trends its control by +0.5143 "
+        "while its own persistence median is -0.0286."
+    )
+
+
+def test_the_clearest_control_case_is_omitted_when_nothing_out_trends_its_control():
+    """A run where no bin beats its control has no clearest case, and the clause must go rather
+    than name the least bad one."""
+    summary = {"groups": [], "comparisons": [
+        comparison_row("decile_00_10", "q90", -0.6000, -0.0286),
+        comparison_row("decile_50_60", "mean", -0.2000, 0.1000),
+    ]}
+    assert reporting_module._clearest_control_case(summary) is None
+
+
+def test_the_clearest_control_case_ignores_rows_outside_the_published_slice():
+    """It is read from the same slice the table below it prints: persistence at the primary
+    scope, padding removed, dynamic membership. A frozen row or a secondary scope creeping into
+    it would name a bin the reader cannot find in the table."""
+    summary = {"groups": [], "comparisons": [
+        {**comparison_row("decile_00_10", "q90", 0.0286, -0.5429),
+         "membership_mode": FROZEN_MEMBERSHIP_MODE},
+        {**comparison_row("decile_10_20", "q90", 0.0286, -0.5429), "score_scope": "layer_0"},
+        {**comparison_row("decile_20_30", "q90", 0.0286, -0.5429),
+         "padding_mode": "unfiltered"},
+        comparison_row("decile_30_40", "q90", 0.4000, -0.5429),
+    ]}
+    clearest = reporting_module._clearest_control_case(summary)
+    assert clearest is not None and "`decile_30_40`" in clearest

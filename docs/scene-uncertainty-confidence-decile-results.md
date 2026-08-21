@@ -20,13 +20,13 @@ The ranking puts `decile_50_60` (`dynamic`, `top20_mean`) first at +0.6286.
 No other selection matches that median: the 2 ranked rows that hold it are this same selection at 2 scene summaries, which the caption on every table here calls views of one selection rather than independent measurements of it.
 The same bin across every scene summary it was ranked at: `mean` +0.6286, `q90` +0.6000, `top20_mean` +0.6286. These are 3 views of one bin on the same images, not 3 independent confirmations of it.
 
-Against the all-query benchmark, one row per scene summary. The difference of medians is what the design ranks on; the paired columns are what make a difference of zero readable, because a median over an even number of images can only move in steps of 0.0286.
+Against the all-query benchmark, one row per scene summary the candidate was scored at. The difference of medians is what the design ranks on; the paired columns are what make a difference of zero readable, because a median over an even number of images can only move in steps of 0.0286. The benchmark is published at `q90` alone here, so its column below is one measurement repeated rather than three.
 
-| summary | candidate | benchmark | difference | W/T/L | win rate, all paired | decided, over N |
-|---|---|---|---|---|---|---|
-| `mean` | +0.6286 | +0.6000 | +0.0286 | 122/40/88 | 0.488 | 0.581 (210) |
-| `q90` | +0.6000 | +0.6000 | +0.0000 | 122/36/92 | 0.488 | 0.570 (214) |
-| `top20_mean` | +0.6286 | +0.6000 | +0.0286 | 127/39/84 | 0.508 | 0.602 (211) |
+| candidate summary | benchmark summary | candidate | benchmark | difference | W/T/L | win rate, all paired | decided, over N |
+|---|---|---|---|---|---|---|---|
+| `mean` | `q90` | +0.6286 | +0.6000 | +0.0286 | 122/40/88 | 0.488 | 0.581 (210) |
+| `q90` | `q90` | +0.6000 | +0.6000 | +0.0000 | 122/36/92 | 0.488 | 0.570 (214) |
+| `top20_mean` | `q90` | +0.6286 | +0.6000 | +0.0286 | 127/39/84 | 0.508 | 0.602 (211) |
 
 Across the ranked field the paired comparison against the benchmark comes out in the candidate's favour 5 times, against it 28 times, and exactly even 0 times, so it is not a procedure that favours whatever it is handed.
 The clearest counter-example is `decile_40_50` at `mean`, which matches or beats the benchmark's median (+0.6000 against +0.6000) and still comes out 103 wins to 112 losses with 35 ties -- 0.479 of the 215 images it decided. At counts that close the comparison is **undecided**: it has not established the candidate, and it has not established the benchmark either.
@@ -53,13 +53,30 @@ The deployable ranking, best first. Only candidates with the padding union remov
 
 18 further candidates are in `summary.json` under `ranked_layer_2_persistence`.
 
+## Which decoder layer this is about
+
+Every number above is persistence scored at `layer_2`. The same rows were scored at `combined`, `layer_0` and `layer_1` as well, and those columns are summarised but never ranked. What they show is not the same result.
+
+The winning selection is `decile_50_60` under `dynamic` at `top20_mean`; the benchmark column is the all-query benchmark at `q90`, the summary it is published at.
+
+| scope | winning selection | all-query benchmark | groups at this scope |
+|---|---|---|---|
+| `combined` | +0.4286 | +0.4286 | 70 |
+| `layer_0` | -0.3143 | -0.4286 | 70 |
+| `layer_1` | -0.2857 | -0.6000 | 70 |
+| `layer_2` | +0.6286 | +0.6000 | 70 |
+
+At `layer_0` and `layer_1` the winning selection's median has the opposite sign: the score there moves against blur rather than with it. So what this report establishes is about `layer_2` and not about persistence in general, and a reader carrying any of it forward is carrying a statement about one decoder layer.
+
+`layer_2` is a constant of this analysis and not a value chosen from these rows: the deployable ranking admits it alone, so all 33 ranked candidates are at it and no candidate could be promoted here by scoring better at another layer.
+
 ## Persistence versus confidence alone
 
 On the same selected queries and the same scene summary, persistence out-trends its confidence control: median Spearman +0.6286 against -0.5429, a difference of +1.1714. Image by image, it wins 176, ties 9 and loses 65 of the 250 images both sides measured -- a win rate of 0.704 over all 250, 0.730 over the 241 it decided.
 
 Every pair below shares one selection and one scene summary, which is what makes the comparison fair; the two scores are in unrelated units, so only their trends are ever compared. Both denominators are given because a per-image Spearman over 6 severities lands on a coarse grid and exact ties are common: a win rate over every paired image counts each tie as a non-win, while a rate over the decided images alone hides how much of the run could not be separated.
 
-**Read the difference column with the control's own column beside it.** Over every valid query the confidence control itself trends -0.6286: `1 - confidence` *falls* as blur rises in this configuration, so the control is strongly anti-correlated in its own right. A large positive difference is therefore partly a statement about the control and only partly about persistence, and the persistence column is the one that says whether the signal rises at all. The bottom bin is the clearest case: it out-trends its control while barely trending itself.
+**Read the difference column with the control's own column beside it.** Over every valid query the confidence control itself trends +0.1143 at `mean`, -0.6286 at `q90` and -0.6000 at `top20_mean`. It *falls* as blur rises at `q90` and `top20_mean` and *rises* at `mean`, so how much of a positive difference belongs to the control is a different answer at different scene summaries, and the row a reader wants is the one at the summary they are reading. Where the control is anti-correlated, a large positive difference is partly a statement about the control and only partly about persistence. The clearest case is `decile_00_10` at `q90`: it out-trends its control by +0.5143 while its own persistence median is -0.0286.
 
 Slice: persistence at `layer_2` against its matched control, with the padding union removed, at every scene summary. Rows that differ only in the summary are views of one selection on the same images, not independent measurements of it.
 
@@ -176,7 +193,7 @@ The `W/T/L` column is the paired comparison the difference of medians cannot mak
 
 **And how much of that survives the other denominator.** Over the 30 rows of this slice, 7 clear 0.5 on the images the comparison decided and 1 clear it over every paired image. Quoting the first alone overstates the effect and quoting the second alone understates it, which is why both are here.
 
-**What the frozen column says about the field the ranking chose from.** The frozen medians are identical at +0.6000 across 6 neighbouring bins, `decile_10_20` through `decile_60_70` -- a run that touches neither end of the confidence range, so a middle bin of almost any kind scores about +0.6000 here once the membership is held still.
+**What the frozen column says about the field the ranking chose from.** At `top20_mean` the frozen medians are identical at +0.6000 across 6 neighbouring bins, `decile_10_20` through `decile_60_70` -- a run that touches neither end of the confidence range, so a middle bin of almost any kind scores about +0.6000 here once the membership is held still.
 
 **What the ranked field says about the selection.** The ranking is choosing among near-equals: 3 of the 11 ranked selections sit within one 1/35 = 0.0286 step of the top median (9 ranked rows, the same selections counted once per scene summary), and no other selection matches the top median exactly -- the 2 ranked rows that hold it are the winner's own scene summaries. The margin over the best of the others is one step of the 1/35 = 0.0286 grid a median over an even number of images can land on, which is the smallest difference this metric can express. Set against that, the same selection is never behind at any scene summary: it holds the top median alone at `mean` and `top20_mean`, and ties for it at `q90`.
 

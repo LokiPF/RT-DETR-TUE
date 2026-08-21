@@ -1981,6 +1981,7 @@ def _bin_versus_benchmark(summary: dict, groups: list[dict]) -> list[str]:
             total = entry["paired_image_count"]
             body.append([
                 f"`{group['aggregation']}`",
+                f"`{entry['benchmark_aggregation']}`",
                 _signed(entry["candidate_median_spearman"]),
                 _signed(entry["benchmark_median_spearman"]),
                 _signed(entry["candidate_minus_benchmark_spearman"]),
@@ -1993,15 +1994,32 @@ def _bin_versus_benchmark(summary: dict, groups: list[dict]) -> list[str]:
             ])
     if not body:
         return []
+    published = sorted({
+        entry["benchmark_aggregation"]
+        for group in groups
+        for entry in _matches(summary["benchmark_comparisons"], **_group_key(group))
+    })
+    # Both summaries are named. The column used to carry the *candidate's* while the row beside
+    # it held the benchmark at its own, and because the published benchmark exists at `q90`
+    # alone, the constant benchmark column read as three evaluations that agreed rather than as
+    # one measurement printed three times.
+    caption = (
+        "Against the all-query benchmark, one row per scene summary the candidate was scored "
+        "at. The difference of medians is what the design ranks on; the paired columns are "
+        "what make a difference of zero readable, because a median over an even number of "
+        f"images can only move in steps of {1 / SPEARMAN_STEP_DENOMINATOR:.4f}."
+    )
+    if len(published) == 1:
+        caption += (
+            f" The benchmark is published at `{published[0]}` alone here, so its column below "
+            "is one measurement repeated rather than three."
+        )
     return [
-        "Against the all-query benchmark, one row per scene summary. The difference of medians "
-        "is what the design ranks on; the paired columns are what make a difference of zero "
-        "readable, because a median over an even number of images can only move in steps of "
-        f"{1 / SPEARMAN_STEP_DENOMINATOR:.4f}.",
+        caption,
         "",
         *_table(
-            ["summary", "candidate", "benchmark", "difference", "W/T/L",
-             "win rate, all paired", "decided, over N"],
+            ["candidate summary", "benchmark summary", "candidate", "benchmark", "difference",
+             "W/T/L", "win rate, all paired", "decided, over N"],
             body,
         ),
         "",
@@ -2158,6 +2176,206 @@ def _ranked_section(summary: dict, ranked: list[dict], winner: dict | None) -> l
     return lines
 
 
+def _control_trend_note(summary: dict) -> list[str]:
+    """The all-valid confidence control's own trend, at every scene summary it was scored at.
+
+    This was one number looked up at a hard-coded `BENCHMARK_AGGREGATION`, with two branches on
+    its sign and neither of them naming the slice. On the published run that number is -0.6286
+    at `q90`, -0.6000 at `top20_mean` and **+0.1143 at `mean`** -- the sign reverses, and
+    `1 - confidence` *rises* with blur at one of the three. So "the control is strongly
+    anti-correlated in its own right" was a statement about one slice, printed as a statement
+    about the control.
+
+    The bias ran *against* the report's own headline -- `q90` is the slice that most deflates
+    the +1.1714 difference -- which is why it survived: nothing in it looked like special
+    pleading. A sign-dependent number is published with the slice it came from whichever way it
+    helps.
+    """
+    medians = {}
+    for aggregation in DECILE_AGGREGATIONS:
+        control = _lookup(
+            summary["groups"], signal="confidence", score_scope=CONFIDENCE_SCOPE,
+            membership_mode=ALL_VALID_BENCHMARK[0], confidence_bin=ALL_VALID_BENCHMARK[1],
+            aggregation=aggregation, padding_mode=ALL_VALID_BENCHMARK[2],
+        )
+        if control is not None and control["median_spearman"] is not None:
+            medians[aggregation] = float(control["median_spearman"])
+    if not medians:
+        return []
+    listed = _and_list([f"{_signed(value)} at `{name}`" for name, value in medians.items()])
+    falling = [f"`{name}`" for name, value in medians.items() if value < 0]
+    rising = [f"`{name}`" for name, value in medians.items() if value > 0]
+    opening = (
+        "**Read the difference column with the control's own column beside it.** Over every "
+        f"valid query the confidence control itself trends {listed}."
+    )
+    if falling and rising:
+        reading = (
+            f" It *falls* as blur rises at {_and_list(falling)} and *rises* at "
+            f"{_and_list(rising)}, so how much of a positive difference belongs to the control "
+            "is a different answer at different scene summaries, and the row a reader wants is "
+            "the one at the summary they are reading. Where the control is anti-correlated, a "
+            "large positive difference is partly a statement about the control and only partly "
+            "about persistence."
+        )
+    elif falling:
+        reading = (
+            " It *falls* as blur rises at every scene summary it was scored at, so the control "
+            "is anti-correlated in its own right throughout. A large positive difference is "
+            "therefore partly a statement about the control and only partly about persistence, "
+            "and the persistence column is the one that says whether the signal rises at all."
+        )
+    elif rising:
+        reading = (
+            " It *rises* with blur at every scene summary it was scored at, so the difference "
+            "column below is a comparison between two signals that both move with blur rather "
+            "than a comparison against a control that moves the wrong way."
+        )
+    else:
+        reading = (
+            " It is flat at every scene summary it was scored at, so the difference column "
+            "below is carried entirely by the persistence column beside it."
+        )
+    lines = [opening + reading]
+    clearest = _clearest_control_case(summary)
+    if clearest is not None:
+        lines[0] += f" {clearest}"
+    return [*lines, ""]
+
+
+def _clearest_control_case(summary: dict) -> str | None:
+    """The row that out-trends its control while barely trending itself, derived not named.
+
+    "The bottom bin is the clearest case" was a literal about one run sitting inside a sentence
+    every other clause of which is computed. It happens to be true here; on a table where it is
+    not, nothing would have said so.
+    """
+    candidates = [
+        entry for entry in summary.get("comparisons") or []
+        if entry.get("score_scope") == PRIMARY_SCORE_SCOPE
+        and entry.get("padding_mode") == FILTERED_PADDING_MODE
+        and entry.get("membership_mode") == DYNAMIC_MEMBERSHIP_MODE
+        and entry.get("persistence_median_spearman") is not None
+        and entry.get("persistence_minus_confidence_spearman") is not None
+        and float(entry["persistence_minus_confidence_spearman"]) > 0
+    ]
+    if not candidates:
+        return None
+    clearest = min(
+        candidates,
+        key=lambda entry: (abs(float(entry["persistence_median_spearman"])),
+                           entry["confidence_bin"], entry["aggregation"]),
+    )
+    return (
+        f"The clearest case is `{clearest['confidence_bin']}` at "
+        f"`{clearest['aggregation']}`: it out-trends its control by "
+        f"{_signed(clearest['persistence_minus_confidence_spearman'])} while its own "
+        f"persistence median is {_signed(clearest['persistence_median_spearman'])}."
+    )
+
+
+def _scope_section(summary: dict, ranked: list[dict], winner: dict | None) -> list[str]:
+    """Which decoder layer every headline number is about, and which ones it is not.
+
+    The document published a ranking, a benchmark comparison and a control comparison without
+    once saying that persistence was also scored at three other scopes. On the real run the
+    winning selection is -0.3143 at `layer_0` and -0.2857 at `layer_1` against +0.6286 at
+    `layer_2`: at two of the four scopes the signal tracks blur *backwards*, so "persistence
+    tracks blur" is a `layer_2` statement and not a statement about the signal.
+
+    The reassuring half has to be here too, or the table above it reads as a scope search.
+    `PRIMARY_SCORE_SCOPE` is a constant of this analysis and the scope the published benchmark
+    is quoted at; `rank_deployable_groups` gates on it, so the other scopes were summarised and
+    never ranked and no candidate could be promoted here by scoring better at another layer.
+    """
+    lines = ["## Which decoder layer this is about", ""]
+    scopes = sorted(
+        {group["score_scope"] for group in summary["groups"]
+         if group["signal"] == "persistence" and _is_persistence_scope(group["score_scope"])}
+    )
+    others = [scope for scope in scopes if scope != PRIMARY_SCORE_SCOPE]
+    if winner is None or not others:
+        lines.extend([
+            f"Persistence was scored at `{PRIMARY_SCORE_SCOPE}` alone on this run, so there is "
+            "no other scope here to compare it against.",
+            "",
+        ])
+        return lines
+    lines.append(
+        f"Every number above is persistence scored at `{PRIMARY_SCORE_SCOPE}`. The same rows "
+        f"were scored at {_and_list([f'`{scope}`' for scope in others])} as well, and those "
+        "columns are summarised but never ranked. What they show is not the same result."
+    )
+    lines.append("")
+
+    def at(scope: str, group: dict, aggregation: str) -> dict | None:
+        return _lookup(
+            summary["groups"], signal="persistence", score_scope=scope,
+            membership_mode=group["membership_mode"], confidence_bin=group["confidence_bin"],
+            aggregation=aggregation, padding_mode=group["padding_mode"],
+        )
+
+    benchmark_key = {
+        "membership_mode": ALL_QUERY_BENCHMARK[0], "confidence_bin": ALL_QUERY_BENCHMARK[1],
+        "padding_mode": ALL_QUERY_BENCHMARK[2],
+    }
+    winner_medians = {scope: at(scope, winner, winner["aggregation"]) for scope in scopes}
+    benchmark_medians = {
+        scope: at(scope, benchmark_key, BENCHMARK_AGGREGATION) for scope in scopes
+    }
+    lines.append(
+        f"The winning selection is `{winner['confidence_bin']}` under "
+        f"`{winner['membership_mode']}` at `{winner['aggregation']}`; the benchmark column is "
+        f"the all-query benchmark at `{BENCHMARK_AGGREGATION}`, the summary it is published at."
+    )
+    lines.append("")
+    lines.extend(_table(
+        ["scope", "winning selection", "all-query benchmark", "groups at this scope"],
+        [
+            [
+                f"`{scope}`",
+                _UNMEASURED if winner_medians[scope] is None
+                else _signed(winner_medians[scope]["median_spearman"]),
+                _UNMEASURED if benchmark_medians[scope] is None
+                else _signed(benchmark_medians[scope]["median_spearman"]),
+                str(sum(1 for group in summary["groups"]
+                        if group["score_scope"] == scope)),
+            ]
+            for scope in scopes
+        ],
+    ))
+    lines.append("")
+    primary = winner_medians.get(PRIMARY_SCORE_SCOPE)
+    primary_median = None if primary is None else primary["median_spearman"]
+    opposed = [
+        scope for scope in others
+        if winner_medians[scope] is not None and primary_median is not None
+        and (float(winner_medians[scope]["median_spearman"]) < 0) != (float(primary_median) < 0)
+    ]
+    if opposed:
+        lines.append(
+            f"At {_and_list([f'`{scope}`' for scope in opposed])} the winning selection's "
+            "median has the opposite sign: the score there moves against blur rather than with "
+            f"it. So what this report establishes is about `{PRIMARY_SCORE_SCOPE}` and not "
+            "about persistence in general, and a reader carrying any of it forward is carrying "
+            "a statement about one decoder layer."
+        )
+    else:
+        lines.append(
+            "The winning selection's median has the same sign at every scope it was scored at, "
+            "so the primary scope is not carrying the direction on its own."
+        )
+    lines.append("")
+    lines.append(
+        f"`{PRIMARY_SCORE_SCOPE}` is a constant of this analysis and not a value chosen from "
+        f"these rows: the deployable ranking admits it alone, so all {len(ranked)} ranked "
+        "candidates are at it and no candidate could be promoted here by scoring better at "
+        "another layer."
+    )
+    lines.append("")
+    return lines
+
+
 def _confidence_section(summary: dict, winner: dict | None) -> list[str]:
     lines = ["## Persistence versus confidence alone", ""]
     lines.extend([_confidence_sentence(summary, winner), ""])
@@ -2170,33 +2388,7 @@ def _confidence_section(summary: dict, winner: dict | None) -> list[str]:
         "over the decided images alone hides how much of the run could not be separated."
     )
     lines.append("")
-    control = _lookup(
-        summary["groups"], signal="confidence", score_scope=CONFIDENCE_SCOPE,
-        membership_mode=ALL_VALID_BENCHMARK[0], confidence_bin=ALL_VALID_BENCHMARK[1],
-        aggregation=BENCHMARK_AGGREGATION, padding_mode=ALL_VALID_BENCHMARK[2],
-    )
-    if control is not None and control["median_spearman"] is not None:
-        median = float(control["median_spearman"])
-        if median < 0:
-            lines.extend([
-                "**Read the difference column with the control's own column beside it.** Over "
-                f"every valid query the confidence control itself trends "
-                f"{_signed(median)}: `1 - confidence` *falls* as blur rises in this "
-                "configuration, so the control is strongly anti-correlated in its own right. "
-                "A large positive difference is therefore partly a statement about the "
-                "control and only partly about persistence, and the persistence column is the "
-                "one that says whether the signal rises at all. The bottom bin is the clearest "
-                "case: it out-trends its control while barely trending itself.",
-                "",
-            ])
-        else:
-            lines.extend([
-                "Over every valid query the confidence control itself trends "
-                f"{_signed(median)}, so the difference column below is a comparison between "
-                "two signals that both move with blur rather than a comparison against a "
-                "control that moves the wrong way.",
-                "",
-            ])
+    lines.extend(_control_trend_note(summary))
     lines.extend([_slice_caption(scoped=True, summaries="every"), ""])
     body = []
     for name in [*DECILE_NAMES, ALL_VALID_BENCHMARK[1]]:
@@ -2704,8 +2896,9 @@ def _movement_profile_note(summary: dict, ranked: list[dict]) -> list[str]:
             "is held still"
         )
         note.extend([
-            "**What the frozen column says about the field the ranking chose from.** The "
-            f"frozen medians are identical at {_signed(frozen[start])} across {length} "
+            "**What the frozen column says about the field the ranking chose from.** At "
+            f"`{winner['aggregation']}` the frozen medians are identical at "
+            f"{_signed(frozen[start])} across {length} "
             f"neighbouring bins, `{profile[start][0]}` through `{profile[stop][0]}` -- "
             f"{reach}.",
             "",
@@ -3050,6 +3243,7 @@ def _easy_report(summary: dict) -> str:
     lines.extend(_preamble(summary))
     lines.extend(_short_answer(summary, ranked, winner))
     lines.extend(_ranked_section(summary, ranked, winner))
+    lines.extend(_scope_section(summary, ranked, winner))
     lines.extend(_confidence_section(summary, winner))
     lines.extend(_dynamic_frozen_section(summary))
     lines.extend(_padding_section(summary))
