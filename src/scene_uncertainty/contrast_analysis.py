@@ -1,11 +1,23 @@
-"""Source scores turned into contrast rows, one per image, severity, arm, summary and method.
+"""Source scores turned into contrast rows, and those rows turned into candidate summaries.
 
-This is where the experiment's shape lives: which arms exist, which signals each produces, and
-which fold's line each residual is allowed to see. Everything numeric it does is a call into
-`contrast_scores` or `contrast_diagnostics`; everything structural it does is here and nowhere
-else, so a change to the arm table changes one file.
+A row is one image, severity, arm, summary and method; a candidate is a row family with the
+scene coordinates taken out, carrying one locked orientation and five per-severity AUROCs.
+
+This is where the experiment's shape lives: which arms exist, which signals each produces,
+which fold's line each residual is allowed to see, and what makes two rows the same candidate.
+Everything numeric it does is a call into `contrast_scores`, `contrast_diagnostics` or
+`corruption_metrics`; everything structural it does is here and nowhere else, so a change to
+the arm table changes one file.
+
+It stops short of deciding anything. There is no `deployable` flag and no ranking here,
+because the spec's eligibility list includes "a computable confidence-only twin" -- a fact
+about a *pair* of candidates that nothing in one candidate's own rows can see. This module
+publishes what each candidate measured; the module that gates and orders them reads these
+dictionaries and the `DEPLOYABLE_SIGNAL` constant below.
 """
 from __future__ import annotations
+
+import numpy as np
 
 from .contrast_diagnostics import between_image_spread, clean_relationship, within_image_drift
 from .contrast_inputs import (
@@ -20,6 +32,12 @@ from .contrast_inputs import (
     ContrastInputs,
 )
 from .contrast_scores import FOLD_COUNT, SCORE_METHODS, assign_folds, contrast_score, robust_line
+from .corruption_metrics import (
+    choose_orientation,
+    complete_trend_metrics,
+    oriented_curve_metrics,
+    severity_aurocs,
+)
 
 RESIDUAL_METHOD = "clean_residual"
 RELATIVE_GAP_METHOD = "relative_gap"
@@ -336,3 +354,240 @@ def build_anchor_diagnostics(inputs: ContrastInputs) -> list[dict]:
                     ),
                 })
     return diagnostics
+
+
+CONTRAST_CANDIDATE_KEY = ("arm", "signal", "aggregation", "method")
+"""A row key with the scene coordinates taken out.
+
+`CONTRAST_ROW_KEY` minus `image_id` and `severity`: what is left is exactly one curve family,
+and grouping by it is what turns per-scene rows into the thing a deployment would ship.
+
+Note what stays separate: a persistence candidate and its confidence twin differ in `signal`,
+so they are two candidates with two independently chosen orientations. That independence is
+the whole point of the twin -- a twin forced to share its candidate's orientation would be
+measuring how well the candidate's direction happens to suit confidence, not how well
+confidence does on its own terms. On the shared fixture the two do disagree, which is why
+`test_a_twin_locks_its_own_direction_and_is_not_handed_the_persistence_one` exists.
+
+`score_scope` is not in the key for the same reason it is not in `CONTRAST_ROW_KEY`: `arm`
+already determines it. It travels with the candidate as provenance instead.
+"""
+
+DEPLOYABLE_SIGNAL = PERSISTENCE_SIGNAL
+"""Only persistence candidates are ranked. Confidence twins are summarised in full and
+published in full; it is the ranking they stay out of, because a control that can win the
+comparison it exists to lose is not a control.
+
+Named here and consumed by Task 6 rather than spelled as the literal `"persistence"` at the
+gate, so that the ranked signal and the signal the rows carry cannot drift apart into two
+strings that happen to match today.
+"""
+
+_CANDIDATE_PROVENANCE = (
+    "arm_family", "declared_before_data", "score_scope", "reference_bin", "responsive_bin",
+)
+"""Row columns that describe the candidate rather than the scene, carried through unchanged.
+
+Every one of these is constant across a candidate's rows -- they are functions of the arm, and
+the arm is part of the candidate key -- so the first row's copy is the candidate's copy. That
+constancy is checked on every row rather than assumed, because it is the one thing about
+provenance that copying the first row silently relies on. The confidence twin is the reason
+it is not obvious: it is labelled by bucket *pair*, so the two differential arms that share a
+pair contribute to one candidate, and an arm table that ever gave them different provenance
+would publish whichever of the two `ARMS` happened to list first.
+
+`reference_bin` and `responsive_bin` are an *ordered* pair and are copied as two named fields
+rather than as a set or a joined string. `contrast_scores.raw_gap(reference, responsive)`
+turns a swap into a sign flip on every contrast in the experiment, and a candidate summary that
+recorded only which two bins were involved would leave a reader unable to see which way round
+the surviving score was taken.
+"""
+
+
+def _severity_statistics(values: np.ndarray) -> dict:
+    """Count, mean, variance, median and quartiles of one severity's scores across images.
+
+    Six keys, always all six, because Task 7 draws a box per severity and a plotting caller
+    that has to test for the existence of `q25` before drawing it will eventually draw a box
+    without whiskers instead of a gap. A severity that no image scored returns `count=0` and
+    five `None`s rather than being left out of the dictionary: "no image reached this severity"
+    is a fact about the run, and an absent key is indistinguishable from a caller that forgot
+    to ask.
+
+    Both a mean and a median are published because they answer different questions about the
+    same column and diverge exactly where it matters. The mean is what a cross-scene AUROC is
+    sensitive to -- it moves with the outlying scenes -- while the median is what the per-image
+    trend behaves like. A candidate whose per-image median falls while its across-image mean
+    rises is not a contradiction to resolve, it is the shape that makes a locked orientation
+    score below 0.5, and collapsing the two into one number would hide it.
+
+    `np.var` is population variance (`ddof=0`), matching `np.mean` over the same finite set:
+    these are descriptions of the images that were scored, not estimates of a wider population
+    the run is a sample of. The quartiles are `np.percentile`'s default linear interpolation,
+    so on four sorted values `[1, 2, 3, 4]` `q25` is 1.75 and not the lower order statistic.
+    """
+    if values.size == 0:
+        return {"count": 0, "mean": None, "variance": None,
+                "median": None, "q25": None, "q75": None}
+    q25, median, q75 = (float(value) for value in np.percentile(values, [25, 50, 75]))
+    return {
+        "count": int(values.size), "mean": float(np.mean(values)),
+        "variance": float(np.var(values)), "median": median, "q25": q25, "q75": q75,
+    }
+
+
+def summarize_contrast_candidates(
+    rows: list[dict], *, expected_image_count: int
+) -> list[dict]:
+    """One dictionary per candidate: its trend, its one locked orientation, and its five AUROCs.
+
+    Orientation is chosen from the median signed Spearman of this candidate's own tuning
+    images, once, before any AUROC is computed -- so no direction can be picked because it
+    scored better. An unorientable candidate gets `orientation=None` and `macro_auroc=None`
+    rather than a defaulted `+1`: "these images do not agree which way this moves" is a
+    finding, and a defaulted direction would publish it as a measurement of roughly 0.5.
+
+    The median rather than the mean, and not only because `choose_orientation` says so. Two
+    images at `+0.94` against three at `-0.2` average to `+0.26` and median to `-0.2`, which is
+    a candidate that falls on most of its images being read as one that rises;
+    `test_the_locked_direction_follows_the_median_and_not_the_mean` is that fixture. The same
+    reasoning is why `median_signed_spearman` and `median_absolute_spearman` are two separate
+    medians and not one median and its absolute value -- a candidate that rises on half its
+    images and falls on the other half has a signed median of `0.0` and an absolute median of
+    `1.0`, and those two numbers say "no agreed direction" and "moves hard on every image",
+    which is a very different report from "moves not at all".
+
+    `expected_image_count` is an argument rather than a count of the rows, for the reason the
+    corruption-sensitivity command gives: the rows cannot tell a run of 240 images apart from a
+    run of 250 that lost ten before scoring, and only the first of those is a smaller run.
+
+    The two per-image curve checks are averaged over whichever images were fully measured, but
+    the AUROCs wait for `complete`. The difference is that a curve check is a statement about
+    one image and survives its neighbour going missing, while an AUROC ranks scores *across*
+    images: computing it on a short roster would compare a clean group of one size against
+    corrupted groups of another, and the macro average would then weight the five severities by
+    how many images happened to survive at each -- which is precisely the size-weighting
+    `severity_aurocs` refuses in its own averaging.
+
+    `missing_count` counts images that produced rows but not a full six-point curve. An image
+    that produced no rows at all cannot appear in it -- there is nothing here to count -- and
+    shows up instead as `image_count` falling short of `expected_image_count`, which is also
+    what withholds `complete`. The direction and measurement fractions divide by `image_count`
+    for the matching reason: they describe the images this candidate actually scored, and
+    dividing by `measured_count` would let a candidate that failed on half its images report
+    the surviving half's agreement as unanimity.
+    """
+    index: dict[tuple, dict] = {}
+    provenance: dict[tuple, dict] = {}
+    seen: set[tuple] = set()
+    for position, row in enumerate(rows):
+        missing = [field for field in CONTRAST_ROW_KEY if field not in row]
+        if missing:
+            raise ContrastAnalysisError(f"contrast row {position} is missing {missing}")
+        key = tuple(row[field] for field in CONTRAST_ROW_KEY)
+        if key in seen:
+            raise ContrastAnalysisError(f"duplicate contrast row key: {key}")
+        seen.add(key)
+        candidate_key = tuple(row[field] for field in CONTRAST_CANDIDATE_KEY)
+        index.setdefault(candidate_key, {}).setdefault(row["image_id"], {})[
+            row["severity"]
+        ] = row["score"]
+        carried = {field: row.get(field) for field in _CANDIDATE_PROVENANCE}
+        established = provenance.setdefault(candidate_key, carried)
+        if established != carried:
+            raise ContrastAnalysisError(
+                f"contrast rows disagree about the provenance of candidate {candidate_key}: "
+                f"{established} then {carried}"
+            )
+
+    candidates: list[dict] = []
+    for candidate_key in sorted(index, key=lambda key: tuple(str(part) for part in key)):
+        by_image = index[candidate_key]
+        trends = {}
+        for image_id, curve in by_image.items():
+            severities = sorted(curve)
+            trends[image_id] = complete_trend_metrics(
+                severities, [curve[severity] for severity in severities]
+            )
+        signed = [
+            trend["signed_spearman"] for trend in trends.values()
+            if trend["signed_spearman"] is not None
+        ]
+        absolute = [
+            trend["absolute_spearman"] for trend in trends.values()
+            if trend["absolute_spearman"] is not None
+        ]
+        directions = [trend["direction"] for trend in trends.values()]
+        orientation = choose_orientation(signed)
+        measured = sum(1 for trend in trends.values() if trend["fully_measured"])
+        complete = measured == len(by_image) == expected_image_count
+
+        oriented = [
+            oriented_curve_metrics(
+                [by_image[image_id][severity] for severity in sorted(by_image[image_id])],
+                orientation,
+            )
+            for image_id in by_image
+            if orientation in (-1, 1) and trends[image_id]["fully_measured"]
+        ]
+
+        auroc_by_severity = macro = None
+        if orientation in (-1, 1) and complete:
+            scores_by_severity = {
+                severity: [by_image[image_id][severity] for image_id in sorted(by_image)]
+                for severity in EXPECTED_SEVERITIES
+            }
+            auroc_by_severity, macro = severity_aurocs(scores_by_severity, orientation)
+
+        candidate = dict(zip(CONTRAST_CANDIDATE_KEY, candidate_key))
+        candidate.update(provenance[candidate_key])
+        candidate.update({
+            "expected_image_count": expected_image_count,
+            "image_count": len(by_image),
+            "measured_count": measured,
+            "missing_count": len(by_image) - measured,
+            "positive_count": directions.count("increasing"),
+            "negative_count": directions.count("decreasing"),
+            "flat_count": directions.count("flat"),
+            "median_signed_spearman": float(np.median(signed)) if signed else None,
+            "median_absolute_spearman": float(np.median(absolute)) if absolute else None,
+            "orientation": orientation,
+            "orientable": orientation in (-1, 1),
+            "complete": complete,
+            "oriented_adjacent_consistency": (
+                float(np.mean([item["adjacent_consistency"] for item in oriented]))
+                if oriented else None
+            ),
+            "max_blur_above_clean_rate": (
+                float(np.mean([item["max_blur_above_clean"] for item in oriented]))
+                if oriented else None
+            ),
+            "auroc_by_severity": auroc_by_severity,
+            "macro_auroc": macro,
+            "severity_statistics": {
+                severity: _severity_statistics(
+                    np.array(
+                        [
+                            by_image[image_id][severity]
+                            for image_id in by_image
+                            if severity in by_image[image_id]
+                        ],
+                        dtype=float,
+                    )
+                )
+                for severity in EXPECTED_SEVERITIES
+            },
+        })
+        total = len(by_image) or 1
+        candidate["measured_fraction"] = measured / total
+        candidate["missing_fraction"] = candidate["missing_count"] / total
+        candidate["positive_fraction"] = candidate["positive_count"] / total
+        candidate["negative_fraction"] = candidate["negative_count"] / total
+        candidate["flat_fraction"] = candidate["flat_count"] / total
+        candidate["dominant_direction_fraction"] = max(
+            candidate["positive_fraction"],
+            candidate["negative_fraction"],
+            candidate["flat_fraction"],
+        )
+        candidates.append(candidate)
+    return candidates

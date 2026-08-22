@@ -28,11 +28,14 @@ import pytest
 
 from src.scene_uncertainty import contrast_analysis
 from src.scene_uncertainty.contrast_analysis import (
+    CONTRAST_CANDIDATE_KEY,
     CONTRAST_ROW_FIELDS,
     CONTRAST_ROW_KEY,
+    DEPLOYABLE_SIGNAL,
     ContrastAnalysisError,
     build_anchor_diagnostics,
     build_contrast_rows,
+    summarize_contrast_candidates,
 )
 from src.scene_uncertainty.contrast_inputs import (
     AGGREGATIONS,
@@ -828,3 +831,463 @@ def test_the_diagnostics_clean_line_is_the_line_the_rows_were_scored_from(tmp_pa
         and row["aggregation"] == "mean"
     )["relationship"]
     assert (crossfit["final_slope"], crossfit["final_offset"]) == (1.0, 2.5)
+
+
+def candidate_rows(curves, *, arm="decile_00_10__50_60", signal="persistence",
+                   aggregation="mean", method="raw_gap"):
+    """Rows for a single candidate from `{image_id: [six scores]}`."""
+    return [
+        {
+            "image_id": image_id, "severity": severity, "arm": arm, "signal": signal,
+            "aggregation": aggregation, "method": method, "arm_family": "anchored",
+            "declared_before_data": True, "score_scope": "layer_2",
+            "reference_bin": "decile_00_10", "responsive_bin": "decile_50_60",
+            "reference": 1.0, "responsive": 1.0 + score, "score": score,
+            "fold": image_id % 5, "fit_slope": None, "fit_offset": None,
+        }
+        for image_id, scores in curves.items()
+        for severity, score in enumerate(scores)
+    ]
+
+
+def test_candidate_key_is_arm_signal_aggregation_method():
+    assert CONTRAST_CANDIDATE_KEY == ("arm", "signal", "aggregation", "method")
+
+
+def test_every_declared_candidate_appears(tmp_path):
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    candidates = summarize_contrast_candidates(rows, expected_image_count=IMAGES)
+    persistence = [item for item in candidates if item["signal"] == "persistence"]
+    confidence = [item for item in candidates if item["signal"] == "confidence"]
+    # 45, not 48: the combined arm has no relative gap (signed z-score)
+    assert len(persistence) == 45
+    assert len(confidence) == 36
+    assert len(candidates) == 81
+    assert not [
+        item for item in persistence
+        if item["arm"].endswith("__combined") and item["method"] == "relative_gap"
+    ]
+
+
+def test_a_rising_candidate_locks_to_plus_one():
+    rows = candidate_rows({image: [0.0, 1.0, 2.0, 3.0, 4.0, 5.0] for image in range(1, 5)})
+    candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
+    assert candidate["median_signed_spearman"] == pytest.approx(1.0)
+    assert candidate["orientation"] == 1
+    assert candidate["macro_auroc"] == pytest.approx(1.0)
+
+
+def test_a_falling_candidate_locks_to_minus_one_and_is_read_that_way():
+    rows = candidate_rows({image: [5.0, 4.0, 3.0, 2.0, 1.0, 0.0] for image in range(1, 5)})
+    candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
+    assert candidate["median_signed_spearman"] == pytest.approx(-1.0)
+    assert candidate["orientation"] == -1
+    # read in its locked direction a falling candidate separates perfectly, not at chance
+    assert candidate["macro_auroc"] == pytest.approx(1.0)
+    assert candidate["auroc_by_severity"][5] == pytest.approx(1.0)
+    assert candidate["auroc_by_severity"] == {
+        severity: pytest.approx(1.0) for severity in range(1, 6)
+    }
+    # the curve checks are read the same way round: a falling curve read upwards would
+    # score 0.0 on both, so these two also pin that `orientation` reaches them
+    assert candidate["oriented_adjacent_consistency"] == pytest.approx(1.0)
+    assert candidate["max_blur_above_clean_rate"] == pytest.approx(1.0)
+    assert candidate["negative_count"] == 4
+    assert candidate["positive_count"] == 0
+    assert candidate["image_count"] == 4
+    assert candidate["expected_image_count"] == 4
+
+
+def test_a_candidate_with_no_agreed_direction_is_unorientable():
+    rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    falling = list(reversed(rising))
+    rows = candidate_rows({1: rising, 2: rising, 3: falling, 4: falling})
+    candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
+    assert candidate["median_signed_spearman"] == pytest.approx(0.0)
+    assert candidate["orientation"] is None
+    assert candidate["macro_auroc"] is None
+    assert candidate["auroc_by_severity"] is None
+    assert candidate["orientable"] is False
+    # "no agreed direction" is not "no movement": every image moves as hard as it can, and
+    # the absolute median says so. `abs(median_signed_spearman)` would report 0.0 here.
+    assert candidate["median_absolute_spearman"] == pytest.approx(1.0)
+    assert candidate["positive_count"] == 2
+    assert candidate["negative_count"] == 2
+    assert candidate["flat_count"] == 0
+    # nothing oriented, so there is no oriented curve to check
+    assert candidate["oriented_adjacent_consistency"] is None
+    assert candidate["max_blur_above_clean_rate"] is None
+
+
+def test_a_flat_curve_is_flat_and_an_incomplete_one_is_unmeasured():
+    flat = [2.0] * 6
+    rows = candidate_rows({1: flat, 2: flat, 3: flat, 4: flat})
+    candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
+    assert candidate["flat_count"] == 4
+    assert candidate["measured_count"] == 4
+    assert candidate["missing_count"] == 0
+    assert candidate["median_absolute_spearman"] == pytest.approx(0.0)
+    # flat is a direction these images agreed on, so it is what dominates them: a
+    # dominant fraction taken over rising and falling alone would report 0.0 here
+    assert candidate["flat_fraction"] == pytest.approx(1.0)
+    assert candidate["dominant_direction_fraction"] == pytest.approx(1.0)
+    assert candidate["complete"] is True
+
+    partial = candidate_rows({1: flat, 2: flat})
+    partial = [row for row in partial if not (row["image_id"] == 2 and row["severity"] == 3)]
+    incomplete = summarize_contrast_candidates(partial, expected_image_count=2)[0]
+    assert incomplete["measured_count"] == 1
+    assert incomplete["missing_count"] == 1
+    assert incomplete["complete"] is False
+
+
+def test_per_severity_auroc_is_computed_severity_by_severity():
+    rows = candidate_rows({
+        1: [0.0, 0.5, 1.0, 1.0, 1.0, 10.0],
+        2: [1.0, 1.5, 2.0, 2.0, 2.0, 11.0],
+        3: [2.0, 2.5, 3.0, 3.0, 3.0, 12.0],
+        4: [3.0, 3.5, 4.0, 4.0, 4.0, 13.0],
+    })
+    candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
+    # 10 of the 16 clean/corrupted pairs separate at severity 1; all 16 at severity 5
+    assert candidate["auroc_by_severity"][1] == pytest.approx(0.625)
+    assert candidate["auroc_by_severity"][5] == pytest.approx(1.0)
+    # severities 2, 3 and 4 are the same column of scores, and each ties one pair with clean:
+    # 11.5 of the 16 pairs separate, which is 0.71875 and not the 0.75 a tie-blind count gives
+    assert candidate["auroc_by_severity"][2] == pytest.approx(0.71875)
+    assert candidate["auroc_by_severity"][3] == pytest.approx(0.71875)
+    assert candidate["auroc_by_severity"][4] == pytest.approx(0.71875)
+    # the macro is pinned to its arithmetic value as well as to its own parts, so that a
+    # macro and a severity curve that are wrong in the same direction cannot agree with
+    # each other and pass
+    assert candidate["macro_auroc"] == pytest.approx(0.75625)
+    assert candidate["macro_auroc"] == pytest.approx(
+        sum(candidate["auroc_by_severity"][severity] for severity in range(1, 6)) / 5
+    )
+
+
+def test_macro_auroc_is_never_a_stand_in_for_severity_one():
+    """A candidate strong only at severe blur must show it, not hide behind the mean."""
+    rows = candidate_rows({
+        1: [0.0, 0.0, 0.0, 0.0, 0.0, 9.0],
+        2: [1.0, 1.0, 1.0, 1.0, 1.0, 9.5],
+        3: [2.0, 2.0, 2.0, 2.0, 2.0, 10.0],
+        4: [3.0, 3.0, 3.0, 3.0, 3.0, 10.5],
+    })
+    candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
+    assert candidate["auroc_by_severity"][1] == pytest.approx(0.5)
+    assert candidate["auroc_by_severity"][5] == pytest.approx(1.0)
+    assert candidate["macro_auroc"] > candidate["auroc_by_severity"][1]
+
+
+def test_severity_statistics_are_published_for_the_plots():
+    rows = candidate_rows({image: [float(image)] * 6 for image in range(1, 5)})
+    candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
+    clean = candidate["severity_statistics"][0]
+    assert clean["count"] == 4
+    assert clean["mean"] == pytest.approx(2.5)
+    assert clean["median"] == pytest.approx(2.5)
+    assert clean["q25"] == pytest.approx(1.75)
+    assert clean["q75"] == pytest.approx(3.25)
+    # population variance over the four images, not the n-1 estimate's 1.6667
+    assert clean["variance"] == pytest.approx(1.25)
+    assert set(candidate["severity_statistics"]) == set(range(6))
+
+
+def test_candidate_provenance_survives_from_the_rows(tmp_path):
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    candidates = summarize_contrast_candidates(rows, expected_image_count=IMAGES)
+    combined = next(
+        item for item in candidates
+        if item["arm"] == "decile_90_100__50_60__combined"
+        and item["method"] == "raw_gap" and item["aggregation"] == "mean"
+    )
+    assert combined["arm_family"] == "differential"
+    assert combined["declared_before_data"] is False
+    assert combined["score_scope"] == "combined"
+    # the bin pair is ordered: `raw_gap` is responsive minus reference, so a summary that
+    # recorded only which two bins were involved would leave the sign unrecoverable
+    assert combined["reference_bin"] == "decile_90_100"
+    assert combined["responsive_bin"] == "decile_50_60"
+    anchored = next(
+        item for item in candidates
+        if item["arm"] == "decile_00_10__50_60" and item["signal"] == "persistence"
+        and item["method"] == "raw_gap" and item["aggregation"] == "mean"
+    )
+    assert anchored["arm_family"] == "anchored"
+    assert anchored["declared_before_data"] is True
+    assert anchored["score_scope"] == "layer_2"
+    assert anchored["reference_bin"] == "decile_00_10"
+    assert anchored["responsive_bin"] == "decile_50_60"
+    # and the twin that shares the differential pair reads confidence, not a decoder layer
+    twin = next(
+        item for item in candidates
+        if item["arm"] == "decile_90_100__50_60" and item["signal"] == "confidence"
+        and item["method"] == "raw_gap" and item["aggregation"] == "mean"
+    )
+    assert twin["score_scope"] == "confidence"
+    assert twin["reference_bin"] == "decile_90_100"
+    assert twin["responsive_bin"] == "decile_50_60"
+
+
+def test_a_duplicated_row_key_is_refused():
+    rows = candidate_rows({1: [0.0] * 6})
+    with pytest.raises(ContrastAnalysisError, match="duplicate"):
+        summarize_contrast_candidates(rows + rows[:1], expected_image_count=1)
+
+
+def test_only_persistence_is_the_deployable_signal(tmp_path):
+    """The signal Task 6 ranks, named once so the gate and the rows cannot drift apart.
+
+    Pinned to the literal *and* checked against the signals the rows actually carry: a
+    constant that named a signal no candidate has would gate everything out, and a gate that
+    spelled `"persistence"` for itself would not notice the rows renaming it.
+    """
+    assert DEPLOYABLE_SIGNAL == "persistence"
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    candidates = summarize_contrast_candidates(rows, expected_image_count=IMAGES)
+    assert {item["signal"] for item in candidates} == {"persistence", "confidence"}
+    # both signals are summarised in full; it is only the ranking the control stays out of
+    assert DEPLOYABLE_SIGNAL in {item["signal"] for item in candidates}
+    assert "deployable" not in candidates[0]
+    assert "rank" not in candidates[0]
+
+
+def test_the_locked_direction_follows_the_median_and_not_the_mean():
+    """Two loud images must not outvote three quiet ones, and the published median says so.
+
+    `strong_up` correlates at +33/35 and `weak_down` at exactly -0.2, so two of the first
+    against three of the second average to +0.257 and median to -0.2. A mean would read this
+    candidate upwards; the median reads it the way most of its images actually move, which is
+    the choice `corruption_metrics.choose_orientation` documents. Every other fixture in this
+    file is symmetric enough that mean and median agree, so this is the only place the swap
+    shows.
+    """
+    strong_up = [1.0, 2.0, 3.0, 4.0, 6.0, 5.0]
+    weak_down = [5.0, 3.0, 2.0, 6.0, 1.0, 4.0]
+    rows = candidate_rows({
+        1: strong_up, 2: strong_up, 3: weak_down, 4: weak_down, 5: weak_down,
+    })
+    candidate = summarize_contrast_candidates(rows, expected_image_count=5)[0]
+    assert candidate["median_signed_spearman"] == pytest.approx(-0.2)
+    assert candidate["orientation"] == -1
+    # the mean of the same five is +0.2571, and the mean of their absolutes is +0.4971
+    assert candidate["median_absolute_spearman"] == pytest.approx(0.2)
+    assert candidate["positive_count"] == 2
+    assert candidate["negative_count"] == 3
+    assert candidate["positive_fraction"] == pytest.approx(0.4)
+    assert candidate["negative_fraction"] == pytest.approx(0.6)
+    assert candidate["dominant_direction_fraction"] == pytest.approx(0.6)
+    # and the locked direction is kept even though it scores the candidate below chance:
+    # this is a finding about the candidate, not a sign to flip after the fact
+    assert candidate["macro_auroc"] == pytest.approx(0.48)
+
+
+def test_a_twin_locks_its_own_direction_and_is_not_handed_the_persistence_one(tmp_path):
+    """`signal` is in the candidate key so the twin chooses its own orientation.
+
+    A twin forced to share its candidate's direction would measure how well the candidate's
+    direction happens to suit confidence, not how well confidence does on its own -- and on
+    the shared fixture the two genuinely disagree, so a twin handed the persistence direction
+    would be reported at `1 - auroc` of its real value.
+    """
+    rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    falling = list(reversed(rising))
+    both = candidate_rows({image: rising for image in range(1, 5)})
+    both += candidate_rows(
+        {image: falling for image in range(1, 5)}, signal="confidence"
+    )
+    candidates = summarize_contrast_candidates(both, expected_image_count=4)
+    by_signal = {item["signal"]: item for item in candidates}
+    assert len(candidates) == 2
+    assert by_signal["persistence"]["orientation"] == 1
+    assert by_signal["confidence"]["orientation"] == -1
+    assert by_signal["persistence"]["macro_auroc"] == pytest.approx(1.0)
+    assert by_signal["confidence"]["macro_auroc"] == pytest.approx(1.0)
+
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    twins = {
+        item["signal"]: item
+        for item in summarize_contrast_candidates(rows, expected_image_count=IMAGES)
+        if item["arm"] == "decile_90_100__50_60"
+        and item["aggregation"] == "mean" and item["method"] == "raw_gap"
+    }
+    assert twins["persistence"]["orientation"] == 1
+    assert twins["confidence"]["orientation"] == -1
+    # the twin outscores the candidate it exists to control, which is exactly why
+    # DEPLOYABLE_SIGNAL keeps it out of the ranking rather than out of the report
+    assert twins["confidence"]["macro_auroc"] > twins["persistence"]["macro_auroc"]
+
+
+def test_the_curve_checks_are_two_numbers_because_neither_says_the_other():
+    """`adjacent_consistency` averages 0.9 while `max_blur_above_clean` averages 0.5 here.
+
+    Two images climb cleanly to severity 5; two climb just as cleanly for four steps and then
+    fall below clean at the last. Orderly steps and a separated endpoint are different claims,
+    and a fixture where both came out the same number would let the two fields be swapped.
+    """
+    rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    collapsing = [0.0, 1.0, 2.0, 3.0, 4.0, -1.0]
+    rows = candidate_rows({1: rising, 2: rising, 3: collapsing, 4: collapsing})
+    candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
+    assert candidate["orientation"] == 1
+    # four of five steps rise on the collapsing images, five of five on the rising ones
+    assert candidate["oriented_adjacent_consistency"] == pytest.approx(0.9)
+    # but only half the images end above where they started
+    assert candidate["max_blur_above_clean_rate"] == pytest.approx(0.5)
+
+
+def test_a_short_roster_withholds_the_auroc_and_says_so():
+    """Four images that were all measured are still not the six the run expected.
+
+    `expected_image_count` is the argument that knows this; the rows do not. The direction and
+    the per-image curve checks survive -- they are claims about single images -- but the
+    AUROCs do not, because they rank scores across images and a short roster would quietly
+    change what the comparison was over.
+    """
+    rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    rows = candidate_rows({image: rising for image in range(1, 5)})
+    candidate = summarize_contrast_candidates(rows, expected_image_count=6)[0]
+    assert candidate["expected_image_count"] == 6
+    assert candidate["image_count"] == 4
+    assert candidate["measured_count"] == 4
+    assert candidate["missing_count"] == 0
+    assert candidate["complete"] is False
+    assert candidate["orientation"] == 1
+    assert candidate["orientable"] is True
+    assert candidate["oriented_adjacent_consistency"] == pytest.approx(1.0)
+    assert candidate["auroc_by_severity"] is None
+    assert candidate["macro_auroc"] is None
+
+    # and the other way round: five images produced rows where four were expected, and the
+    # four that were fully measured are not the whole roster either. `complete` needs all
+    # three numbers to agree, because `measured == expected_image_count` alone would send a
+    # roster with an extra half-scored image into the AUROC.
+    longer = candidate_rows({image: rising for image in range(1, 6)})
+    longer = [row for row in longer if not (row["image_id"] == 5 and row["severity"] == 3)]
+    overrun = summarize_contrast_candidates(longer, expected_image_count=4)[0]
+    assert overrun["image_count"] == 5
+    assert overrun["measured_count"] == 4
+    assert overrun["expected_image_count"] == 4
+    assert overrun["complete"] is False
+    assert overrun["macro_auroc"] is None
+
+
+def test_an_unmeasured_image_stays_in_every_denominator():
+    """Two rising, one flat, one short curve: the short one is a quarter of this candidate.
+
+    Dividing the direction counts by `measured_count` instead would turn two agreeing images
+    out of four into two out of three, so a candidate that failed to produce a curve on some
+    of its images would report the survivors' agreement as if the failures had never been
+    asked. The unmeasured image is also kept out of the Spearman medians entirely rather than
+    entered as a `0.0`, which would drag the median towards "no direction" in proportion to
+    how often the candidate failed.
+    """
+    rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    rows = candidate_rows({1: rising, 2: rising, 3: [2.0] * 6, 4: rising})
+    rows = [row for row in rows if not (row["image_id"] == 4 and row["severity"] == 3)]
+    candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
+    assert candidate["image_count"] == 4
+    assert candidate["measured_count"] == 3
+    assert candidate["missing_count"] == 1
+    assert candidate["measured_fraction"] == pytest.approx(0.75)
+    assert candidate["missing_fraction"] == pytest.approx(0.25)
+    assert candidate["positive_count"] == 2
+    assert candidate["flat_count"] == 1
+    assert candidate["negative_count"] == 0
+    assert candidate["positive_fraction"] == pytest.approx(0.5)
+    assert candidate["flat_fraction"] == pytest.approx(0.25)
+    assert candidate["dominant_direction_fraction"] == pytest.approx(0.5)
+    # three finite trends, +1, +1 and 0.0; a fourth read as 0.0 would median to 0.5
+    assert candidate["median_signed_spearman"] == pytest.approx(1.0)
+    assert candidate["median_absolute_spearman"] == pytest.approx(1.0)
+    # the flat image is oriented too, and it is the one that never clears its own clean score
+    assert candidate["oriented_adjacent_consistency"] == pytest.approx(1.0)
+    assert candidate["max_blur_above_clean_rate"] == pytest.approx(2 / 3)
+    assert candidate["complete"] is False
+    assert candidate["macro_auroc"] is None
+    # the severity the short image never reached still reports the three images that did
+    assert candidate["severity_statistics"][3]["count"] == 3
+    assert candidate["severity_statistics"][0]["count"] == 4
+
+
+def test_a_severity_no_image_reached_is_published_as_an_empty_row():
+    """Task 7 draws a box per severity, so an absent severity is a zero count, not a gap."""
+    rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    rows = candidate_rows({1: rising, 2: rising})
+    rows = [row for row in rows if row["severity"] != 3]
+    candidate = summarize_contrast_candidates(rows, expected_image_count=2)[0]
+    assert candidate["severity_statistics"][3] == {
+        "count": 0, "mean": None, "variance": None,
+        "median": None, "q25": None, "q75": None,
+    }
+    assert candidate["severity_statistics"][0]["count"] == 2
+    assert candidate["measured_count"] == 0
+    assert candidate["orientation"] is None
+
+
+def test_a_row_without_its_key_fields_is_refused():
+    """The position is in the message because a bare field name locates nothing in 29,160 rows."""
+    rows = candidate_rows({1: [0.0] * 6})
+    del rows[2]["severity"]
+    with pytest.raises(ContrastAnalysisError, match=r"contrast row 2 is missing \['severity'\]"):
+        summarize_contrast_candidates(rows, expected_image_count=1)
+
+
+def test_candidates_are_published_in_a_stable_order(tmp_path):
+    """Task 8 writes these to a CSV, so the order has to be the key's and not the rows'."""
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    candidates = summarize_contrast_candidates(rows, expected_image_count=IMAGES)
+    keys = [tuple(item[field] for field in CONTRAST_CANDIDATE_KEY) for item in candidates]
+    assert keys == sorted(keys)
+    assert len(set(keys)) == len(keys)
+    assert keys[0] == ("decile_00_10__50_60", "confidence", "mean", "clean_residual")
+    assert keys[-1] == ("quintile_00_20__40_60", "persistence", "top20_mean", "relative_gap")
+    shuffled = summarize_contrast_candidates(
+        list(reversed(rows)), expected_image_count=IMAGES
+    )
+    assert [
+        tuple(item[field] for field in CONTRAST_CANDIDATE_KEY) for item in shuffled
+    ] == keys
+
+
+def test_the_severity_mean_and_median_are_two_numbers_because_one_scene_can_move_one():
+    """Three scenes near 2 and one at 10: the mean goes to 4.0 and the median stays at 2.5.
+
+    Every other fixture in this file has a symmetric score column, where mean and median are
+    the same number and either could stand in for the other. They must not: the mean is what
+    the cross-scene AUROC is sensitive to and the median is what the per-image trend behaves
+    like, and a candidate whose median falls while its mean rises is exactly the shape that
+    puts a locked orientation below 0.5.
+    """
+    rows = candidate_rows({1: [1.0] * 6, 2: [2.0] * 6, 3: [3.0] * 6, 4: [10.0] * 6})
+    candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
+    clean = candidate["severity_statistics"][0]
+    assert clean["count"] == 4
+    assert clean["mean"] == pytest.approx(4.0)
+    assert clean["median"] == pytest.approx(2.5)
+    assert clean["q25"] == pytest.approx(1.75)
+    assert clean["q75"] == pytest.approx(4.75)
+    assert clean["variance"] == pytest.approx(12.5)
+
+
+def test_rows_that_disagree_about_a_candidates_provenance_are_refused():
+    """Copying the first row's provenance is only safe if every row carries the same.
+
+    Refused rather than resolved, because there is no honest way to pick: two rows that
+    disagree about `score_scope` are two experiments filed under one candidate name, and
+    publishing either scope beside a merged set of scores would label half the numbers wrong.
+    Nothing else in the pipeline re-checks it -- `CONTRAST_ROW_KEY` deliberately leaves
+    `score_scope` out, so the row grid cannot tell the two apart on its own.
+    """
+    rows = candidate_rows({1: [0.0] * 6, 2: [1.0] * 6})
+    rows[-1]["score_scope"] = "combined"
+    with pytest.raises(ContrastAnalysisError, match="disagree about the provenance"):
+        summarize_contrast_candidates(rows, expected_image_count=2)
+
+    swapped = candidate_rows({1: [0.0] * 6, 2: [1.0] * 6})
+    swapped[-1]["reference_bin"], swapped[-1]["responsive_bin"] = (
+        swapped[-1]["responsive_bin"], swapped[-1]["reference_bin"],
+    )
+    with pytest.raises(ContrastAnalysisError, match="disagree about the provenance"):
+        summarize_contrast_candidates(swapped, expected_image_count=2)
