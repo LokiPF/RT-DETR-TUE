@@ -2448,7 +2448,9 @@ from src.scene_uncertainty.contrast_controls import (
     BOOTSTRAP_SAMPLES,
     BOOTSTRAP_SEED,
     attach_controls,
+    beats_both_inputs,
     index_curves,
+    is_confidence_redundant,
     paired_macro_bootstrap,
     rank_contrast_candidates,
     reference_control_rows,
@@ -2569,15 +2571,20 @@ def test_a_candidate_that_only_restates_confidence_is_flagged_redundant(tmp_path
     assert checked == 45  # the assertion above is vacuous if the loop never runs
 
 
-def test_an_exactly_tied_twin_counts_as_redundant():
-    """Equal is not better. `>=` in place of `>` would let a tie read as a win."""
-    from src.scene_uncertainty.contrast_controls import attach_controls
-
-    tied = stub(macro_auroc=0.7, twin_macro_auroc=0.7)
-    tied["confidence_redundant"] = not (
-        tied["macro_auroc"] > tied["twin_macro_auroc"]
-    )
-    assert tied["confidence_redundant"] is True
+@pytest.mark.parametrize(
+    "own, twin, redundant",
+    [
+        (0.70, 0.60, False),   # ahead of confidence
+        (0.70, 0.70, True),    # exactly tied: equal is not better
+        (0.60, 0.70, True),    # behind confidence
+        (0.70, None, True),    # no computable twin: unmeasured never reads as a win
+        (None, 0.60, True),    # no AUROC of its own
+    ],
+)
+def test_confidence_redundancy_is_strict(own, twin, redundant):
+    assert is_confidence_redundant(
+        stub(macro_auroc=own, twin_macro_auroc=twin)
+    ) is redundant
 
 
 def test_a_candidate_is_compared_with_both_of_its_inputs(tmp_path):
@@ -2606,8 +2613,6 @@ def test_beating_one_input_while_losing_to_the_other_is_not_beating_both():
     )
     candidate["responsive_control_macro_difference"] = 0.10
     candidate["reference_control_macro_difference"] = -0.15
-    from src.scene_uncertainty.contrast_controls import beats_both_inputs
-
     assert beats_both_inputs(candidate) is False
 
 
@@ -2909,6 +2914,19 @@ def beats_both_inputs(candidate: dict) -> bool:
     )
 
 
+def is_confidence_redundant(candidate: dict) -> bool:
+    """True unless the candidate's macro AUROC is strictly ahead of its twin's.
+
+    Strictly, and default-true. A candidate level with its confidence twin has not been shown
+    to add anything, and a candidate or twin that produced no AUROC at all has been shown even
+    less -- so an absent measurement reads as redundant rather than as a win it never earned.
+    A `>=` here would let an exact tie be published as beating confidence.
+    """
+    own = candidate.get("macro_auroc")
+    twin = candidate.get("twin_macro_auroc")
+    return not (own is not None and twin is not None and own > twin)
+
+
 def _by_key(items: list[dict]) -> dict[tuple, dict]:
     return {
         (item["arm"], item["signal"], item["aggregation"], item["method"]): item
@@ -2979,11 +2997,7 @@ def attach_controls(
             }
 
         candidate["beats_both_inputs"] = beats_both_inputs(candidate)
-        candidate["confidence_redundant"] = not (
-            candidate["macro_auroc"] is not None
-            and candidate["twin_macro_auroc"] is not None
-            and candidate["macro_auroc"] > candidate["twin_macro_auroc"]
-        )
+        candidate["confidence_redundant"] = is_confidence_redundant(candidate)
 
         candidate["responsive_control_bootstrap"] = None
         candidate["twin_bootstrap"] = None
@@ -3053,7 +3067,7 @@ def rank_contrast_candidates(candidates: list[dict]) -> list[dict]:
 $UE_PY -m pytest tests/scene_uncertainty/test_contrast_controls.py -v
 ```
 
-Expected: 20 passed.
+Expected: 24 passed.
 
 - [ ] **Step 5: Mutation check**
 
@@ -3066,7 +3080,8 @@ Break each, confirm the *named* test fails, revert:
 5. `_sort_key` → remove the `-auroc[2]` term. `test_ranking_uses_severity_two_as_the_third_criterion` must fail.
 6. `beats_both_inputs` → use `or` instead of `and`. `test_beating_one_input_while_losing_to_the_other_is_not_beating_both` must fail.
 7. `rank_contrast_candidates` → drop the `twin_macro_auroc is not None` clause. `test_a_candidate_without_a_computable_twin_is_not_deployable` must fail.
-8. `confidence_redundant` → use `>=` instead of `>`. Build a candidate whose macro exactly equals its twin's and assert `confidence_redundant is True`. **Not covered by the first draft.** Add it.
+8. `is_confidence_redundant` → use `>=` instead of `>`. The tied case of `test_confidence_redundancy_is_strict` must fail.
+10. `is_confidence_redundant` → return `False` when either value is `None`. Two cases of that test must fail.
 
 - [ ] **Step 6: Commit**
 
