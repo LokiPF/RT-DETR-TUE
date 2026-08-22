@@ -136,6 +136,16 @@ Tests mirror the modules: `tests/scene_uncertainty/test_contrast_<name>.py`, plu
 >    `REQUIRED_SERIES`. The `raise` below therefore fires on every real bundle. Move the
 >    membership/padding test up beside the `entry not in wanted` filter as a `continue`, and
 >    rewrite the `SCORE_KEY` docstring, which currently documents the bug as a design decision.
+> 1b. **The fixture blocks below are superseded.** `contrast_test_utils.py` as implemented is
+>    the authoritative version; the block here is the round-0 draft and re-deriving from it
+>    would reintroduce two fixed bugs — a bin-blind confidence branch, and invented
+>    `run.membership_modes` / `run.padding_modes` / top-level `per_scene_row_count` keys the
+>    real bundle does not have. The `confidence` column holds `1 - confidence`
+>    (`decile_scoring._checked_confidence`), so it runs *descending* across the bins as named:
+>    roughly 0.985 at `decile_00_10` down to 0.645 at `decile_90_100`, with the top decile
+>    rising steeply across severity while the lower bins stay near-flat, two drifting down and
+>    two up. Later tasks import `write_source_bundle` and `default_score` from the file, not
+>    from this block.
 > 2. **Negativity is scope-aware.** `layer_N` persistence and confidence are non-negative;
 >    `combined` is a robust z-score built as the mean over layers of `(score - center) / scale`
 >    against the clean median, and it is negative for any selection below that median — 548 of

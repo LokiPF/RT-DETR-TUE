@@ -126,8 +126,10 @@ Every number below is that column as published, with the confidence reading give
 
 At the 90--100 percent decile the uncertainty column rises hard with blur, at +0.829, which
 means the detector's confidence in the queries it is surest about falls hard with blur.
-Persistence distance in that same bucket also falls, at -0.829. Two signals moving with blur in
-the same direction at identical strength on the same images is the signature of measuring one
+Persistence distance in that same bucket also falls, at -0.829. The two Spearman signs are
+opposite because one is measured on an inverted column; once both are read as what they say
+about the detector, confidence and persistence distance are moving together, at identical
+strength, on the same images. Two signals doing that is the signature of measuring one
 underlying thing twice, and confidence alone already reaches macro AUROC 0.642 against
 persistence's 0.685. At the 50--60 percent decile the two behave differently: the uncertainty
 column barely moves and slightly falls, while persistence rises at +0.629, and confidence's
