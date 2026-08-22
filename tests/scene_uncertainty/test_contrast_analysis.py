@@ -41,7 +41,12 @@ from src.scene_uncertainty.contrast_inputs import (
     ContrastInputError,
     load_contrast_inputs,
 )
-from src.scene_uncertainty.contrast_scores import FOLD_COUNT, SCORE_METHODS, assign_folds
+from src.scene_uncertainty.contrast_scores import (
+    FOLD_COUNT,
+    SCORE_METHODS,
+    assign_folds,
+    robust_line,
+)
 
 from tests.scene_uncertainty.contrast_test_utils import default_score, write_source_bundle
 
@@ -612,6 +617,68 @@ def test_anchor_diagnostics_cover_every_arm_and_summary(tmp_path):
     assert (combined["reference_bin"], combined["responsive_bin"]) == (
         "decile_90_100", "decile_50_60"
     )
+
+
+def test_every_diagnostic_names_which_bin_is_which_way_round(tmp_path):
+    """The two bin labels are checked for *order*, which membership structurally cannot do.
+
+    `test_every_diagnostic_names_a_series_the_loader_actually_read` reads both bin fields, and
+    it can never bind their order: `contrast_inputs.required_series` iterates them symmetrically
+    -- `for confidence_bin in (arm.reference_bin, arm.responsive_bin)` -- so a swapped pair lands
+    back inside `REQUIRED_SERIES` and the membership clause is satisfied by both orders. That
+    symmetry is deliberate; the `Arm` docstring says the asymmetry gets bound one task
+    downstream. It is, on the rows path, by `test_rows_carry_the_source_scores_their_arm_names`,
+    which reads each row's `reference`/`responsive` *value* back out of `inputs.scores` keyed by
+    that row's own bin fields. The diagnostics publish no per-bin values, so no analogous
+    read-back existed and only a single spot-read on arm 4's `q90` row bound anything -- leaving
+    a swap on arm 1 alone, on the three twins, or on any 20 of the 21 rows entirely unbound.
+
+    Two clauses, because they fail independently.
+
+    The first is that read-back, in the only form the diagnostics allow: `clean_relationship`
+    consumes both clean curves, so the line it publishes can be recomputed from the source keyed
+    by the row's *own* two labels and must come back bit-identical. `robust_line` is
+    deterministic, so this is exact equality rather than a tolerance, and it needs nothing from
+    the arm table -- it asks the labels to answer to the numbers printed beside them.
+
+    The second compares the ordered pair against the arm table directly, which is what binds
+    `responsive_bin` when a mutation fabricates it without touching `reference_bin`. It is not
+    circular: Task 1's `test_arm_table_is_the_four_declared_arms` pins all eight fields of all
+    four arms as literals, so the table this reads is independently held down.
+    """
+    inputs = loaded(tmp_path)
+    diagnostics = build_anchor_diagnostics(inputs)
+    assert len(diagnostics) == 21
+
+    for row in diagnostics:
+        def clean(confidence_bin):
+            return [
+                inputs.scores[(
+                    image_id, 0, row["signal"], confidence_bin,
+                    row["aggregation"], row["score_scope"],
+                )]
+                for image_id in inputs.image_ids
+            ]
+
+        recomputed = robust_line(clean(row["reference_bin"]), clean(row["responsive_bin"]))
+        relationship = row["relationship"]
+        assert recomputed == (relationship["final_slope"], relationship["final_offset"]), (
+            row["arm"], row["signal"], row["aggregation"]
+        )
+        # ... and the reverse reading is a different line on every one of the 21, so the
+        # equality above is a statement about order and not an accident of symmetry
+        assert robust_line(
+            clean(row["responsive_bin"]), clean(row["reference_bin"])
+        ) != recomputed, (row["arm"], row["signal"], row["aggregation"])
+
+    declared = {}
+    for arm in ARMS:
+        for label in (arm.name, arm.pair_name):
+            declared.setdefault(label, (arm.reference_bin, arm.responsive_bin))
+    for row in diagnostics:
+        assert (row["reference_bin"], row["responsive_bin"]) == declared[row["arm"]], (
+            row["arm"], row["signal"], row["aggregation"]
+        )
 
 
 def test_every_diagnostic_names_a_series_the_loader_actually_read(tmp_path):
