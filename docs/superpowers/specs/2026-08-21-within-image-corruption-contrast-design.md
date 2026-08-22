@@ -108,21 +108,32 @@ construction than the anchored pair can produce. The 90--100 percent decile was 
 strongest single mover among the persistence candidates in the completed sweep, at the largest
 absolute median signed Spearman of any of them.
 
-Third, the top decile carries a redundancy risk that the responsive range does not. The matched
-confidence-only control gives the following, on the same dynamic, padding-filtered, `mean`
-configuration:
+Third, the top decile carries a redundancy risk that the responsive range does not.
 
-| Range | Locked orientation | Median signed Spearman | Macro AUROC |
-|---|---|---|---|
-| `decile_00_10` | -1 | -0.600 | 0.557 |
-| `decile_50_60` | -1 | -0.514 | 0.534 |
-| `decile_90_100` | +1 | +0.829 | 0.642 |
+Read the confidence control's sign carefully: the `confidence` signal column does not hold
+confidence. `decile_scoring._checked_confidence` writes `1 - confidence`, so the column is a
+confidence *uncertainty* and larger means less confident. That is why the 0--10 percent bucket
+carries the column's highest value, 0.985, and the 90--100 percent bucket its lowest, 0.645.
+Every number below is that column as published, with the confidence reading given in words.
 
-At the 90--100 percent decile, persistence and detector confidence have the same magnitude of
-median signed Spearman, 0.829, with opposite signs, and confidence alone already reaches macro
-AUROC 0.642. That pattern is what a restatement of confidence looks like. At the 50--60 percent
-decile the two disagree in both sign and strength, so persistence there carries information
-confidence does not. The confidence-only twin is mandatory for this reason.
+| Range | Column at severity 0 | Column at severity 5 | Median signed Spearman | Macro AUROC |
+|---|---|---|---|---|
+| `decile_00_10` | 0.985 | 0.983 | -0.600 | 0.557 |
+| `quintile_00_20` | 0.979 | 0.976 | -0.600 | 0.556 |
+| `quintile_40_60` | 0.936 | 0.937 | -0.543 | 0.537 |
+| `decile_50_60` | 0.930 | 0.932 | -0.514 | 0.534 |
+| `decile_90_100` | 0.645 | 0.799 | +0.829 | 0.642 |
+
+At the 90--100 percent decile the uncertainty column rises hard with blur, at +0.829, which
+means the detector's confidence in the queries it is surest about falls hard with blur.
+Persistence distance in that same bucket also falls, at -0.829. Two signals moving with blur in
+the same direction at identical strength on the same images is the signature of measuring one
+underlying thing twice, and confidence alone already reaches macro AUROC 0.642 against
+persistence's 0.685. At the 50--60 percent decile the two behave differently: the uncertainty
+column barely moves and slightly falls, while persistence rises at +0.629, and confidence's
+macro AUROC sits at 0.534, near chance, against persistence's 0.610. So persistence there
+carries information confidence does not. The confidence-only twin is mandatory for this reason,
+and any fixture standing in for this column must reproduce its direction, not its name.
 
 Two further measurements shape the design:
 
