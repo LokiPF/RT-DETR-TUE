@@ -1,4 +1,4 @@
-"""What the loader must refuse, and what a real bundle must be allowed to carry.
+"""What the loader must refuse, what a real bundle may carry, and what the fixture must be.
 
 Half of these tests exist because the *permissive* half of the loader is as load-bearing as the
 strict half. A real `per_scene.csv` holds a `frozen` twin of every bin, an `unfiltered` control
@@ -7,7 +7,17 @@ of which this command reads 1,296 per 6-image fixture and 54,000 in production. 
 at any of the rows it does not read is a refusal of every bundle the producer can write, so
 `test_discards_the_frozen_and_unfiltered_twins_a_real_bundle_carries` is not a nicety: it is the
 test that says this command can run at all.
+
+The rest exist because the fixture is a shared artefact, not a private one. Nine tasks read
+`contrast_test_utils` and only this module reads `contrast_inputs.py`, so from Task 3 onwards
+every expectation anyone writes is an expectation about the fixture's numbers -- and the loader
+is blind to almost all of them. It never reads `selected_count`, `clean_overlap` or any of the
+four trend columns; it cannot tell a bin whose curve is flat from one that moves; it accepts a
+`combined` column that is `layer_2` plus a constant. So a fixture defect does not fail here, it
+propagates. Every test below whose name starts `test_the_fixture_` or which names a producer
+behaviour is guarding a property no loader assertion can reach.
 """
+import csv
 import json
 from dataclasses import astuple
 
@@ -20,10 +30,17 @@ from src.scene_uncertainty.contrast_inputs import (
     ContrastInputError,
     load_contrast_inputs,
 )
+from src.scene_uncertainty.corruption_metrics import (
+    choose_orientation,
+    complete_trend_metrics,
+    severity_aurocs,
+)
 
 from tests.scene_uncertainty.contrast_test_utils import (
     AGGREGATIONS,
+    SELECTED_COUNT,
     SERIES,
+    clean_overlap_for,
     write_source_bundle,
 )
 
@@ -33,17 +50,52 @@ RETAINED = 12 * 3 * 6 * 6  # 12 series x 3 aggregations x 6 images x 6 severitie
 
 
 def source_row(**overrides):
-    """One raw `per_scene.csv` row for `extra_rows`, defaulting to a row this command reads."""
+    """One raw `per_scene.csv` row for `extra_rows`, defaulting to a row this command reads.
+
+    The defaults describe a *severity-zero dynamic* row, which is why `clean_overlap` is `1.0`
+    and not a plausible-looking fraction: that row's membership is compared against itself, so
+    the producer cannot write anything else there. `selected_count` and the four trend columns
+    come from the same place as the fixture's own -- `SELECTED_COUNT` by scheme, and a flat
+    curve's `0.0 / 0.0 / "flat"`, which is what `complete_trend_metrics` returns for the
+    constant curves the callers below build out of these rows. A caller overriding
+    `bucket_scheme` or `severity` must override the matching column too, which the twins test
+    does through the same two helpers the fixture uses.
+    """
     row = {
         "image_id": 1, "severity": 0, "signal": "persistence", "bucket_scheme": "decile",
         "confidence_bin": "decile_50_60", "membership_mode": "dynamic",
         "padding_mode": "filtered", "aggregation": "mean", "score_scope": "layer_2",
-        "source_partition": "tuning", "score": 1.0, "selected_count": 30,
-        "clean_overlap": 0.2, "fully_measured": True, "signed_spearman": 0.6,
-        "absolute_spearman": 0.6, "direction": "increasing",
+        "source_partition": "tuning", "score": 1.0,
+        "selected_count": SELECTED_COUNT["decile"], "clean_overlap": 1.0,
+        "fully_measured": True, "signed_spearman": 0.0,
+        "absolute_spearman": 0.0, "direction": "flat",
     }
     row.update(overrides)
     return row
+
+
+def read_rows(source):
+    """`per_scene.csv` as raw dictionaries, for the columns `load_contrast_inputs` drops."""
+    with (source / "per_scene.csv").open(newline="") as handle:
+        return list(csv.DictReader(handle))
+
+
+def curve(inputs, image_id, signal, confidence_bin, scope, aggregation="mean"):
+    """One image's six-severity curve out of a loaded bundle, in severity order."""
+    return [
+        inputs.scores[(image_id, severity, signal, confidence_bin, aggregation, scope)]
+        for severity in SEVERITIES
+    ]
+
+
+def signed_trends(inputs, signal, confidence_bin, scope, aggregation="mean"):
+    """Every image's `signed_spearman` for one candidate, the input `choose_orientation` takes."""
+    return [
+        complete_trend_metrics(
+            SEVERITIES, curve(inputs, image_id, signal, confidence_bin, scope, aggregation)
+        )["signed_spearman"]
+        for image_id in inputs.image_ids
+    ]
 
 
 def test_arm_table_is_the_four_declared_arms():
@@ -96,9 +148,11 @@ def test_loads_every_required_series(tmp_path):
     inputs = load_contrast_inputs(source, expected_image_count=6)
     assert inputs.image_ids == (1, 2, 3, 4, 5, 6)
     assert len(inputs.scores) == RETAINED
-    assert inputs.scores[(1, 0, "persistence", "decile_50_60", "mean", "layer_2")] == 1.31
-    # the same bin at the combined scope is a different measurement, not a copy
-    assert inputs.scores[(1, 0, "persistence", "decile_50_60", "mean", "combined")] == 1.81
+    # a mean nearest-neighbour distance, near the run's own 0.083 and nowhere near 1.0
+    assert inputs.scores[(1, 0, "persistence", "decile_50_60", "mean", "layer_2")] == 0.067517
+    # the same bin at the combined scope is a different measurement, not a copy -- a signed
+    # z-score against the clean median, and this bin sits below it
+    assert inputs.scores[(1, 0, "persistence", "decile_50_60", "mean", "combined")] == -0.29306
     # and the confidence twin varies by bin, so a contrast against it is not identically zero
     assert inputs.scores[(1, 0, "confidence", "decile_00_10", "mean", "confidence")] == 0.984
     assert inputs.scores[(1, 0, "confidence", "decile_90_100", "mean", "confidence")] == 0.644
@@ -171,6 +225,269 @@ def test_a_full_tuning_roster_keeps_the_confidence_column_inside_its_bounds(tmp_
     assert len(set(lowest_bin)) == 250
 
 
+def test_every_arms_persistence_reference_can_be_oriented(tmp_path):
+    """A flat reference curve is an arm that cannot be compared with anything.
+
+    `complete_trend_metrics` short-circuits a constant curve to `signed_spearman = 0.0` and
+    `direction = "flat"`, and `choose_orientation` returns `None` on a median of exactly zero
+    -- not `+1`, deliberately, because breaking the tie would hand an unorientable candidate a
+    full set of curve checks and AUROCs indistinguishable from an oriented one's. Downstream
+    that `None` is a `macro_auroc` of `None`, a `beats_both_inputs` that is structurally
+    `False`, and a `TypeError` the first time anything subtracts one AUROC from another.
+
+    It bites hardest on the two *anchored* arms, whose references are the lowest bin of each
+    scheme. Those are the arms declared before any tuning number was read, so they are the two
+    the spec's "beats both its inputs" criterion is worth demonstrating on, and a fixture that
+    left them flat made it undemonstrable. Both signs are pinned, not just non-`None`: the run
+    has `decile_00_10` falling at a median signed Spearman of -0.200 and `quintile_00_20`
+    rising at +0.086, and a fixture that oriented them the other way would give every anchored
+    contrast in nine tasks the wrong sign.
+    """
+    inputs = load_contrast_inputs(
+        write_source_bundle(tmp_path / "source"), expected_image_count=6
+    )
+    expected = {"decile_00_10__50_60": -1, "quintile_00_20__40_60": 1}
+    for arm in ARMS:
+        for confidence_bin in (arm.reference_bin, arm.responsive_bin):
+            signed = signed_trends(inputs, "persistence", confidence_bin, arm.score_scope)
+            assert choose_orientation(signed) is not None, (arm.name, confidence_bin)
+        reference = signed_trends(inputs, "persistence", arm.reference_bin, arm.score_scope)
+        if arm.name in expected:
+            assert choose_orientation(reference) == expected[arm.name], arm.name
+    # and no curve anywhere in the bundle is the constant one that produced the `None`
+    assert "flat" not in {row["direction"] for row in read_rows(tmp_path / "source")}
+
+
+def test_the_two_bucket_schemes_are_not_one_series(tmp_path):
+    """Separating the two resolutions *is* the comparison this command exists to make.
+
+    That sentence is `corruption_reporting.ROW_KEY`'s own, and it is why `bucket_scheme` is in
+    the row key at all. A fixture that gives `decile_00_10` and `quintile_00_20` one level and
+    one slope, and `decile_50_60` and `quintile_40_60` another, makes arms 1 and 2 produce the
+    same number at every image, severity, aggregation and method -- identical contrasts,
+    identical orientations, identical macro AUROCs -- so a mutation that computed the quintile
+    arm out of the decile bins would pass every test in nine tasks.
+
+    Equality is checked exactly rather than approximately: two bins that agree to six decimal
+    places have already collapsed for every downstream purpose.
+    """
+    inputs = load_contrast_inputs(
+        write_source_bundle(tmp_path / "source"), expected_image_count=6
+    )
+    pairs = (("decile_00_10", "quintile_00_20"), ("decile_50_60", "quintile_40_60"))
+    for decile_bin, quintile_bin in pairs:
+        for image_id in inputs.image_ids:
+            for severity in SEVERITIES:
+                for aggregation in AGGREGATIONS:
+                    key = (image_id, severity, "persistence")
+                    assert (
+                        inputs.scores[(*key, decile_bin, aggregation, "layer_2")]
+                        != inputs.scores[(*key, quintile_bin, aggregation, "layer_2")]
+                    ), (decile_bin, quintile_bin, image_id, severity, aggregation)
+
+    def gap(reference_bin, responsive_bin, image_id, severity):
+        key = (image_id, severity, "persistence")
+        return (
+            inputs.scores[(*key, responsive_bin, "mean", "layer_2")]
+            - inputs.scores[(*key, reference_bin, "mean", "layer_2")]
+        )
+
+    # the arms themselves, not just their inputs: a shared slope survives a level split
+    for image_id in inputs.image_ids:
+        for severity in SEVERITIES:
+            assert (
+                gap("decile_00_10", "decile_50_60", image_id, severity)
+                != gap("quintile_00_20", "quintile_40_60", image_id, severity)
+            ), (image_id, severity)
+
+
+def test_the_combined_scope_is_a_signed_z_score_not_an_offset_layer(tmp_path):
+    """`combined` is `(score - clean median) / scale` averaged over layers, so it is signed.
+
+    A fixture that writes `layer_2 + 0.5` gets the levels plausibly wrong in the one way that
+    hides itself: the offset cancels in `raw_gap` and in `clean_residual`, so arms 3 and 4 --
+    the same bucket pair read at the two scopes -- come out identical for two of their three
+    methods, and no default bundle ever emits a negative value. The loader's `COMBINED_SCOPE`
+    exemption and Task 2's exclusion of the symmetric relative gap at this scope are the two
+    places the design pays for `combined` being signed, and both would then be exercised only
+    by bespoke overrides.
+    """
+    inputs = load_contrast_inputs(
+        write_source_bundle(tmp_path / "source"), expected_image_count=6
+    )
+    combined = [value for key, value in inputs.scores.items() if key[5] == "combined"]
+    negative = [value for value in combined if value < 0.0]
+    assert negative, "the default bundle must exercise the signed scope"
+    assert len(negative) > len(combined) / 4
+    # ... while `layer_2` stays a distance, which the loader refuses to see go negative
+    assert min(value for key, value in inputs.scores.items() if key[5] == "layer_2") > 0.0
+
+    def score(scope, image_id, severity):
+        return inputs.scores[
+            (image_id, severity, "persistence", "decile_50_60", "mean", scope)
+        ]
+
+    offsets = {
+        round(score("combined", image_id, severity) - score("layer_2", image_id, severity), 6)
+        for image_id in inputs.image_ids
+        for severity in SEVERITIES
+    }
+    assert len(offsets) == len(inputs.image_ids) * len(SEVERITIES)
+
+    def gap(scope, image_id, severity):
+        key = (image_id, severity, "persistence")
+        return (
+            inputs.scores[(*key, "decile_50_60", "mean", scope)]
+            - inputs.scores[(*key, "decile_90_100", "mean", scope)]
+        )
+
+    # arms 3 and 4 are one bucket pair at two scopes; an offset makes their raw gaps identical
+    for image_id in inputs.image_ids:
+        for severity in SEVERITIES:
+            assert gap("layer_2", image_id, severity) != gap("combined", image_id, severity)
+
+
+def test_every_row_carries_the_trend_of_its_own_curve(tmp_path):
+    """The four trend columns are a derivation, and the fixture must not disagree with itself.
+
+    `corruption_reporting.summarize_candidates` computes them once per candidate and image with
+    `complete_trend_metrics` and repeats them on all six of that image's rows, so `direction` is
+    the sign of `signed_spearman` by construction, `absolute_spearman` is its magnitude, and a
+    curve that is not the full ladder comes back `None` rather than a number. Literal values
+    cannot hold that: `0.6 / 0.6 / "increasing"` on every row was wrong on every row, most
+    visibly on the confidence bins the fixture had otherwise been made to *fall*.
+
+    `load_contrast_inputs` never reads these columns, which is exactly why they need a test
+    here -- nothing else in this task can see them, and Tasks 3 through 9 read them as fact.
+    """
+    source = write_source_bundle(tmp_path / "source")
+    rows = read_rows(source)
+    curves = {}
+    for row in rows:
+        key = (row["signal"], row["confidence_bin"], row["score_scope"],
+               row["aggregation"], row["image_id"])
+        curves.setdefault(key, {})[int(row["severity"])] = float(row["score"])
+    for row in rows:
+        key = (row["signal"], row["confidence_bin"], row["score_scope"],
+               row["aggregation"], row["image_id"])
+        by_severity = curves[key]
+        severities = sorted(by_severity)
+        trend = complete_trend_metrics(severities, [by_severity[s] for s in severities])
+        assert row["fully_measured"] == str(trend["fully_measured"])
+        assert float(row["signed_spearman"]) == pytest.approx(trend["signed_spearman"])
+        assert float(row["absolute_spearman"]) == pytest.approx(trend["absolute_spearman"])
+        assert row["direction"] == trend["direction"]
+    # not one number repeated: the whole point is that candidates and images disagree
+    assert len({row["signed_spearman"] for row in rows}) > 10
+    # and the confidence bins rounds 2 and 3 were convened to make fall are recorded as falling
+    assert {
+        row["direction"] for row in rows
+        if row["signal"] == "confidence" and row["confidence_bin"] == "decile_00_10"
+    } >= {"decreasing"}
+
+
+def test_clean_overlap_is_one_where_the_producer_can_only_write_one(tmp_path):
+    """Two whole classes of row where `0.2` is not merely unlikely but impossible.
+
+    `corruption_analysis` sets `clean_filtered = memberships[0]["dynamic"]` and measures every
+    filtered row's Jaccard against it -- so a dynamic severity-zero row compares that partition
+    with itself and reads exactly `1.0`. Frozen membership *is* severity zero's bins at every
+    severity, so every frozen row reads `1.0` too. The completed run's table confirms both.
+
+    A fixture writing `0.2` there tells nine downstream tasks that severity zero moved, which is
+    the diagnostic this column exists to deny, and no assertion in this task's loader can see it.
+    """
+    source = write_source_bundle(tmp_path / "source")
+    rows = read_rows(source)
+    assert {row["clean_overlap"] for row in rows if row["severity"] == "0"} == {"1.0"}
+    corrupted = [float(row["clean_overlap"]) for row in rows if row["severity"] != "0"]
+    assert max(corrupted) < 1.0
+    for confidence_bin in ("decile_00_10", "decile_90_100", "quintile_40_60"):
+        series = [
+            float(row["clean_overlap"]) for severity in SEVERITIES for row in rows
+            if row["confidence_bin"] == confidence_bin and row["severity"] == str(severity)
+            and row["image_id"] == "1" and row["aggregation"] == "mean"
+            and row["signal"] == "confidence"
+        ]
+        assert all(later < earlier for earlier, later in zip(series, series[1:])), confidence_bin
+    # frozen membership is severity zero's by construction, at every severity
+    frozen = write_source_bundle(tmp_path / "frozen", membership_mode="frozen")
+    assert {row["clean_overlap"] for row in read_rows(frozen)} == {"1.0"}
+
+
+def test_a_quintile_bin_holds_twice_a_decile_bins_queries(tmp_path):
+    """`selected_count` is the only column recording how much evidence a bin was pooled over.
+
+    A quintile is two deciles wide. Writing one count for both makes the two resolutions
+    indistinguishable in the one place the difference between them is stated, and "pooled over
+    twice the queries" is the entire reason the coarser scheme is in the experiment.
+    """
+    rows = read_rows(write_source_bundle(tmp_path / "source"))
+    counts = {}
+    for row in rows:
+        counts.setdefault(row["bucket_scheme"], set()).add(row["selected_count"])
+    assert counts == {"decile": {"30"}, "quintile": {"60"}}
+
+
+def test_images_disagree_about_the_trend_so_no_candidate_sits_at_the_ceiling(tmp_path):
+    """A per-image *level* cancels in every gap method; only a per-image *slope* survives it.
+
+    `raw_gap` and `clean_residual` both subtract two bins of the same image, so a fixture whose
+    only per-image term is an offset produces one identical gap curve on all six images. Every
+    candidate then scores a macro AUROC of exactly 1.0, Task 6's redundancy comparisons are
+    decided by 1.0-versus-1.0 ties at the ceiling, and the paired bootstrap's interval collapses
+    to a point -- none of which fails anything, and all of which is meaningless.
+
+    The variation is deterministic: a six-entry tilt table read with `image_id % 6`. Nothing
+    here may reach for `random`, a clock or anything else whose value moves between two runs,
+    because a fixture that is not byte-identical run to run makes every failure below it
+    unreproducible.
+    """
+    inputs = load_contrast_inputs(
+        write_source_bundle(tmp_path / "source"), expected_image_count=6
+    )
+
+    def macro_auroc(scores_by_image_severity):
+        signed = [
+            complete_trend_metrics(
+                SEVERITIES, [scores_by_image_severity[(i, s)] for s in SEVERITIES]
+            )["signed_spearman"]
+            for i in inputs.image_ids
+        ]
+        orientation = choose_orientation(signed)
+        assert orientation is not None
+        assert len(set(signed)) > 1, signed
+        _, macro = severity_aurocs(
+            {s: [scores_by_image_severity[(i, s)] for i in inputs.image_ids]
+             for s in SEVERITIES},
+            orientation,
+        )
+        return macro
+
+    for arm in ARMS:
+        gap = {
+            (image_id, severity): (
+                inputs.scores[(image_id, severity, "persistence", arm.responsive_bin,
+                               "mean", arm.score_scope)]
+                - inputs.scores[(image_id, severity, "persistence", arm.reference_bin,
+                                 "mean", arm.score_scope)]
+            )
+            for image_id in inputs.image_ids for severity in SEVERITIES
+        }
+        assert macro_auroc(gap) < 1.0, arm.name
+
+    # the raw inputs a candidate is compared against, and the confidence twin, land below it too
+    for signal, scope in (("persistence", "layer_2"), ("confidence", "confidence")):
+        for confidence_bin in ("decile_00_10", "quintile_00_20", "quintile_40_60",
+                               "decile_50_60", "decile_90_100"):
+            raw = {
+                (image_id, severity):
+                    inputs.scores[(image_id, severity, signal, confidence_bin, "mean", scope)]
+                for image_id in inputs.image_ids for severity in SEVERITIES
+            }
+            assert macro_auroc(raw) < 1.0, (signal, confidence_bin)
+
+
 def test_discards_the_frozen_and_unfiltered_twins_a_real_bundle_carries(tmp_path):
     """A real bundle holds both membership modes and both padding modes for these very bins.
 
@@ -189,6 +506,8 @@ def test_discards_the_frozen_and_unfiltered_twins_a_real_bundle_carries(tmp_path
                         image_id=image_id, severity=severity, signal=signal,
                         bucket_scheme=scheme, confidence_bin=confidence_bin, score_scope=scope,
                         aggregation=aggregation, membership_mode="frozen", score=99.0,
+                        selected_count=SELECTED_COUNT[scheme],
+                        clean_overlap=clean_overlap_for(confidence_bin, severity, "frozen"),
                     ))
     for confidence_bin, scheme in (("decile_00_10", "decile"), ("quintile_00_20", "quintile")):
         for signal, scope in (("persistence", "layer_2"), ("confidence", "confidence")):
@@ -201,12 +520,14 @@ def test_discards_the_frozen_and_unfiltered_twins_a_real_bundle_carries(tmp_path
                                 bucket_scheme=scheme, confidence_bin=confidence_bin,
                                 score_scope=scope, aggregation=aggregation,
                                 membership_mode=mode, padding_mode="unfiltered", score=99.0,
+                                selected_count=SELECTED_COUNT[scheme],
+                                clean_overlap=clean_overlap_for(confidence_bin, severity, mode),
                             ))
 
     source = write_source_bundle(tmp_path / "source", extra_rows=twins)
     inputs = load_contrast_inputs(source, expected_image_count=6)
     assert len(inputs.scores) == RETAINED
-    assert inputs.scores[(1, 0, "persistence", "decile_50_60", "mean", "layer_2")] == 1.31
+    assert inputs.scores[(1, 0, "persistence", "decile_50_60", "mean", "layer_2")] == 0.067517
     assert 99.0 not in inputs.scores.values()
 
 
