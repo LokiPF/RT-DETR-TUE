@@ -37,6 +37,7 @@ from src.scene_uncertainty.contrast_analysis import (
 from src.scene_uncertainty.contrast_inputs import (
     AGGREGATIONS,
     ARMS,
+    REQUIRED_SERIES,
     ContrastInputError,
     load_contrast_inputs,
 )
@@ -613,6 +614,39 @@ def test_anchor_diagnostics_cover_every_arm_and_summary(tmp_path):
     )
 
 
+def test_every_diagnostic_names_a_series_the_loader_actually_read(tmp_path):
+    """`score_scope` has to be the scope the numbers beside it were measured at.
+
+    Checked on all 21 rows against `REQUIRED_SERIES` rather than by spot-reading one, because
+    the field is only *wrong* on the three confidence twins and only there. A twin's scope comes
+    from the signal plan, not from its arm -- confidence has no decoder layer -- so writing
+    `arm.score_scope` here labels all three `layer_2`, which is a scope the confidence signal
+    does not have at all. Every count, every key and every numeric assertion survives it: the
+    scores are still read at the right scope, only the label shipped beside them is wrong, and
+    Task 8 writes that label into `anchor_diagnostics.csv`.
+
+    `REQUIRED_SERIES` is the right yardstick because it is the loader's own list of what the arm
+    table needs, so a row naming a series outside it is naming something that was never loaded.
+    """
+    diagnostics = build_anchor_diagnostics(loaded(tmp_path))
+    required = set(REQUIRED_SERIES)
+    for row in diagnostics:
+        for side in ("reference_bin", "responsive_bin"):
+            assert (row["signal"], row[side], row["score_scope"]) in required, (
+                row["arm"], row["signal"], side, row["score_scope"]
+            )
+    # and said plainly for the three twins, which are the only rows that can be wrong here
+    twins = {
+        row["score_scope"] for row in diagnostics if row["signal"] == "confidence"
+    }
+    assert twins == {"confidence"}
+    scopes = {
+        (row["arm"], row["score_scope"])
+        for row in diagnostics if row["signal"] == "persistence"
+    }
+    assert scopes == {(arm.name, arm.score_scope) for arm in ARMS}
+
+
 def test_a_differential_arm_reports_its_anchor_failure_rather_than_hiding_it(tmp_path):
     diagnostics = build_anchor_diagnostics(loaded(tmp_path))
     row = next(
@@ -625,6 +659,49 @@ def test_a_differential_arm_reports_its_anchor_failure_rather_than_hiding_it(tmp
     assert row["arm_family"] == "differential"
     assert row["drift"]["by_severity"][5]["median_absolute_drift"] > 0.0
     assert row["spread"][5]["stability_to_spread"] is not None
+
+
+def test_the_published_stability_is_the_ratio_of_the_two_numbers_beside_it(tmp_path):
+    """`stability_to_spread` must be built from the drift this row publishes, not another.
+
+    `between_image_spread` divides a median absolute drift by the clean interquartile range, and
+    Task 3's tests pin that arithmetic against *that function's own* arguments. What is open is
+    Task 4's wiring: handing it `within_image_drift(responsives)` while the row publishes
+    `within_image_drift(references)` leaves every number finite, every key present and every
+    `is not None` assertion true, and only the value moves. On arm 1 it moves by a factor of 70,
+    because that arm pairs the flattest reference in the fixture (`decile_00_10`, -0.00006 a
+    step) with a responsive bin that climbs fifty times faster.
+
+    So the check is the identity rather than a bound: the published ratio has to equal the
+    published drift over the published clean spread. A pinned absolute sits beside it so that
+    changing both halves in step is caught too.
+    """
+    diagnostics = build_anchor_diagnostics(loaded(tmp_path))
+    for row in diagnostics:
+        drift, spread = row["drift"]["by_severity"], row["spread"]
+        clean_iqr = spread[0]["iqr"]
+        assert spread[0]["stability_to_spread"] is None  # severity zero has no ratio
+        for severity in range(1, SEVERITIES):
+            ratio = spread[severity]["stability_to_spread"]
+            if clean_iqr == 0.0:
+                assert ratio is None, (row["arm"], severity)
+            else:
+                assert ratio == pytest.approx(
+                    drift[severity]["median_absolute_drift"] / clean_iqr
+                ), (row["arm"], row["signal"], row["aggregation"], severity)
+
+    anchored = next(
+        row for row in diagnostics
+        if row["arm"] == "decile_00_10__50_60"
+        and row["signal"] == "persistence"
+        and row["aggregation"] == "mean"
+    )
+    # 0.0002115 of drift against 0.00926125 of clean spread: an anchor that holds still
+    assert anchored["spread"][2]["stability_to_spread"] == pytest.approx(0.022837, abs=1e-6)
+    assert anchored["spread"][0]["iqr"] == pytest.approx(0.00926125)
+    assert anchored["drift"]["by_severity"][2]["median_absolute_drift"] == pytest.approx(
+        0.0002115
+    )
 
 
 def test_the_diagnostics_measure_the_reference_and_not_the_responsive(tmp_path):

@@ -354,11 +354,17 @@ those phases were equal to their own `BIN_TREND_PHASE`, and that is *why* `quint
 Deranging the phase table is not negotiable, so both ratios had to be re-solved against the new
 phases, and the two came out differently.
 
-`quintile_00_20` moved 4.05 -> 4.00, and 4.00 is the unique minimum of the joint
-`|signed error| + |absolute error|` over the whole grid under every invariant below: 0.171
-against 0.285 for every neighbouring hundredth. It improves *both* metrics at once -- signed
--0.609 against -0.543 for the run's -0.600, and absolute 0.609 against 0.543 for the run's
-0.771 -- so there is no trade to weigh.
+`quintile_00_20` moved 4.05 -> 4.00, the unique minimum of the joint
+`|signed error| + |absolute error|` **among the ratios that satisfy every invariant below**.
+It improves *both* metrics at once -- signed -0.609 against -0.543 for the run's -0.600, and
+absolute 0.609 against 0.543 for the run's 0.771 -- so there is no trade to weigh, and every
+valid neighbouring hundredth scores 0.285 against its 0.171.
+
+A reader spot-checking the grid will find 3.96 through 3.99 tying that 0.171, and they are
+excluded rather than missed: all four collapse the bin to **four** distinct per-image strengths.
+That is the same invariant that keeps `decile_50_60` at 1.45 below, doing the same work on the
+other bin -- which is the reason it is stated as an invariant here rather than left as a
+property that happened to hold.
 
 `decile_50_60` stayed at 1.45, and its per-metric optimum was declined rather than missed. 1.20
 gives -0.477 signed and 0.886 absolute, both nearer the run's -0.514 and 0.829 than 1.45's
