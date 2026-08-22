@@ -1,25 +1,32 @@
 """What the three controls, the paired bootstrap and the deployment ranking are held to.
 
-Two fixtures do most of the work here and they answer different questions.
+Three fixtures do most of the work here and each answers a question the others cannot.
 
 `prepared` builds the shared six-image bundle every task from 3 onwards reads, and is what says
 the controls survive contact with the real arm table: 21 reference controls, 45 persistence
-candidates, 36 confidence twins, and a redundancy verdict that comes out both ways. What it
-*cannot* say anything about is which series a lookup matched, because
-`contrast_test_utils.default_score` ignores its `aggregation` argument -- so all three summaries
-of one bin are byte-identical and a control matched to the wrong summary reads exactly like one
-matched to the right one.
+candidates, 36 confidence twins, four arms with four different reference controls, and a
+redundancy verdict that comes out both ways. What it *cannot* say anything about is which
+*summary* a lookup matched, because `contrast_test_utils.default_score` ignores its `aggregation`
+argument -- so all three summaries of one bin are byte-identical and a control matched to the
+wrong summary reads exactly like one matched to the right one.
 
 `matched_rows` is the fixture for that. It is one arm and its twin at two summaries and two
 methods, with twelve pairwise-distinct macro AUROCs by construction, so every one of the four
 attached comparisons can only be satisfied by the series it names. It uses the `combined`
-differential arm on purpose, because that is the one arm whose name is not its pair name.
+differential arm on purpose, because that is the one arm whose name is not its pair name. What
+*it* cannot bind is the arm dimension, having only one persistence arm -- which is why the
+reference control's arm is bound on `prepared` instead.
 
-Neither fixture is asked for a number that moves with the roster. The margins between a
-candidate and its twin shrink as images are added -- nine confidence candidates sit below chance
-at six images and drift towards it at 250 -- so what is pinned here is either an exact
-hand-computable value on a hand-built curve, an identity between two things the code computes
-separately, or the *side* of a comparison.
+`unmeasured_rows` is the third, and it exists because neither of the other two contains a single
+missing measurement. In production a candidate loses its AUROC only by being unorientable, and
+the shared bundle has no unorientable candidate, so the whole `None`-handling half of
+`attach_controls` would otherwise run on no input the suite ever builds.
+
+No fixture is asked for a number that moves with the roster. The margins between a candidate and
+its twin shrink as images are added -- nine confidence candidates sit below chance at six images
+and drift towards it at 250 -- so what is pinned here is either an exact hand-computable value on
+a hand-built curve, an identity between two things the code computes separately, or the *side* of
+a comparison.
 """
 import pytest
 
@@ -30,6 +37,7 @@ from src.scene_uncertainty.contrast_analysis import (
     summarize_contrast_candidates,
 )
 from src.scene_uncertainty.contrast_controls import (
+    ARM_NAMES,
     BOOTSTRAP_SAMPLES,
     BOOTSTRAP_SEED,
     REFERENCE_CONTROL_METHOD,
@@ -41,7 +49,12 @@ from src.scene_uncertainty.contrast_controls import (
     rank_contrast_candidates,
     reference_control_rows,
 )
-from src.scene_uncertainty.contrast_inputs import FULL_TUNING_IMAGE_COUNT, load_contrast_inputs
+from src.scene_uncertainty.contrast_inputs import (
+    AGGREGATIONS,
+    ARMS,
+    FULL_TUNING_IMAGE_COUNT,
+    load_contrast_inputs,
+)
 from src.scene_uncertainty.contrast_scores import SCORE_METHODS
 from src.scene_uncertainty.corruption_metrics import severity_aurocs
 
@@ -67,7 +80,7 @@ CONTROL_FIELDS = (
     "reference_control_macro_difference", "reference_control_auroc_difference_by_severity",
     "twin_macro_difference", "twin_auroc_difference_by_severity",
     "beats_both_inputs", "confidence_redundant",
-    "responsive_control_bootstrap", "twin_bootstrap",
+    "responsive_control_bootstrap", "reference_control_bootstrap", "twin_bootstrap",
 )
 """Every field `attach_controls` writes. Task 8 projects exactly these into the CSV and JSON.
 
@@ -226,6 +239,76 @@ def keyed(items):
     }
 
 
+# --- every way a comparison can be missing, in one fixture -----------------------------------
+
+UNMEASURED_IMAGES = 4
+
+UNMEASURED_PLAN = (
+    # (arm, signal, method, score slope, reference-column slope); a slope of 0.0 is a flat
+    # curve, which `choose_orientation` refuses to orient and which therefore produces no AUROC
+    ("decile_00_10__50_60", "persistence", "raw_responsive", 1.0, 2.0),
+    ("decile_00_10__50_60", "persistence", "raw_gap", 0.0, 2.0),        # unorientable candidate
+    ("decile_00_10__50_60", "persistence", "relative_gap", 0.7, 2.0),   # its twin is flat
+    ("decile_00_10__50_60", "persistence", "clean_residual", 0.4, 2.0),  # it has no twin at all
+    ("decile_00_10__50_60", "confidence", "raw_responsive", -1.0, -2.0),
+    ("decile_00_10__50_60", "confidence", "raw_gap", -0.6, -2.0),
+    ("decile_00_10__50_60", "confidence", "relative_gap", 0.0, -2.0),   # unorientable twin
+    # no confidence `clean_residual`: that arm's residual candidate has no twin object
+    ("quintile_00_20__40_60", "persistence", "raw_responsive", 1.0, 0.0),  # flat reference column
+    ("quintile_00_20__40_60", "persistence", "raw_gap", 0.8, 0.0),
+    ("quintile_00_20__40_60", "confidence", "raw_responsive", -1.0, -0.9),
+    ("quintile_00_20__40_60", "confidence", "raw_gap", -0.5, -0.9),
+    # no persistence `raw_responsive`: this arm has neither a responsive nor a reference control
+    ("decile_90_100__50_60", "persistence", "raw_gap", 0.9, 1.5),
+    ("decile_90_100__50_60", "confidence", "raw_gap", -0.7, 1.5),
+    ("decile_90_100__50_60__combined", "persistence", "raw_responsive", 0.0, 1.5),
+    ("decile_90_100__50_60__combined", "persistence", "raw_gap", 0.6, 1.5),
+)
+"""Nine persistence candidates covering every absent-measurement state `attach_controls` can meet.
+
+The shared bundle cannot produce any of them. `contrast_inputs` refuses a roster mismatch and
+`contrast_analysis._curve` builds every image at every severity or raises, so in production the
+only way a candidate loses its AUROC is by being unorientable -- and the shared fixture has no
+unorientable candidate either. Without this fixture the whole `None`-handling half of
+`attach_controls` is code that runs on no input the suite ever builds, and nine separate mutants
+of it survive: a missing control published as `0.0`, a missing bootstrap field left absent
+instead of `None`, and every guard that produces them.
+
+Every slope is distinct so no two series score the same, and the flat ones are exactly the four
+states that matter: an unorientable candidate, an unorientable twin, an unorientable reference
+control and an unorientable responsive control.
+"""
+
+
+def unmeasured_rows():
+    return [
+        {
+            "image_id": image_id, "severity": severity, "arm": arm,
+            "signal": signal, "aggregation": "mean", "method": method,
+            "arm_family": "anchored", "declared_before_data": True,
+            "score_scope": "layer_2", "reference_bin": "decile_00_10",
+            "responsive_bin": "decile_50_60",
+            "reference": 20.0 + image_id + reference_slope * severity,
+            "responsive": float(image_id) + severity,
+            "score": image_id + slope * severity,
+            "fold": image_id % 5, "fit_slope": None, "fit_offset": None,
+        }
+        for arm, signal, method, slope, reference_slope in UNMEASURED_PLAN
+        for image_id in range(1, UNMEASURED_IMAGES + 1)
+        for severity in range(6)
+    ]
+
+
+def unmeasured():
+    rows = unmeasured_rows()
+    candidates = summarize_contrast_candidates(rows, expected_image_count=UNMEASURED_IMAGES)
+    controls = summarize_contrast_candidates(
+        reference_control_rows(rows), expected_image_count=UNMEASURED_IMAGES
+    )
+    attach_controls(candidates, controls, rows, samples=FAST_SAMPLES)
+    return keyed(candidates), controls
+
+
 def curve(rate, *, images, level=0.0):
     """`{image: {severity: level + image + rate * severity}}` for the bootstrap fixtures."""
     return {
@@ -243,12 +326,18 @@ def test_the_seed_and_sample_count_are_the_declared_ones():
 
 
 def test_the_reference_control_is_not_one_of_the_declared_score_methods():
-    """The spec calls it a reported control that does not change the count of four methods."""
+    """The spec calls it a reported control that does not change the count of four methods.
+
+    Being outside that set is also the whole of how the ranking gate excludes it, so this is not
+    a naming convention -- it is the exclusion.
+    """
     assert REFERENCE_CONTROL_METHOD == "raw_reference"
     assert REFERENCE_CONTROL_METHOD not in SCORE_METHODS
     assert contrast_controls.RESPONSIVE_CONTROL_METHOD == "raw_responsive"
     assert contrast_controls.RESPONSIVE_CONTROL_METHOD in SCORE_METHODS
     assert len(SCORE_METHODS) == 4
+    assert ARM_NAMES == {arm.name for arm in ARMS} and len(ARM_NAMES) == 4
+    assert AGGREGATIONS == ("mean", "q90", "top20_mean")
 
 
 # --- the raw reference control ----------------------------------------------------------------
@@ -267,12 +356,16 @@ def test_a_reference_control_exists_for_every_arm_summary_and_signal(tmp_path):
 def test_the_reference_control_scores_the_reference_range_itself(tmp_path):
     rows, _ = build_contrast_rows(loaded(tmp_path))
     control_rows = reference_control_rows(rows)
-    assert len(control_rows) == len(
-        [row for row in rows if row["method"] == "raw_responsive"]
-    )
-    for row in control_rows:
-        assert row["score"] == row["reference"]
-        assert row["method"] == "raw_reference"
+    source = [row for row in rows if row["method"] == "raw_responsive"]
+    assert len(control_rows) == len(source)
+    # exactly two columns rewritten and every other one carried through untouched, so a control
+    # row still says which two ranges it came from -- `reference` *and* `responsive`, and the
+    # second of those is what a comparison against `row["reference"]` alone cannot see
+    for control, row in zip(control_rows, source):
+        assert control == {**row, "method": "raw_reference", "score": row["reference"]}
+        assert control["score"] == control["reference"]
+        assert control["method"] == "raw_reference"
+    assert any(row["reference"] != row["responsive"] for row in source)
     # one copy of each series and not four: four methods share one reference column, and four
     # copies would collide on the row key rather than quadruple the control
     assert {row["method"] for row in rows} == set(SCORE_METHODS)
@@ -434,8 +527,40 @@ def test_a_responsive_control_that_runs_the_other_way_keeps_its_own_direction():
     )
 
 
+def test_the_reference_control_gets_an_interval_read_in_its_own_direction():
+    """The spec's amended controls section: both inputs get an interval, not only the responsive.
+
+    The reference column of this fixture falls at every summary while the candidate rises, so the
+    two lock opposite directions and a bootstrap that reused the candidate's would report a
+    mirrored control.
+    """
+    candidates, controls, _ = matched()
+    candidate = keyed(candidates)[(MATCHED_ARM, "persistence", "mean", "raw_gap")]
+    reference = next(
+        item for item in controls
+        if item["arm"] == MATCHED_ARM and item["signal"] == "persistence"
+        and item["aggregation"] == "mean"
+    )
+    assert candidate["orientation"] == 1
+    assert reference["orientation"] == -1
+    bootstrap = candidate["reference_control_bootstrap"]
+    assert sorted(bootstrap) == ["high", "low", "macro_difference", "samples", "seed", "verdict"]
+    assert bootstrap["seed"] == 20260821
+    assert bootstrap["macro_difference"] == pytest.approx(
+        candidate["macro_auroc"] - reference["macro_auroc"]
+    )
+    assert bootstrap["macro_difference"] != pytest.approx(
+        candidate["macro_auroc"] - (1.0 - reference["macro_auroc"])
+    )
+    # the candidate loses to this reference range, and the interval says so rather than being
+    # a bare point estimate on the arm where a point estimate is least trustworthy
+    assert bootstrap["macro_difference"] < 0
+    assert bootstrap["verdict"] == "not supported on tuning"
+    assert bootstrap["low"] <= bootstrap["macro_difference"] <= bootstrap["high"]
+
+
 def test_every_bootstrap_point_estimate_is_the_pair_of_macro_aurocs_it_reports(tmp_path):
-    """Across all 45 candidates: the resampled statistic and the summariser agree unresampled.
+    """Across all 45 candidates and all three comparisons: 135 intervals, 135 agreements.
 
     Two independent implementations of the same AUROC -- `severity_aurocs` over the candidate's
     own scores and `_macro_from_draws` over an identity draw -- so a tie rule, an orientation or
@@ -446,7 +571,7 @@ def test_every_bootstrap_point_estimate_is_the_pair_of_macro_aurocs_it_reports(t
     for candidate in candidates:
         if candidate["signal"] != "persistence":
             continue
-        for label in ("responsive_control", "twin"):
+        for label in ("responsive_control", "reference_control", "twin"):
             bootstrap = candidate[f"{label}_bootstrap"]
             assert bootstrap["macro_difference"] == pytest.approx(
                 candidate[f"{label}_macro_difference"]
@@ -455,7 +580,7 @@ def test_every_bootstrap_point_estimate_is_the_pair_of_macro_aurocs_it_reports(t
             assert bootstrap["samples"] == FAST_SAMPLES
             assert bootstrap["low"] <= bootstrap["high"]
             checked += 1
-    assert checked == 90
+    assert checked == 135
 
 
 def test_a_candidate_that_only_restates_confidence_is_flagged_redundant(tmp_path):
@@ -565,6 +690,53 @@ def test_the_per_severity_differences_are_the_two_aurocs_subtracted():
     })
 
 
+def test_each_arm_is_matched_to_its_own_reference_control(tmp_path):
+    """The arm dimension of the reference control lookup, on the four-arm bundle.
+
+    `matched` cannot bind this -- it has one persistence arm, so "this arm's control" and "any
+    arm's control" are the same object there. Dropping `arm` from the lookup key hands one arm's
+    reference macro to all four, which at 250 images changes the published number for 33 of the
+    45 candidates and flips `beats_both_inputs` for six of them.
+    """
+    candidates, controls, _ = prepared(tmp_path)
+    control_by_key = {
+        (item["arm"], item["signal"], item["aggregation"]): item for item in controls
+    }
+    by_arm = {}
+    checked = 0
+    for candidate in candidates:
+        if candidate["signal"] != "persistence":
+            continue
+        key = (candidate["arm"], "persistence", candidate["aggregation"])
+        assert candidate["reference_control_macro_auroc"] == control_by_key[key]["macro_auroc"]
+        assert candidate["responsive_control_macro_auroc"] == keyed(candidates)[
+            (candidate["arm"], "persistence", candidate["aggregation"], "raw_responsive")
+        ]["macro_auroc"]
+        by_arm[candidate["arm"]] = candidate["reference_control_macro_auroc"]
+        checked += 1
+    assert checked == 45
+    # four arms, four different reference controls: an arm-blind lookup cannot satisfy the above
+    assert set(by_arm) == {arm.name for arm in ARMS}
+    assert len(set(by_arm.values())) == 4
+
+
+def test_the_twin_severity_aurocs_are_a_copy_and_not_the_twin_own_dictionary(tmp_path):
+    """Both differential arms read one twin, so a shared dictionary would propagate twice."""
+    candidates, _, _ = prepared(tmp_path)
+    by_key = keyed(candidates)
+    twin = by_key[("decile_90_100__50_60", "confidence", "mean", "raw_gap")]
+    layer = by_key[("decile_90_100__50_60", "persistence", "mean", "raw_gap")]
+    combined = by_key[("decile_90_100__50_60__combined", "persistence", "mean", "raw_gap")]
+    for candidate in (layer, combined):
+        assert candidate["twin_auroc_by_severity"] == twin["auroc_by_severity"]
+        assert candidate["twin_auroc_by_severity"] is not twin["auroc_by_severity"]
+    assert layer["twin_auroc_by_severity"] is not combined["twin_auroc_by_severity"]
+    before = dict(twin["auroc_by_severity"])
+    layer["twin_auroc_by_severity"][1] = -1.0
+    assert twin["auroc_by_severity"] == before
+    assert combined["twin_auroc_by_severity"] == before
+
+
 def test_a_raw_responsive_candidate_is_its_own_responsive_control(tmp_path):
     """Matched on arm and summary, so the one method that *is* the control ties with itself."""
     candidates, _, _ = prepared(tmp_path)
@@ -589,6 +761,119 @@ def test_a_confidence_twin_is_given_no_controls_of_its_own(tmp_path):
     assert len(twins) == 36
     for twin in twins:
         assert not [field for field in CONTROL_FIELDS if field in twin]
+
+
+def test_every_candidate_in_the_unmeasured_fixture_carries_all_control_fields():
+    """Seventeen fields on every persistence candidate, measured or not.
+
+    `CONTROL_FIELDS` is what Task 8 projects into `candidate_metrics.csv` and `summary.json`, so
+    a field that is *absent* rather than `None` is a column that silently disappears for exactly
+    the rows a reader most needs to see it on.
+    """
+    candidates, _ = unmeasured()
+    persistence = [
+        candidate for candidate in candidates.values()
+        if candidate["signal"] == "persistence"
+    ]
+    assert len(persistence) == 9
+    for candidate in persistence:
+        assert not [field for field in CONTROL_FIELDS if field not in candidate]
+    # the fixture is only worth running if it really contains unmeasured candidates
+    assert sum(1 for item in persistence if item["macro_auroc"] is None) == 2
+
+
+def test_an_unorientable_candidate_keeps_its_controls_and_withholds_every_comparison():
+    """The one way a candidate loses its AUROC in this pipeline, carried all the way through.
+
+    Its three counterparts are all perfectly well measured, so every `None` below is the
+    candidate's own missing AUROC and not a missing control -- and both flags fall to the
+    defaults their own docstrings promise rather than to whatever a comparison with `None`
+    would have produced.
+    """
+    candidates, _ = unmeasured()
+    candidate = candidates[("decile_00_10__50_60", "persistence", "mean", "raw_gap")]
+    assert candidate["orientation"] is None
+    assert candidate["macro_auroc"] is None
+    assert candidate["auroc_by_severity"] is None
+    # the three counterparts are measured, so nothing below is about them
+    assert candidate["responsive_control_macro_auroc"] is not None
+    assert candidate["reference_control_macro_auroc"] is not None
+    assert candidate["twin_macro_auroc"] is not None
+    assert candidate["twin_arm"] == "decile_00_10__50_60"
+    for label in ("responsive_control", "reference_control", "twin"):
+        assert candidate[f"{label}_macro_difference"] is None
+        assert candidate[f"{label}_auroc_difference_by_severity"] is None
+        assert candidate[f"{label}_bootstrap"] is None
+    assert candidate["beats_both_inputs"] is False
+    assert candidate["confidence_redundant"] is True
+
+
+@pytest.mark.parametrize(
+    "arm, method, withheld",
+    [
+        ("decile_00_10__50_60", "relative_gap", "twin"),
+        ("quintile_00_20__40_60", "raw_gap", "reference_control"),
+        ("decile_90_100__50_60__combined", "raw_gap", "responsive_control"),
+    ],
+)
+def test_an_unorientable_control_withholds_only_its_own_comparison(arm, method, withheld):
+    """One counterpart of the three is flat; the candidate and the other two are not."""
+    candidates, _ = unmeasured()
+    candidate = candidates[(arm, "persistence", "mean", method)]
+    assert candidate["macro_auroc"] is not None
+    macro = {
+        "responsive_control": "responsive_control_macro_auroc",
+        "reference_control": "reference_control_macro_auroc",
+        "twin": "twin_macro_auroc",
+    }
+    assert candidate[macro[withheld]] is None
+    assert candidate[f"{withheld}_macro_difference"] is None
+    assert candidate[f"{withheld}_auroc_difference_by_severity"] is None
+    assert candidate[f"{withheld}_bootstrap"] is None
+    for label in set(macro) - {withheld}:
+        assert candidate[macro[label]] is not None
+        assert candidate[f"{label}_macro_difference"] is not None
+        assert candidate[f"{label}_auroc_difference_by_severity"] is not None
+        assert candidate[f"{label}_bootstrap"] is not None
+
+
+def test_a_control_or_twin_that_does_not_exist_is_absent_and_never_zero():
+    """A missing comparison must not publish `0.0`, which reads as a measured chance-level AUROC.
+
+    Worse than merely wrong: `0.0` is *below* every real AUROC, so a candidate would show a large
+    positive difference against a control that does not exist, and `beats_both_inputs` would then
+    report that it beat an input nobody measured.
+    """
+    candidates, controls = unmeasured()
+    control_keys = {(item["arm"], item["signal"], item["aggregation"]) for item in controls}
+
+    # the residual candidate's arm has no confidence residual, so it has no twin object at all
+    orphan = candidates[("decile_00_10__50_60", "persistence", "mean", "clean_residual")]
+    assert ("decile_00_10__50_60", "confidence", "mean", "clean_residual") not in candidates
+    assert orphan["macro_auroc"] is not None
+    assert orphan["twin_arm"] == "decile_00_10__50_60"  # still says which twin was looked for
+    assert orphan["twin_macro_auroc"] is None
+    assert orphan["twin_auroc_by_severity"] is None
+    assert orphan["twin_orientation"] is None
+    assert orphan["twin_macro_difference"] is None
+    assert orphan["twin_bootstrap"] is None
+    assert orphan["confidence_redundant"] is True
+
+    # this arm has no persistence `raw_responsive` rows, so it has neither input control
+    stranded = candidates[("decile_90_100__50_60", "persistence", "mean", "raw_gap")]
+    assert ("decile_90_100__50_60", "persistence", "mean", "raw_responsive") not in candidates
+    assert ("decile_90_100__50_60", "persistence", "mean") not in control_keys
+    assert stranded["macro_auroc"] is not None
+    assert stranded["responsive_control_macro_auroc"] is None
+    assert stranded["reference_control_macro_auroc"] is None
+    assert stranded["responsive_control_macro_difference"] is None
+    assert stranded["reference_control_macro_difference"] is None
+    assert stranded["responsive_control_bootstrap"] is None
+    assert stranded["reference_control_bootstrap"] is None
+    assert stranded["beats_both_inputs"] is False
+    # and its twin, which does exist, is untouched by either absence
+    assert stranded["twin_macro_difference"] is not None
+    assert stranded["twin_bootstrap"] is not None
 
 
 def test_beating_one_input_while_losing_to_the_other_is_not_beating_both():
@@ -719,6 +1004,27 @@ def test_the_paired_bootstrap_resamples_the_roster_it_was_given_and_no_other():
     assert narrow["macro_difference"] != paired_macro_bootstrap(
         everything, candidate, control, **keywords
     )["macro_difference"]
+
+
+def test_the_paired_bootstrap_sorts_the_roster_before_it_draws_from_it():
+    """Two callers holding the same images in different orders must get the same interval.
+
+    The draws are positions into the roster, so an unsorted roster pairs draw *k* with a
+    different image and moves the interval -- to (0.047994, 0.081300) on the shuffle below,
+    against the (0.047238, 0.079019) the sorted roster gives. The point estimate survives,
+    because reordering both methods' columns together cannot change a rank statistic; only the
+    resampling notices, which is why this needs its own test beside the determinism one.
+    """
+    images = list(range(1, 21))
+    shuffled = images[10:] + images[:10]
+    assert shuffled != images and sorted(shuffled) == images
+    candidate = curve(1.0, images=images)
+    control = curve(0.5, images=images)
+    keywords = dict(candidate_orientation=1, control_orientation=1, samples=200)
+    assert (
+        paired_macro_bootstrap(shuffled, candidate, control, **keywords)
+        == paired_macro_bootstrap(images, candidate, control, **keywords)
+    )
 
 
 def test_the_paired_bootstrap_point_estimate_is_the_two_macro_aurocs_difference():
@@ -931,24 +1237,54 @@ def test_ranking_falls_through_to_spearman_then_direction_then_consistency():
 
 
 def test_ranking_ends_with_a_deterministic_arm_summary_and_method_order():
-    """Arm, then summary, then method, ascending -- and in that order, not any other."""
-    later_arm = stub(arm="b_arm", aggregation="a_summary", method="a_method")
-    earlier_arm = stub(arm="a_arm", aggregation="b_summary", method="b_method")
+    """Arm, then summary, then method, ascending -- and in that order, not any other.
+
+    Declared names throughout, because the eligibility gate refuses anything outside the three
+    closed sets. Each pair is arranged so that reading the three fields in any other order, or in
+    the other direction, reverses it: the arm that sorts first carries the summary and the method
+    that sort last.
+    """
+    later_arm = stub(arm="decile_90_100__50_60", aggregation="mean", method="clean_residual")
+    earlier_arm = stub(arm="decile_00_10__50_60", aggregation="q90", method="raw_gap")
     assert [item["arm"] for item in rank_contrast_candidates([later_arm, earlier_arm])] == [
-        "a_arm", "b_arm"
+        "decile_00_10__50_60", "decile_90_100__50_60"
     ]
-    later_summary = stub(arm="one", aggregation="b_summary", method="a_method")
-    earlier_summary = stub(arm="one", aggregation="a_summary", method="b_method")
+    later_summary = stub(aggregation="q90", method="clean_residual")
+    earlier_summary = stub(aggregation="mean", method="raw_gap")
     assert [
         item["aggregation"] for item in rank_contrast_candidates(
             [later_summary, earlier_summary]
         )
-    ] == ["a_summary", "b_summary"]
-    later_method = stub(arm="one", aggregation="one", method="b_method")
-    earlier_method = stub(arm="one", aggregation="one", method="a_method")
+    ] == ["mean", "q90"]
+    later_method = stub(method="raw_gap")
+    earlier_method = stub(method="clean_residual")
     assert [
         item["method"] for item in rank_contrast_candidates([later_method, earlier_method])
-    ] == ["a_method", "b_method"]
+    ] == ["clean_residual", "raw_gap"]
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("arm", "decile_30_40__50_60"),   # a bucket pair no arm declares
+        ("aggregation", "median"),        # a fourth summary
+        ("method", "log_ratio"),          # a fifth score method
+        ("method", "raw_reference"),      # and the reference control, by the same clause
+    ],
+)
+def test_a_candidate_outside_the_three_closed_sets_is_not_deployable(field, value):
+    """Three of the spec's seven eligibility items, and the only thing excluding the control.
+
+    `rank_contrast_candidates` takes a list of dictionaries rather than one pipeline stage's
+    output, so "one of the four declared arms, one of the three matched summaries, one of the
+    four declared score methods" are checks and not restatements of what the caller must already
+    have got right.
+    """
+    outsider = stub(**{field: value})
+    assert value not in ARM_NAMES | set(AGGREGATIONS) | set(SCORE_METHODS)
+    assert rank_contrast_candidates([outsider]) == []
+    assert outsider["deployable"] is False
+    assert rank_contrast_candidates([stub()]) != []  # and the same stub without the change ranks
 
 
 def test_confidence_twins_and_reference_controls_are_never_ranked():

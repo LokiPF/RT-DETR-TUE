@@ -26,7 +26,13 @@ import numpy as np
 from scipy.stats import rankdata
 
 from .contrast_analysis import CONTRAST_CANDIDATE_KEY, DEPLOYABLE_SIGNAL
-from .contrast_inputs import ARMS, CONFIDENCE_SIGNAL, FULL_TUNING_IMAGE_COUNT
+from .contrast_inputs import (
+    AGGREGATIONS,
+    ARMS,
+    CONFIDENCE_SIGNAL,
+    FULL_TUNING_IMAGE_COUNT,
+)
+from .contrast_scores import SCORE_METHODS
 from .corruption_metrics import EXPECTED_SEVERITIES
 
 BOOTSTRAP_SEED = 20260821
@@ -57,7 +63,12 @@ REFERENCE_CONTROL_METHOD = "raw_reference"
 Deliberately *not* one of `contrast_scores.SCORE_METHODS`. The spec calls the reference range "a
 reported control, not a ranked candidate: it adds no rows to the candidate list and does not
 change the count of four declared score methods", and a label collision with a real method is
-exactly how it would acquire both. `rank_contrast_candidates` excludes it by name.
+exactly how it would acquire both.
+
+Being outside that set is also the *whole* of how `rank_contrast_candidates` excludes it. There
+is no second clause naming this constant at the gate, because the spec's eligibility list already
+says "one of the four declared score methods" and a control that is not one of them is refused by
+that line. Two clauses saying the same thing would leave a reader unsure which was load-bearing.
 """
 
 RESPONSIVE_CONTROL_METHOD = "raw_responsive"
@@ -74,6 +85,13 @@ CORRUPTED_SEVERITIES = EXPECTED_SEVERITIES[1:]
 """Severities 1 through 5. Severity 0 is the clean group of all five comparisons, never a
 comparison of its own, and slicing the declared ladder is what keeps that true if the ladder
 ever changes length.
+"""
+
+ARM_NAMES = frozenset(arm.name for arm in ARMS)
+"""The four declared arm names, for the eligibility gate's closed-set check.
+
+Derived from the arm table rather than listed, so adding a fifth arm cannot leave the gate
+refusing it.
 """
 
 _PAIR_BY_ARM = {arm.name: arm.pair_name for arm in ARMS}
@@ -140,8 +158,8 @@ def _macro_from_draws(
     """Macro AUROC for every bootstrap draw at once.
 
     Ranked in batch with `rankdata(..., axis=1)` rather than one draw at a time. The paired
-    bootstrap needs 2,000 draws for each of 45 candidates against each of two controls, and a
-    per-draw loop turns a half-minute report into a quarter-hour one. `method="average"` is the
+    bootstrap needs 2,000 draws for each of 45 candidates against each of three counterparts, and
+    a per-draw loop turns a minute-long report into a quarter-hour one. `method="average"` is the
     same tie handling `corruption_metrics.binary_auroc` uses, so a bootstrap median and the
     point estimate cannot disagree about what a tie is worth -- and a resampled image list draws
     duplicates by construction, so ties are the common case here rather than the exotic one.
@@ -329,15 +347,22 @@ def attach_controls(
     share one. Their persistence numbers differ; their twin does not, and that is correct --
     there is only one confidence measurement of that bucket pair to be redundant with.
 
-    Two bootstraps per candidate and not three. The spec asks for an interval on the responsive
-    control comparison and on the twin comparison, and reports the reference control as a
-    difference in macro and in all five severity AUROCs. The reference range's curves are also
-    not in `rows` -- they are `reference_control_rows`' own output -- so an interval against them
-    would need a second index built here, at a third of the run's bootstrap cost, for a number
-    no output consumes.
+    Three bootstraps per candidate: the responsive control, the reference control and the twin.
+    The spec's anchored success criterion asks for a contrast that beats *both* of its inputs and
+    whose macro improvement survives resampling, and with an interval on only one of the two that
+    criterion is not checkable as written. It is also the reference comparison that most needs
+    one, because on a differential arm the reference is a second responsive range rather than an
+    anchor -- which is exactly where a bare point estimate is least trustworthy.
+
+    The reference range's curves are not in `rows`, so they are re-derived here from
+    `reference_control_rows`. Re-derived rather than taken as a fourth argument: the caller
+    already built `controls` from that same pure function over these same rows, so the two cannot
+    disagree, and widening the signature would let a caller hand over control summaries and
+    control curves that describe different rows.
     """
     indexed = _by_key(candidates)
     curves = index_curves(rows)
+    reference_curves = index_curves(reference_control_rows(rows))
     control_index = {
         (item["arm"], item["signal"], item["aggregation"]): item for item in controls
     }
@@ -356,7 +381,10 @@ def attach_controls(
 
         candidate["twin_arm"] = twin_arm
         candidate["twin_macro_auroc"] = twin["macro_auroc"] if twin else None
-        candidate["twin_auroc_by_severity"] = twin["auroc_by_severity"] if twin else None
+        twin_severities = twin["auroc_by_severity"] if twin else None
+        candidate["twin_auroc_by_severity"] = (
+            dict(twin_severities) if twin_severities is not None else None
+        )
         candidate["twin_orientation"] = twin["orientation"] if twin else None
         candidate["responsive_control_macro_auroc"] = (
             responsive["macro_auroc"] if responsive else None
@@ -387,6 +415,7 @@ def attach_controls(
         candidate["confidence_redundant"] = is_confidence_redundant(candidate)
 
         candidate["responsive_control_bootstrap"] = None
+        candidate["reference_control_bootstrap"] = None
         candidate["twin_bootstrap"] = None
         if candidate["macro_auroc"] is None:
             continue
@@ -398,6 +427,16 @@ def attach_controls(
                 curves[(arm, DEPLOYABLE_SIGNAL, aggregation, RESPONSIVE_CONTROL_METHOD)],
                 candidate_orientation=candidate["orientation"],
                 control_orientation=responsive["orientation"],
+                samples=samples,
+            )
+        if reference is not None and reference["macro_auroc"] is not None:
+            candidate["reference_control_bootstrap"] = paired_macro_bootstrap(
+                image_ids, own,
+                reference_curves[
+                    (arm, DEPLOYABLE_SIGNAL, aggregation, REFERENCE_CONTROL_METHOD)
+                ],
+                candidate_orientation=candidate["orientation"],
+                control_orientation=reference["orientation"],
                 samples=samples,
             )
         if twin is not None and twin["macro_auroc"] is not None:
@@ -445,12 +484,22 @@ def rank_contrast_candidates(candidates: list[dict]) -> list[dict]:
     controls, and they are excluded because a control that can win the comparison it exists to
     lose is not a control.
 
-    `complete` is checked beside `macro_auroc is not None` even though the summariser withholds
-    the AUROC from any candidate that is not complete, so on a candidate that came from
-    `summarize_contrast_candidates` the first clause never fires alone. It is kept because this
-    function takes dictionaries rather than a pipeline stage's output, and "all 250 images and
-    all six severities" is the first line of the spec's eligibility list -- a reader checking the
-    list against the code should find it, not have to derive it.
+    The gate below is the spec's seven-item eligibility list, one clause per item and in its
+    order, and it is written out even where a clause cannot fire on a candidate that came from
+    `summarize_contrast_candidates`. Complete coverage is one such: withholding completeness
+    withholds the AUROC, so on pipeline output the `complete` clause never fires alone. The three
+    closed-set clauses -- one of the four declared arms, one of the three matched summaries, one
+    of the four declared score methods -- are three more.
+
+    They are written out because this function takes a list of dictionaries, not a pipeline
+    stage's output, and reaches it from tests, from a re-read CSV and from whatever Task 9
+    assembles. The alternative -- keeping the clauses that happen to fire and dropping the rest --
+    would leave a reader comparing the spec's list with this code unable to tell an item that was
+    considered and shown redundant from one that was forgotten.
+
+    The closed method set is also the *only* thing that keeps the raw reference control out of the
+    ranking. `REFERENCE_CONTROL_METHOD` is deliberately not in `SCORE_METHODS`, so a control is
+    refused by the same line that refuses a typo, and there is no second clause naming it.
 
     The returned list holds the same dictionaries, not copies -- a reader that edits one sees
     the other, which is what keeps a report from quoting two different values for one candidate.
@@ -458,12 +507,14 @@ def rank_contrast_candidates(candidates: list[dict]) -> list[dict]:
     for candidate in candidates:
         candidate["deployable"] = bool(
             candidate["signal"] == DEPLOYABLE_SIGNAL
-            and candidate["method"] != REFERENCE_CONTROL_METHOD
             and candidate.get("complete")
+            and candidate.get("expected_image_count") == FULL_TUNING_IMAGE_COUNT
             and candidate.get("orientable")
             and candidate.get("macro_auroc") is not None
+            and candidate["arm"] in ARM_NAMES
+            and candidate["aggregation"] in AGGREGATIONS
+            and candidate["method"] in SCORE_METHODS
             and candidate.get("twin_macro_auroc") is not None
-            and candidate.get("expected_image_count") == FULL_TUNING_IMAGE_COUNT
         )
     return sorted(
         [candidate for candidate in candidates if candidate["deployable"]], key=_sort_key
