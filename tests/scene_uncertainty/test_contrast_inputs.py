@@ -23,6 +23,7 @@ from dataclasses import astuple
 from statistics import mean, median
 
 import pytest
+from scipy.stats import spearmanr
 
 from src.scene_uncertainty.contrast_inputs import (
     ARMS,
@@ -39,8 +40,14 @@ from src.scene_uncertainty.corruption_metrics import (
 
 from tests.scene_uncertainty.contrast_test_utils import (
     AGGREGATIONS,
+    BIN_TREND_PHASE,
+    COMBINED_LEVEL,
+    CONFIDENCE_TREND_PHASE,
+    CONFIDENCE_UNCERTAINTY,
+    PERSISTENCE_LEVEL,
     SELECTED_COUNT,
     SERIES,
+    TREND_SHAPE,
     clean_overlap_for,
     write_source_bundle,
 )
@@ -155,8 +162,8 @@ def test_loads_every_required_series(tmp_path):
     # z-score against the clean median, and this bin sits below it
     assert inputs.scores[(1, 0, "persistence", "decile_50_60", "mean", "combined")] == -0.29306
     # and the confidence twin varies by bin, so a contrast against it is not identically zero
-    assert inputs.scores[(1, 0, "confidence", "decile_00_10", "mean", "confidence")] == 0.984957
-    assert inputs.scores[(1, 0, "confidence", "decile_90_100", "mean", "confidence")] == 0.668592
+    assert inputs.scores[(1, 0, "confidence", "decile_00_10", "mean", "confidence")] == 0.983049
+    assert inputs.scores[(1, 0, "confidence", "decile_90_100", "mean", "confidence")] == 0.666684
     assert inputs.provenance["source_partition"] == "tuning"
     assert inputs.provenance["retained_row_count"] == RETAINED
 
@@ -269,19 +276,87 @@ def test_the_confidence_twins_carry_the_runs_per_image_trend(tmp_path):
         ) == -1, confidence_bin
 
 
-def test_a_full_tuning_roster_keeps_the_confidence_column_inside_its_bounds(tmp_path):
+def test_the_confidence_control_does_not_wobble_in_step_with_its_own_signal(tmp_path):
+    """A bin's confidence twin is the control for that bin's persistence signal, so the two
+    must not share a wobble. Measured on the tables and on the bundle, because only the first
+    localises the defect and only the second proves it reaches the rows.
+
+    `TREND_SHAPE` is rotated by `(severity + image_id + phase) % 6`. When a bin's
+    `CONFIDENCE_TREND_PHASE` equals its `BIN_TREND_PHASE` the two signals read the *same* entry
+    at every severity of every image, so their wobble components are one sequence and their
+    rank correlation is exactly `+1.0` on every image -- the fixture answering, by arithmetic,
+    the independence question Task 6's redundancy control is there to measure. Two bins carried
+    that: `quintile_00_20`, arm 2's reference, and `decile_50_60`, the responsive bin of arms 1,
+    3 and 4. Between them they are the fixture's most-read pair of series, and nothing else in
+    this suite could see it -- the two signals live in different rows, so no count, key or
+    coverage check compares them.
+
+    `spearmanr` on the wobble alone is the direct measurement; the loaded-bundle assertion is
+    the consequence, and it is deliberately weaker than `!= +1.0` on a median. A shared wobble
+    does not make the two *curves* identical, because the level, the slope and the tilt tables
+    all differ, so the median cross-signal correlation only rose to +0.800 rather than to 1.0.
+    What it did do is put at least one image at exactly `+1.0`, and that is what is pinned.
+    """
+    # every bin's confidence phase differs from its own persistence phase: a derangement
+    assert all(
+        CONFIDENCE_TREND_PHASE[name] != BIN_TREND_PHASE[name] for name in BIN_TREND_PHASE
+    ), {name: (BIN_TREND_PHASE[name], CONFIDENCE_TREND_PHASE[name]) for name in BIN_TREND_PHASE}
+    # and neither table repeats a phase, which is the separate property that stops two bins of
+    # one arm sharing a wobble that would subtract out of their gap
+    assert len(set(BIN_TREND_PHASE.values())) == len(BIN_TREND_PHASE)
+    assert len(set(CONFIDENCE_TREND_PHASE.values())) == len(CONFIDENCE_TREND_PHASE)
+
+    for name in BIN_TREND_PHASE:
+        for image_id in IMAGES:
+            persistence = [
+                TREND_SHAPE[(severity + image_id + BIN_TREND_PHASE[name]) % 6]
+                for severity in SEVERITIES
+            ]
+            confidence = [
+                TREND_SHAPE[(severity + image_id + CONFIDENCE_TREND_PHASE[name]) % 6]
+                for severity in SEVERITIES
+            ]
+            assert persistence != confidence, (name, image_id)
+            assert spearmanr(persistence, confidence).statistic < 1.0, (name, image_id)
+
+    inputs = load_contrast_inputs(
+        write_source_bundle(tmp_path / "source"), expected_image_count=6
+    )
+    for name in BIN_TREND_PHASE:
+        for image_id in inputs.image_ids:
+            correlation = spearmanr(
+                curve(inputs, image_id, "persistence", name, "layer_2"),
+                curve(inputs, image_id, "confidence", name, CONFIDENCE_SCOPE),
+            ).statistic
+            assert correlation < 1.0, (name, image_id)
+
+
+def test_a_full_tuning_roster_keeps_the_columns_where_the_run_measured_them(tmp_path):
     """250 images, the size the real command runs at, and the only test that reaches it.
 
-    `1 - confidence` cannot leave [0, 1], and the loader would not notice if it did -- it checks
-    negativity and finiteness, and 1.235 is both non-negative and finite. The bound is therefore
-    the fixture's own responsibility, and a per-image term that is harmless across six images is
-    what breaks it: the roster is the axis this fixture grows along, and every earlier test in
-    this file runs six images.
+    Two properties, and both are invisible at six images because both are properties of the
+    *per-image term* and the per-image term is the one thing that scales with the roster.
+
+    The bound. `1 - confidence` cannot leave [0, 1], and the loader would not notice if it did
+    -- it checks negativity and finiteness, and 1.235 is both non-negative and finite. A
+    `- 0.001 * image_id` term is 0.005 of spread across six images and 0.25 across 250, so the
+    version of this fixture that carried one passed every six-image test in this file and wrote
+    impossible rows at the roster the command actually runs.
+
+    The level. Every published level table is an across-image mean the completed run measured,
+    so at the full roster the fixture's own across-image mean has to *be* that number. That is
+    what says the per-image term is centred rather than merely small: the `- 0.001 * image_id`
+    term only ever subtracted, so it moved all five confidence bins a uniform 0.1255 below the
+    run -- 0.985 published, 0.860 written -- while leaving the six-image column a plausible
+    0.982. Nothing but a full-roster mean can see that, and the tolerance below is 1e-3, a
+    hundred times smaller than the offset it exists to catch and ten times larger than the
+    residue left by 250 not being a multiple of the six-entry wobble table.
 
     This is also the only test that exercises the production `expected_image_count` default
     rather than passing 6, and the only one that overrides `image_ids`.
     """
-    source = write_source_bundle(tmp_path / "source", image_ids=range(1, 251))
+    roster = range(1, 251)
+    source = write_source_bundle(tmp_path / "source", image_ids=roster)
     inputs = load_contrast_inputs(source)
     confidence = [
         value for key, value in inputs.scores.items() if key[2] == "confidence"
@@ -292,9 +367,23 @@ def test_a_full_tuning_roster_keeps_the_confidence_column_inside_its_bounds(tmp_
     # and the spread survives the shrink: every image still has its own value
     lowest_bin = [
         inputs.scores[(image_id, 0, "confidence", "decile_00_10", "mean", "confidence")]
-        for image_id in range(1, 251)
+        for image_id in roster
     ]
     assert len(set(lowest_bin)) == 250
+
+    for signal, scope, levels in (
+        ("confidence", "confidence", CONFIDENCE_UNCERTAINTY),
+        ("persistence", "layer_2", PERSISTENCE_LEVEL),
+        ("persistence", "combined", COMBINED_LEVEL),
+    ):
+        for confidence_bin, published in levels.items():
+            if (signal, confidence_bin, scope) not in set(REQUIRED_SERIES):
+                continue  # only two bins are written at the combined scope
+            measured = mean(
+                inputs.scores[(image_id, 0, signal, confidence_bin, "mean", scope)]
+                for image_id in roster
+            )
+            assert measured == pytest.approx(published, abs=1e-3), (signal, confidence_bin)
 
 
 def test_every_arms_persistence_reference_can_be_oriented(tmp_path):

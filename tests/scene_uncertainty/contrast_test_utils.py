@@ -335,31 +335,65 @@ criteria outright, because `median_absolute_spearman` and `dominant_direction_fr
 exactly 1.0 for every confidence candidate and cannot break a tie between identical values. The
 run's are 0.771 to 0.857 and 0.60 to 0.80.
 
-Solved against the run's per-bin medians the same way `PERSISTENCE_TREND_NOISE` was, jointly
-with `CONFIDENCE_TREND_PHASE` and under the constraint that the six-image median keep the run's
-sign. What the five land on, at 250 images:
+Solved against the run's per-bin medians the same way `PERSISTENCE_TREND_NOISE` was, under the
+constraint that the median keep the run's sign at both roster sizes. What the five land on, at
+the 250 images the real command runs:
 
 | bin | median signed | run | median absolute | run |
 |---|---|---|---|---|
 | `decile_00_10` | -0.657 | -0.600 | 0.771 | 0.771 |
-| `quintile_00_20` | -0.600 | -0.600 | 0.771 | 0.771 |
+| `quintile_00_20` | -0.543 | -0.600 | 0.543 | 0.771 |
 | `quintile_40_60` | -0.571 | -0.543 | 0.857 | 0.800 |
-| `decile_50_60` | -0.571 | -0.514 | 0.800 | 0.829 |
+| `decile_50_60` | -0.429 | -0.514 | 0.714 | 0.829 |
 | `decile_90_100` | +0.841 | +0.829 | 0.841 | 0.857 |
+
+Two rows are looser than the other three, and the looseness is bought deliberately. These
+ratios were originally solved jointly with `CONFIDENCE_TREND_PHASE` -- but two of those phases
+were then equal to their own `BIN_TREND_PHASE`, which is what made `quintile_00_20` and
+`decile_50_60` fit so well: their confidence wobble was a copy of their persistence wobble.
+Deranging the phase table is not negotiable (it is the independence Task 6's redundancy control
+measures), and re-solving the two ratios around the new phases does not recover the run's
+numbers either -- the six-point Spearman grid has no value nearer than these for
+`quintile_00_20` without pushing its median absolute further off. So the phases were fixed and
+the ratios left where they are, and this table records where that lands rather than where the
+old one claimed to.
+
+What is preserved exactly, because it is what downstream code reads: every bin's orientation,
+no bin unanimous, and five distinct per-image strengths per bin at both roster sizes. Task 6's
+criteria 4 and 5 still have room to move -- median absolute Spearman spans 0.543 to 0.857
+against the run's 0.771 to 0.857, and the dominant-direction fraction 0.66 to 0.83 against the
+run's 0.60 to 0.80.
+
+At six images the medians are -0.657, -0.600, -0.571, -0.429 and +0.863, for the reason spelled
+out under `PERSISTENCE_TREND_NOISE`: six images sample each residue once and their median
+averages two values, where 250 images land on one.
 """
 
 CONFIDENCE_TREND_PHASE = {
-    "decile_00_10": 4, "quintile_00_20": 0,
-    "quintile_40_60": 5, "decile_50_60": 1,
+    "decile_00_10": 4, "quintile_00_20": 1,
+    "quintile_40_60": 5, "decile_50_60": 0,
     "decile_90_100": 2,
 }
 """Where each confidence bin starts reading `TREND_SHAPE`. Five distinct phases, as for
 persistence, so that no two bins share a wobble that would subtract out of their gap.
 
-Every one also differs from that bin's `BIN_TREND_PHASE`, so a bin's confidence control does
-not wobble in step with the persistence signal it is the control for. An image that looks
-noisy in one has no reason to look noisy in the other, and the redundancy question Task 6 asks
-should not be answered by the fixture's arithmetic.
+**A derangement of `BIN_TREND_PHASE`**: every bin's confidence phase differs from that same
+bin's persistence phase, so a bin's confidence control does not wobble in step with the signal
+it is the control for. An image that looks noisy in one has no reason to look noisy in the
+other, and the redundancy question Task 6 asks should not be answered by the fixture's
+arithmetic. Two of these five used to equal their persistence twin -- `quintile_00_20` at 0 and
+`decile_50_60` at 1 -- which gave those two bins a wobble-only Spearman of exactly `+1.0`
+between the two signals *on every image*. Those are arm 2's reference and arms 1, 3 and 4's
+responsive bin, so the destroyed independence was the fixture's most-read pair of series, and
+nothing in the suite could see it: the two signals live in different rows and no count, key or
+coverage check compares them. `test_the_confidence_control_does_not_wobble_in_step_with_its_own_signal`
+is what now holds this table to the sentence above.
+
+The repair is the swap `quintile_00_20: 0 -> 1` and `decile_50_60: 1 -> 0`, and it is one of
+only two two-digit edits that produce a derangement while keeping five distinct phases, every
+bin's median signed Spearman on the run's side of zero at both six and 250 images, and no bin
+unanimous at six. Of the two it is the one whose 250-image medians sit closest to the run's.
+The noise ratios were *not* re-solved around it: see `CONFIDENCE_TREND_NOISE`.
 """
 
 PERSISTENCE_TREND_NOISE = {
@@ -372,9 +406,18 @@ PERSISTENCE_TREND_NOISE = {
 Expressed as a ratio rather than an absolute size because Spearman is scale-free: the ratio,
 the tilt table and the phase are the *whole* of what decides a curve's rank correlation, so
 these five numbers are what set the median signed Spearman -- and they were solved for, not
-picked. At six images the medians come out -0.200, +0.086, +0.657, +0.629 and -0.829, which is
-the run's column exactly; at 250 they are the same except `quintile_00_20`, which the six-point
-Spearman grid cannot place between +0.057 and +0.171.
+picked. At **250 images**, the roster the real command runs, the medians come out -0.200,
++0.086, +0.657, +0.629 and -0.829: the run's column exactly, all five.
+
+**At six images two of the five differ**, and every test in this suite but one runs at six.
+`quintile_00_20` reads +0.057 against the run's +0.086 and `decile_90_100` reads -0.743 against
+-0.829; the other three are unchanged. That is a property of the median, not of these ratios. A
+curve depends on `image_id` only through `image_id % 6`, so six images sample each of the six
+residues exactly once and their median is the *mean of the third and fourth* of six values,
+while 250 images give each residue 41 or 42 curves and the 125th and 126th of those need not
+straddle the same boundary. Three bins happen to land on the same number either way; these two
+do not. So a later task pinning a median at six images must pin the six-image value -- writing
++0.086 or -0.829 into a six-image expectation is writing the 250-image answer.
 
 The ordering is the point as much as the levels. `decile_90_100` moves hardest and most
 consistently, the two middle bins next, and the two lowest bins barely hold a direction at all
@@ -389,20 +432,43 @@ COMBINED_TREND_NOISE = {
 }
 """The same ratios for the `combined` scope, solved against that scope's own medians.
 
-They differ from the `layer_2` ratios because the run's two columns disagree about how
-consistently each bin moves: `quintile_40_60` and `decile_50_60` both fall from a signed
-Spearman near +0.64 at `layer_2` to +0.371 combined, and `decile_00_10` and `quintile_00_20`
-change sign outright. Reusing one map would make the two scopes rank-identical, and arms 3 and
-4 -- which are the same bucket pair read at the two scopes -- would then differ only in scale.
+**Only two of these five entries are ever written into a bundle.** `SERIES` carries a `combined`
+row for `decile_50_60` and `decile_90_100` and for nothing else, because those are arm 4's two
+bins and arm 4 is the only arm that reads this scope. The other three exist so `default_score`
+stays total over its five bins for a test that overrides `score` and asks for one; they are not
+measurements the fixture publishes, and no expectation anywhere rests on them.
+
+Of the two that are written, `decile_50_60` is the one this table earns its place with: it falls
+from a signed Spearman of +0.629 at `layer_2` to +0.371 combined, so a consumer that read one
+scope where it meant the other gets a different answer rather than the same answer twice. That
+is the run's disagreement between its two columns, and reusing the `layer_2` ratio would erase
+it -- arms 3 and 4 are the same bucket pair read at the two scopes, and they have to differ by
+more than a scale factor for the pair to be worth carrying twice.
+
+`decile_90_100` is the exception and it is worth naming rather than leaving to be discovered.
+Its ratio here is 2.15, the same as its `layer_2` ratio, and the tilt table and phase are shared
+across scopes too -- so within an image its `combined` curve is `|COMBINED_SLOPE|/|
+PERSISTENCE_SLOPE|` times its `layer_2` curve about that image's own baseline. A positive affine
+transform preserves rank, so this bin's per-image signed Spearman is **-0.829 at both scopes**
+and every rank statistic taken on it alone cannot tell the two apart. It is arms 3 and 4's
+*reference*, so what still separates those two arms is their responsive bin (3.40 against 5.60)
+and the signed `COMBINED_LEVEL`, not the reference's trend. A test that means to prove the two
+scopes are distinct must read a contrast or a level, not this bin's reference trend.
 """
 
 SCENE_BASELINE_SPREAD = 0.02
-"""How far apart two scenes' baseline persistence distances sit, end to end.
+"""How far apart two scenes' baselines sit, end to end, in both columns.
 
-Chosen the same size as the severity effect (the steepest bin moves 0.017 across the sweep) so
-that neither swamps the other: a spread much larger makes every cross-scene AUROC chance-level
-whatever the candidate does, and a spread much smaller makes the raw score a perfect corruption
-detector and leaves the paired within-image design with nothing to be better than.
+Chosen the same size as the persistence severity effect (the steepest bin moves 0.017 across the
+sweep) so that neither swamps the other: a spread much larger makes every cross-scene AUROC
+chance-level whatever the candidate does, and a spread much smaller makes the raw score a perfect
+corruption detector and leaves the paired within-image design with nothing to be better than.
+
+It is a floor rather than a ceiling for the confidence column, whose four low-movement bins only
+travel 0.002 across the sweep against `decile_90_100`'s 0.154. That asymmetry is the run's, not
+the fixture's -- those four bins really are nearly flat -- and it is why their raw candidates
+land near chance (0.448-0.567) while the top decile's reaches 0.820. Shrinking the spread to
+rescue the four would tell nine downstream tasks that a flat confidence bin detects corruption.
 """
 
 COMBINED_SCALE_GAIN = 6.7
@@ -417,7 +483,12 @@ same number on every image.
 
 
 def _scene_baseline(image_id: int) -> float:
-    """One image's own distance level, distinct for every image on the tuning roster.
+    """One image's own offset, distinct for every image on the tuning roster.
+
+    Shared by both signals. `default_score`'s persistence and confidence branches add exactly
+    this term, so the two columns of one image are offset together and neither carries a
+    per-image shape the other does not -- which is the honest default when nothing in the run
+    says how a scene's confidence level relates to its persistence level.
 
     `(89 * image_id) mod 251` is a bijection on 1..250 because 251 is prime and 89 is not a
     multiple of it, so all 250 tuning images get their own baseline and none collide -- while
@@ -469,12 +540,32 @@ def default_score(
     `CONFIDENCE_UNCERTAINTY_SLOPE`, and its median sets which way the majority goes -- which is
     what `choose_orientation` reads and therefore which way the twin is read in nine tasks.
 
-    Its per-image term subtracts, where persistence's is centred on zero, for the same reason.
-    `1 - confidence` is bounded above by 1.0 -- `decile_scoring._checked_confidence` refuses a
-    source confidence outside [0, 1] -- and these levels start at 0.985, so an *additive* term
-    crosses the bound at fifteen images and reaches 1.235 on the 250-image roster the real
-    command runs at. The loader checks negativity and finiteness, and would accept every one of
-    those impossible rows.
+    Its per-image term is `_scene_baseline`, the same one the persistence branch uses. The two
+    columns are two summaries of the same image, so a fixture where a scene's confidence offset
+    were unrelated in shape to its persistence offset would be making a claim about the data
+    that nobody measured; sharing the term makes no claim at all, which is the right amount.
+
+    It used to be `- 0.001 * image_id`, and that failed three ways at once. It is strictly
+    monotone in `image_id`, which is the shape `_scene_baseline`'s own docstring rejects: it
+    turns the roster into a second severity axis, so the "clean" group of any cross-scene AUROC
+    is the low half of an ordered list rather than a sample. It *scales with the roster* --
+    0.005 of spread across six images and 0.25 across 250, where a scene offset should be a
+    property of the scene and not of how many scenes were loaded. And because it only ever
+    subtracts, it moved the whole column down by its own mean: at 250 images the bins sat at
+    0.860, 0.854, 0.811, 0.805 and 0.520 against the run's 0.985, 0.979, 0.936, 0.930 and 0.645,
+    a uniform 0.1255 low, with the 0.25 spread swamping four of the five bins' 0.002 severity
+    movement and collapsing their raw macro AUROCs to 0.496-0.505. With `_scene_baseline` the
+    250-image means come back to 0.985, 0.979, 0.936, 0.930 and 0.645 -- the run's, because the
+    term is centred -- and those four AUROCs move to 0.448-0.567. Six images hid all of it.
+
+    The bound survives the swap and that is the constraint the term has to satisfy.
+    `1 - confidence` cannot exceed 1.0 -- `decile_scoring._checked_confidence` refuses a source
+    confidence outside [0, 1] -- and `_scene_baseline` is bounded by half of
+    `SCENE_BASELINE_SPREAD`, so the highest bin reaches 0.998 and no further, at any roster size.
+    The loader checks negativity and finiteness and would accept an impossible 1.235 without
+    complaint, so this is the fixture's own responsibility and
+    `test_a_full_tuning_roster_keeps_the_confidence_column_inside_its_bounds` is where it is
+    discharged.
 
     `aggregation` is the one exception, and it is a gap rather than a decision: three
     aggregations of one selection are three summaries of one population, and this callback is
@@ -491,7 +582,7 @@ def default_score(
         ]
         return round(
             CONFIDENCE_UNCERTAINTY[confidence_bin]
-            - 0.001 * image_id
+            + _scene_baseline(image_id)
             + slope * tilt * severity
             + abs(slope) * CONFIDENCE_TREND_NOISE[confidence_bin] * wobble,
             6,
