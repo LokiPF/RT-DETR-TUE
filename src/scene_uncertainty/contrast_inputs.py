@@ -1,0 +1,252 @@
+"""The four declared arms, and the only door a finished bundle comes through.
+
+This module is the whole of the command's contact with the filesystem's input side. Everything
+downstream sees a `ContrastInputs`, which is a flat dictionary of numbers plus provenance --
+so no later module has to know that the source was a CSV, and no later module can quietly
+widen the set of rows the experiment is allowed to see.
+"""
+from __future__ import annotations
+
+import csv
+import json
+from dataclasses import dataclass
+from pathlib import Path
+
+SOURCE_FILES = ("per_scene.csv", "summary.json")
+SOURCE_PARTITION = "tuning"
+FULL_TUNING_IMAGE_COUNT = 250
+EXPECTED_SEVERITIES = tuple(range(6))
+MEMBERSHIP_MODE = "dynamic"
+PADDING_MODE = "filtered"
+PERSISTENCE_SIGNAL = "persistence"
+CONFIDENCE_SIGNAL = "confidence"
+CONFIDENCE_SCOPE = "confidence"
+AGGREGATIONS = ("mean", "q90", "top20_mean")
+
+SCORE_KEY = ("image_id", "severity", "signal", "confidence_bin", "aggregation", "score_scope")
+"""What makes two source scores measurements of different things, once the fixed fields are gone.
+
+`membership_mode` and `padding_mode` are absent because they are *validated* to single values
+rather than varied: a source carrying a frozen or unfiltered row for a required series is
+refused, not filed under a longer key. `bucket_scheme` is absent because `confidence_bin`
+already determines it -- `decile_00_10` and `quintile_00_20` cannot collide -- and a redundant
+key field is a second place for two rows to be told apart, which is one more than there should
+be.
+"""
+
+
+class ContrastInputError(ValueError):
+    """A source bundle this command will not read.
+
+    A `ValueError` so `pipeline.command_analyze_within_image_contrast` turns it into one line
+    on stderr through the same `except ValueError` its siblings use, rather than a traceback
+    through frames the operator did not write.
+    """
+
+
+@dataclass(frozen=True)
+class Arm:
+    """One bucket pair at one persistence scope, with the provenance of how it was chosen.
+
+    `pair_name` is the bucket pair without the scope, and it is a stored field rather than a
+    string derived from `name` because it is what the confidence-only twin is keyed on.
+    Confidence has no decoder layer, so the two differential arms -- `layer_2` and `combined`
+    over the same two buckets -- have one twin between them, and that identity has to be
+    something the code states rather than something a suffix-stripping rule infers.
+    """
+
+    name: str
+    pair_name: str
+    family: str
+    bucket_scheme: str
+    score_scope: str
+    reference_bin: str
+    responsive_bin: str
+    declared_before_data: bool
+
+
+ARMS = (
+    Arm("decile_00_10__50_60", "decile_00_10__50_60", "anchored", "decile", "layer_2",
+        "decile_00_10", "decile_50_60", True),
+    Arm("quintile_00_20__40_60", "quintile_00_20__40_60", "anchored", "quintile", "layer_2",
+        "quintile_00_20", "quintile_40_60", True),
+    Arm("decile_90_100__50_60", "decile_90_100__50_60", "differential", "decile", "layer_2",
+        "decile_90_100", "decile_50_60", False),
+    Arm("decile_90_100__50_60__combined", "decile_90_100__50_60", "differential", "decile",
+        "combined", "decile_90_100", "decile_50_60", False),
+)
+"""The closed set. Four arms, and adding a fifth is a spec change.
+
+`declared_before_data` is a field rather than a comment because it is the difference between a
+result and a hypothesis: the two anchored arms were named before any tuning number was read,
+and the two differential arms were named after the completed deployment analysis showed the
+90--100 percent decile moving hardest and against the 50--60 percent range. A tuning macro
+AUROC from an arm with `declared_before_data=False` is a selection estimate. Carrying the flag
+all the way to the easy report is what stops it being quoted as performance.
+"""
+
+
+def required_series() -> tuple[tuple[str, str, str], ...]:
+    """Every `(signal, confidence_bin, score_scope)` the four arms need, deduplicated.
+
+    Derived from `ARMS` rather than listed, so an arm cannot be added without the loader
+    demanding its rows. The confidence entries collapse across scope on purpose: confidence has
+    no decoder layer, so the two differential arms need one confidence series between them and
+    that is also why they share a single confidence-only twin downstream.
+    """
+    series: list[tuple[str, str, str]] = []
+    for arm in ARMS:
+        for confidence_bin in (arm.reference_bin, arm.responsive_bin):
+            for entry in (
+                (PERSISTENCE_SIGNAL, confidence_bin, arm.score_scope),
+                (CONFIDENCE_SIGNAL, confidence_bin, CONFIDENCE_SCOPE),
+            ):
+                if entry not in series:
+                    series.append(entry)
+    return tuple(series)
+
+
+REQUIRED_SERIES = required_series()
+
+
+@dataclass(frozen=True)
+class ContrastInputs:
+    """The retained scores, the image roster, and where they came from."""
+
+    scores: dict[tuple, float]
+    image_ids: tuple[int, ...]
+    provenance: dict
+
+
+def _read_summary(source: Path) -> dict:
+    try:
+        return json.loads((source / "summary.json").read_text())
+    except FileNotFoundError as error:
+        raise ContrastInputError(
+            f"source is not a finished corruption-sensitivity bundle: summary.json "
+            f"is missing from {source}"
+        ) from error
+    except json.JSONDecodeError as error:
+        raise ContrastInputError(f"summary.json in {source} is not valid JSON: {error}") from error
+
+
+def load_contrast_inputs(
+    source_value: str | Path, *, expected_image_count: int = FULL_TUNING_IMAGE_COUNT
+) -> ContrastInputs:
+    """Every score the four arms need, and a refusal if the source cannot supply them all.
+
+    The checks run in this order because each one makes the next one's message readable. The
+    partition is checked first: a held-out bundle is refused outright rather than filtered,
+    because silently dropping rows from a held-out source is how a held-out claim gets made by
+    accident. Provenance agreement between the CSV and the JSON comes next, because a
+    disagreement means one of the two is describing a different run and every count after this
+    point would be measuring the wrong thing. Only then are the rows filed, and only then can a
+    missing series be reported as "this bundle does not contain what this experiment needs"
+    rather than as a `KeyError` five frames away.
+
+    Rows outside `REQUIRED_SERIES` are discarded, not refused. The source legitimately holds
+    765,000 rows across ten deciles, five quintiles, four scopes, two membership modes and two
+    padding modes; this command reads 54,000 of them. Refusing the rest would refuse every real
+    bundle.
+    """
+    source = Path(source_value)
+    summary = _read_summary(source)
+    run = summary.get("run", {})
+    if run.get("source_partition") != SOURCE_PARTITION:
+        raise ContrastInputError(
+            f"within-image contrast reads the tuning partition only; {source} reports "
+            f"source_partition={run.get('source_partition')!r}"
+        )
+
+    path = source / "per_scene.csv"
+    try:
+        handle = path.open(newline="")
+    except FileNotFoundError as error:
+        raise ContrastInputError(
+            f"source is not a finished corruption-sensitivity bundle: per_scene.csv "
+            f"is missing from {source}"
+        ) from error
+
+    wanted = set(REQUIRED_SERIES)
+    scores: dict[tuple, float] = {}
+    images: set[int] = set()
+    seen_series: set[tuple[str, str, str]] = set()
+    with handle:
+        for index, row in enumerate(csv.DictReader(handle)):
+            entry = (row["signal"], row["confidence_bin"], row["score_scope"])
+            if entry not in wanted:
+                continue
+            if row["source_partition"] != SOURCE_PARTITION:
+                raise ContrastInputError(
+                    f"per_scene.csv row {index} is outside the tuning partition: "
+                    f"source_partition={row['source_partition']!r}"
+                )
+            if row["membership_mode"] != MEMBERSHIP_MODE or row["padding_mode"] != PADDING_MODE:
+                raise ContrastInputError(
+                    f"per_scene.csv row {index} for {entry} is "
+                    f"{row['membership_mode']}/{row['padding_mode']}; this experiment reads "
+                    f"{MEMBERSHIP_MODE}/{PADDING_MODE} only"
+                )
+            if row["aggregation"] not in AGGREGATIONS:
+                continue
+            score = float(row["score"])
+            if row["signal"] == PERSISTENCE_SIGNAL and score < 0.0:
+                raise ContrastInputError(
+                    f"per_scene.csv row {index} has a negative persistence distance: {score}"
+                )
+            if score != score:
+                raise ContrastInputError(f"per_scene.csv row {index} has a non-finite score")
+            key = (
+                int(row["image_id"]), int(row["severity"]), row["signal"],
+                row["confidence_bin"], row["aggregation"], row["score_scope"],
+            )
+            if key in scores:
+                raise ContrastInputError(f"duplicate source row key: {key}")
+            scores[key] = score
+            images.add(key[0])
+            seen_series.add(entry)
+
+    missing = [entry for entry in REQUIRED_SERIES if entry not in seen_series]
+    if missing:
+        described = ", ".join(f"{signal}/{name}/{scope}" for signal, name, scope in missing)
+        raise ContrastInputError(f"source is missing required series: {described}")
+
+    image_ids = tuple(sorted(images))
+    if len(image_ids) != expected_image_count:
+        raise ContrastInputError(
+            f"within-image contrast needs {expected_image_count} tuning images; "
+            f"{source} has {len(image_ids)}"
+        )
+    if run.get("image_count") != len(image_ids):
+        raise ContrastInputError(
+            f"summary.json reports image_count={run.get('image_count')} but per_scene.csv "
+            f"contains {len(image_ids)} images"
+        )
+    if tuple(run.get("severities", ())) != EXPECTED_SEVERITIES:
+        raise ContrastInputError(
+            f"within-image contrast needs severities {list(EXPECTED_SEVERITIES)}; "
+            f"{source} reports {run.get('severities')}"
+        )
+
+    expected = len(REQUIRED_SERIES) * len(AGGREGATIONS) * len(image_ids) * len(EXPECTED_SEVERITIES)
+    if len(scores) != expected:
+        raise ContrastInputError(
+            f"source coverage is incomplete: expected {expected} retained rows, found "
+            f"{len(scores)}; every required series must cover every image at every severity"
+        )
+
+    return ContrastInputs(
+        scores=scores,
+        image_ids=image_ids,
+        provenance={
+            "source": str(source),
+            "source_partition": SOURCE_PARTITION,
+            "image_count": len(image_ids),
+            "severities": list(EXPECTED_SEVERITIES),
+            "membership_mode": MEMBERSHIP_MODE,
+            "padding_mode": PADDING_MODE,
+            "aggregations": list(AGGREGATIONS),
+            "required_series": [list(entry) for entry in REQUIRED_SERIES],
+            "retained_row_count": len(scores),
+        },
+    )
