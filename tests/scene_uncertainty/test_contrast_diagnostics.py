@@ -315,6 +315,25 @@ def test_both_errors_are_medians_of_absolute_errors_not_means():
     assert result["predictive"] is True
 
 
+def test_one_extreme_scene_does_not_decide_which_predictor_wins():
+    # The fixture above puts its outlier on the *responsive* axis, where it hurts both
+    # predictors and the verdict survives the mean. This one puts it on the *reference* axis,
+    # which the constant predictor never looks at: image 10 has a baseline of a thousand and
+    # an ordinary responsive, so the line -- still exactly (2.0, 1.0) on every fold, since 21
+    # of each training set's 28 pairwise slopes are 2.0 -- predicts 2001 and misses by 1996,
+    # while the constant misses by 6. Line errors [0 x 9, 1996]: median 0.0, mean 199.6.
+    # Constant errors [0, 0, 3, 3, 5, 5, 6, 7, 7, 10]: median 5.0, mean 4.6. On medians the
+    # line wins; on means that one scene hands the verdict to the constant.
+    references = {image_id: float(image_id) for image_id in range(1, 10)}
+    references[10] = 1000.0
+    responsives = {image_id: 2.0 * float(image_id) + 1.0 for image_id in range(1, 10)}
+    responsives[10] = 5.0
+    result = clean_relationship(references, responsives, folds=assign_folds(references))
+    assert result["crossfit_median_absolute_error"] == 0.0
+    assert result["constant_median_absolute_error"] == 5.0
+    assert result["predictive"] is True
+
+
 def test_the_residual_summary_is_taken_about_the_median():
     result = one_scene_far_off_the_line()
     # the same [497, 0 x 9] residuals. Taken about the mean of 49.7 all three of these read
@@ -385,14 +404,32 @@ def test_the_final_line_is_fitted_on_every_clean_image():
     # image 1 it is (2.0, 1.0), which is what each of the fold lines is.
     assert result["final_slope"] == pytest.approx(2.5)
     assert result["final_offset"] == pytest.approx(-0.75)
+    # four images over five folds leaves fold 4 holding nothing, and a fold that held nothing
+    # gets no key rather than a line fitted on the whole roster. Task 8's flattener reads this
+    # dict, so its width is a contract and not an accident.
+    assert set(result["fold_lines"]) == {0, 1, 2, 3}
 
 
-def test_a_fold_outside_the_range_is_refused_rather_than_never_held_out():
+@pytest.mark.parametrize("stray", [FOLD_COUNT, -1])
+def test_a_fold_outside_the_range_is_refused_rather_than_never_held_out(stray):
     references = {1: 1.0, 2: 2.0, 3: 3.0, 4: 4.0}
     responsives = {image_id: 2.0 * value + 1.0 for image_id, value in references.items()}
     folds = assign_folds(references)
-    folds[4] = FOLD_COUNT  # one past the last fold the cross-fitting loop visits
+    folds[4] = stray  # one past the last fold the cross-fitting loop visits, and one before
     # unguarded, image 4 is never held out and never predicted: it stays in every training
-    # set and the constant error median silently moves from 3.0 to 2.0.
+    # set and the constant error median silently moves from 3.0 to 2.0. Below zero is the
+    # same bug and is refused the same way, which a guard written as `>= FOLD_COUNT` is not.
     with pytest.raises(ValueError, match="every fold must lie in range"):
         clean_relationship(references, responsives, folds=folds)
+
+
+def test_the_fold_guard_judges_only_the_images_it_was_handed():
+    references = {1: 1.0, 2: 2.0, 3: 3.0, 4: 4.0}
+    responsives = {image_id: 2.0 * value + 1.0 for image_id, value in references.items()}
+    folds = assign_folds(references)
+    folds[99] = FOLD_COUNT + 3  # an image this call is not scoring
+    # The fold map is a property of the whole image roster, so an arm scoring a subset of it
+    # is handed a wider map and must not be refused for an image it never looks at.
+    result = clean_relationship(references, responsives, folds=folds)
+    assert result["crossfit_median_absolute_error"] == 0.0
+    assert set(result["fold_lines"]) == {0, 1, 2, 3}

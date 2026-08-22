@@ -186,11 +186,17 @@ def clean_relationship(
     construct the line that predicts it.
 
     `folds` must give every image in `references` a fold in `range(FOLD_COUNT)`, and one
-    outside that range is refused rather than skipped. It is the only way this function can
-    return a wrong number that looks right: the cross-fitting loop visits `range(FOLD_COUNT)`,
-    so an image assigned past the end is never held out, stays in every training set, and
-    disappears from both error medians -- which then move without anything reading as missing.
-    `assign_folds` cannot produce one, so the guard exists for the caller that stops using it.
+    outside that range -- past the end or below zero, both are refused -- is rejected rather
+    than skipped. It is the only way this function can return a wrong number that looks right:
+    the cross-fitting loop visits `range(FOLD_COUNT)`, so an image assigned outside it is never
+    held out, stays in every training set, and disappears from both error medians -- which then
+    move without anything reading as missing. `assign_folds` cannot produce one, so the guard
+    exists for the caller that stops using it.
+
+    The check reads only the folds of the images in `references`, so a `folds` map covering a
+    wider roster is accepted. That is deliberate: the fold assignment is a property of the whole
+    image roster and a caller scoring one arm's clean subset should not have to trim it first,
+    which would be an opportunity to trim it wrongly.
     """
     image_ids = sorted(references)
     stray = sorted({folds[image_id] for image_id in image_ids} - set(range(FOLD_COUNT)))
