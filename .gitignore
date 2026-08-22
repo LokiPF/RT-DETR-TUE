@@ -1,2 +1,5 @@
 output/scene_uncertainty/
 .worktrees/
+__pycache__/
+*.pyc
+.pytest_cache/
