@@ -591,7 +591,17 @@ twin as a dashed line in the same color as its persistence candidate, so redunda
 without a separate figure. Include a horizontal chance line at 0.5. These panels can share a
 y-axis because AUROC has the same meaning for every method.
 
-Record all plotted values, panel selections, and axis limits in `summary.json`.
+Record all plotted values, panel selections, and figure spans in `summary.json`, under the key
+`figure_spans`.
+
+Only one of the four is an applied axis limit. The AUROC figure pins every panel to 0 to 1,
+because AUROC means the same thing everywhere and a shared axis is what makes a dashed twin
+readable against its solid candidate. The other three figures autoscale, and their recorded
+span is the range of the data drawn rather than a limit imposed on it. They autoscale for the
+reason `corruption_plots` already gives: three arms carry `layer_2` distances around 0.07 to
+0.12 while the fourth carries a `combined` z-score from about -0.6 to +0.2, so one shared range
+would draw the fourth arm's whole row as flat lines. Recording the span still serves the purpose
+-- a reader can see what range the picture covers -- but the report must not call it a limit.
 
 ## Outputs
 
@@ -608,7 +618,7 @@ The output directory contains exactly:
 - `summary.json`: source provenance, fixed configuration, arm table with family and
   `declared_before_data`, validation counts, fold assignments, fold-specific fits, final fits,
   anchor diagnostics, candidate metrics, raw reference control metrics, confidence-twin metrics,
-  bootstrap intervals, figure data, axis limits, and ranking;
+  bootstrap intervals, figure data, figure spans, and ranking;
 - `anchor_and_responsive_actual_distance.png`;
 - `clean_anchor_relationship.png`;
 - `contrast_scores_by_severity.png`;
@@ -719,7 +729,8 @@ directory on failure.
 - paired bootstrap resamples image IDs identically for candidate and control, and for candidate
   and confidence twin;
 - bootstrap output is deterministic under seed `20260821`;
-- all figure data and axis limits are present in `summary.json`;
+- all figure data and figure spans are present in `summary.json`, with the AUROC entry recorded
+  as an applied limit and the other three as data spans;
 - every arm carries the correct `declared_before_data` value into both `candidate_metrics.csv`
   and `summary.json`, and the easy report states it for any differential result it reports;
 - the output bundle contains exactly nine declared files;
