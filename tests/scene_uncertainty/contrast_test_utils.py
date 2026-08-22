@@ -209,7 +209,7 @@ CONFIDENCE_UNCERTAINTY_SLOPE = {
     "quintile_40_60": 0.00022, "decile_50_60": 0.00044,
     "decile_90_100": 0.03074,
 }
-"""Per-severity drift of the same column, and the one place this fixture has to be steep.
+"""Per-severity drift of the **across-image mean** of the same column, and only of the mean.
 
 Four of the five bins are flat to the third decimal across all six severities -- two drifting down
 and two up, which is the run's own pattern and not a rounding artefact. `decile_90_100` climbs
@@ -218,6 +218,14 @@ single behaviour the redundancy control exists to expose. A fixture where every 
 severity would let a consumer that had the top decile upside down pass every test.
 
 Each slope is `(severity 5 - severity 0) / 5` from the completed run.
+
+**A single image does not have to move this way, and for two of these bins most of them do not.**
+The run's `quintile_40_60` and `decile_50_60` both *rise* in mean level while 154 and 151 of the
+250 images individually *fall* -- an ordinary mean-versus-median split, where a minority of
+images with large rises carries the average. `CONFIDENCE_TREND_TILT` is where that lives, and
+it is not a detail: `choose_orientation` reads the median of the per-image signed Spearmans, so
+a fixture that made every image follow the mean orients those two twins `+1` where the run
+orients them `-1`.
 """
 
 TREND_TILT = (1.0, 1.6, 2.2, -0.4, 1.9, -0.3)
@@ -273,19 +281,85 @@ assignment is the one that puts each bin's median signed Spearman closest to the
 the noise ratios below; see `PERSISTENCE_TREND_NOISE`.
 """
 
-SIGNAL_TREND_PHASE = {"persistence": 0, "confidence": 5}
-"""Which `TREND_TILT` entry a signal reads for a given image, as an offset on `image_id`.
+CONFIDENCE_TREND_TILT = {
+    "decile_00_10":   (2.4, 1.5, -0.5, 2.0, -0.7, 1.3),
+    "quintile_00_20": (1.6, 2.4, -0.7, 1.2, -0.3, 1.8),
+    "quintile_40_60": (4.6, -0.8, 4.2, -0.6, -0.9, -0.5),
+    "decile_50_60":   (4.4, -0.7, -0.5, 4.0, -0.6, -0.6),
+    "decile_90_100":  (1.4, 1.2, -0.3, 1.5, 1.0, 1.2),
+}
+"""How much of its bin's mean severity slope one image gets, per bin, at `image_id % 6`.
 
-The two signals read the same table at different offsets so that an image which responds
-strongly in persistence is not the same image that responds strongly in confidence. Sharing one
-offset would make the control move with the signal it is controlling for, image by image, and
-the redundancy question Task 6 asks -- does the persistence gap tell us anything its confidence
-twin does not -- would be answered by the fixture's arithmetic instead of by the data.
+A table per bin rather than the one `TREND_TILT` the persistence branch shares, because the run
+says the five confidence bins disagree with their own means by *different amounts and in
+different directions*, and a shared table cannot express that: the fraction of images moving
+against the mean is a property of the tilt multiset, and a phase rotation does not change a
+multiset.
 
-Confidence's offset is 5, which hands image 1 the tilt `1.0`. That is not arbitrary either:
-image 1 is the image every pinned confidence value in `test_contrast_inputs` reads, and a tilt
-of 1.0 there keeps the column exactly the run's own curve at the one place it is asserted
-against the run.
+**Every table sums to 6.0.** That is the whole reason this can carry two facts at once: a mean
+tilt of exactly 1.0 leaves `CONFIDENCE_UNCERTAINTY_SLOPE` as the across-image mean curve
+untouched, while the *median* tilt decides which way most images go. The run's splits, and the
+nearest a six-entry table can come to them:
+
+| bin | mean level | images rising / 250 | that fraction | tilts positive |
+|---|---|---|---|---|
+| `decile_00_10` | falls | 70 | 28% | 4 of 6 (28% of tilts negative -> 33%) |
+| `quintile_00_20` | falls | 73 | 29% | 4 of 6 |
+| `quintile_40_60` | **rises** | 96 | 38% | **2 of 6** |
+| `decile_50_60` | **rises** | 99 | 40% | **2 of 6** |
+| `decile_90_100` | rises | 200 | 80% | 5 of 6 |
+
+The two middle rows are the point. Their mean rises and their median falls, so four of their
+six tilts are negative and the two positive ones are large (4.6 and 4.2, against -0.5 to -0.9)
+-- a minority of images carrying the average, which is exactly what 96 of 250 rising while the
+mean climbs 0.0011 describes. Give them a mostly-positive table and their twin's locked
+orientation flips from `-1` to `+1`, which no count, key or coverage check in this repository
+can see.
+
+Six images cannot reproduce a 250-image proportion: `k/6` is 0, 17, 33, 50, 67, 83 or 100
+percent and nothing between. Each row above takes the nearest, so 28% and 40% both land on 33%.
+What is preserved exactly is the *side* of one half every bin falls on, which is what
+`choose_orientation` reads.
+"""
+
+CONFIDENCE_TREND_NOISE = {
+    "decile_00_10": 4.35, "quintile_00_20": 4.05,
+    "quintile_40_60": 1.25, "decile_50_60": 1.45,
+    "decile_90_100": 2.00,
+}
+"""`TREND_SHAPE`'s amplitude for each confidence bin, as a multiple of that bin's mean slope.
+
+Without a wobble every confidence curve is a straight line and every image's `signed_spearman`
+is exactly `+1` or `-1`. That is not merely unrealistic -- it kills two of Task 6's five ranking
+criteria outright, because `median_absolute_spearman` and `dominant_direction_fraction` are then
+exactly 1.0 for every confidence candidate and cannot break a tie between identical values. The
+run's are 0.771 to 0.857 and 0.60 to 0.80.
+
+Solved against the run's per-bin medians the same way `PERSISTENCE_TREND_NOISE` was, jointly
+with `CONFIDENCE_TREND_PHASE` and under the constraint that the six-image median keep the run's
+sign. What the five land on, at 250 images:
+
+| bin | median signed | run | median absolute | run |
+|---|---|---|---|---|
+| `decile_00_10` | -0.657 | -0.600 | 0.771 | 0.771 |
+| `quintile_00_20` | -0.600 | -0.600 | 0.771 | 0.771 |
+| `quintile_40_60` | -0.571 | -0.543 | 0.857 | 0.800 |
+| `decile_50_60` | -0.571 | -0.514 | 0.800 | 0.829 |
+| `decile_90_100` | +0.841 | +0.829 | 0.841 | 0.857 |
+"""
+
+CONFIDENCE_TREND_PHASE = {
+    "decile_00_10": 4, "quintile_00_20": 0,
+    "quintile_40_60": 5, "decile_50_60": 1,
+    "decile_90_100": 2,
+}
+"""Where each confidence bin starts reading `TREND_SHAPE`. Five distinct phases, as for
+persistence, so that no two bins share a wobble that would subtract out of their gap.
+
+Every one also differs from that bin's `BIN_TREND_PHASE`, so a bin's confidence control does
+not wobble in step with the persistence signal it is the control for. An image that looks
+noisy in one has no reason to look noisy in the other, and the redundancy question Task 6 asks
+should not be answered by the fixture's arithmetic.
 """
 
 PERSISTENCE_TREND_NOISE = {
@@ -386,11 +460,14 @@ def default_score(
     The confidence branch runs *opposite* to the persistence one and that is not a slip. The
     column is `1 - confidence`, so its bins descend where persistence ascends, and only the top
     decile rises with severity where persistence at that bin falls. A fixture that made the two
-    signals parallel would hide the redundancy the confidence twin exists to detect. It takes
-    the tilt but no wobble: the column's shape is asserted directly against the run in
-    `test_the_confidence_column_runs_the_way_the_producer_writes_it`, including that four of
-    its five bins move by less than 0.01 across the whole sweep, and a wobble large enough to
-    bend a curve that flat would be larger than the curve.
+    signals parallel would hide the redundancy the confidence twin exists to detect.
+
+    It carries the same four terms, with its own tables for the last two, because the run says
+    the confidence column disagrees with itself in a way the persistence column does not: for
+    `quintile_40_60` and `decile_50_60` the *mean level* rises while most individual images
+    fall. `CONFIDENCE_TREND_TILT` sums to 6.0 per bin so the mean curve stays exactly
+    `CONFIDENCE_UNCERTAINTY_SLOPE`, and its median sets which way the majority goes -- which is
+    what `choose_orientation` reads and therefore which way the twin is read in nine tasks.
 
     Its per-image term subtracts, where persistence's is centred on zero, for the same reason.
     `1 - confidence` is bounded above by 1.0 -- `decile_scoring._checked_confidence` refuses a
@@ -407,11 +484,16 @@ def default_score(
     read `q90` where it meant `mean` would not be caught here.
     """
     if signal == "confidence":
-        tilt = TREND_TILT[(image_id + SIGNAL_TREND_PHASE["confidence"]) % 6]
+        slope = CONFIDENCE_UNCERTAINTY_SLOPE[confidence_bin]
+        tilt = CONFIDENCE_TREND_TILT[confidence_bin][image_id % 6]
+        wobble = TREND_SHAPE[
+            (severity + image_id + CONFIDENCE_TREND_PHASE[confidence_bin]) % 6
+        ]
         return round(
             CONFIDENCE_UNCERTAINTY[confidence_bin]
             - 0.001 * image_id
-            + CONFIDENCE_UNCERTAINTY_SLOPE[confidence_bin] * tilt * severity,
+            + slope * tilt * severity
+            + abs(slope) * CONFIDENCE_TREND_NOISE[confidence_bin] * wobble,
             6,
         )
     if scope == "combined":
@@ -424,7 +506,7 @@ def default_score(
         slope = PERSISTENCE_SLOPE[confidence_bin]
         noise = PERSISTENCE_TREND_NOISE[confidence_bin]
         gain = 1.0
-    tilt = TREND_TILT[(image_id + SIGNAL_TREND_PHASE["persistence"]) % 6]
+    tilt = TREND_TILT[image_id % 6]
     wobble = TREND_SHAPE[(severity + image_id + BIN_TREND_PHASE[confidence_bin]) % 6]
     return round(
         level

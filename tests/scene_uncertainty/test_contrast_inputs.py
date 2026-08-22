@@ -20,6 +20,7 @@ behaviour is guarding a property no loader assertion can reach.
 import csv
 import json
 from dataclasses import astuple
+from statistics import mean, median
 
 import pytest
 
@@ -154,14 +155,14 @@ def test_loads_every_required_series(tmp_path):
     # z-score against the clean median, and this bin sits below it
     assert inputs.scores[(1, 0, "persistence", "decile_50_60", "mean", "combined")] == -0.29306
     # and the confidence twin varies by bin, so a contrast against it is not identically zero
-    assert inputs.scores[(1, 0, "confidence", "decile_00_10", "mean", "confidence")] == 0.984
-    assert inputs.scores[(1, 0, "confidence", "decile_90_100", "mean", "confidence")] == 0.644
+    assert inputs.scores[(1, 0, "confidence", "decile_00_10", "mean", "confidence")] == 0.984957
+    assert inputs.scores[(1, 0, "confidence", "decile_90_100", "mean", "confidence")] == 0.668592
     assert inputs.provenance["source_partition"] == "tuning"
     assert inputs.provenance["retained_row_count"] == RETAINED
 
 
 def test_the_confidence_column_runs_the_way_the_producer_writes_it(tmp_path):
-    """`1 - confidence`: bins descend, and only the top decile climbs with severity.
+    """`1 - confidence`: the bins descend, and only the top decile's mean climbs with severity.
 
     Both directions are pinned because neither is visible to the loader. An inverted map keeps
     every count, key and coverage check intact and flips the sign of all 36 confidence-twin
@@ -169,20 +170,33 @@ def test_the_confidence_column_runs_the_way_the_producer_writes_it(tmp_path):
     consumer that had the top decile upside down pass anyway. The rise at `decile_90_100` --
     0.645 to 0.799 in the completed run -- is the detector losing the queries it was surest
     about, which is the behaviour the redundancy control exists to expose.
+
+    Asserted on the **across-image mean** at each severity, not on image 1's curve. That is the
+    quantity these five slopes actually are, and reading one image's curve as if it were the
+    mean is what forced the fixture to make every image follow its bin -- which is false of the
+    run for two of the five bins, and which
+    `test_the_confidence_twins_carry_the_runs_per_image_trend` now pins the other way. The two
+    tests are the mean and the median of the same column and both have to hold.
     """
     inputs = load_contrast_inputs(
         write_source_bundle(tmp_path / "source"), expected_image_count=6
     )
 
     def column(confidence_bin, severity=0):
-        return inputs.scores[(1, severity, "confidence", confidence_bin, "mean", "confidence")]
+        return mean(
+            inputs.scores[(image_id, severity, "confidence", confidence_bin, "mean", "confidence")]
+            for image_id in inputs.image_ids
+        )
 
     descending = [column(name) for name in (
         "decile_00_10", "quintile_00_20", "quintile_40_60", "decile_50_60", "decile_90_100"
     )]
-    # strictly, pair by pair: a non-strict check admits a tie, and collapsing `quintile_00_20`
-    # onto `decile_00_10` is exactly how the two schemes stop being distinguishable
-    assert all(higher > lower for higher, lower in zip(descending, descending[1:]))
+    # pair by pair and by a margin, not merely `>`. Averaging the wobble away leaves a
+    # rounding residue of order 1e-7, so two bins given the *same* level would still come out
+    # ordered, one way or the other, by nothing -- and collapsing `quintile_00_20` onto
+    # `decile_00_10` is exactly how the two schemes stop being distinguishable. The run's
+    # smallest adjacent gap is 0.006, six times this margin and far larger than any wobble.
+    assert all(higher - lower > 0.001 for higher, lower in zip(descending, descending[1:]))
 
     top = [column("decile_90_100", severity) for severity in SEVERITIES]
     assert top == sorted(top)
@@ -195,6 +209,64 @@ def test_the_confidence_column_runs_the_way_the_producer_writes_it(tmp_path):
     for name in ("quintile_40_60", "decile_50_60"):
         assert column(name, 5) > column(name, 0)
         assert column(name, 5) - column(name, 0) < 0.01
+
+
+def test_the_confidence_twins_carry_the_runs_per_image_trend(tmp_path):
+    """The mean level and the per-image trend disagree in sign, and both are load-bearing.
+
+    `quintile_40_60` and `decile_50_60` both *rise* in mean level in the completed run while 154
+    and 151 of the 250 images individually *fall* -- a minority of large risers carrying the
+    average. `choose_orientation` reads the median of the per-image signed Spearmans, so the
+    real twins for those two bins are locked at `-1`, and a fixture where every image followed
+    its bin's mean locks them at `+1`. That is round 2's defect at a different depth: it moves
+    no count, no key and no coverage check, and surfaces as two of five confidence twins read
+    backwards.
+
+    The unanimity is separately fatal. With every image at exactly `+1` or `-1`, a candidate's
+    `median_absolute_spearman` and `dominant_direction_fraction` are both exactly 1.0 -- Task
+    6's ranking criteria 4 and 5 -- and a criterion that takes one value on every candidate
+    cannot order anything. The run spreads them over 0.771-0.857 and 0.60-0.80.
+
+    Six images cannot hold a 250-image proportion: a six-point Spearman is quantised and `k/6`
+    is the only fraction available. What is pinned here is what survives that -- the side of
+    zero each bin's median falls on, and that no bin is unanimous.
+    """
+    inputs = load_contrast_inputs(
+        write_source_bundle(tmp_path / "source"), expected_image_count=6
+    )
+    # the run's median signed Spearman, dynamic/filtered/mean over all 250 tuning images
+    run = {
+        "decile_00_10": -0.600, "quintile_00_20": -0.600, "quintile_40_60": -0.543,
+        "decile_50_60": -0.514, "decile_90_100": +0.829,
+    }
+    for confidence_bin, expected in run.items():
+        signed = signed_trends(inputs, "confidence", confidence_bin, "confidence")
+        assert len(signed) == len(inputs.image_ids)
+        # the locked direction, which is the whole of what nine tasks read this column through
+        assert choose_orientation(signed) == (1 if expected > 0 else -1), confidence_bin
+        # ... and it is not unanimous: some images move against their own bin's median
+        assert 0 < sum(1 for value in signed if value > 0) < len(signed), confidence_bin
+        # criteria 4 and 5 have somewhere to move. A single image may still be perfectly
+        # monotone -- the run's median absolute Spearman is 0.771 to 0.857, so roughly half of
+        # them sit above it -- but the median may not be 1.0 and the strengths may not be one
+        # repeated value, because a criterion with one value on every candidate orders nothing.
+        strengths = [abs(value) for value in signed]
+        assert median(strengths) < 1.0, confidence_bin
+        assert len(set(strengths)) > 1, confidence_bin
+
+    # the two bins whose mean rises while their median falls -- the reason this test exists
+    for confidence_bin in ("quintile_40_60", "decile_50_60"):
+        rising_mean = mean(
+            inputs.scores[(i, 5, "confidence", confidence_bin, "mean", "confidence")]
+            for i in inputs.image_ids
+        ) > mean(
+            inputs.scores[(i, 0, "confidence", confidence_bin, "mean", "confidence")]
+            for i in inputs.image_ids
+        )
+        assert rising_mean, confidence_bin
+        assert choose_orientation(
+            signed_trends(inputs, "confidence", confidence_bin, "confidence")
+        ) == -1, confidence_bin
 
 
 def test_a_full_tuning_roster_keeps_the_confidence_column_inside_its_bounds(tmp_path):
