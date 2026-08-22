@@ -1128,11 +1128,12 @@ def test_a_twin_locks_its_own_direction_and_is_not_handed_the_persistence_one(tm
 
 
 def test_the_curve_checks_are_two_numbers_because_neither_says_the_other():
-    """`adjacent_consistency` averages 0.9 while `max_blur_above_clean` averages 0.5 here.
+    """`adjacent_consistency` averages 0.8 while `max_blur_above_clean` averages 0.5 here.
 
-    Two images climb cleanly to severity 5; two climb just as cleanly for four steps and then
-    fall below clean at the last. Orderly steps and a separated endpoint are different claims,
-    and a fixture where both came out the same number would let the two fields be swapped.
+    Two images climb cleanly to severity 5, one climbs just as cleanly for four steps and then
+    drops below clean at the last, and one saws up and down and also ends below where it
+    started. Orderly steps and a separated endpoint are different claims, and a fixture where
+    both came out the same number would let the two fields be swapped.
     """
     rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
     collapsing = [0.0, 1.0, 2.0, 3.0, 4.0, -1.0]
@@ -1404,3 +1405,71 @@ def test_a_curve_is_read_by_severity_and_not_by_the_order_the_rows_arrived():
     assert candidate["severity_statistics"][5]["mean"] == pytest.approx(5.0)
     assert candidate["severity_statistics"][0]["mean"] == pytest.approx(0.0)
     assert summarize_contrast_candidates(forward, expected_image_count=4)[0] == candidate
+
+
+def test_every_fraction_divides_by_the_roster_and_not_the_declared_count():
+    """Five images produced rows, eight were declared, and every fraction below is n/5.
+
+    The fractions that matter here are the small ones. `missing_fraction`,
+    `negative_fraction` and `flat_fraction` are each `1/5` on this fixture and would each be
+    `1/8` if the denominator were the declared count -- and every other fixture in this file
+    either has a full roster or asserts these three at zero, where a zero numerator says
+    nothing at all about what divided it. The shared `total` is not the only way to get this
+    wrong either: any one of the five can be switched on its own, so all five are pinned.
+    """
+    rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    falling = list(reversed(rising))
+    rows = candidate_rows({1: rising, 2: rising, 3: falling, 4: [2.0] * 6, 5: rising})
+    rows = [row for row in rows if not (row["image_id"] == 5 and row["severity"] == 2)]
+    candidate = summarize_contrast_candidates(rows, expected_image_count=8)[0]
+    assert candidate["image_count"] == 5
+    assert candidate["expected_image_count"] == 8
+    assert candidate["measured_count"] == 4
+    assert candidate["missing_count"] == 1
+    assert candidate["positive_count"] == 2
+    assert candidate["negative_count"] == 1
+    assert candidate["flat_count"] == 1
+    # n/5 against the n/8 a declared-count denominator would give: 0.8/0.5, 0.2/0.125,
+    # 0.4/0.25, 0.2/0.125, 0.2/0.125
+    assert candidate["measured_fraction"] == pytest.approx(0.8)
+    assert candidate["missing_fraction"] == pytest.approx(0.2)
+    assert candidate["positive_fraction"] == pytest.approx(0.4)
+    assert candidate["negative_fraction"] == pytest.approx(0.2)
+    assert candidate["flat_fraction"] == pytest.approx(0.2)
+    assert candidate["dominant_direction_fraction"] == pytest.approx(0.4)
+    # the four measured images are read at +1, so the falling one contributes 0.0 and the
+    # other three contribute 1.0 -- a mean of 0.75 where their median is 1.0
+    assert candidate["orientation"] == 1
+    assert candidate["oriented_adjacent_consistency"] == pytest.approx(0.75)
+    assert candidate["complete"] is False
+
+
+def test_a_row_carrying_only_what_this_function_reads_is_enough():
+    """`_REQUIRED_ROW_FIELDS` promises "exactly what it reads", and both halves are a promise.
+
+    The demanding half is obvious and is tested one function up. The permissive half is not:
+    every fixture in this file hands over all seventeen columns a contrast row carries, so a
+    required-field list widened to the full row would keep the whole suite green while
+    refusing a Task 9 caller who assembled the twelve columns this function actually looks at.
+    The columns are spelled out here rather than imported from the module, because a test that
+    builds its rows from the constant it is checking would accept any list the constant grew.
+    """
+    rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    reads = (
+        "image_id", "severity", "arm", "signal", "aggregation", "method",
+        "arm_family", "declared_before_data", "score_scope",
+        "reference_bin", "responsive_bin", "score",
+    )
+    full = candidate_rows({image: rising for image in range(1, 5)})
+    minimal = [{field: row[field] for field in reads} for row in full]
+    assert set(minimal[0]) == set(reads)
+    assert len(full[0]) == 17
+    for dropped in ("reference", "responsive", "fold", "fit_slope", "fit_offset"):
+        assert dropped not in minimal[0]
+
+    candidate = summarize_contrast_candidates(minimal, expected_image_count=4)[0]
+    assert candidate["macro_auroc"] == pytest.approx(1.0)
+    assert candidate["arm_family"] == "anchored"
+    assert candidate["reference_bin"] == "decile_00_10"
+    # and the five columns it does not read change nothing about what it publishes
+    assert candidate == summarize_contrast_candidates(full, expected_image_count=4)[0]

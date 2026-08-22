@@ -398,12 +398,16 @@ this is a public entry point taking a list of dictionaries, and rows reach it fr
 a re-read CSV and from whatever Task 9 assembles -- not only from the one function that cannot
 get it wrong.
 
-`CONTRAST_ROW_KEY` is what makes the check load-bearing rather than decorative on that path:
-it deliberately leaves `score_scope` out, so two rows that differ only in scope carry the
-*same* row key, the duplicate refusal above sees nothing, and the first row would silently
-label both. Refused rather than reconciled -- two rows disagreeing about `declared_before_data`
-are a hypothesis and a result filed under one name, and either answer mislabels half the
-scores.
+`CONTRAST_ROW_KEY` is what makes the check load-bearing rather than decorative on that path,
+because it deliberately leaves `score_scope` out: scope is a column no key ever compares. Two
+rows differing *only* in scope are not the case that matters -- they collide on the row key and
+the duplicate refusal above catches them before this check is reached. The case that matters is
+two rows for the same candidate on *different scenes*: different `image_id`, so different row
+keys, so the duplicate refusal is correctly silent, and different scope. Nothing downstream
+looks at scope again, so without this check one scene's label would be printed beside both
+scenes' scores. Refused rather than reconciled -- two rows disagreeing about
+`declared_before_data` are a hypothesis and a result filed under one name, and either answer
+mislabels half the scores.
 
 `reference_bin` and `responsive_bin` are an *ordered* pair and are copied as two named fields
 rather than as a set or a joined string. `contrast_scores.raw_gap(reference, responsive)`
@@ -421,6 +425,12 @@ A longer list than `CONTRAST_ROW_KEY`, because `row.get(field)` on an absent pro
 publishes `None` and no refusal -- and `arm_family` and `declared_before_data` are the two
 fields that stop a differential arm's tuning macro AUROC being quoted as performance. A
 candidate labelled `arm_family=None` has lost precisely the warning it was carrying.
+
+Both halves of that are tested, and only the demanding half is obvious. Every fixture in the
+test file hands over all seventeen row columns, so widening this tuple to
+`CONTRAST_ROW_FIELDS` would keep the suite green while refusing the minimal rows a Task 9
+caller has every right to assemble; `test_a_row_carrying_only_what_this_function_reads_is_
+enough` is the fixture that carries exactly these twelve and nothing else.
 """
 
 
@@ -489,14 +499,17 @@ def summarize_contrast_candidates(
     how many images happened to survive at each -- which is precisely the size-weighting
     `severity_aurocs` refuses in its own averaging.
 
-    Nothing here depends on the order the rows arrived in. Every image loop runs over
-    `sorted(by_image)` and every curve is read by severity rather than by position, so two
-    callers holding the same rows in different orders get dictionaries that compare equal --
-    not merely equal-looking. That is worth the two `sorted` calls: `severity` is an identity
-    on the blur axis and not a position, so a curve read in arrival order would correlate `+1`
-    against its own axis when the rows happened to arrive reversed, and a candidate summary
-    that changed because a CSV was sorted differently would be impossible to reproduce from
-    the published file.
+    Nothing here depends on the order the rows arrived in. Every image loop runs over one
+    sorted roster and every curve is read by severity rather than by position, so two callers
+    holding the same rows in different orders get dictionaries that compare equal -- not
+    merely equal-looking, which is why the test for it can use `==` rather than a tolerance.
+
+    Reading the curve by severity is the half that is not merely tidiness. `severity` is an
+    identity on the blur axis and not a position, and `complete_trend_metrics` refuses an axis
+    that is not `EXPECTED_SEVERITIES` in order rather than grading what it was handed. So a
+    curve read in arrival order does not come out slightly wrong: rows that arrive reversed
+    turn every candidate `unmeasured` -- no trend, no orientation, no AUROC -- while the
+    candidate list, its order and its keys all look exactly as they should.
 
     `missing_count` counts images that produced rows but not a full six-point curve. An image
     that produced no rows at all cannot appear in it -- there is nothing here to count -- and
