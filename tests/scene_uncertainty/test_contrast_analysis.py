@@ -22,6 +22,7 @@ arm rather than by pair is currently a no-op -- `test_the_confidence_twin_is_lab
 and_not_by_whichever_arm_came_first` reorders the table until it stops being one.
 """
 import csv
+import re
 from statistics import median
 
 import pytest
@@ -1039,8 +1040,18 @@ def test_candidate_provenance_survives_from_the_rows(tmp_path):
 
 
 def test_a_duplicated_row_key_is_refused():
+    """The refused key is named in full, because "a duplicate" is not something to go and find.
+
+    All six fields in `CONTRAST_ROW_KEY` order. An operator handed `duplicate contrast row
+    key` and nothing else has 29,160 rows to search, and a message that named only the image
+    or only the arm would send them to the wrong subset of them.
+    """
     rows = candidate_rows({1: [0.0] * 6})
-    with pytest.raises(ContrastAnalysisError, match="duplicate"):
+    expected = (
+        "duplicate contrast row key: "
+        "(1, 0, 'decile_00_10__50_60', 'persistence', 'mean', 'raw_gap')"
+    )
+    with pytest.raises(ContrastAnalysisError, match=re.escape(expected)):
         summarize_contrast_candidates(rows + rows[:1], expected_image_count=1)
 
 
@@ -1273,7 +1284,12 @@ def test_a_row_without_the_fields_this_function_reads_is_refused():
     with pytest.raises(ContrastAnalysisError, match=r"contrast row 2 is missing \['severity'\]"):
         summarize_contrast_candidates(rows, expected_image_count=1)
 
-    for field in ("arm_family", "declared_before_data", "score_scope", "reference_bin",
+    # every one of the twelve, and not only the ones whose absence would otherwise be
+    # silent. Dropping `arm` from the required list still stops the run -- on a bare
+    # `KeyError: 'arm'` from the line that builds the row key -- and a bare field name is
+    # exactly the diagnostic this refusal exists to replace.
+    for field in ("image_id", "severity", "arm", "signal", "aggregation", "method",
+                  "arm_family", "declared_before_data", "score_scope", "reference_bin",
                   "responsive_bin", "score"):
         stripped = candidate_rows({1: [0.0] * 6})
         del stripped[4][field]
@@ -1387,10 +1403,12 @@ def test_a_flat_image_votes_in_the_orientation_rather_than_dropping_out():
 def test_a_curve_is_read_by_severity_and_not_by_the_order_the_rows_arrived():
     """The same four rising images, handed over back to front, are still four rising images.
 
-    `severity` is an identity on the blur axis and not a position in a list. A curve read in
-    arrival order correlates `+1` against its own axis when the rows happen to arrive
-    reversed, so the failure this pins is not "the numbers move a little" -- it is a candidate
-    reporting `measured_count=0` and no trend at all while every score it needs is present.
+    `severity` is an identity on the blur axis and not a position in a list, and
+    `complete_trend_metrics` refuses an axis that is not `EXPECTED_SEVERITIES` in order
+    rather than grading what it was handed. So the failure this pins is not "the numbers move
+    a little": a curve read in arrival order comes back `unmeasured`, and the candidate
+    reports `measured_count=0` and no trend at all while every score it needs is present --
+    with its key, its provenance and its place in the published order all still correct.
     """
     rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
     forward = candidate_rows({image: rising for image in range(1, 5)})
@@ -1407,40 +1425,57 @@ def test_a_curve_is_read_by_severity_and_not_by_the_order_the_rows_arrived():
     assert summarize_contrast_candidates(forward, expected_image_count=4)[0] == candidate
 
 
-def test_every_fraction_divides_by_the_roster_and_not_the_declared_count():
-    """Five images produced rows, eight were declared, and every fraction below is n/5.
+def test_every_fraction_is_its_own_count_over_the_roster():
+    """Ten images produced rows, sixteen were declared, and no two of these numbers coincide.
 
-    The fractions that matter here are the small ones. `missing_fraction`,
-    `negative_fraction` and `flat_fraction` are each `1/5` on this fixture and would each be
-    `1/8` if the denominator were the declared count -- and every other fixture in this file
-    either has a full roster or asserts these three at zero, where a zero numerator says
-    nothing at all about what divided it. The shared `total` is not the only way to get this
-    wrong either: any one of the five can be switched on its own, so all five are pinned.
+    A fraction has two halves and each can be wrong on its own, so this fixture separates
+    both. The **denominator**: every value below is n/10, and is a different number over the
+    sixteen declared or the eight measured. The **numerator**: the five counts are 8, 2, 4, 1
+    and 3, all different, so no count can be published under another count's name.
+
+    That second half is why this fixture was rebuilt. Its first version separated the three
+    denominators cleanly and still had `missing_count`, `negative_count` and `flat_count` all
+    equal to 1, which left `missing_fraction` free to publish the flat count with the whole
+    suite green. The shape has now cost this task four fixtures: a value asserted against a
+    number that some *other* correct value also happens to equal is not asserted at all. Zero
+    numerators, symmetric columns and coincident counts are three faces of one mistake.
     """
     rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
     falling = list(reversed(rising))
-    rows = candidate_rows({1: rising, 2: rising, 3: falling, 4: [2.0] * 6, 5: rising})
-    rows = [row for row in rows if not (row["image_id"] == 5 and row["severity"] == 2)]
-    candidate = summarize_contrast_candidates(rows, expected_image_count=8)[0]
-    assert candidate["image_count"] == 5
-    assert candidate["expected_image_count"] == 8
-    assert candidate["measured_count"] == 4
-    assert candidate["missing_count"] == 1
-    assert candidate["positive_count"] == 2
+    rows = candidate_rows({
+        1: rising, 2: rising, 3: rising, 4: rising,        # four increasing
+        5: falling,                                        # one decreasing
+        6: [1.0] * 6, 7: [2.0] * 6, 8: [3.0] * 6,          # three flat
+        9: rising, 10: rising,                             # two that lose a severity below
+    })
+    rows = [
+        row for row in rows
+        if not (row["image_id"] == 9 and row["severity"] == 2)
+        and not (row["image_id"] == 10 and row["severity"] == 4)
+    ]
+    candidate = summarize_contrast_candidates(rows, expected_image_count=16)[0]
+    assert candidate["image_count"] == 10
+    assert candidate["expected_image_count"] == 16
+    assert candidate["measured_count"] == 8
+    assert candidate["missing_count"] == 2
+    assert candidate["positive_count"] == 4
     assert candidate["negative_count"] == 1
-    assert candidate["flat_count"] == 1
-    # n/5 against the n/8 a declared-count denominator would give: 0.8/0.5, 0.2/0.125,
-    # 0.4/0.25, 0.2/0.125, 0.2/0.125
+    assert candidate["flat_count"] == 3
+    # n/10, against n/16 over the declared count and n/8 over the measured images:
+    #   measured 0.8 / 0.5    / 1.0        missing  0.2 / 0.125  / 0.25
+    #   positive 0.4 / 0.25   / 0.5        negative 0.1 / 0.0625 / 0.125
+    #   flat     0.3 / 0.1875 / 0.375
     assert candidate["measured_fraction"] == pytest.approx(0.8)
     assert candidate["missing_fraction"] == pytest.approx(0.2)
     assert candidate["positive_fraction"] == pytest.approx(0.4)
-    assert candidate["negative_fraction"] == pytest.approx(0.2)
-    assert candidate["flat_fraction"] == pytest.approx(0.2)
+    assert candidate["negative_fraction"] == pytest.approx(0.1)
+    assert candidate["flat_fraction"] == pytest.approx(0.3)
     assert candidate["dominant_direction_fraction"] == pytest.approx(0.4)
-    # the four measured images are read at +1, so the falling one contributes 0.0 and the
-    # other three contribute 1.0 -- a mean of 0.75 where their median is 1.0
+    # eight measured images read at +1: the one falling image contributes 0.0 and the other
+    # seven contribute 1.0, a mean of 0.875 where their median is 1.0
     assert candidate["orientation"] == 1
-    assert candidate["oriented_adjacent_consistency"] == pytest.approx(0.75)
+    assert candidate["oriented_adjacent_consistency"] == pytest.approx(0.875)
+    assert candidate["max_blur_above_clean_rate"] == pytest.approx(0.5)
     assert candidate["complete"] is False
 
 
