@@ -507,8 +507,16 @@ Spearman. This is a reported control, not a ranked candidate: it adds no rows to
 list and does not change the count of four declared score methods.
 
 Report each contrast's macro and per-severity differences against both the raw responsive control
-and the raw reference control. A contrast that fails to beat either input is reported as failing,
-whatever its absolute macro AUROC.
+and the raw reference control, and a paired image bootstrap of each macro difference. A contrast
+that fails to beat either input is reported as failing, whatever its absolute macro AUROC.
+
+Both comparisons get an interval, not just the responsive one. The anchored success criterion
+below asks for a contrast that beats both of its inputs *and* whose macro improvement survives
+resampling; with an interval on only one of the two, that criterion is not checkable as written.
+The alternative reading -- bootstrap the responsive comparison alone, because it is the headline
+control -- would leave the reference comparison a bare point estimate on the very arms whose
+reference is a second responsive range rather than an anchor, which is where the point estimate
+is least trustworthy. The cost is one more resampling per candidate.
 
 ### Confidence-only redundancy control
 
@@ -526,7 +534,7 @@ Report for every candidate:
 - the twin's five severity AUROCs and macro AUROC;
 - the persistence-minus-confidence difference at each severity and at macro;
 - a paired image bootstrap of the macro difference, using the same seed and procedure as the
-  control comparison below;
+  two control comparisons above;
 - a `confidence_redundant` boolean, true when the persistence candidate's macro AUROC does not
   exceed its twin's.
 
@@ -736,7 +744,8 @@ The internal-reference hypothesis is supported on tuning only when all of the fo
   at every corrupted severity 1 through 5;
 - one contrast on that arm and summary has complete coverage and macro AUROC above both its
   matched raw responsive control and its matched raw reference control;
-- the paired bootstrap's 95 percent interval for that macro AUROC improvement remains above zero;
+- the paired bootstrap's 95 percent interval remains above zero for *both* of those macro AUROC
+  improvements, the responsive one and the reference one;
 - the contrast's severity-1 AUROC is at least as high as the matched raw control's severity-1
   AUROC, so severe blur does not hide a mild-blur loss;
 - the contrast's macro AUROC exceeds its confidence-only twin's;
