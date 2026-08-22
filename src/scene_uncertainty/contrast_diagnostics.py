@@ -67,6 +67,14 @@ def within_image_drift(curves: dict[int, dict[int, float]]) -> dict:
     with both correlations zero and an incomplete one is `unmeasured` with both `None`. That
     distinction is the difference between "this anchor holds still", which is the desired
     result, and "this anchor produced no curve", which is not a result at all.
+
+    Every curve must carry all of `EXPECTED_SEVERITIES` with finite values. That is a
+    precondition, not something checked here: `contrast_inputs` already refuses a non-finite
+    score at load, so the pipeline cannot present one. It matters because only half of this
+    function is defended against a breach -- `by_image` routes an incomplete curve to
+    `unmeasured`, but `by_severity` does not filter, and one `nan` would turn that severity's
+    two medians into `nan` while counting as a non-zero drift in `zero_drift_fraction`. A
+    caller that stops loading through `contrast_inputs` inherits that.
     """
     by_severity: dict[int, dict] = {}
     for severity in EXPECTED_SEVERITIES:
@@ -176,8 +184,22 @@ def clean_relationship(
     `final_slope` and `final_offset` are fitted on all clean images and are what a deployment
     would store, but they never touch the two error numbers above -- an image must not help
     construct the line that predicts it.
+
+    `folds` must give every image in `references` a fold in `range(FOLD_COUNT)`, and one
+    outside that range is refused rather than skipped. It is the only way this function can
+    return a wrong number that looks right: the cross-fitting loop visits `range(FOLD_COUNT)`,
+    so an image assigned past the end is never held out, stays in every training set, and
+    disappears from both error medians -- which then move without anything reading as missing.
+    `assign_folds` cannot produce one, so the guard exists for the caller that stops using it.
     """
     image_ids = sorted(references)
+    stray = sorted({folds[image_id] for image_id in image_ids} - set(range(FOLD_COUNT)))
+    if stray:
+        raise ValueError(
+            f"every fold must lie in range({FOLD_COUNT}); got {stray}. An image assigned "
+            "outside that range is never held out, never predicted, and silently absent from "
+            "both error medians"
+        )
     reference = np.array([references[image_id] for image_id in image_ids], dtype=float)
     responsive = np.array([responsives[image_id] for image_id in image_ids], dtype=float)
     pearson, spearman = _correlation(reference, responsive)
