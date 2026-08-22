@@ -386,8 +386,9 @@ arithmetic. Two of these five used to equal their persistence twin -- `quintile_
 between the two signals *on every image*. Those are arm 2's reference and arms 1, 3 and 4's
 responsive bin, so the destroyed independence was the fixture's most-read pair of series, and
 nothing in the suite could see it: the two signals live in different rows and no count, key or
-coverage check compares them. `test_the_confidence_control_does_not_wobble_in_step_with_its_own_signal`
-is what now holds this table to the sentence above.
+coverage check compares them. The test named
+`test_the_confidence_control_does_not_wobble_in_step_with_its_own_signal` in
+`test_contrast_inputs` is what now holds this table to the sentence above.
 
 The repair is the swap `quintile_00_20: 0 -> 1` and `decile_50_60: 1 -> 0`, and it is one of
 only two two-digit edits that produce a derangement while keeping five distinct phases, every

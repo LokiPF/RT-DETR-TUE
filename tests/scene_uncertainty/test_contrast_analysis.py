@@ -1,0 +1,638 @@
+"""What the arm table turns into, and the two things about it that nothing else can see.
+
+Most of this file is shape: how many rows, under which names, carrying which columns. That
+matters because `build_contrast_rows` is the only place the experiment's structure is written
+down, and a row that is missing, duplicated or filed under the wrong arm is not a wrong number
+-- it is a candidate that silently does not exist, or two candidates that lock opposite
+orientations on one series.
+
+The rest is the cross-fitting, and it is here because it is invisible everywhere else. A
+residual scored from the line its own image helped fit is smaller than it should be, by exactly
+the amount of that image's influence -- smallest for the images least like the rest, which are
+the ones a residual exists to flag. Every number stays plausible. `crossfit_score` is a fixture
+built so the fold-0 line and the final line disagree loudly, which is the only way an assertion
+can tell which one a row was scored from.
+
+Two mutations this file guards against are ones the shared fixture cannot see on its own.
+`contrast_test_utils.default_score` does not vary with `aggregation`, so a `_curve` that read
+`mean` where it meant `q90` produces byte-identical rows -- `test_the_three_aggregations_are_
+three_series` rewrites a bundle's score column to break that tie. And every arm that is first
+with its bucket pair happens to have `name == pair_name`, so labelling the confidence twin by
+arm rather than by pair is currently a no-op -- `test_the_confidence_twin_is_labelled_by_pair_
+and_not_by_whichever_arm_came_first` reorders the table until it stops being one.
+"""
+import csv
+from statistics import median
+
+import pytest
+
+from src.scene_uncertainty import contrast_analysis
+from src.scene_uncertainty.contrast_analysis import (
+    CONTRAST_ROW_FIELDS,
+    CONTRAST_ROW_KEY,
+    ContrastAnalysisError,
+    build_anchor_diagnostics,
+    build_contrast_rows,
+)
+from src.scene_uncertainty.contrast_inputs import (
+    AGGREGATIONS,
+    ARMS,
+    load_contrast_inputs,
+)
+from src.scene_uncertainty.contrast_scores import FOLD_COUNT, SCORE_METHODS, assign_folds
+
+from tests.scene_uncertainty.contrast_test_utils import default_score, write_source_bundle
+
+IMAGES = 6
+SEVERITIES = 6
+
+
+def loaded(tmp_path, *, images=IMAGES, **kwargs):
+    source = write_source_bundle(tmp_path / "source", image_ids=range(1, images + 1), **kwargs)
+    return load_contrast_inputs(source, expected_image_count=images)
+
+
+def crossfit_score(image_id, severity, confidence_bin, signal, scope):
+    """A reference/responsive pair whose fold-0 line differs sharply from the final line.
+
+    reference = image_id; responsive = image_id + [0, 5, 5, 5, 0, 0][image_id - 1].
+    Fold 0 holds images 1 and 6, so its four training images carry all three of the lifts and
+    its fitted slope is 1/6 against the final line's 1. Every other fold trains on at least one
+    unlifted image and fits a slope of exactly 1, so the fold that matters is the one the test
+    reads and the difference is 3.75 of residual on image 1 -- far outside any tolerance.
+    """
+    if signal != "persistence" or scope != "layer_2":
+        return default_score(image_id, severity, confidence_bin, signal, scope)
+    if confidence_bin == "decile_00_10":
+        return float(image_id)
+    if confidence_bin == "decile_50_60":
+        return float(image_id) + [0.0, 5.0, 5.0, 5.0, 0.0, 0.0][image_id - 1]
+    return default_score(image_id, severity, confidence_bin, signal, scope)
+
+
+def index(rows):
+    return {tuple(row[field] for field in CONTRAST_ROW_KEY): row for row in rows}
+
+
+def rewrite_scores(source, rescore):
+    """Rewrite a written bundle's `score` column in place, leaving every other column alone.
+
+    `rescore` is handed the row and its score and must not vary with `severity`. That is not a
+    convenience: the four trend columns beside the score were computed by
+    `complete_trend_metrics` on the curve as first written, and a per-severity edit would leave
+    them describing a curve the file no longer contains. An offset that is constant along a
+    curve changes no rank, so `signed_spearman`, `absolute_spearman` and `direction` stay true
+    of the rewritten rows and the fixture keeps the self-consistency it is built on.
+    """
+    path = source / "per_scene.csv"
+    with path.open(newline="") as handle:
+        reader = csv.DictReader(handle)
+        header = list(reader.fieldnames)
+        rows = list(reader)
+    for row in rows:
+        row["score"] = rescore(row, float(row["score"]))
+    with path.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=header)
+        writer.writeheader()
+        writer.writerows(rows)
+    return source
+
+
+AGGREGATION_STEP = {"mean": 0.0, "q90": 1.0, "top20_mean": 2.0}
+BIN_STEP = {
+    "decile_00_10": 0.001, "quintile_00_20": 0.002, "quintile_40_60": 0.003,
+    "decile_50_60": 0.004, "decile_90_100": 0.005,
+}
+
+
+def aggregation_offset(row, score):
+    """Push the three aggregations apart, by a different amount in each bin.
+
+    Different per bin as well as per aggregation, so the offset does not cancel inside a gap:
+    an aggregation term that moved both bins of an arm equally would change `raw_responsive`
+    and leave `raw_gap` and the fitted line exactly where they were, and a `_curve` that read
+    the wrong aggregation would still be caught on only one of the four methods.
+
+    The sign follows the signal so both columns stay inside their own bounds -- persistence is
+    a distance and rises, `1 - confidence` is capped at 1.0 and falls. The largest offset is
+    0.010 against a smallest fixture score of 0.055 and a largest of 0.991.
+    """
+    offset = AGGREGATION_STEP[row["aggregation"]] * BIN_STEP[row["confidence_bin"]]
+    return score + (offset if row["signal"] == "persistence" else -offset)
+
+
+def test_every_arm_summary_and_method_produces_a_full_grid(tmp_path):
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    persistence = [row for row in rows if row["signal"] == "persistence"]
+    confidence = [row for row in rows if row["signal"] == "confidence"]
+    # three layer_2 arms at four methods plus the combined arm at three: fifteen combinations
+    assert len(persistence) == 15 * 3 * IMAGES * SEVERITIES
+    assert len(confidence) == 3 * 3 * len(SCORE_METHODS) * IMAGES * SEVERITIES
+    assert len(index(rows)) == len(rows)  # no duplicate row keys
+    # and the same source twice is the same list: nothing here depends on set or dict ordering
+    again, _ = build_contrast_rows(loaded(tmp_path))
+    assert rows == again
+
+
+def test_the_row_key_and_columns_are_what_a_published_table_needs(tmp_path):
+    """Pinned as literals, because every consumer of this module groups or writes by them.
+
+    `index` above builds its keys out of `CONTRAST_ROW_KEY`, so a mutation of the constant moves
+    the test's own expectation with it and every duplicate check in this file goes quiet. The
+    literal here is what stops that. `CONTRAST_ROW_FIELDS` is pinned in order as well as by
+    membership because Task 5 writes it as a CSV header, and a reordered header is a file whose
+    columns no longer mean what a previous run's did.
+    """
+    assert CONTRAST_ROW_KEY == ("image_id", "severity", "arm", "signal", "aggregation", "method")
+    assert CONTRAST_ROW_FIELDS == (
+        "image_id", "severity", "arm", "signal", "aggregation", "method",
+        "arm_family", "declared_before_data", "score_scope",
+        "reference_bin", "responsive_bin", "reference", "responsive", "score",
+        "fold", "fit_slope", "fit_offset",
+    )
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    assert all(tuple(row) == CONTRAST_ROW_FIELDS for row in rows)
+
+
+def test_the_relative_gap_is_unavailable_at_the_combined_scope(tmp_path):
+    """A signed z-score has no symmetric relative gap; the reason is recorded, not silent."""
+    rows, fits = build_contrast_rows(loaded(tmp_path))
+    combined = {
+        row["method"] for row in rows
+        if row["arm"] == "decile_90_100__50_60__combined"
+    }
+    assert combined == {"raw_responsive", "raw_gap", "clean_residual"}
+    layered = {
+        row["method"] for row in rows if row["arm"] == "decile_90_100__50_60"
+        and row["signal"] == "persistence"
+    }
+    assert layered == set(SCORE_METHODS)
+    fit = fits[("decile_90_100__50_60__combined", "persistence", "mean")]
+    assert fit["relative_gap_available"] is False
+    assert "signed z-score" in fit["relative_gap_unavailable_reason"]
+    assert fits[("decile_90_100__50_60", "persistence", "mean")][
+        "relative_gap_available"
+    ] is True
+    # the confidence twin is not a signed scope either, and keeps all four methods
+    twin = fits[("decile_90_100__50_60", "confidence", "mean")]
+    assert twin["relative_gap_available"] is True
+    assert twin["relative_gap_unavailable_reason"] is None
+
+
+def test_the_two_differential_arms_share_one_confidence_twin(tmp_path):
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    twins = {row["arm"] for row in rows if row["signal"] == "confidence"}
+    assert twins == {
+        "decile_00_10__50_60", "quintile_00_20__40_60", "decile_90_100__50_60"
+    }
+    assert "decile_90_100__50_60__combined" not in twins
+    # the set alone would survive emitting the shared twin twice under the same label, which is
+    # exactly what a `_signal_plan` without its first-with-pair guard does. The count is what
+    # says it was emitted once: three aggregations, four methods, six images, six severities.
+    shared = [
+        row for row in rows
+        if row["signal"] == "confidence" and row["arm"] == "decile_90_100__50_60"
+    ]
+    assert len(shared) == len(AGGREGATIONS) * len(SCORE_METHODS) * IMAGES * SEVERITIES
+
+
+def test_persistence_rows_carry_their_arm_scope_and_provenance(tmp_path):
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    by_key = index(rows)
+    combined = by_key[
+        (1, 0, "decile_90_100__50_60__combined", "persistence", "mean", "raw_gap")
+    ]
+    assert combined["score_scope"] == "combined"
+    assert combined["arm_family"] == "differential"
+    assert combined["declared_before_data"] is False
+    assert combined["reference_bin"] == "decile_90_100"
+    assert combined["responsive_bin"] == "decile_50_60"
+    anchored = by_key[(1, 0, "decile_00_10__50_60", "persistence", "mean", "raw_gap")]
+    assert anchored["score_scope"] == "layer_2"
+    assert anchored["arm_family"] == "anchored"
+    assert anchored["declared_before_data"] is True
+    assert anchored["reference_bin"] == "decile_00_10"
+    assert anchored["responsive_bin"] == "decile_50_60"
+    # the twin inherits the provenance of the arm that owns the pair, not a default
+    twin = by_key[(1, 0, "decile_90_100__50_60", "confidence", "mean", "raw_gap")]
+    assert twin["score_scope"] == "confidence"
+    assert twin["arm_family"] == "differential"
+    assert twin["declared_before_data"] is False
+    assert (twin["reference_bin"], twin["responsive_bin"]) == ("decile_90_100", "decile_50_60")
+
+
+def test_the_two_differential_arms_read_different_scopes(tmp_path):
+    """`combined` is a signed z-score, not `layer_2` shifted, and the rows have to show it."""
+    inputs = loaded(tmp_path)
+    rows, _ = build_contrast_rows(inputs)
+    by_key = index(rows)
+    layer = by_key[(2, 1, "decile_90_100__50_60", "persistence", "q90", "raw_responsive")]
+    combined = by_key[
+        (2, 1, "decile_90_100__50_60__combined", "persistence", "q90", "raw_responsive")
+    ]
+    assert layer["score"] != combined["score"]
+    assert layer["score"] > 0.0 > combined["score"]
+
+    # ... and the two are not one series plus a constant, which is what an offset fixture would
+    # make them: an offset cancels in `raw_gap` and in `clean_residual`, so two of arm 4's three
+    # methods would be arm 3's answers under a different name.
+    def responsives(arm):
+        return {
+            (row["image_id"], row["severity"]): row["responsive"]
+            for row in rows
+            if row["arm"] == arm and row["signal"] == "persistence"
+            and row["aggregation"] == "q90" and row["method"] == "raw_responsive"
+        }
+
+    layered, combineds = responsives("decile_90_100__50_60"), responsives(
+        "decile_90_100__50_60__combined"
+    )
+    assert layered.keys() == combineds.keys()
+    differences = {
+        round(combineds[key] - layered[key], 9) for key in layered
+    }
+    assert len(differences) == IMAGES * SEVERITIES
+    assert min(combineds.values()) < 0.0 <= min(layered.values())
+
+
+def test_raw_responsive_and_raw_gap_match_their_inputs(tmp_path):
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    by_key = index(rows)
+    key = (3, 2, "decile_00_10__50_60", "persistence", "mean")
+    control = by_key[(*key, "raw_responsive")]
+    gap = by_key[(*key, "raw_gap")]
+    assert control["score"] == control["responsive"]
+    assert gap["score"] == pytest.approx(gap["responsive"] - gap["reference"])
+    assert control["reference"] == gap["reference"]
+
+
+def test_rows_carry_the_source_scores_their_arm_names(tmp_path):
+    """`reference` and `responsive` are read back against the bundle, not against each other.
+
+    Every within-row assertion in this file is symmetric under swapping the two: `raw_responsive`
+    returns whatever sits in `responsive`, and `raw_gap` returns their signed difference, so a
+    `_curve` pair built the wrong way round is perfectly self-consistent and only the *sign* of
+    every contrast in the experiment is inverted. The source is the only thing that can tell
+    them apart, and the two bins differ -- 0.0768 against 0.0721 on this row -- so the swap is
+    visible rather than a wash.
+    """
+    inputs = loaded(tmp_path)
+    rows, _ = build_contrast_rows(inputs)
+    for row in rows:
+        for side in ("reference", "responsive"):
+            assert row[side] == inputs.scores[(
+                row["image_id"], row["severity"], row["signal"],
+                row[f"{side}_bin"], row["aggregation"], row["score_scope"],
+            )], (side, row["arm"], row["image_id"], row["severity"])
+    anchored = index(rows)[(3, 2, "decile_00_10__50_60", "persistence", "mean", "raw_gap")]
+    assert anchored["reference"] == 0.076843
+    assert anchored["responsive"] == 0.072131
+
+
+def test_the_three_aggregations_are_three_series(tmp_path):
+    """The shared fixture makes the three summaries identical; this one does not.
+
+    `contrast_test_utils.default_score` is not handed the aggregation, so every `mean`, `q90`
+    and `top20_mean` row of a default bundle carries the same number -- and a `_curve` that
+    ignored its `aggregation` argument, or hardcoded one, would produce a grid nothing in this
+    file could distinguish from the right one. That is the fixture's own recorded gap. Here the
+    written bundle is rewritten so the three come apart, by a different step in each bin so the
+    difference survives the subtraction inside `raw_gap` as well as showing up in
+    `raw_responsive`.
+    """
+    source = rewrite_scores(
+        write_source_bundle(tmp_path / "source"), aggregation_offset
+    )
+    inputs = load_contrast_inputs(source, expected_image_count=IMAGES)
+    rows, fits = build_contrast_rows(inputs)
+    by_key = index(rows)
+
+    for method in SCORE_METHODS:
+        scores = {
+            aggregation: by_key[
+                (2, 3, "decile_00_10__50_60", "persistence", aggregation, method)
+            ]["score"]
+            for aggregation in AGGREGATIONS
+        }
+        assert len(set(scores.values())) == len(AGGREGATIONS), method
+
+    # the fitted lines are three lines too, not one reused three times
+    lines = {
+        aggregation: tuple(fits[("decile_00_10__50_60", "persistence", aggregation)]["final_line"])
+        for aggregation in AGGREGATIONS
+    }
+    assert len(set(lines.values())) == len(AGGREGATIONS)
+
+    # and the diagnostics read their own aggregation too. They call `_curve` separately, so a
+    # hardcoded summary there is a second copy of the same mutation that the rows above cannot
+    # see -- 21 diagnostics would still be produced, each describing the wrong series.
+    levels = {
+        row["aggregation"]: row["spread"][0]["median"]
+        for row in build_anchor_diagnostics(inputs)
+        if row["arm"] == "decile_00_10__50_60" and row["signal"] == "persistence"
+    }
+    assert len(set(levels.values())) == len(AGGREGATIONS)
+
+
+def test_all_six_severities_of_an_image_share_its_fold(tmp_path):
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    folds = assign_folds(range(1, IMAGES + 1))
+    for row in rows:
+        assert row["fold"] == folds[row["image_id"]]
+    # `folds` above is the same function the production code calls, so the loop proves the rows
+    # agree with it and not that it assigned anything. Six images over five folds is
+    # `{0, 1, 2, 3, 4}` with fold 0 twice; a constant map would satisfy every assertion above.
+    assert {row["fold"] for row in rows} == set(range(FOLD_COUNT))
+    assert sorted(folds.values()) == [0, 0, 1, 2, 3, 4]
+
+
+def test_residual_uses_its_own_fold_line_and_not_the_final_line(tmp_path):
+    rows, fits = build_contrast_rows(loaded(tmp_path, score=crossfit_score))
+    key = ("decile_00_10__50_60", "persistence", "mean")
+    fit = fits[key]
+    fold_slope, fold_offset = fit["fold_lines"][0]
+    final_slope, final_offset = fit["final_line"]
+    assert (fold_slope, fold_offset) != (final_slope, final_offset)
+    # pinned, because every assertion below is self-consistent under a `robust_line` whose two
+    # arguments are swapped or whose clean side is taken from the wrong curve: the stored line
+    # would move, and the residual computed from the stored line would move with it.
+    assert (final_slope, final_offset) == (1.0, 2.5)
+    assert fold_slope == pytest.approx(1 / 6)
+    assert fold_offset == pytest.approx(85 / 12)
+
+    row = index(rows)[
+        (1, 0, "decile_00_10__50_60", "persistence", "mean", "clean_residual")
+    ]
+    reference, responsive = row["reference"], row["responsive"]
+    # image 1 is in fold 0, so its residual is -6.25 from the fold line, not -2.5
+    assert row["score"] == pytest.approx(
+        responsive - (fold_offset + fold_slope * reference)
+    )
+    assert row["score"] == pytest.approx(-6.25)
+    assert row["score"] != pytest.approx(
+        responsive - (final_offset + final_slope * reference)
+    )
+    assert row["fit_slope"] == pytest.approx(fold_slope)
+    assert row["fit_offset"] == pytest.approx(fold_offset)
+
+
+def test_only_a_residual_row_carries_the_line_it_was_scored_from(tmp_path):
+    """The other three methods never see a line, so a line on their row would be decoration.
+
+    Worse than decoration: `fit_slope` and `fit_offset` are how a reader recomputes a residual
+    by hand, and a raw-gap row carrying them says a subtraction it did not perform was performed.
+    """
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+    for row in rows:
+        if row["method"] == "clean_residual":
+            assert row["fit_slope"] is not None and row["fit_offset"] is not None, row["arm"]
+        else:
+            assert row["fit_slope"] is None and row["fit_offset"] is None, row["method"]
+
+
+def test_only_severity_zero_rows_influence_a_fit(tmp_path):
+    """Changing corrupted severities alone must leave every fitted line untouched."""
+    def corrupted_only(image_id, severity, confidence_bin, signal, scope):
+        value = default_score(image_id, severity, confidence_bin, signal, scope)
+        if severity > 0 and signal == "persistence":
+            return value + 7.0
+        return value
+
+    _, baseline = build_contrast_rows(loaded(tmp_path / "a"))
+    _, shifted = build_contrast_rows(loaded(tmp_path / "b", score=corrupted_only))
+    assert baseline.keys() == shifted.keys()
+    for key in baseline:
+        assert baseline[key]["final_line"] == shifted[key]["final_line"]
+        assert baseline[key]["fold_lines"] == shifted[key]["fold_lines"]
+
+
+def test_twenty_one_final_lines_are_stored(tmp_path):
+    _, fits = build_contrast_rows(loaded(tmp_path))
+    persistence = [key for key in fits if key[1] == "persistence"]
+    confidence = [key for key in fits if key[1] == "confidence"]
+    assert len(persistence) == 12  # four arms x three summaries
+    assert len(confidence) == 9  # three bucket pairs x three summaries
+    assert len(fits) == 21
+
+
+def test_a_constant_reference_makes_the_residual_unavailable(tmp_path):
+    def constant_reference(image_id, severity, confidence_bin, signal, scope):
+        if signal == "persistence" and confidence_bin == "decile_00_10":
+            return 2.0
+        return default_score(image_id, severity, confidence_bin, signal, scope)
+
+    rows, fits = build_contrast_rows(loaded(tmp_path, score=constant_reference))
+    fit = fits[("decile_00_10__50_60", "persistence", "mean")]
+    assert fit["final_line"] is None
+    assert fit["residual_available"] is False
+    assert "constant" in fit["unavailable_reason"]
+    residuals = [
+        row for row in rows
+        if row["arm"] == "decile_00_10__50_60"
+        and row["signal"] == "persistence"
+        and row["method"] == "clean_residual"
+    ]
+    assert residuals == []
+    # the other three methods survive a constant reference
+    survivors = {
+        row["method"] for row in rows
+        if row["arm"] == "decile_00_10__50_60" and row["signal"] == "persistence"
+    }
+    assert survivors == {"raw_responsive", "raw_gap", "relative_gap"}
+
+
+def test_one_unfittable_fold_withdraws_the_whole_residual(tmp_path):
+    """A final line can exist while one fold's cannot, and four fifths of a residual is not one.
+
+    Fold 0 holds images 1 and 6, so it trains on 2 through 5. Give those four one shared clean
+    reference and leave 1 and 6 their own, and the all-clean line is perfectly fittable while
+    fold 0's is not. Publishing the four folds that worked would drop a fifth of the images from
+    a candidate, and nothing downstream re-counts a candidate's rows -- so the missing images
+    would reach a macro AUROC as a smaller sample rather than as an absence.
+    """
+    def constant_within_fold_zeros_training_set(
+        image_id, severity, confidence_bin, signal, scope
+    ):
+        if signal == "persistence" and confidence_bin == "decile_00_10":
+            return {1: 1.0, 6: 3.0}.get(image_id, 2.0)
+        return default_score(image_id, severity, confidence_bin, signal, scope)
+
+    rows, fits = build_contrast_rows(
+        loaded(tmp_path, score=constant_within_fold_zeros_training_set)
+    )
+    fit = fits[("decile_00_10__50_60", "persistence", "mean")]
+    assert fit["final_line"] is not None
+    assert fit["fold_lines"][0] is None
+    assert all(fit["fold_lines"][fold] is not None for fold in range(1, FOLD_COUNT))
+    assert fit["residual_available"] is False
+    assert "folds [0]" in fit["unavailable_reason"]
+    assert "constant" in fit["unavailable_reason"]
+    assert not [
+        row for row in rows
+        if row["arm"] == "decile_00_10__50_60" and row["signal"] == "persistence"
+        and row["method"] == "clean_residual"
+    ]
+
+
+def test_a_short_roster_leaves_its_empty_folds_out_of_the_fit(tmp_path):
+    """Three images fill three of five folds, and the two empty ones are absent, not `None`.
+
+    A `None` fold line means "this fold could not be fitted", which is a finding. A fold with no
+    images is not a finding, and recording one would make `residual_available` false for every
+    candidate on any roster smaller than five.
+    """
+    rows, fits = build_contrast_rows(loaded(tmp_path, images=3))
+    fit = fits[("decile_00_10__50_60", "persistence", "mean")]
+    assert sorted(fit["fold_lines"]) == [0, 1, 2]
+    assert fit["residual_available"] is True
+    assert {row["fold"] for row in rows} == {0, 1, 2}
+    assert len(rows) == (15 + 3 * len(SCORE_METHODS)) * 3 * 3 * SEVERITIES
+
+
+def test_the_confidence_twin_is_labelled_by_pair_and_not_by_whichever_arm_came_first(
+    tmp_path, monkeypatch
+):
+    """Reordering the arm table must not rename a series that nine tasks read.
+
+    In the declared table every arm that is first with its bucket pair has `name == pair_name`,
+    so `arm.name` and `arm.pair_name` are the same string on the only line where the difference
+    could show, and the mutation that labels the twin by arm passes the whole suite. Putting the
+    `combined` differential arm ahead of its `layer_2` sibling is the smallest change that makes
+    the two disagree -- and it is not a hypothetical, because the arm table is a literal tuple
+    and reordering it looks like a cosmetic edit.
+    """
+    reordered = (ARMS[0], ARMS[1], ARMS[3], ARMS[2])
+    monkeypatch.setattr(contrast_analysis, "ARMS", reordered)
+    inputs = loaded(tmp_path)
+    rows, fits = build_contrast_rows(inputs)
+    expected = {"decile_00_10__50_60", "quintile_00_20__40_60", "decile_90_100__50_60"}
+    twins = {row["arm"] for row in rows if row["signal"] == "confidence"}
+    assert twins == expected
+    assert {key[0] for key in fits if key[1] == "confidence"} == twins
+    # and the persistence rows still separate the two scopes under their own names
+    assert {row["arm"] for row in rows if row["signal"] == "persistence"} == {
+        arm.name for arm in ARMS
+    }
+    assert len(index(rows)) == len(rows)
+    assert len(fits) == 21
+    # the diagnostics label their arms from the same plan, and inherit the same trap
+    diagnostics = build_anchor_diagnostics(inputs)
+    assert {
+        row["arm"] for row in diagnostics if row["signal"] == "confidence"
+    } == expected
+    assert len({(row["arm"], row["signal"], row["aggregation"]) for row in diagnostics}) == 21
+
+
+def test_two_arms_that_would_share_a_series_are_refused(tmp_path, monkeypatch):
+    """An arm table with a repeated name silently overwrites a fit and doubles its rows.
+
+    Refused rather than deduplicated. Two arms with one name are two different experiments
+    filed under one heading, and picking either one for the reader is picking which of two
+    hypotheses gets reported.
+    """
+    from dataclasses import replace
+
+    clash = replace(ARMS[1], name=ARMS[0].name)
+    monkeypatch.setattr(contrast_analysis, "ARMS", (ARMS[0], clash, ARMS[2], ARMS[3]))
+    with pytest.raises(ContrastAnalysisError, match="same contrast series"):
+        build_contrast_rows(loaded(tmp_path))
+
+
+def test_anchor_diagnostics_cover_every_arm_and_summary(tmp_path):
+    diagnostics = build_anchor_diagnostics(loaded(tmp_path))
+    keys = {(row["arm"], row["signal"], row["aggregation"]) for row in diagnostics}
+    assert len(keys) == 21
+    assert len(diagnostics) == 21
+    families = {row["arm"]: row["arm_family"] for row in diagnostics}
+    assert families["decile_90_100__50_60__combined"] == "differential"
+    assert families["decile_00_10__50_60"] == "anchored"
+    assert all(
+        set(row) == {
+            "arm", "arm_family", "declared_before_data", "signal", "aggregation",
+            "score_scope", "reference_bin", "responsive_bin", "drift", "spread",
+            "relationship",
+        }
+        for row in diagnostics
+    )
+    combined = next(
+        row for row in diagnostics
+        if row["arm"] == "decile_90_100__50_60__combined" and row["aggregation"] == "q90"
+    )
+    assert combined["score_scope"] == "combined"
+    assert combined["declared_before_data"] is False
+    assert (combined["reference_bin"], combined["responsive_bin"]) == (
+        "decile_90_100", "decile_50_60"
+    )
+
+
+def test_a_differential_arm_reports_its_anchor_failure_rather_than_hiding_it(tmp_path):
+    diagnostics = build_anchor_diagnostics(loaded(tmp_path))
+    row = next(
+        item for item in diagnostics
+        if item["arm"] == "decile_90_100__50_60"
+        and item["signal"] == "persistence"
+        and item["aggregation"] == "mean"
+    )
+    # the fixture's 90-100 reference falls with blur, so it drifts and is not an anchor
+    assert row["arm_family"] == "differential"
+    assert row["drift"]["by_severity"][5]["median_absolute_drift"] > 0.0
+    assert row["spread"][5]["stability_to_spread"] is not None
+
+
+def test_the_diagnostics_measure_the_reference_and_not_the_responsive(tmp_path):
+    """Both bins drift and both spread, so only a signed or a levelled number tells them apart.
+
+    `median_absolute_drift` is positive for either bin of arm 3 and `stability_to_spread` is
+    non-`None` for either, so the assertions above pass unchanged if `within_image_drift` and
+    `between_image_spread` are handed the responsive curve. The two bins move in *opposite*
+    directions -- the top decile falls with blur at -0.0037 a step while the middle decile
+    rises at +0.0032 -- and they sit at different clean levels, which is what these two
+    assertions read.
+    """
+    inputs = loaded(tmp_path)
+    diagnostics = build_anchor_diagnostics(inputs)
+    row = next(
+        item for item in diagnostics
+        if item["arm"] == "decile_90_100__50_60"
+        and item["signal"] == "persistence"
+        and item["aggregation"] == "mean"
+    )
+    assert row["drift"]["by_severity"][5]["median_signed_drift"] < 0.0
+    assert row["spread"][0]["median"] == pytest.approx(median(
+        inputs.scores[(image_id, 0, "persistence", "decile_90_100", "mean", "layer_2")]
+        for image_id in inputs.image_ids
+    ))
+    # ... and the responsive bin, which is what a swap would report, is the other sign and level
+    assert median(
+        inputs.scores[(image_id, 5, "persistence", "decile_50_60", "mean", "layer_2")]
+        - inputs.scores[(image_id, 0, "persistence", "decile_50_60", "mean", "layer_2")]
+        for image_id in inputs.image_ids
+    ) > 0.0
+
+
+def test_the_diagnostics_clean_line_is_the_line_the_rows_were_scored_from(tmp_path):
+    """One relationship per fit, and the two functions must not disagree about it.
+
+    `clean_relationship` and `_fit` both regress the responsive clean level on the reference
+    clean level over the same roster and the same folds, so their lines are the same line. A
+    swap of the two arguments in either place -- which Pearson and Spearman are blind to,
+    because both are symmetric -- shows up here as two different slopes for one candidate.
+    """
+    inputs = loaded(tmp_path, score=crossfit_score)
+    _, fits = build_contrast_rows(inputs)
+    for row in build_anchor_diagnostics(inputs):
+        key = (row["arm"], row["signal"], row["aggregation"])
+        relationship, fit = row["relationship"], fits[key]
+        assert relationship["fold_lines"] == fit["fold_lines"], key
+        if fit["final_line"] is None:
+            assert relationship["final_slope"] is None, key
+        else:
+            assert [relationship["final_slope"], relationship["final_offset"]] == (
+                fit["final_line"]
+            ), key
+    crossfit = next(
+        row for row in build_anchor_diagnostics(inputs)
+        if row["arm"] == "decile_00_10__50_60" and row["signal"] == "persistence"
+        and row["aggregation"] == "mean"
+    )["relationship"]
+    assert (crossfit["final_slope"], crossfit["final_offset"]) == (1.0, 2.5)
