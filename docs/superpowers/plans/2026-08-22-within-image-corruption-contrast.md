@@ -1123,7 +1123,7 @@ git commit -m "feat: add pure contrast score methods, folds, and robust clean li
 
 **Interfaces:**
 - Consumes: `contrast_scores.robust_line`, `contrast_scores.assign_folds` (Task 2); `corruption_metrics.complete_trend_metrics` (existing).
-- Produces: `within_image_drift(curves)`, `between_image_spread(curves, drift)`, `clean_relationship(references, responsives, *, folds)`. Task 5 calls all three once per `(arm, summary, signal)`; Task 7 writes their output to `anchor_diagnostics.csv`.
+- Produces: `within_image_drift(curves)`, `between_image_spread(curves, drift)`, `clean_relationship(references, responsives, *, folds)`. **Task 4**'s `build_anchor_diagnostics` calls all three once per `(arm, summary, signal)`; **Task 8** writes their output to `anchor_diagnostics.csv`.
 
 **These diagnostics gate only the anchored arms.** They run on all four and are reported in full, but a differential arm is *expected* to fail them — its reference range responds to blur by design. This module computes; it does not judge. The `arm_family` label that decides how a number is read is attached in Task 5, and the pass/fail rule lives in Task 8's success reporting.
 
