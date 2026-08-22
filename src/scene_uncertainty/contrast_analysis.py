@@ -100,6 +100,30 @@ def _signal_plan(arm: Arm) -> tuple[tuple[str, str, str], ...]:
     return tuple(entries)
 
 
+def _unique(
+    seen: set[tuple[str, str, str]], key: tuple[str, str, str]
+) -> tuple[str, str, str]:
+    """Record one `(arm-or-pair, signal, aggregation)` series, refusing a second of the same.
+
+    Called by both public functions rather than only by the one that keys a dictionary. A
+    repeated key in `build_contrast_rows` overwrites a fit and doubles its rows; in
+    `build_anchor_diagnostics` it appends a duplicate to a list, which is quieter still --
+    nothing there is keyed, so a Task 7 or 8 caller that reads the diagnostics on their own
+    would get 24 entries where the 21 are documented and no signal that two of them describe
+    experiments filed under one heading.
+
+    Refused rather than deduplicated: two arms with one name are two different hypotheses, and
+    silently keeping either one is choosing which gets reported.
+    """
+    if key in seen:
+        raise ContrastAnalysisError(
+            f"two arms produce the same contrast series {key}; the arm table must "
+            "give every arm its own name and every bucket pair one confidence twin"
+        )
+    seen.add(key)
+    return key
+
+
 def _curve(
     inputs: ContrastInputs, confidence_bin: str, aggregation: str, scope: str, signal: str
 ) -> dict[int, dict[int, float]]:
@@ -227,17 +251,13 @@ def build_contrast_rows(inputs: ContrastInputs) -> tuple[list[dict], dict]:
     if the two came from the same place.
     """
     folds = assign_folds(inputs.image_ids)
+    seen: set[tuple[str, str, str]] = set()
     rows: list[dict] = []
     fits: dict[tuple[str, str, str], dict] = {}
     for arm in ARMS:
         for label, signal, scope in _signal_plan(arm):
             for aggregation in AGGREGATIONS:
-                key = (label, signal, aggregation)
-                if key in fits:
-                    raise ContrastAnalysisError(
-                        f"two arms produce the same contrast series {key}; the arm table must "
-                        "give every arm its own name and every bucket pair one confidence twin"
-                    )
+                key = _unique(seen, (label, signal, aggregation))
                 references = _curve(inputs, arm.reference_bin, aggregation, scope, signal)
                 responsives = _curve(inputs, arm.responsive_bin, aggregation, scope, signal)
                 fit = _fit(references, responsives, folds, scope)
@@ -291,10 +311,12 @@ def build_anchor_diagnostics(inputs: ContrastInputs) -> list[dict]:
     build 60,000 rows to get 21 dictionaries.
     """
     folds = assign_folds(inputs.image_ids)
+    seen: set[tuple[str, str, str]] = set()
     diagnostics: list[dict] = []
     for arm in ARMS:
         for label, signal, scope in _signal_plan(arm):
             for aggregation in AGGREGATIONS:
+                _unique(seen, (label, signal, aggregation))
                 references = _curve(inputs, arm.reference_bin, aggregation, scope, signal)
                 responsives = _curve(inputs, arm.responsive_bin, aggregation, scope, signal)
                 drift = within_image_drift(references)

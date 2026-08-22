@@ -323,7 +323,7 @@ What is preserved exactly is the *side* of one half every bin falls on, which is
 """
 
 CONFIDENCE_TREND_NOISE = {
-    "decile_00_10": 4.35, "quintile_00_20": 4.05,
+    "decile_00_10": 4.35, "quintile_00_20": 4.00,
     "quintile_40_60": 1.25, "decile_50_60": 1.45,
     "decile_90_100": 2.00,
 }
@@ -342,29 +342,38 @@ the 250 images the real command runs:
 | bin | median signed | run | median absolute | run |
 |---|---|---|---|---|
 | `decile_00_10` | -0.657 | -0.600 | 0.771 | 0.771 |
-| `quintile_00_20` | -0.543 | -0.600 | 0.543 | 0.771 |
+| `quintile_00_20` | -0.609 | -0.600 | 0.609 | 0.771 |
 | `quintile_40_60` | -0.571 | -0.543 | 0.857 | 0.800 |
 | `decile_50_60` | -0.429 | -0.514 | 0.714 | 0.829 |
 | `decile_90_100` | +0.841 | +0.829 | 0.841 | 0.857 |
 
-Two rows are looser than the other three, and the looseness is bought deliberately. These
-ratios were originally solved jointly with `CONFIDENCE_TREND_PHASE` -- but two of those phases
-were then equal to their own `BIN_TREND_PHASE`, which is what made `quintile_00_20` and
-`decile_50_60` fit so well: their confidence wobble was a copy of their persistence wobble.
-Deranging the phase table is not negotiable (it is the independence Task 6's redundancy control
-measures), and re-solving the two ratios around the new phases does not recover the run's
-numbers either -- the six-point Spearman grid has no value nearer than these for
-`quintile_00_20` without pushing its median absolute further off. So the phases were fixed and
-the ratios left where they are, and this table records where that lands rather than where the
-old one claimed to.
+Two of these five were re-solved when `CONFIDENCE_TREND_PHASE` was deranged, and one of the two
+was then left alone. The ratios had originally been solved jointly with the phases -- but two of
+those phases were equal to their own `BIN_TREND_PHASE`, and that is *why* `quintile_00_20` and
+`decile_50_60` fitted so well: their confidence wobble was a copy of their persistence wobble.
+Deranging the phase table is not negotiable, so both ratios had to be re-solved against the new
+phases, and the two came out differently.
+
+`quintile_00_20` moved 4.05 -> 4.00, and 4.00 is the unique minimum of the joint
+`|signed error| + |absolute error|` over the whole grid under every invariant below: 0.171
+against 0.285 for every neighbouring hundredth. It improves *both* metrics at once -- signed
+-0.609 against -0.543 for the run's -0.600, and absolute 0.609 against 0.543 for the run's
+0.771 -- so there is no trade to weigh.
+
+`decile_50_60` stayed at 1.45, and its per-metric optimum was declined rather than missed. 1.20
+gives -0.477 signed and 0.886 absolute, both nearer the run's -0.514 and 0.829 than 1.45's
+-0.429 and 0.714. It also collapses the bin to **four** distinct per-image strengths, and five
+distinct strengths is what stops Task 6's criteria 4 and 5 from being decided by ties. A closer
+median that cannot order anything is not closer to the thing being modelled, so the invariant
+wins and this row stays loose.
 
 What is preserved exactly, because it is what downstream code reads: every bin's orientation,
 no bin unanimous, and five distinct per-image strengths per bin at both roster sizes. Task 6's
-criteria 4 and 5 still have room to move -- median absolute Spearman spans 0.543 to 0.857
+criteria 4 and 5 still have room to move -- median absolute Spearman spans 0.609 to 0.857
 against the run's 0.771 to 0.857, and the dominant-direction fraction 0.66 to 0.83 against the
 run's 0.60 to 0.80.
 
-At six images the medians are -0.657, -0.600, -0.571, -0.429 and +0.863, for the reason spelled
+At six images the medians are -0.657, -0.633, -0.571, -0.429 and +0.863, for the reason spelled
 out under `PERSISTENCE_TREND_NOISE`: six images sample each residue once and their median
 averages two values, where 250 images land on one.
 """
@@ -394,7 +403,8 @@ The repair is the swap `quintile_00_20: 0 -> 1` and `decile_50_60: 1 -> 0`, and 
 only two two-digit edits that produce a derangement while keeping five distinct phases, every
 bin's median signed Spearman on the run's side of zero at both six and 250 images, and no bin
 unanimous at six. Of the two it is the one whose 250-image medians sit closest to the run's.
-The noise ratios were *not* re-solved around it: see `CONFIDENCE_TREND_NOISE`.
+One of the two noise ratios was re-solved around it and one was deliberately not: see
+`CONFIDENCE_TREND_NOISE`.
 """
 
 PERSISTENCE_TREND_NOISE = {
@@ -446,15 +456,28 @@ is the run's disagreement between its two columns, and reusing the `layer_2` rat
 it -- arms 3 and 4 are the same bucket pair read at the two scopes, and they have to differ by
 more than a scale factor for the pair to be worth carrying twice.
 
-`decile_90_100` is the exception and it is worth naming rather than leaving to be discovered.
-Its ratio here is 2.15, the same as its `layer_2` ratio, and the tilt table and phase are shared
-across scopes too -- so within an image its `combined` curve is `|COMBINED_SLOPE|/|
-PERSISTENCE_SLOPE|` times its `layer_2` curve about that image's own baseline. A positive affine
-transform preserves rank, so this bin's per-image signed Spearman is **-0.829 at both scopes**
-and every rank statistic taken on it alone cannot tell the two apart. It is arms 3 and 4's
-*reference*, so what still separates those two arms is their responsive bin (3.40 against 5.60)
-and the signed `COMBINED_LEVEL`, not the reference's trend. A test that means to prove the two
-scopes are distinct must read a contrast or a level, not this bin's reference trend.
+`decile_90_100` shares its `layer_2` ratio of 2.15, and that is the run's finding rather than a
+copied constant. The tilt table and the phase are shared across scopes too, so within an image
+its `combined` curve is a fixed positive multiple -- `|COMBINED_SLOPE| / |PERSISTENCE_SLOPE|` --
+of its `layer_2` curve about that image's own baseline. A positive affine transform preserves
+rank, so this bin's per-image median signed Spearman is **the same at both scopes**: -0.829
+across 250 images and -0.743 across six. That is what the run does. Its `decile_90_100` median
+is -0.829 at both scopes at `mean` and -0.771 at both at `q90`, and it is the only bin of the
+five whose two scopes agree -- so making this ratio differ from its `layer_2` twin would be
+inventing a disagreement the measurement does not show.
+
+The consequence has to be said out loud anyway, because it is a hole in what the fixture can
+prove: no rank statistic taken on this bin's reference trend alone can tell the two scopes
+apart. It is arms 3 and 4's *reference*, so what separates those two arms here is their
+responsive bin (3.40 against 5.60) and the signed `COMBINED_LEVEL`, not the reference's trend. A
+test that means to prove the two scopes are distinct must read a contrast or a level.
+
+None of this is why the three *aggregations* are rank-identical. That is `default_score`
+ignoring its `aggregation` argument entirely, which makes every bin byte-identical across the
+three summaries at every scope -- see that function's last paragraph. A later task that needs
+the run's `top20_mean` scope disagreement cannot get it by moving a ratio in this table; it
+needs a bundle whose score column is rewritten per aggregation, the way
+`test_contrast_analysis.rewrite_scores` does it.
 """
 
 SCENE_BASELINE_SPREAD = 0.02

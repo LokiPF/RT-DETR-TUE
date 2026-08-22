@@ -37,6 +37,7 @@ from src.scene_uncertainty.contrast_analysis import (
 from src.scene_uncertainty.contrast_inputs import (
     AGGREGATIONS,
     ARMS,
+    ContrastInputError,
     load_contrast_inputs,
 )
 from src.scene_uncertainty.contrast_scores import FOLD_COUNT, SCORE_METHODS, assign_folds
@@ -169,6 +170,12 @@ def test_the_relative_gap_is_unavailable_at_the_combined_scope(tmp_path):
     assert layered == set(SCORE_METHODS)
     fit = fits[("decile_90_100__50_60__combined", "persistence", "mean")]
     assert fit["relative_gap_available"] is False
+    # both halves of the recorded reason, because Task 8 publishes the string and a reader who
+    # gets only "it is a signed z-score" is not told which property of the method that breaks
+    assert fit["relative_gap_unavailable_reason"] == (
+        "the combined scope is a signed z-score, and the symmetric relative gap's scale "
+        "invariance and +/-2 bounds both require non-negative inputs"
+    )
     assert "signed z-score" in fit["relative_gap_unavailable_reason"]
     assert fits[("decile_90_100__50_60", "persistence", "mean")][
         "relative_gap_available"
@@ -261,9 +268,22 @@ def test_raw_responsive_and_raw_gap_match_their_inputs(tmp_path):
     key = (3, 2, "decile_00_10__50_60", "persistence", "mean")
     control = by_key[(*key, "raw_responsive")]
     gap = by_key[(*key, "raw_gap")]
+    relative = by_key[(*key, "relative_gap")]
     assert control["score"] == control["responsive"]
     assert gap["score"] == pytest.approx(gap["responsive"] - gap["reference"])
     assert control["reference"] == gap["reference"]
+    # the fourth method is value-checked too, and against its formula rather than against the
+    # other three. Everywhere else in this file `relative_gap` appears only as a name inside a
+    # set of method names, so computing it as a raw gap or as the responsive alone would satisfy
+    # every count and every membership assertion. On this row the three are -0.063259, -0.004712
+    # and 0.072131, so the confusion is an order of magnitude, not a rounding difference.
+    reference, responsive = relative["reference"], relative["responsive"]
+    assert relative["score"] == pytest.approx(
+        2.0 * (responsive - reference) / (responsive + reference)
+    )
+    assert relative["score"] == pytest.approx(-0.063259, abs=1e-6)
+    assert relative["score"] != pytest.approx(gap["score"])
+    assert relative["score"] != pytest.approx(control["score"])
 
 
 def test_rows_carry_the_source_scores_their_arm_names(tmp_path):
@@ -360,20 +380,34 @@ def test_residual_uses_its_own_fold_line_and_not_the_final_line(tmp_path):
     assert fold_slope == pytest.approx(1 / 6)
     assert fold_offset == pytest.approx(85 / 12)
 
-    row = index(rows)[
-        (1, 0, "decile_00_10__50_60", "persistence", "mean", "clean_residual")
-    ]
-    reference, responsive = row["reference"], row["responsive"]
-    # image 1 is in fold 0, so its residual is -6.25 from the fold line, not -2.5
-    assert row["score"] == pytest.approx(
-        responsive - (fold_offset + fold_slope * reference)
-    )
-    assert row["score"] == pytest.approx(-6.25)
-    assert row["score"] != pytest.approx(
-        responsive - (final_offset + final_slope * reference)
-    )
-    assert row["fit_slope"] == pytest.approx(fold_slope)
-    assert row["fit_offset"] == pytest.approx(fold_offset)
+    by_key = index(rows)
+    # Both images of fold 0, and the second one is not optional. `crossfit_score` sets
+    # `reference = float(image_id)`, so on image 1 the reference is exactly 1.0 and
+    # `offset + slope * 1 == slope + offset * 1` -- a line passed to `contrast_score` with its
+    # two halves transposed scores image 1 identically, and `fit_slope`/`fit_offset` are read
+    # back off the stored fit rather than off what the score was computed with, so all three
+    # assertions below pass on a transposed call. `robust_line` returns `(slope, offset)` and
+    # `contrast_score` unpacks positionally, which is exactly the shape of refactor slip that
+    # produces one. Image 6 has reference 6.0 and separates -25/12 from -110/3.
+    for image_id, expected in ((1, -6.25), (6, -25 / 12)):
+        row = by_key[
+            (image_id, 0, "decile_00_10__50_60", "persistence", "mean", "clean_residual")
+        ]
+        assert row["fold"] == 0
+        reference, responsive = row["reference"], row["responsive"]
+        assert row["score"] == pytest.approx(
+            responsive - (fold_offset + fold_slope * reference)
+        )
+        assert row["score"] == pytest.approx(expected)
+        assert row["score"] != pytest.approx(
+            responsive - (final_offset + final_slope * reference)
+        )
+        if reference != 1.0:  # where the transposition is not a fixed point
+            assert row["score"] != pytest.approx(
+                responsive - (fold_slope + fold_offset * reference)
+            )
+        assert row["fit_slope"] == pytest.approx(fold_slope)
+        assert row["fit_offset"] == pytest.approx(fold_offset)
 
 
 def test_only_a_residual_row_carries_the_line_it_was_scored_from(tmp_path):
@@ -534,8 +568,22 @@ def test_two_arms_that_would_share_a_series_are_refused(tmp_path, monkeypatch):
 
     clash = replace(ARMS[1], name=ARMS[0].name)
     monkeypatch.setattr(contrast_analysis, "ARMS", (ARMS[0], clash, ARMS[2], ARMS[3]))
+    inputs = loaded(tmp_path)
     with pytest.raises(ContrastAnalysisError, match="same contrast series"):
-        build_contrast_rows(loaded(tmp_path))
+        build_contrast_rows(inputs)
+    # the diagnostics refuse it too. Nothing there is keyed by the series, so a clash appends a
+    # duplicate to a list instead of overwriting a dictionary entry -- 24 rows where 21 are
+    # documented, and no signal to a Task 7 or 8 caller that reads them without the rows.
+    with pytest.raises(ContrastAnalysisError, match="same contrast series"):
+        build_anchor_diagnostics(inputs)
+
+
+def test_the_refusal_is_a_value_error_so_the_cli_prints_one_line(tmp_path):
+    """`pipeline` catches `ValueError`; a bare `Exception` base would give the operator a
+    traceback through frames they did not write, and every other assertion in this file passes.
+    """
+    assert issubclass(ContrastAnalysisError, ValueError)
+    assert issubclass(ContrastInputError, ValueError)
 
 
 def test_anchor_diagnostics_cover_every_arm_and_summary(tmp_path):
