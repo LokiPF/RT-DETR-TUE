@@ -389,18 +389,38 @@ _CANDIDATE_PROVENANCE = (
 """Row columns that describe the candidate rather than the scene, carried through unchanged.
 
 Every one of these is constant across a candidate's rows -- they are functions of the arm, and
-the arm is part of the candidate key -- so the first row's copy is the candidate's copy. That
-constancy is checked on every row rather than assumed, because it is the one thing about
-provenance that copying the first row silently relies on. The confidence twin is the reason
-it is not obvious: it is labelled by bucket *pair*, so the two differential arms that share a
-pair contribute to one candidate, and an arm table that ever gave them different provenance
-would publish whichever of the two `ARMS` happened to list first.
+the arm is part of the candidate key -- so the first row's copy is the candidate's copy. Both
+the presence and the constancy are checked on every row rather than assumed, and the reason is
+not that `build_contrast_rows` might break the invariant. It cannot: `_unique` gives every
+`(label, signal, aggregation)` series exactly one `Arm`, including the confidence twin, which
+`_signal_plan` hands to the first arm with a bucket pair and to no other. The reason is that
+this is a public entry point taking a list of dictionaries, and rows reach it from tests, from
+a re-read CSV and from whatever Task 9 assembles -- not only from the one function that cannot
+get it wrong.
+
+`CONTRAST_ROW_KEY` is what makes the check load-bearing rather than decorative on that path:
+it deliberately leaves `score_scope` out, so two rows that differ only in scope carry the
+*same* row key, the duplicate refusal above sees nothing, and the first row would silently
+label both. Refused rather than reconciled -- two rows disagreeing about `declared_before_data`
+are a hypothesis and a result filed under one name, and either answer mislabels half the
+scores.
 
 `reference_bin` and `responsive_bin` are an *ordered* pair and are copied as two named fields
 rather than as a set or a joined string. `contrast_scores.raw_gap(reference, responsive)`
 turns a swap into a sign flip on every contrast in the experiment, and a candidate summary that
 recorded only which two bins were involved would leave a reader unable to see which way round
 the surviving score was taken.
+"""
+
+_REQUIRED_ROW_FIELDS = (*CONTRAST_ROW_KEY, *_CANDIDATE_PROVENANCE, "score")
+"""Exactly the columns `summarize_contrast_candidates` reads, and all of them are required.
+
+A shorter list than `CONTRAST_ROW_FIELDS`, because demanding a column this function never
+looks at would refuse a caller for a reason that has nothing to do with what it is computing.
+A longer list than `CONTRAST_ROW_KEY`, because `row.get(field)` on an absent provenance column
+publishes `None` and no refusal -- and `arm_family` and `declared_before_data` are the two
+fields that stop a differential arm's tuning macro AUROC being quoted as performance. A
+candidate labelled `arm_family=None` has lost precisely the warning it was carrying.
 """
 
 
@@ -469,6 +489,15 @@ def summarize_contrast_candidates(
     how many images happened to survive at each -- which is precisely the size-weighting
     `severity_aurocs` refuses in its own averaging.
 
+    Nothing here depends on the order the rows arrived in. Every image loop runs over
+    `sorted(by_image)` and every curve is read by severity rather than by position, so two
+    callers holding the same rows in different orders get dictionaries that compare equal --
+    not merely equal-looking. That is worth the two `sorted` calls: `severity` is an identity
+    on the blur axis and not a position, so a curve read in arrival order would correlate `+1`
+    against its own axis when the rows happened to arrive reversed, and a candidate summary
+    that changed because a CSV was sorted differently would be impossible to reproduce from
+    the published file.
+
     `missing_count` counts images that produced rows but not a full six-point curve. An image
     that produced no rows at all cannot appear in it -- there is nothing here to count -- and
     shows up instead as `image_count` falling short of `expected_image_count`, which is also
@@ -481,7 +510,7 @@ def summarize_contrast_candidates(
     provenance: dict[tuple, dict] = {}
     seen: set[tuple] = set()
     for position, row in enumerate(rows):
-        missing = [field for field in CONTRAST_ROW_KEY if field not in row]
+        missing = [field for field in _REQUIRED_ROW_FIELDS if field not in row]
         if missing:
             raise ContrastAnalysisError(f"contrast row {position} is missing {missing}")
         key = tuple(row[field] for field in CONTRAST_ROW_KEY)
@@ -492,7 +521,7 @@ def summarize_contrast_candidates(
         index.setdefault(candidate_key, {}).setdefault(row["image_id"], {})[
             row["severity"]
         ] = row["score"]
-        carried = {field: row.get(field) for field in _CANDIDATE_PROVENANCE}
+        carried = {field: row[field] for field in _CANDIDATE_PROVENANCE}
         established = provenance.setdefault(candidate_key, carried)
         if established != carried:
             raise ContrastAnalysisError(
@@ -503,8 +532,10 @@ def summarize_contrast_candidates(
     candidates: list[dict] = []
     for candidate_key in sorted(index, key=lambda key: tuple(str(part) for part in key)):
         by_image = index[candidate_key]
+        image_ids = sorted(by_image)
         trends = {}
-        for image_id, curve in by_image.items():
+        for image_id in image_ids:
+            curve = by_image[image_id]
             severities = sorted(curve)
             trends[image_id] = complete_trend_metrics(
                 severities, [curve[severity] for severity in severities]
@@ -527,14 +558,14 @@ def summarize_contrast_candidates(
                 [by_image[image_id][severity] for severity in sorted(by_image[image_id])],
                 orientation,
             )
-            for image_id in by_image
+            for image_id in image_ids
             if orientation in (-1, 1) and trends[image_id]["fully_measured"]
         ]
 
         auroc_by_severity = macro = None
         if orientation in (-1, 1) and complete:
             scores_by_severity = {
-                severity: [by_image[image_id][severity] for image_id in sorted(by_image)]
+                severity: [by_image[image_id][severity] for image_id in image_ids]
                 for severity in EXPECTED_SEVERITIES
             }
             auroc_by_severity, macro = severity_aurocs(scores_by_severity, orientation)
@@ -569,7 +600,7 @@ def summarize_contrast_candidates(
                     np.array(
                         [
                             by_image[image_id][severity]
-                            for image_id in by_image
+                            for image_id in image_ids
                             if severity in by_image[image_id]
                         ],
                         dtype=float,

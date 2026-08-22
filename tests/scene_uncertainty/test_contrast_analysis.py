@@ -927,6 +927,14 @@ def test_a_flat_curve_is_flat_and_an_incomplete_one_is_unmeasured():
     assert candidate["measured_count"] == 4
     assert candidate["missing_count"] == 0
     assert candidate["median_absolute_spearman"] == pytest.approx(0.0)
+    # a flat image's 0.0 is a measurement and it votes: dropped from the orientation vote
+    # as if it were a missing curve, these four would leave nothing to median and the
+    # candidate would publish `None` here rather than the zero it measured
+    assert candidate["median_signed_spearman"] == pytest.approx(0.0)
+    assert candidate["orientation"] is None
+    assert candidate["orientable"] is False
+    assert candidate["macro_auroc"] is None
+    assert candidate["auroc_by_severity"] is None
     # flat is a direction these images agreed on, so it is what dominates them: a
     # dominant fraction taken over rising and falling alone would report 0.0 here
     assert candidate["flat_fraction"] == pytest.approx(1.0)
@@ -1128,12 +1136,17 @@ def test_the_curve_checks_are_two_numbers_because_neither_says_the_other():
     """
     rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
     collapsing = [0.0, 1.0, 2.0, 3.0, 4.0, -1.0]
-    rows = candidate_rows({1: rising, 2: rising, 3: collapsing, 4: collapsing})
+    sawtooth = [5.0, 4.0, 3.0, 4.0, 3.0, 4.0]
+    rows = candidate_rows({1: rising, 2: rising, 3: collapsing, 4: sawtooth})
     candidate = summarize_contrast_candidates(rows, expected_image_count=4)[0]
     assert candidate["orientation"] == 1
-    # four of five steps rise on the collapsing images, five of five on the rising ones
-    assert candidate["oriented_adjacent_consistency"] == pytest.approx(0.9)
-    # but only half the images end above where they started
+    # 5/5, 5/5, 4/5 and 2/5 steps rise, which averages to 0.8. The four images are three
+    # distinct values on purpose: on any fixture where the consistencies are symmetric the
+    # across-image mean equals their median and either could stand in for the other. The
+    # median of these four is 0.9.
+    assert candidate["oriented_adjacent_consistency"] == pytest.approx(0.8)
+    # and only half the images end above where they started, which is a different claim
+    # about a different property, not a restatement of the number above
     assert candidate["max_blur_above_clean_rate"] == pytest.approx(0.5)
 
 
@@ -1158,6 +1171,13 @@ def test_a_short_roster_withholds_the_auroc_and_says_so():
     assert candidate["oriented_adjacent_consistency"] == pytest.approx(1.0)
     assert candidate["auroc_by_severity"] is None
     assert candidate["macro_auroc"] is None
+    # this is the only fixture where the roster and the declared count differ, so it is the
+    # only one that can say which of the two the fractions divide by: four measured images
+    # out of four that produced rows is 1.0, and out of the six that were expected is 0.667
+    assert candidate["measured_fraction"] == pytest.approx(1.0)
+    assert candidate["missing_fraction"] == pytest.approx(0.0)
+    assert candidate["positive_fraction"] == pytest.approx(1.0)
+    assert candidate["dominant_direction_fraction"] == pytest.approx(1.0)
 
     # and the other way round: five images produced rows where four were expected, and the
     # four that were fully measured are not the whole roster either. `complete` needs all
@@ -1171,6 +1191,18 @@ def test_a_short_roster_withholds_the_auroc_and_says_so():
     assert overrun["expected_image_count"] == 4
     assert overrun["complete"] is False
     assert overrun["macro_auroc"] is None
+
+    # and once more with nothing wrong except the count: five images, all fully measured,
+    # four declared. `complete` is an equality on all three numbers and not a floor under
+    # them -- a roster larger than the run declared is a roster nobody counted correctly,
+    # and its AUROC would be taken over images the report does not know about.
+    crowded = candidate_rows({image: rising for image in range(1, 6)})
+    surplus = summarize_contrast_candidates(crowded, expected_image_count=4)[0]
+    assert surplus["image_count"] == 5
+    assert surplus["measured_count"] == 5
+    assert surplus["expected_image_count"] == 4
+    assert surplus["complete"] is False
+    assert surplus["macro_auroc"] is None
 
 
 def test_an_unmeasured_image_stays_in_every_denominator():
@@ -1226,16 +1258,39 @@ def test_a_severity_no_image_reached_is_published_as_an_empty_row():
     assert candidate["orientation"] is None
 
 
-def test_a_row_without_its_key_fields_is_refused():
-    """The position is in the message because a bare field name locates nothing in 29,160 rows."""
+def test_a_row_without_the_fields_this_function_reads_is_refused():
+    """The position is in the message because a bare field name locates nothing in 29,160 rows.
+
+    Provenance is required and not merely copied when present. `arm_family` and
+    `declared_before_data` are the two fields that stop a differential arm's tuning macro
+    AUROC being quoted as performance, so a candidate that published `arm_family=None`
+    because a row did not carry it would have lost exactly the warning it exists to hand on.
+    `score` is required for the plainer reason that there is nothing to summarise without it.
+    """
     rows = candidate_rows({1: [0.0] * 6})
     del rows[2]["severity"]
     with pytest.raises(ContrastAnalysisError, match=r"contrast row 2 is missing \['severity'\]"):
         summarize_contrast_candidates(rows, expected_image_count=1)
 
+    for field in ("arm_family", "declared_before_data", "score_scope", "reference_bin",
+                  "responsive_bin", "score"):
+        stripped = candidate_rows({1: [0.0] * 6})
+        del stripped[4][field]
+        with pytest.raises(
+            ContrastAnalysisError, match=rf"contrast row 4 is missing \['{field}'\]"
+        ):
+            summarize_contrast_candidates(stripped, expected_image_count=1)
 
-def test_candidates_are_published_in_a_stable_order(tmp_path):
-    """Task 8 writes these to a CSV, so the order has to be the key's and not the rows'."""
+
+def test_candidates_are_published_in_a_stable_order_with_stable_contents(tmp_path):
+    """Task 8 writes these to a CSV, so neither the order nor the numbers may follow the rows.
+
+    The comparison is of the whole dictionaries and not of the key tuples. A key list is the
+    one thing about a summary that survives almost any mistake inside it: read every curve in
+    arrival order rather than by severity and all 81 candidates turn `unmeasured` when the
+    rows arrive reversed -- every macro AUROC gone, every trend `None` -- while the key list
+    comes out identical and an order-and-uniqueness check passes on both.
+    """
     rows, _ = build_contrast_rows(loaded(tmp_path))
     candidates = summarize_contrast_candidates(rows, expected_image_count=IMAGES)
     keys = [tuple(item[field] for field in CONTRAST_CANDIDATE_KEY) for item in candidates]
@@ -1243,12 +1298,17 @@ def test_candidates_are_published_in_a_stable_order(tmp_path):
     assert len(set(keys)) == len(keys)
     assert keys[0] == ("decile_00_10__50_60", "confidence", "mean", "clean_residual")
     assert keys[-1] == ("quintile_00_20__40_60", "persistence", "top20_mean", "relative_gap")
+    # every candidate on this fixture is measured and oriented, so a summary that quietly
+    # stopped measuring would have something to lose
+    assert all(item["measured_count"] == IMAGES for item in candidates)
+    assert sum(item["macro_auroc"] is not None for item in candidates) == 81
+
     shuffled = summarize_contrast_candidates(
         list(reversed(rows)), expected_image_count=IMAGES
     )
-    assert [
-        tuple(item[field] for field in CONTRAST_CANDIDATE_KEY) for item in shuffled
-    ] == keys
+    # exact equality, not approximate: every image loop runs over a sorted roster, so the
+    # floating-point sums are the same sums in the same order and not merely close ones
+    assert shuffled == candidates
 
 
 def test_the_severity_mean_and_median_are_two_numbers_because_one_scene_can_move_one():
@@ -1291,3 +1351,56 @@ def test_rows_that_disagree_about_a_candidates_provenance_are_refused():
     )
     with pytest.raises(ContrastAnalysisError, match="disagree about the provenance"):
         summarize_contrast_candidates(swapped, expected_image_count=2)
+
+
+def test_a_flat_image_votes_in_the_orientation_rather_than_dropping_out():
+    """Two rising images and three flat ones do not agree on a direction, and must not lock one.
+
+    A flat image measured `0.0`, and `0.0` is a vote. Filtered out of the orientation vote as
+    if it were the `None` of a curve that was never measured, these five would median to
+    `+1.0`, lock `+1`, and publish a full set of AUROCs for a candidate that three of its five
+    images say does not move at all. The distinction between a completed measurement that
+    found no trend and an absent measurement is the one thing `complete_trend_metrics` is
+    most explicit about, and it survives only if the caller keeps the zeros.
+    """
+    rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    rows = candidate_rows({
+        1: rising, 2: rising, 3: [2.0] * 6, 4: [3.0] * 6, 5: [4.0] * 6,
+    })
+    candidate = summarize_contrast_candidates(rows, expected_image_count=5)[0]
+    assert candidate["positive_count"] == 2
+    assert candidate["flat_count"] == 3
+    assert candidate["measured_count"] == 5
+    # nothing is missing here, so the refusal to orient is about disagreement and not about
+    # data: the candidate is complete and still has no direction and no AUROC
+    assert candidate["complete"] is True
+    assert candidate["median_signed_spearman"] == pytest.approx(0.0)
+    assert candidate["median_absolute_spearman"] == pytest.approx(0.0)
+    assert candidate["orientation"] is None
+    assert candidate["orientable"] is False
+    assert candidate["macro_auroc"] is None
+    assert candidate["auroc_by_severity"] is None
+    assert candidate["oriented_adjacent_consistency"] is None
+
+
+def test_a_curve_is_read_by_severity_and_not_by_the_order_the_rows_arrived():
+    """The same four rising images, handed over back to front, are still four rising images.
+
+    `severity` is an identity on the blur axis and not a position in a list. A curve read in
+    arrival order correlates `+1` against its own axis when the rows happen to arrive
+    reversed, so the failure this pins is not "the numbers move a little" -- it is a candidate
+    reporting `measured_count=0` and no trend at all while every score it needs is present.
+    """
+    rising = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+    forward = candidate_rows({image: rising for image in range(1, 5)})
+    candidate = summarize_contrast_candidates(
+        list(reversed(forward)), expected_image_count=4
+    )[0]
+    assert candidate["measured_count"] == 4
+    assert candidate["missing_count"] == 0
+    assert candidate["median_signed_spearman"] == pytest.approx(1.0)
+    assert candidate["orientation"] == 1
+    assert candidate["macro_auroc"] == pytest.approx(1.0)
+    assert candidate["severity_statistics"][5]["mean"] == pytest.approx(5.0)
+    assert candidate["severity_statistics"][0]["mean"] == pytest.approx(0.0)
+    assert summarize_contrast_candidates(forward, expected_image_count=4)[0] == candidate
