@@ -100,8 +100,8 @@ def test_loads_every_required_series(tmp_path):
     # the same bin at the combined scope is a different measurement, not a copy
     assert inputs.scores[(1, 0, "persistence", "decile_50_60", "mean", "combined")] == 1.81
     # and the confidence twin varies by bin, so a contrast against it is not identically zero
-    assert inputs.scores[(1, 0, "confidence", "decile_00_10", "mean", "confidence")] == 0.986
-    assert inputs.scores[(1, 0, "confidence", "decile_90_100", "mean", "confidence")] == 0.646
+    assert inputs.scores[(1, 0, "confidence", "decile_00_10", "mean", "confidence")] == 0.984
+    assert inputs.scores[(1, 0, "confidence", "decile_90_100", "mean", "confidence")] == 0.644
     assert inputs.provenance["source_partition"] == "tuning"
     assert inputs.provenance["retained_row_count"] == RETAINED
 
@@ -126,16 +126,49 @@ def test_the_confidence_column_runs_the_way_the_producer_writes_it(tmp_path):
     descending = [column(name) for name in (
         "decile_00_10", "quintile_00_20", "quintile_40_60", "decile_50_60", "decile_90_100"
     )]
-    assert descending == sorted(descending, reverse=True)
-    # the two schemes stay distinguishable, as they are in the run
-    assert column("decile_50_60") != column("quintile_40_60")
+    # strictly, pair by pair: a non-strict check admits a tie, and collapsing `quintile_00_20`
+    # onto `decile_00_10` is exactly how the two schemes stop being distinguishable
+    assert all(higher > lower for higher, lower in zip(descending, descending[1:]))
 
     top = [column("decile_90_100", severity) for severity in SEVERITIES]
     assert top == sorted(top)
     assert top[-1] - top[0] > 0.15
-    low = [column("decile_00_10", severity) for severity in SEVERITIES]
-    assert low[-1] < low[0]
-    assert low[0] - low[-1] < 0.01
+    # the lower four are flat, but not flat in one direction: two fall and two rise, and an
+    # edit that gave all four a common downward slope would otherwise pass
+    for name in ("decile_00_10", "quintile_00_20"):
+        assert column(name, 5) < column(name, 0)
+        assert column(name, 0) - column(name, 5) < 0.01
+    for name in ("quintile_40_60", "decile_50_60"):
+        assert column(name, 5) > column(name, 0)
+        assert column(name, 5) - column(name, 0) < 0.01
+
+
+def test_a_full_tuning_roster_keeps_the_confidence_column_inside_its_bounds(tmp_path):
+    """250 images, the size the real command runs at, and the only test that reaches it.
+
+    `1 - confidence` cannot leave [0, 1], and the loader would not notice if it did -- it checks
+    negativity and finiteness, and 1.235 is both non-negative and finite. The bound is therefore
+    the fixture's own responsibility, and a per-image term that is harmless across six images is
+    what breaks it: the roster is the axis this fixture grows along, and every earlier test in
+    this file runs six images.
+
+    This is also the only test that exercises the production `expected_image_count` default
+    rather than passing 6, and the only one that overrides `image_ids`.
+    """
+    source = write_source_bundle(tmp_path / "source", image_ids=range(1, 251))
+    inputs = load_contrast_inputs(source)
+    confidence = [
+        value for key, value in inputs.scores.items() if key[2] == "confidence"
+    ]
+    assert len(confidence) == 5 * 3 * 250 * 6
+    assert 0.0 < min(confidence)
+    assert max(confidence) < 1.0
+    # and the spread survives the shrink: every image still has its own value
+    lowest_bin = [
+        inputs.scores[(image_id, 0, "confidence", "decile_00_10", "mean", "confidence")]
+        for image_id in range(1, 251)
+    ]
+    assert len(set(lowest_bin)) == 250
 
 
 def test_discards_the_frozen_and_unfiltered_twins_a_real_bundle_carries(tmp_path):

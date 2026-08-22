@@ -98,6 +98,14 @@ def default_score(
     decile rises with severity where persistence at that bin falls. A fixture that made the two
     signals parallel would hide the redundancy the confidence twin exists to detect.
 
+    Its per-image term subtracts, where persistence's adds, for the same reason. `1 - confidence`
+    is bounded above by 1.0 -- `decile_scoring._checked_confidence` refuses a source confidence
+    outside [0, 1] -- and these levels start at 0.985, so an *additive* term crosses the bound at
+    fifteen images and reaches 1.235 on the 250-image roster the real command runs at. The loader
+    checks negativity and finiteness, and would accept every one of those impossible rows.
+    Subtracting keeps the 0.001-per-image spread the drift and spread diagnostics read and holds
+    the whole column inside (0.39, 0.99) at 250 images, the largest roster the loader accepts.
+
     `aggregation` is the one exception, and it is a gap rather than a decision: three
     aggregations of one selection are three summaries of one population, and this callback is
     not handed the aggregation to vary on. The signature is five positional arguments because
@@ -108,7 +116,7 @@ def default_score(
     if signal == "confidence":
         return round(
             CONFIDENCE_UNCERTAINTY[confidence_bin]
-            + 0.001 * image_id
+            - 0.001 * image_id
             + CONFIDENCE_UNCERTAINTY_SLOPE[confidence_bin] * severity,
             6,
         )
