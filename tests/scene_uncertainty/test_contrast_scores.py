@@ -1,3 +1,23 @@
+"""Hand arithmetic against `scene_uncertainty.contrast_scores`, one claim per test.
+
+Every expected value here was worked out on paper before the module existed, which is the
+whole return on keeping the four methods, the fold rule and the Theil-Sen line free of I/O.
+Two fixtures are chosen rather than obvious, and both choices are load-bearing -- the natural
+version of each passes against broken code:
+
+`test_an_undefined_pairwise_slope_is_dropped_not_divided_by_zero` uses a *descending* tied
+pair. The ascending version -- `[1, 1, 2, 3]` against `[5, 7, 7, 9]`, which is what
+`test_repeated_reference_values_skip_undefined_pairwise_slopes` above it uses -- cannot see
+the bug it looks like it is aimed at: keeping the undefined pair contributes `+inf`, which
+sorts above the middle of an even-length list of slopes and leaves the answer at `(2.0, 3.0)`
+either way. Descending makes that contribution `-inf`, which moves the median to 1.5.
+
+`test_fold_assignment_ignores_set_iteration_order` uses `[1_000_000, 2, 3]`. Small consecutive
+integers come out of a CPython set in ascending order already, so every fold test built from a
+`range(...)` passes whether or not `assign_folds` sorts. One id far outside the others'
+hash-slot range is what makes the sort observable at all.
+"""
+
 import math
 import warnings
 
@@ -55,6 +75,10 @@ def test_relative_gap_stays_within_two(reference, responsive):
 def test_relative_gap_reaches_the_bounds_only_when_one_side_is_zero():
     assert relative_gap(0.0, 5.0) == pytest.approx(2.0)
     assert relative_gap(5.0, 0.0) == pytest.approx(-2.0)
+    # and stays strictly inside them the moment both sides are positive, however lopsided,
+    # which is the "only" the name claims
+    assert -2.0 < relative_gap(1e-12, 5.0) < 2.0
+    assert -2.0 < relative_gap(5.0, 1e-12) < 2.0
 
 
 def test_clean_residual_subtracts_the_predicted_clean_responsive():
@@ -145,7 +169,7 @@ def test_an_undefined_pairwise_slope_is_dropped_not_divided_by_zero():
     The division must not happen at all, so the warning it would raise is an error here.
     """
     with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        warnings.simplefilter("error", RuntimeWarning)
         line = robust_line([1.0, 1.0, 2.0, 3.0], [7.0, 5.0, 7.0, 9.0])
     assert line == pytest.approx((2.0, 3.0))
 
@@ -174,6 +198,30 @@ def test_fold_assignment_is_deterministic_under_reordering():
     forward = assign_folds([1, 3, 5, 7, 10])
     backward = assign_folds([10, 7, 5, 3, 1])
     assert forward == backward == {1: 0, 3: 1, 5: 2, 7: 3, 10: 4}
+
+
+def test_fold_assignment_ignores_set_iteration_order():
+    """A roster whose set order is not its sorted order, which no `range(...)` supplies.
+
+    `list({1_000_000, 2, 3})` is `[1_000_000, 2, 3]`: the large id lands in a low hash slot, so
+    an `assign_folds` that deduplicated without sorting would give it fold 0 here -- while
+    still answering every consecutive-id test correctly, because small ints iterate out of a
+    set in ascending order. This is the roster that tells the two apart.
+    """
+    assert assign_folds([1_000_000, 2, 3]) == {2: 0, 3: 1, 1_000_000: 2}
+
+
+def test_repeated_image_ids_collapse_to_one_fold_each():
+    """Three rows per image, deliberately not the six the real run has.
+
+    Six would hide a missing deduplication instead of exposing it. Without the set, the fold an
+    image ends up with is the one its *last* row's position gives; at six rows per image that
+    position is `6 * index + 5`, and since `6 = 1 (mod 5)` and `5 = 0 (mod 5)` it reduces to
+    `index % 5` -- the correct answer, arrived at by accident. At three rows per image the
+    coincidence is gone: `[2, 4, 6, 8]` would come out as folds 2, 0, 3, 1.
+    """
+    ids = [2, 2, 2, 4, 4, 4, 6, 6, 6, 8, 8, 8]
+    assert assign_folds(ids) == {2: 0, 4: 1, 6: 2, 8: 3}
 
 
 def test_fold_assignment_wraps_at_the_fold_count():
