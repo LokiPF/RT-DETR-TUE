@@ -355,10 +355,12 @@ def attach_controls(
     anchor -- which is exactly where a bare point estimate is least trustworthy.
 
     The reference range's curves are not in `rows`, so they are re-derived here from
-    `reference_control_rows`. Re-derived rather than taken as a fourth argument: the caller
-    already built `controls` from that same pure function over these same rows, so the two cannot
-    disagree, and widening the signature would let a caller hand over control summaries and
-    control curves that describe different rows.
+    `reference_control_rows`. Re-derived rather than taken as a fourth argument, and the claim
+    that buys is narrow: the control *curves* and the candidate *rows* are then two views of one
+    list, and a caller cannot hand over curves describing rows it did not also pass. It says
+    nothing about `controls`, which is still the caller's own summary list and could in principle
+    have been built from something else -- that is the caller's to get right, the same way
+    `candidates` is. The cost is 14 ms of re-indexing against a 50-second call.
     """
     indexed = _by_key(candidates)
     curves = index_curves(rows)

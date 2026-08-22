@@ -73,6 +73,18 @@ back three quarters of a second per call across a dozen tests without weakening 
 exercised.
 """
 
+COUNTERPART_MACRO = {
+    "responsive_control": "responsive_control_macro_auroc",
+    "reference_control": "reference_control_macro_auroc",
+    "twin": "twin_macro_auroc",
+}
+"""The three counterparts, and where each one's own macro AUROC is published.
+
+The comparison labels are not quite the field names -- the twin's macro is `twin_macro_auroc`,
+not `twin_control_macro_auroc` -- so the mapping is written once here rather than spelled out
+in each test that wants to loop over all three.
+"""
+
 CONTROL_FIELDS = (
     "twin_arm", "twin_macro_auroc", "twin_auroc_by_severity", "twin_orientation",
     "responsive_control_macro_auroc", "reference_control_macro_auroc",
@@ -583,6 +595,43 @@ def test_every_bootstrap_point_estimate_is_the_pair_of_macro_aurocs_it_reports(t
     assert checked == 135
 
 
+def test_every_bootstrap_resamples_the_curves_of_its_own_summary():
+    """The same identity as above, on the fixture whose summaries are not byte-identical.
+
+    `prepared` cannot bind the *summary* dimension of a curve lookup. `default_score` ignores its
+    `aggregation` argument, so all three summaries of one bin carry the same numbers there and a
+    curve fetched from the wrong one is indistinguishable from the right one. Here they differ at
+    every comparison -- the reference control is 0.960 at `mean` against 0.816 at `q90` and the
+    twin 0.708 against 0.784 -- so a summary-blind lookup produces an interval whose point
+    estimate no longer matches the macro difference published beside it.
+
+    That is the silent failure this catches: the macro AUROC in the CSV would still be the right
+    summary's, and only the interval printed next to it would have resampled a different one.
+    Reading these bootstraps at `mean` alone is not enough either, because `mean` is the summary
+    a blind lookup returns first.
+    """
+    candidates, _, _ = matched()
+    by_key = keyed(candidates)
+    checked = 0
+    for candidate in candidates:
+        if candidate["signal"] != "persistence":
+            continue
+        for label in COUNTERPART_MACRO:
+            assert candidate[f"{label}_bootstrap"]["macro_difference"] == pytest.approx(
+                candidate[f"{label}_macro_difference"]
+            )
+            checked += 1
+    assert checked == 12  # four persistence candidates, three comparisons each
+    # and the two summaries disagree at every comparison, so none of the twelve is satisfied by
+    # a curve taken from the other one
+    for label, field in COUNTERPART_MACRO.items():
+        across_summaries = {
+            by_key[(MATCHED_ARM, "persistence", aggregation, "raw_gap")][field]
+            for aggregation in ("mean", "q90")
+        }
+        assert len(across_summaries) == 2, label
+
+
 def test_a_candidate_that_only_restates_confidence_is_flagged_redundant(tmp_path):
     candidates, _, _ = prepared(tmp_path)
     checked = 0
@@ -719,6 +768,36 @@ def test_each_arm_is_matched_to_its_own_reference_control(tmp_path):
     assert set(by_arm) == {arm.name for arm in ARMS}
     assert len(set(by_arm.values())) == 4
 
+    # the *signal* of the control matters too, and three of the four arms carry a confidence
+    # control under the same label as their persistence one, with a different macro AUROC
+    twinned = [
+        arm for arm in by_arm
+        if (arm, "confidence", "mean") in control_by_key
+    ]
+    assert len(twinned) == 3
+    for arm in twinned:
+        assert (
+            control_by_key[(arm, "persistence", "mean")]["macro_auroc"]
+            != control_by_key[(arm, "confidence", "mean")]["macro_auroc"]
+        )
+    # a signal-blind index would land on whichever of the two the list happened to end on, so
+    # the same controls in the other order must produce the same answer
+    reversed_candidates, _, reversed_rows = prepared(tmp_path)
+    reversed_controls = summarize_contrast_candidates(
+        reference_control_rows(reversed_rows), expected_image_count=IMAGES
+    )
+    attach_controls(
+        reversed_candidates, list(reversed(reversed_controls)), reversed_rows,
+        samples=FAST_SAMPLES,
+    )
+    assert [
+        item["reference_control_macro_auroc"] for item in reversed_candidates
+        if item["signal"] == "persistence"
+    ] == [
+        item["reference_control_macro_auroc"] for item in candidates
+        if item["signal"] == "persistence"
+    ]
+
 
 def test_the_twin_severity_aurocs_are_a_copy_and_not_the_twin_own_dictionary(tmp_path):
     """Both differential arms read one twin, so a shared dictionary would propagate twice."""
@@ -821,17 +900,12 @@ def test_an_unorientable_control_withholds_only_its_own_comparison(arm, method, 
     candidates, _ = unmeasured()
     candidate = candidates[(arm, "persistence", "mean", method)]
     assert candidate["macro_auroc"] is not None
-    macro = {
-        "responsive_control": "responsive_control_macro_auroc",
-        "reference_control": "reference_control_macro_auroc",
-        "twin": "twin_macro_auroc",
-    }
-    assert candidate[macro[withheld]] is None
+    assert candidate[COUNTERPART_MACRO[withheld]] is None
     assert candidate[f"{withheld}_macro_difference"] is None
     assert candidate[f"{withheld}_auroc_difference_by_severity"] is None
     assert candidate[f"{withheld}_bootstrap"] is None
-    for label in set(macro) - {withheld}:
-        assert candidate[macro[label]] is not None
+    for label in set(COUNTERPART_MACRO) - {withheld}:
+        assert candidate[COUNTERPART_MACRO[label]] is not None
         assert candidate[f"{label}_macro_difference"] is not None
         assert candidate[f"{label}_auroc_difference_by_severity"] is not None
         assert candidate[f"{label}_bootstrap"] is not None
