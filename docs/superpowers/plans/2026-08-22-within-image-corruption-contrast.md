@@ -289,13 +289,13 @@ import json
 
 import pytest
 
-from scene_uncertainty.contrast_inputs import (
+from src.scene_uncertainty.contrast_inputs import (
     ARMS,
     ContrastInputError,
     load_contrast_inputs,
 )
 
-from .contrast_test_utils import write_source_bundle
+from tests.scene_uncertainty.contrast_test_utils import write_source_bundle
 
 
 def test_arm_table_is_the_four_declared_arms():
@@ -704,7 +704,7 @@ import math
 
 import pytest
 
-from scene_uncertainty.contrast_scores import (
+from src.scene_uncertainty.contrast_scores import (
     FOLD_COUNT,
     SCORE_METHODS,
     assign_folds,
@@ -1124,12 +1124,12 @@ Create `tests/scene_uncertainty/test_contrast_diagnostics.py`:
 ```python
 import pytest
 
-from scene_uncertainty.contrast_diagnostics import (
+from src.scene_uncertainty.contrast_diagnostics import (
     between_image_spread,
     clean_relationship,
     within_image_drift,
 )
-from scene_uncertainty.contrast_scores import assign_folds
+from src.scene_uncertainty.contrast_scores import assign_folds
 
 SEVERITIES = range(6)
 
@@ -1567,14 +1567,14 @@ Create `tests/scene_uncertainty/test_contrast_analysis.py`:
 ```python
 import pytest
 
-from scene_uncertainty.contrast_analysis import (
+from src.scene_uncertainty.contrast_analysis import (
     build_anchor_diagnostics,
     build_contrast_rows,
 )
-from scene_uncertainty.contrast_inputs import ARMS, load_contrast_inputs
-from scene_uncertainty.contrast_scores import SCORE_METHODS, assign_folds
+from src.scene_uncertainty.contrast_inputs import ARMS, load_contrast_inputs
+from src.scene_uncertainty.contrast_scores import SCORE_METHODS, assign_folds
 
-from .contrast_test_utils import default_score, write_source_bundle
+from tests.scene_uncertainty.contrast_test_utils import default_score, write_source_bundle
 
 IMAGES = 6
 SEVERITIES = 6
@@ -2060,7 +2060,7 @@ git commit -m "feat: build contrast rows with cross-fitted residuals and anchor 
 - [ ] **Step 1: Write the failing tests (append to `test_contrast_analysis.py`)**
 
 ```python
-from scene_uncertainty.contrast_analysis import (
+from src.scene_uncertainty.contrast_analysis import (
     CONTRAST_CANDIDATE_KEY,
     summarize_contrast_candidates,
 )
@@ -2440,11 +2440,11 @@ Create `tests/scene_uncertainty/test_contrast_controls.py`:
 import numpy as np
 import pytest
 
-from scene_uncertainty.contrast_analysis import (
+from src.scene_uncertainty.contrast_analysis import (
     build_contrast_rows,
     summarize_contrast_candidates,
 )
-from scene_uncertainty.contrast_controls import (
+from src.scene_uncertainty.contrast_controls import (
     BOOTSTRAP_SAMPLES,
     BOOTSTRAP_SEED,
     attach_controls,
@@ -2453,9 +2453,9 @@ from scene_uncertainty.contrast_controls import (
     rank_contrast_candidates,
     reference_control_rows,
 )
-from scene_uncertainty.contrast_inputs import FULL_TUNING_IMAGE_COUNT, load_contrast_inputs
+from src.scene_uncertainty.contrast_inputs import FULL_TUNING_IMAGE_COUNT, load_contrast_inputs
 
-from .contrast_test_utils import write_source_bundle
+from tests.scene_uncertainty.contrast_test_utils import write_source_bundle
 
 IMAGES = 6
 
@@ -2589,7 +2589,7 @@ def test_beating_one_input_while_losing_to_the_other_is_not_beating_both():
     )
     candidate["responsive_control_macro_difference"] = 0.10
     candidate["reference_control_macro_difference"] = -0.15
-    from scene_uncertainty.contrast_controls import beats_both_inputs
+    from src.scene_uncertainty.contrast_controls import beats_both_inputs
 
     assert beats_both_inputs(candidate) is False
 
@@ -3089,18 +3089,18 @@ import json
 
 import pytest
 
-from scene_uncertainty.contrast_analysis import (
+from src.scene_uncertainty.contrast_analysis import (
     build_contrast_rows,
     summarize_contrast_candidates,
 )
-from scene_uncertainty.contrast_controls import (
+from src.scene_uncertainty.contrast_controls import (
     attach_controls,
     reference_control_rows,
 )
-from scene_uncertainty.contrast_inputs import load_contrast_inputs
-from scene_uncertainty.contrast_plots import PLOT_FILENAMES, write_contrast_plots
+from src.scene_uncertainty.contrast_inputs import load_contrast_inputs
+from src.scene_uncertainty.contrast_plots import PLOT_FILENAMES, write_contrast_plots
 
-from .contrast_test_utils import write_source_bundle
+from tests.scene_uncertainty.contrast_test_utils import write_source_bundle
 
 IMAGES = 6
 
@@ -3152,7 +3152,7 @@ def test_axis_limits_survive_a_json_round_trip(tmp_path, prepared):
 
 
 def test_the_panel_counts_are_the_declared_ones(tmp_path, prepared):
-    from scene_uncertainty.contrast_plots import panel_plan
+    from src.scene_uncertainty.contrast_plots import panel_plan
 
     plan = panel_plan(prepared["candidates"])
     assert len(plan["anchor"]) == 12
@@ -3271,13 +3271,13 @@ PYTHONPATH=$PWD $UE_PY - <<'PY'
 import sys
 from pathlib import Path
 
-from scene_uncertainty.contrast_analysis import (
+from src.scene_uncertainty.contrast_analysis import (
     build_contrast_rows,
     summarize_contrast_candidates,
 )
-from scene_uncertainty.contrast_controls import attach_controls, reference_control_rows
-from scene_uncertainty.contrast_inputs import load_contrast_inputs
-from scene_uncertainty.contrast_plots import write_contrast_plots
+from src.scene_uncertainty.contrast_controls import attach_controls, reference_control_rows
+from src.scene_uncertainty.contrast_inputs import load_contrast_inputs
+from src.scene_uncertainty.contrast_plots import write_contrast_plots
 
 sys.path.insert(0, str(Path.cwd() / "tests" / "scene_uncertainty"))
 from contrast_test_utils import write_source_bundle  # noqa: E402
@@ -3364,25 +3364,25 @@ import json
 
 import pytest
 
-from scene_uncertainty.contrast_analysis import (
+from src.scene_uncertainty.contrast_analysis import (
     build_anchor_diagnostics,
     build_contrast_rows,
     summarize_contrast_candidates,
 )
-from scene_uncertainty.contrast_controls import (
+from src.scene_uncertainty.contrast_controls import (
     attach_controls,
     rank_contrast_candidates,
     reference_control_rows,
 )
-from scene_uncertainty.contrast_inputs import load_contrast_inputs
-from scene_uncertainty.contrast_reporting import (
+from src.scene_uncertainty.contrast_inputs import load_contrast_inputs
+from src.scene_uncertainty.contrast_reporting import (
     EXPECTED_FILES,
     SECTION_TITLES,
     render_contrast_report,
     write_contrast_report,
 )
 
-from .contrast_test_utils import write_source_bundle
+from tests.scene_uncertainty.contrast_test_utils import write_source_bundle
 
 IMAGES = 6
 
@@ -3423,7 +3423,7 @@ def test_an_existing_output_directory_is_refused_before_anything_is_computed(
 
 
 def test_a_failed_run_leaves_neither_output_nor_staging(tmp_path, bundle_inputs, monkeypatch):
-    import scene_uncertainty.contrast_reporting as reporting
+    import src.scene_uncertainty.contrast_reporting as reporting
 
     def explode(*args, **kwargs):
         raise RuntimeError("figure failure")
@@ -3521,8 +3521,8 @@ def test_the_summary_is_json_serialisable_without_a_fallback(tmp_path, bundle_in
 
 
 def _summary_for(tmp_path, bundle_inputs):
-    from scene_uncertainty.contrast_reporting import build_contrast_summary
-    from scene_uncertainty.contrast_plots import write_contrast_plots
+    from src.scene_uncertainty.contrast_reporting import build_contrast_summary
+    from src.scene_uncertainty.contrast_plots import write_contrast_plots
 
     directory = tmp_path / "figures"
     directory.mkdir()
