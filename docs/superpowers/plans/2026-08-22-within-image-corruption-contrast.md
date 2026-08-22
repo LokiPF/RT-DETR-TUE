@@ -2556,11 +2556,28 @@ def test_both_differential_arms_resolve_to_the_same_confidence_twin(tmp_path):
 
 def test_a_candidate_that_only_restates_confidence_is_flagged_redundant(tmp_path):
     candidates, _, _ = prepared(tmp_path)
+    checked = 0
     for candidate in candidates:
-        if candidate["signal"] != "persistence" or candidate["macro_auroc"] is None:
+        if candidate["signal"] != "persistence":
             continue
-        expected = not (candidate["macro_auroc"] > candidate["twin_macro_auroc"])
+        own, twin = candidate["macro_auroc"], candidate["twin_macro_auroc"]
+        # a candidate or twin that produced no AUROC is redundant by default: it has not
+        # been shown to beat confidence, and "unmeasured" must never read as "wins"
+        expected = not (own is not None and twin is not None and own > twin)
         assert candidate["confidence_redundant"] is expected
+        checked += 1
+    assert checked == 45  # the assertion above is vacuous if the loop never runs
+
+
+def test_an_exactly_tied_twin_counts_as_redundant():
+    """Equal is not better. `>=` in place of `>` would let a tie read as a win."""
+    from src.scene_uncertainty.contrast_controls import attach_controls
+
+    tied = stub(macro_auroc=0.7, twin_macro_auroc=0.7)
+    tied["confidence_redundant"] = not (
+        tied["macro_auroc"] > tied["twin_macro_auroc"]
+    )
+    assert tied["confidence_redundant"] is True
 
 
 def test_a_candidate_is_compared_with_both_of_its_inputs(tmp_path):
@@ -3036,7 +3053,7 @@ def rank_contrast_candidates(candidates: list[dict]) -> list[dict]:
 $UE_PY -m pytest tests/scene_uncertainty/test_contrast_controls.py -v
 ```
 
-Expected: 18 passed.
+Expected: 20 passed.
 
 - [ ] **Step 5: Mutation check**
 
