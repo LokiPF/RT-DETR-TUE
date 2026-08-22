@@ -194,8 +194,9 @@ The source must prove all of the following before any contrast is calculated:
 - image count is 250;
 - severities are exactly 0, 1, 2, 3, 4, and 5;
 - every selected source candidate covers all 250 images at all six severities;
-- membership is `dynamic`;
-- padding mode is `filtered`;
+- rows outside `dynamic` membership or `filtered` padding are discarded, not refused: the
+  producer writes a `frozen` twin for every bin and an `unfiltered` control for the first bin
+  of each scheme, so refusing them would refuse every real bundle;
 - persistence rows are present at score scope `layer_2` for every declared range, and at score
   scope `combined` for the ranges the combined-layer differential arm uses;
 - confidence rows are present at score scope `confidence` for every declared range under the same
@@ -235,8 +236,31 @@ AUROC is a selection estimate. It may motivate a held-out test. It may not stand
 ## Four score methods
 
 Let `reference` be the current image's reference-bucket scene score and `responsive` the current
-image's responsive-bucket scene score. Both are non-negative query-to-clean-bank persistence
-distance summaries at the arm's scope, in the same units.
+image's responsive-bucket scene score. Both are query-to-clean-bank persistence distance
+summaries at the arm's scope, in the same units.
+
+Sign depends on the scope, and it is not the same for both scopes this design uses. A `layer_N`
+score is a raw mean-kNN distance and is non-negative by construction. The `combined` score is
+not a distance at all: `decile_scoring.score_selection` builds it as the mean over layers of
+`(score - center) / scale`, where `center` is the clean median and `scale` the clean
+interquartile range, so it is a robust z-score that is negative whenever the selected queries
+sit below the clean median. The completed deployment analysis confirms this -- 548 of its
+published `combined` per-severity statistics are negative, against none at `layer_2`, and both
+of the `combined` differential arm's own bins go negative under `mean`.
+
+Three consequences, and this design takes all three:
+
+- Validation is scope-aware. A `layer_N` persistence score and a confidence score must be
+  finite and non-negative; a `combined` score must be finite only. Refusing a negative
+  `combined` score would refuse every real bundle.
+- The symmetric relative gap is unavailable at the `combined` scope. Its scale-invariance
+  argument and its bounds both rest on non-negative inputs, and neither survives a signed one.
+  Marking it unavailable is the same treatment the clean-predicted residual gets when its line
+  cannot be fitted: a recorded reason and an excluded candidate, never a computed number whose
+  meaning has quietly changed.
+- The candidate count is therefore 45 persistence candidates, not 48: three arms at four
+  methods plus the `combined` arm at three. The 36 confidence twins are unaffected, because
+  confidence has one scope and is non-negative. Total 81.
 
 The four methods apply unchanged to every arm and to every confidence-only twin. In a
 differential arm, read "reference" as the first slot rather than as a baseline.
@@ -268,9 +292,12 @@ score = 2 times (responsive - reference), divided by (responsive + reference)
 This removes multiplicative scale. Two scenes whose raw distances differ tenfold receive the
 same value when the responsive-to-reference relationship is proportional.
 
-Because both inputs are non-negative, the denominator cannot be negative. When both are exactly
-zero, define the relative gap as zero. Do not add a tunable epsilon. For finite non-negative
-inputs with a positive denominator, the score lies between negative two and positive two.
+This method requires non-negative inputs and is therefore declared only for `layer_N` arms; see
+the sign discussion above. Given that, the denominator cannot be negative. When both inputs are
+exactly zero, define the relative gap as zero. Do not add a tunable epsilon. For finite
+non-negative inputs with a positive denominator, the score lies between negative two and
+positive two. A negative input is refused rather than accommodated -- an arm that would supply
+one has no business using this method.
 
 ### 4. Clean-predicted residual
 
@@ -596,7 +623,8 @@ Fail before writing a final output directory when:
 - a required arm, summary, or persistence row is missing at that arm's scope;
 - a confidence row needed for a candidate's confidence-only twin is missing;
 - a source or derived row key is duplicated;
-- a source score is negative, non-finite, or otherwise invalid for a persistence distance;
+- a source score is non-finite, or negative at a scope where negativity is impossible
+  (`layer_N` persistence and confidence, never `combined`);
 - the output directory already exists.
 
 A constant clean reference does not invalidate raw responsive, raw gap, or relative gap. It makes
@@ -617,7 +645,11 @@ directory on failure.
 - equal positive inputs give zero relative gap;
 - zero plus zero gives zero relative gap;
 - positive inputs keep the relative gap between negative two and positive two;
-- non-finite and negative distances are rejected.
+- non-finite inputs are rejected by every method;
+- a negative input is rejected by the relative gap and accepted by the other three, because
+  only the relative gap needs non-negativity;
+- the relative gap is unavailable for a `combined` arm, with a recorded reason, and its
+  candidates are excluded rather than computed.
 
 ### Robust-fit and fold tests
 

@@ -4,7 +4,7 @@
 
 **Goal:** Add a reporting-only `analyze-within-image-contrast` command that scores corruption from one image at one timestamp by combining two confidence-percentile ranges measured on that same image, and that reports two separate verdicts — an anchored hypothesis and a differential hypothesis — each against its own controls.
 
-**Architecture:** The command reads a *completed* `analyze-corruption-sensitivity` output directory and nothing else. It never touches DETR, the comparison bank, kNN, or the feature cache — every number it needs is already in `per_scene.csv`. Four predeclared arms (bucket pair at one persistence scope) cross four score methods cross three matched scene summaries give 48 named candidates. Each candidate is oriented once from its median signed tuning Spearman, evaluated with per-severity clean-versus-corrupted AUROC, and compared against three controls: the raw responsive range, the raw reference range, and a confidence-only twin. The clean-predicted residual is cross-fitted over five deterministic image folds so no image helps construct its own expected clean value.
+**Architecture:** The command reads a *completed* `analyze-corruption-sensitivity` output directory and nothing else. It never touches DETR, the comparison bank, kNN, or the feature cache — every number it needs is already in `per_scene.csv`. Four predeclared arms (bucket pair at one persistence scope) cross four score methods cross three matched scene summaries give 45 named candidates — 45 and not 48 because the `combined` arm is a signed z-score and has no symmetric relative gap. Each candidate is oriented once from its median signed tuning Spearman, evaluated with per-severity clean-versus-corrupted AUROC, and compared against three controls: the raw responsive range, the raw reference range, and a confidence-only twin. The clean-predicted residual is cross-fitted over five deterministic image folds so no image helps construct its own expected clean value.
 
 **Tech Stack:** Python 3.10+, NumPy, SciPy (`rankdata` only), pandas, Matplotlib, pytest, the existing `scene_uncertainty` CLI and artifact formats.
 
@@ -65,9 +65,20 @@ An **arm** is one bucket pair at one persistence scope. This table is the closed
 The four score methods are `raw_responsive`, `raw_gap`, `relative_gap`, `clean_residual`.
 The three matched summaries are `mean`, `q90`, `top20_mean`.
 
-4 arms × 3 summaries × 4 methods = **48 persistence candidates**, every one named before the command runs.
+**Scope decides sign, and the `combined` arm is signed.** A `layer_N` score is a raw mean-kNN
+distance and is non-negative. The `combined` score is a robust z-score — `score_selection`
+builds it as the mean over layers of `(score - center) / scale` with `center` the clean median —
+so it goes negative whenever the selected queries sit below that median. The completed run
+confirms it: 548 negative `combined` per-severity statistics against none at `layer_2`, and both
+of the combined arm's own bins go negative under `mean`. Two consequences bind every task:
+validation is scope-aware (non-negative required for `layer_N` persistence and for confidence,
+finite-only for `combined`), and **`relative_gap` is unavailable at the `combined` scope**,
+because its scale invariance and its ±2 bounds both rest on non-negative inputs.
 
-Confidence-only twins are keyed by *bucket pair*, not arm, because confidence has a single scope: the two differential arms share one twin. 3 bucket pairs × 3 summaries × 4 methods = **36 twins**.
+3 layer_2 arms × 3 summaries × 4 methods, plus the combined arm × 3 summaries × 3 methods =
+**45 persistence candidates**, every one named before the command runs.
+
+Confidence-only twins are keyed by *bucket pair*, not arm, because confidence has a single scope: the two differential arms share one twin. 3 bucket pairs × 3 summaries × 4 methods = **36 twins** — unaffected by the sign rule, since confidence is non-negative. Total candidates: **81**.
 
 Robust clean lines are fitted per (arm, summary, signal): 4 × 3 = 12 persistence plus 3 × 3 = 9 confidence = **21 final fits**.
 
@@ -81,7 +92,7 @@ aggregation,score_scope,source_partition,score,selected_count,clean_overlap,
 fully_measured,signed_spearman,absolute_spearman,direction
 ```
 
-Required series, all at `membership_mode="dynamic"` and `padding_mode="filtered"`, all three aggregations:
+Required series, all at `membership_mode="dynamic"` and `padding_mode="filtered"`, all three aggregations. **Rows outside those two modes are discarded, not refused** — the producer writes a `frozen` twin for every bin and an `unfiltered` control for the first bin of each scheme, so a loader that refused them would refuse every real bundle:
 
 | Signal | `confidence_bin` | `score_scope` |
 |---|---|---|
@@ -114,6 +125,24 @@ Tests mirror the modules: `tests/scene_uncertainty/test_contrast_<name>.py`, plu
 ---
 
 ## Task 1: Load and validate a finished corruption-sensitivity bundle
+
+> **Amended after review, 2026-08-22.** The code block below was written against two false
+> premises and both were confirmed false against the completed run. Apply these corrections;
+> everything else in the block stands.
+>
+> 1. **Rows outside `dynamic`/`filtered` are discarded, not refused.** The producer writes a
+>    `frozen` twin for every bin and an `unfiltered` control for the first bin of each scheme,
+>    and those rows carry `(signal, confidence_bin, score_scope)` triples that are in
+>    `REQUIRED_SERIES`. The `raise` below therefore fires on every real bundle. Move the
+>    membership/padding test up beside the `entry not in wanted` filter as a `continue`, and
+>    rewrite the `SCORE_KEY` docstring, which currently documents the bug as a design decision.
+> 2. **Negativity is scope-aware.** `layer_N` persistence and confidence are non-negative;
+>    `combined` is a robust z-score built as the mean over layers of `(score - center) / scale`
+>    against the clean median, and it is negative for any selection below that median — 548 of
+>    the completed run's published `combined` statistics are, against none at `layer_2`. Refuse
+>    a negative `layer_N` or confidence score; accept a negative `combined` one. Add
+>    `COMBINED_SCOPE = "combined"` as an exported constant; Task 4 imports it.
+
 
 **Files:**
 - Create: `src/scene_uncertainty/contrast_inputs.py`
@@ -736,9 +765,21 @@ def test_clean_residual_subtracts_the_predicted_clean_responsive():
 
 
 @pytest.mark.parametrize("reference, responsive", [(-0.1, 1.0), (1.0, -0.1)])
-def test_negative_distances_are_rejected(reference, responsive):
-    with pytest.raises(ValueError, match="negative"):
-        raw_gap(reference, responsive)
+def test_only_the_relative_gap_rejects_a_negative_input(reference, responsive):
+    """The combined scope is a signed z-score, so three of the four methods must accept it."""
+    with pytest.raises(ValueError, match="non-negative"):
+        relative_gap(reference, responsive)
+    assert raw_responsive(reference, responsive) == responsive
+    assert raw_gap(reference, responsive) == pytest.approx(responsive - reference)
+    assert clean_residual(
+        reference, responsive, slope=1.0, offset=0.0
+    ) == pytest.approx(responsive - reference)
+
+
+def test_a_signed_combined_style_gap_is_computed_not_refused():
+    """Real values from the completed run's combined-scope decile_90_100 arm."""
+    assert raw_gap(-0.2599, -0.0230) == pytest.approx(0.2369)
+    assert contrast_score("raw_gap", -0.2599, -0.0230) == pytest.approx(0.2369)
 
 
 @pytest.mark.parametrize("bad", [math.nan, math.inf, -math.inf])
@@ -850,14 +891,22 @@ SCORE_METHODS = ("raw_responsive", "raw_gap", "relative_gap", "clean_residual")
 FOLD_COUNT = 5
 
 
-def _validated(reference: float, responsive: float) -> tuple[float, float]:
-    """Both inputs as finite non-negative floats, or a refusal naming which rule broke.
+def _validated(
+    reference: float, responsive: float, *, non_negative: bool = False
+) -> tuple[float, float]:
+    """Both inputs as finite floats, and non-negative too when the caller needs that.
 
-    Persistence distances are non-negative by construction, so a negative one is a bug upstream
-    rather than an unusual measurement -- and it would silently reverse the sign of every gap
-    it appeared in. Non-finite is refused for the same reason `complete_trend_metrics` refuses
-    it: a `nan` propagates through subtraction into a score that is neither a measurement nor
-    an absence, and lands in a CSV cell that reads as neither.
+    Non-finite is always refused, for the reason `complete_trend_metrics` refuses it: a `nan`
+    propagates through subtraction into a score that is neither a measurement nor an absence,
+    and lands in a CSV cell that reads as neither.
+
+    Non-negativity is *not* always refused, and that is the correction the completed run
+    forced. A `layer_N` score is a raw mean-kNN distance and cannot be negative. A `combined`
+    score is a robust z-score against the clean median and goes negative for any selection
+    below it -- 548 of the completed run's published `combined` statistics are, against none at
+    `layer_2`. So the check belongs to the one method that mathematically requires it rather
+    than to every method: `relative_gap`'s scale invariance and its bounds both collapse on a
+    signed input, while a raw gap and a residual are perfectly well defined on one.
     """
     reference = float(reference)
     responsive = float(responsive)
@@ -865,10 +914,10 @@ def _validated(reference: float, responsive: float) -> tuple[float, float]:
         raise ValueError(
             f"contrast inputs must be finite: reference={reference}, responsive={responsive}"
         )
-    if reference < 0.0 or responsive < 0.0:
+    if non_negative and (reference < 0.0 or responsive < 0.0):
         raise ValueError(
-            f"contrast inputs must be non-negative distances: reference={reference}, "
-            f"responsive={responsive}"
+            f"the symmetric relative gap needs non-negative inputs: reference={reference}, "
+            f"responsive={responsive}; a signed scope must not declare this method"
         )
     return reference, responsive
 
@@ -905,14 +954,16 @@ def relative_gap(reference: float, responsive: float) -> float:
     responsive-to-reference relationship is proportional, which is the multiplicative
     counterpart to what `raw_gap` removes additively.
 
-    Both inputs are non-negative, so the denominator cannot be negative and the only degenerate
-    case is both being exactly zero -- defined as zero, because "neither range moved at all" is
-    an absence of contrast and not an undefined one. No epsilon is added. An epsilon would be a
+    This method alone requires non-negative inputs, and refuses a negative one rather than
+    accommodating it: an arm whose scope can go negative has no business declaring this method,
+    and Task 4 excludes it there. Given non-negative inputs the denominator cannot be negative
+    and the only degenerate case is both being exactly zero -- defined as zero, because
+    "neither range moved at all" is an absence of contrast and not an undefined one. No epsilon is added. An epsilon would be a
     tunable constant sitting inside a score that is otherwise entirely determined by the data,
     and it would make the near-zero region's values a function of a number nobody chose on
     evidence.
     """
-    reference, responsive = _validated(reference, responsive)
+    reference, responsive = _validated(reference, responsive, non_negative=True)
     total = responsive + reference
     if total == 0.0:
         return 0.0
@@ -1029,7 +1080,7 @@ def robust_line(
 $UE_PY -m pytest tests/scene_uncertainty/test_contrast_scores.py -v
 ```
 
-Expected: 30 passed.
+Expected: 31 passed.
 
 - [ ] **Step 5: Mutation check**
 
@@ -1041,7 +1092,9 @@ Break each, confirm the *named* test fails, revert:
 4. `robust_line` → drop the `usable` filter (expect a divide-by-zero warning and a `nan` slope). `test_repeated_reference_values_skip_undefined_pairwise_slopes` must fail.
 5. `robust_line` → return `(0.0, 0.0)` instead of `None` for a constant reference. `test_a_constant_reference_makes_the_line_unavailable` must fail.
 6. `assign_folds` → drop the `sorted(...)`, iterating the input order. `test_fold_assignment_is_deterministic_under_reordering` must fail.
-7. `_validated` → drop the negativity check. `test_negative_distances_are_rejected` must fail.
+7. `_validated` → drop the `non_negative` guard. `test_only_the_relative_gap_rejects_a_negative_input` must fail.
+8. `relative_gap` → call `_validated` without `non_negative=True`. The same test must fail.
+9. `raw_gap` → pass `non_negative=True`. `test_a_signed_combined_style_gap_is_computed_not_refused` must fail.
 
 - [ ] **Step 6: Commit**
 
@@ -1560,9 +1613,31 @@ def test_every_arm_summary_and_method_produces_a_full_grid(tmp_path):
     rows, _ = build_contrast_rows(loaded(tmp_path))
     persistence = [row for row in rows if row["signal"] == "persistence"]
     confidence = [row for row in rows if row["signal"] == "confidence"]
-    assert len(persistence) == 4 * 3 * len(SCORE_METHODS) * IMAGES * SEVERITIES
+    # three layer_2 arms at four methods plus the combined arm at three: fifteen combinations
+    assert len(persistence) == 15 * 3 * IMAGES * SEVERITIES
     assert len(confidence) == 3 * 3 * len(SCORE_METHODS) * IMAGES * SEVERITIES
     assert len(index(rows)) == len(rows)  # no duplicate row keys
+
+
+def test_the_relative_gap_is_unavailable_at_the_combined_scope(tmp_path):
+    """A signed z-score has no symmetric relative gap; the reason is recorded, not silent."""
+    rows, fits = build_contrast_rows(loaded(tmp_path))
+    combined = {
+        row["method"] for row in rows
+        if row["arm"] == "decile_90_100__50_60__combined"
+    }
+    assert combined == {"raw_responsive", "raw_gap", "clean_residual"}
+    layered = {
+        row["method"] for row in rows if row["arm"] == "decile_90_100__50_60"
+        and row["signal"] == "persistence"
+    }
+    assert layered == set(SCORE_METHODS)
+    fit = fits[("decile_90_100__50_60__combined", "persistence", "mean")]
+    assert fit["relative_gap_available"] is False
+    assert "signed z-score" in fit["relative_gap_unavailable_reason"]
+    assert fits[("decile_90_100__50_60", "persistence", "mean")][
+        "relative_gap_available"
+    ] is True
 
 
 def test_the_two_differential_arms_share_one_confidence_twin(tmp_path):
@@ -1741,6 +1816,7 @@ from .contrast_diagnostics import between_image_spread, clean_relationship, with
 from .contrast_inputs import (
     AGGREGATIONS,
     ARMS,
+    COMBINED_SCOPE,
     CONFIDENCE_SCOPE,
     CONFIDENCE_SIGNAL,
     EXPECTED_SEVERITIES,
@@ -1799,7 +1875,7 @@ def _curve(inputs: ContrastInputs, confidence_bin, aggregation, scope, signal) -
     }
 
 
-def _fit(references: dict, responsives: dict, folds: dict) -> dict:
+def _fit(references: dict, responsives: dict, folds: dict, scope: str) -> dict:
     """The final all-clean line, the five fold lines, and whether the residual is usable.
 
     The final line is what a deployment would store and is never used to score a tuning image;
@@ -1837,6 +1913,12 @@ def _fit(references: dict, responsives: dict, folds: dict) -> dict:
                        for fold, line in fold_lines.items()},
         "residual_available": final is not None and not unavailable,
         "unavailable_reason": reason,
+        "relative_gap_available": scope != COMBINED_SCOPE,
+        "relative_gap_unavailable_reason": (
+            None if scope != COMBINED_SCOPE else
+            "the combined scope is a signed z-score, and the symmetric relative gap's "
+            "scale invariance and bounds both require non-negative inputs"
+        ),
     }
 
 
@@ -1856,10 +1938,12 @@ def build_contrast_rows(inputs: ContrastInputs) -> tuple[list[dict], dict]:
             for aggregation in AGGREGATIONS:
                 references = _curve(inputs, arm.reference_bin, aggregation, scope, signal)
                 responsives = _curve(inputs, arm.responsive_bin, aggregation, scope, signal)
-                fit = _fit(references, responsives, folds)
+                fit = _fit(references, responsives, folds, scope)
                 fits[(label, signal, aggregation)] = fit
                 for method in SCORE_METHODS:
                     if method == "clean_residual" and not fit["residual_available"]:
+                        continue
+                    if method == "relative_gap" and scope == COMBINED_SCOPE:
                         continue
                     for image_id in inputs.image_ids:
                         fold = folds[image_id]
@@ -1935,12 +2019,13 @@ def build_anchor_diagnostics(inputs: ContrastInputs) -> list[dict]:
 $UE_PY -m pytest tests/scene_uncertainty/test_contrast_analysis.py -v
 ```
 
-Expected: 12 passed.
+Expected: 13 passed.
 
 - [ ] **Step 5: Mutation check**
 
 Break each, confirm the *named* test fails, revert:
 
+0. `build_contrast_rows` → drop the `relative_gap` / `COMBINED_SCOPE` skip. `test_the_relative_gap_is_unavailable_at_the_combined_scope` must fail, and so must the row count in `test_every_arm_summary_and_method_produces_a_full_grid`.
 1. `_signal_plan` → always append the confidence entry. `test_the_two_differential_arms_share_one_confidence_twin` must fail (twin rows double).
 2. `_fit` → fit fold lines on all images instead of `trained`. `test_residual_uses_its_own_fold_line_and_not_the_final_line` must fail.
 3. `_fit` → use `curve[severity]` for every severity rather than `curve[0]`. `test_only_severity_zero_rows_influence_a_fit` must fail.
@@ -2007,9 +2092,14 @@ def test_every_declared_candidate_appears(tmp_path):
     candidates = summarize_contrast_candidates(rows, expected_image_count=IMAGES)
     persistence = [item for item in candidates if item["signal"] == "persistence"]
     confidence = [item for item in candidates if item["signal"] == "confidence"]
-    assert len(persistence) == 48
+    # 45, not 48: the combined arm has no relative gap (signed z-score)
+    assert len(persistence) == 45
     assert len(confidence) == 36
-    assert len(candidates) == 84
+    assert len(candidates) == 81
+    assert not [
+        item for item in persistence
+        if item["arm"].endswith("__combined") and item["method"] == "relative_gap"
+    ]
 
 
 def test_a_rising_candidate_locks_to_plus_one():
@@ -2573,7 +2663,7 @@ def test_the_full_two_thousand_sample_bootstrap_runs_in_reasonable_time():
 def test_row_curves_are_indexed_in_one_pass(tmp_path):
     rows, _ = build_contrast_rows(loaded(tmp_path))
     curves = index_curves(rows)
-    assert len(curves) == 48 + 36
+    assert len(curves) == 45 + 36
     one = curves[("decile_00_10__50_60", "persistence", "mean", "raw_gap")]
     assert sorted(one) == list(range(1, IMAGES + 1))
     assert sorted(one[1]) == list(range(6))
@@ -2712,7 +2802,7 @@ def _macro_from_draws(
     """Macro AUROC for every bootstrap draw at once.
 
     Ranked in batch with `rankdata(..., axis=1)` rather than one draw at a time. The paired
-    bootstrap needs 2,000 draws for each of 48 candidates against each of two controls, and a
+    bootstrap needs 2,000 draws for each of 45 candidates against each of two controls, and a
     per-draw loop turns a half-minute report into a quarter-hour one. `method="average"` is the
     same tie handling `corruption_metrics.binary_auroc` uses, so a bootstrap median and the
     point estimate cannot disagree about what a tie is worth.
@@ -3970,7 +4060,7 @@ Confirm each, with the command or file that shows it:
 2. `analyze-within-image-contrast` publishes exactly the nine declared files and nothing else.
 3. `summary.json` names four arms with correct `family` and `declared_before_data` values.
 4. `summary.json` holds 21 final fits — twelve persistence, nine confidence.
-5. `candidate_metrics.csv` holds 48 persistence candidates and 36 confidence twins, and no cell holds a dictionary.
+5. `candidate_metrics.csv` holds 45 persistence candidates and 36 confidence twins — 45 because the `combined` arm has no relative gap — and no cell holds a dictionary.
 6. `anchor_diagnostics.csv` covers all 21 configurations, differential arms included.
 7. Every persistence candidate carries a raw responsive comparison, a raw reference comparison, a twin comparison, and a `confidence_redundant` flag.
 8. Both differential arms report the same `twin_arm`.
