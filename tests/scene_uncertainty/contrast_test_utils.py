@@ -41,18 +41,40 @@ SERIES = (
 
 AGGREGATIONS = ("mean", "q90", "top20_mean")
 
-CONFIDENCE_LEVEL = {
-    "decile_00_10": 0.05, "quintile_00_20": 0.10,
-    "decile_50_60": 0.55, "quintile_40_60": 0.50,
-    "decile_90_100": 0.95,
+CONFIDENCE_UNCERTAINTY = {
+    "decile_00_10": 0.985, "quintile_00_20": 0.979,
+    "quintile_40_60": 0.936, "decile_50_60": 0.930,
+    "decile_90_100": 0.645,
 }
-"""Roughly the mean confidence of the queries a bin actually holds, per bin.
+"""Severity zero of the `confidence` column, per bin -- and the column is `1 - confidence`.
 
-The confidence control is not one number repeated: a decile bucket is *defined* by the
-confidence of its members, so the 90--100 percent bucket's control sits near 0.95 and the
-0--10 percent bucket's near 0.05. The two schemes are given distinguishable levels for the same
-reason the persistence terms are -- `decile_50_60` at 0.55 against `quintile_40_60` at 0.50 --
-so a consumer that read the wrong scheme's twin would not find identical numbers.
+`decile_scoring._checked_confidence` writes one minus the maximum class score, so **larger means
+less confident** and the bins, which are named by ascending confidence, carry *descending* values.
+The 0--10 percent bucket is the least confident and reads highest. Getting this backwards does not
+break anything visibly: it flips the sign of all 36 confidence-twin contrasts and leaves every
+count, key and coverage check intact, so it survives the entire loader suite and surfaces four
+tasks later as an orientation nobody can explain.
+
+The five levels are the completed run's own dynamic/filtered `mean` figures at severity zero,
+rounded to three places. The two schemes stay distinguishable -- `decile_50_60` at 0.930 against
+`quintile_40_60` at 0.936 -- so a consumer reading the wrong scheme's twin does not find identical
+numbers, and that ordering is the run's too.
+"""
+
+CONFIDENCE_UNCERTAINTY_SLOPE = {
+    "decile_00_10": -0.00044, "quintile_00_20": -0.00050,
+    "quintile_40_60": 0.00022, "decile_50_60": 0.00044,
+    "decile_90_100": 0.03074,
+}
+"""Per-severity drift of the same column, and the one place this fixture has to be steep.
+
+Four of the five bins are flat to the third decimal across all six severities -- two drifting down
+and two up, which is the run's own pattern and not a rounding artefact. `decile_90_100` climbs
+0.645 to 0.799: the detector losing confidence in the queries it was surest about, which is the
+single behaviour the redundancy control exists to expose. A fixture where every bin fell with
+severity would let a consumer that had the top decile upside down pass every test.
+
+Each slope is `(severity 5 - severity 0) / 5` from the completed run.
 """
 
 
@@ -65,11 +87,16 @@ def default_score(
     between-image spread test measures nothing. Without the `severity` term the trend is flat
     and every orientation test passes vacuously. Without the bin term the reference and
     responsive series are identical and every contrast is exactly zero -- which is why the
-    confidence branch carries `CONFIDENCE_LEVEL` rather than returning early on `signal` alone:
-    a bin-blind control is a control that reads `0.0` for every image at every severity, and the
-    confidence twin is the comparison the whole arm table is built around. Without the `scope`
-    term the `layer_2` and `combined` differential arms are byte-identical, and a mutation that
-    read the wrong scope would pass every test in the suite.
+    confidence branch reads `CONFIDENCE_UNCERTAINTY` and its slope rather than returning early on
+    `signal` alone: a bin-blind control is a control that reads `0.0` for every image at every
+    severity, and the confidence twin is the comparison the whole arm table is built around.
+    Without the `scope` term the `layer_2` and `combined` differential arms are byte-identical,
+    and a mutation that read the wrong scope would pass every test in the suite.
+
+    The confidence branch runs *opposite* to the persistence one and that is not a slip. The
+    column is `1 - confidence`, so its bins descend where persistence ascends, and only the top
+    decile rises with severity where persistence at that bin falls. A fixture that made the two
+    signals parallel would hide the redundancy the confidence twin exists to detect.
 
     `aggregation` is the one exception, and it is a gap rather than a decision: three
     aggregations of one selection are three summaries of one population, and this callback is
@@ -79,7 +106,12 @@ def default_score(
     read `q90` where it meant `mean` would not be caught here.
     """
     if signal == "confidence":
-        return round(CONFIDENCE_LEVEL[confidence_bin] + 0.001 * image_id - 0.002 * severity, 6)
+        return round(
+            CONFIDENCE_UNCERTAINTY[confidence_bin]
+            + 0.001 * image_id
+            + CONFIDENCE_UNCERTAINTY_SLOPE[confidence_bin] * severity,
+            6,
+        )
     base = 1.0 + 0.01 * image_id + (0.5 if scope == "combined" else 0.0)
     lift = {"decile_00_10": 0.0, "quintile_00_20": 0.0,
             "decile_50_60": 0.30, "quintile_40_60": 0.30,

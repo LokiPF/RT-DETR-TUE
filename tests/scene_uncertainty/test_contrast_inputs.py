@@ -100,10 +100,42 @@ def test_loads_every_required_series(tmp_path):
     # the same bin at the combined scope is a different measurement, not a copy
     assert inputs.scores[(1, 0, "persistence", "decile_50_60", "mean", "combined")] == 1.81
     # and the confidence twin varies by bin, so a contrast against it is not identically zero
-    assert inputs.scores[(1, 0, "confidence", "decile_00_10", "mean", "confidence")] == 0.051
-    assert inputs.scores[(1, 0, "confidence", "decile_90_100", "mean", "confidence")] == 0.951
+    assert inputs.scores[(1, 0, "confidence", "decile_00_10", "mean", "confidence")] == 0.986
+    assert inputs.scores[(1, 0, "confidence", "decile_90_100", "mean", "confidence")] == 0.646
     assert inputs.provenance["source_partition"] == "tuning"
     assert inputs.provenance["retained_row_count"] == RETAINED
+
+
+def test_the_confidence_column_runs_the_way_the_producer_writes_it(tmp_path):
+    """`1 - confidence`: bins descend, and only the top decile climbs with severity.
+
+    Both directions are pinned because neither is visible to the loader. An inverted map keeps
+    every count, key and coverage check intact and flips the sign of all 36 confidence-twin
+    contrasts four tasks downstream; a fixture where every bin fell with severity would let a
+    consumer that had the top decile upside down pass anyway. The rise at `decile_90_100` --
+    0.645 to 0.799 in the completed run -- is the detector losing the queries it was surest
+    about, which is the behaviour the redundancy control exists to expose.
+    """
+    inputs = load_contrast_inputs(
+        write_source_bundle(tmp_path / "source"), expected_image_count=6
+    )
+
+    def column(confidence_bin, severity=0):
+        return inputs.scores[(1, severity, "confidence", confidence_bin, "mean", "confidence")]
+
+    descending = [column(name) for name in (
+        "decile_00_10", "quintile_00_20", "quintile_40_60", "decile_50_60", "decile_90_100"
+    )]
+    assert descending == sorted(descending, reverse=True)
+    # the two schemes stay distinguishable, as they are in the run
+    assert column("decile_50_60") != column("quintile_40_60")
+
+    top = [column("decile_90_100", severity) for severity in SEVERITIES]
+    assert top == sorted(top)
+    assert top[-1] - top[0] > 0.15
+    low = [column("decile_00_10", severity) for severity in SEVERITIES]
+    assert low[-1] < low[0]
+    assert low[0] - low[-1] < 0.01
 
 
 def test_discards_the_frozen_and_unfiltered_twins_a_real_bundle_carries(tmp_path):
@@ -246,6 +278,23 @@ def test_accepts_a_negative_persistence_score_at_the_combined_scope(tmp_path):
     inputs = load_contrast_inputs(source, expected_image_count=6)
     assert inputs.scores[(3, 5, "persistence", "decile_90_100", "mean", "combined")] == -0.26
     assert inputs.scores[(3, 5, "persistence", "decile_90_100", "mean", "layer_2")] == 1.0
+
+
+def test_refuses_a_negative_confidence_score(tmp_path):
+    """The predicate is default-deny, and this is the test that says so.
+
+    `1 - confidence` is bounded in [0, 1] by construction, so a negative value here is a corrupt
+    column rather than a measurement -- and without this case a guard loosened to
+    `scope not in (COMBINED_SCOPE, CONFIDENCE_SCOPE)` passes the whole suite.
+    """
+    def negative_confidence(image_id, severity, confidence_bin, signal, scope):
+        return -0.2 if signal == "confidence" else 1.0
+
+    source = write_source_bundle(tmp_path / "source", score=negative_confidence)
+    with pytest.raises(
+        ContrastInputError, match="negative confidence score at scope confidence"
+    ):
+        load_contrast_inputs(source, expected_image_count=6)
 
 
 def test_refuses_a_non_finite_score(tmp_path):
