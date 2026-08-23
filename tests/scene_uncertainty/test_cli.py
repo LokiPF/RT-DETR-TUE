@@ -37,6 +37,7 @@ def test_cli_exposes_complete_artifact_pipeline():
         "report",
         "analyze-confidence-deciles",
         "analyze-corruption-sensitivity",
+        "analyze-within-image-contrast",
     }
 
 
@@ -70,7 +71,7 @@ def test_top_level_help_lists_every_subcommand(capsys):
 # The module docstring is the top-level epilog and the only ordered listing of the chain, so it
 # is the one place where a subcommand can be added to the parser and stay invisible to a reader
 # of `--help`. Spelled out rather than derived because the docstring spells it out.
-SUBCOMMAND_COUNT_WORDS = {5: "Five", 6: "Six", 7: "Seven", 8: "Eight"}
+SUBCOMMAND_COUNT_WORDS = {5: "Five", 6: "Six", 7: "Seven", 8: "Eight", 9: "Nine"}
 
 
 def test_the_pipeline_overview_counts_names_and_orders_every_subcommand():
@@ -1213,3 +1214,30 @@ def test_main_lets_an_unexpected_failure_surface(tmp_path: Path, monkeypatch):
     monkeypatch.setitem(pipeline.COMMANDS, "report", explode)
     with pytest.raises(ZeroDivisionError):
         main(["report", "--results", "r.csv", "--output", str(tmp_path)])
+
+
+def test_the_contrast_subcommand_requires_source_and_output(capsys):
+    from src.scene_uncertainty.cli import build_parser
+
+    parser = build_parser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(["analyze-within-image-contrast", "--source", "a"])
+    with pytest.raises(SystemExit):
+        parser.parse_args(["analyze-within-image-contrast", "--output", "b"])
+    args = parser.parse_args(
+        ["analyze-within-image-contrast", "--source", "a", "--output", "b"]
+    )
+    assert args.command == "analyze-within-image-contrast"
+    assert str(args.source) == "a"
+    assert str(args.output) == "b"
+
+
+def test_the_contrast_subcommand_has_no_partition_flag():
+    """The tuning partition is the only legal input, so there is nothing to choose."""
+    from src.scene_uncertainty.cli import build_parser
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args([
+            "analyze-within-image-contrast", "--source", "a",
+            "--output", "b", "--partition", "held_out",
+        ])

@@ -463,6 +463,60 @@ re-derived set that is empty by the gate's own definition. It does not inspect P
 that claim belongs to `tests/scene_uncertainty/test_corruption_plots.py`, which asserts it
 against the `Axes` objects.
 
+### Scoring one image against itself
+
+Everything above needs a second image. The bank is other images, the kNN search is over other
+images, and a scene's distance only means something relative to the population it was compared
+with -- so nothing above can tell an operator whether *this* frame, right now, looks corrupted.
+`analyze-within-image-contrast` asks whether one image can be scored from itself alone, by
+comparing two of its own confidence percentile ranges at one timestamp: a low-confidence
+reference range that ought to hold still under blur, against a mid-confidence responsive range
+that ought to move.
+
+```bash
+PYTHONPATH=$PWD $UE_PY tools/scene_uncertainty.py analyze-within-image-contrast \
+  --source $OUT/reports/corruption_sensitivity_raw_k5 \
+  --output $OUT/reports/within_image_contrast
+```
+
+**It reads one finished bundle and nothing else.** `--source` is a completed
+`analyze-corruption-sensitivity` output directory, and every number this command publishes is
+already in that bundle's `per_scene.csv`. There is no cache argument and no results argument
+because it needs neither: no detector forward pass, no fingerprint extraction, no bank, no kNN
+search, no re-fitted normalizer. That is why it finishes in minutes on a CPU where the commands
+above take GPU hours, and it is checked rather than asserted --
+`tests/scene_uncertainty/test_contrast_integration.py` replaces all twenty-three expensive entry
+points with charges that raise and requires the command to complete. Tuning results only: there
+is deliberately no `--partition` flag, and a source whose `source_partition` is not `tuning` is
+refused.
+
+**Four arms, and two of them are not the same kind of claim.** The two anchored arms
+(`decile_00_10__50_60` and `quintile_00_20__40_60`) were declared before any tuning number was
+read. The two differential arms (`decile_90_100__50_60` and its `combined`-scope variant) were
+chosen after the experiment above showed the 90-100 per cent decile moving hardest, against the
+50-60 per cent range. Every arm carries `declared_before_data` from the arm table through to the
+report, and `easy-report.md` reports anchored and differential as two separate verdicts, because
+a number from an arm chosen by looking at the data is a selection estimate: it may motivate a
+held-out test and it may not stand in for one.
+
+**Three controls per candidate, all scored over the same images.** Its own raw responsive range
+and its own raw reference range -- a contrast built from two ranges has to clear both to have
+added anything -- and a confidence-only twin built the same way from the detector's own
+confidence. A candidate that cannot beat the twin is named in the report as adding nothing over
+the detector's own confidence, which is the finding most easily mistaken for a success: the
+AUROC can be high and the contrast still be redundant. Each comparison is resampled by drawing
+images with replacement and rescoring both methods on the same draw, so the published interval
+measures the difference between the methods rather than which scenes were sampled.
+
+**A ranking statistic, never a corruption probability.** As everywhere else in this pipeline,
+nothing is fitted against a corruption label. The published AUROCs say how well a score *orders*
+clean scenes against blurred ones and nothing more, and no held-out image is read -- the five
+folds behind the cross-fitted residuals are folds *within* the tuning partition, held out from
+each other. `--output` must not exist: the nine files are written into a staging directory
+beside it and renamed into place in one step, so a failed run leaves neither a partial bundle
+nor an empty directory, and a directory that does exist is a finished report that is never
+overwritten.
+
 ### Reading the artifacts
 
 * **One writer per `--output`.** The immutability guard is a file check, so two extractions

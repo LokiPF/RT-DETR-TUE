@@ -1,6 +1,6 @@
 """The one entry point for the class-independent persistence scene-uncertainty study.
 
-Eight subcommands, run in this order:
+Nine subcommands, run in this order:
 
     select                         -> reference.json + evaluation.json (which COCO images are used)
     extract-reference              -> a feature cache over the clean reference images
@@ -10,6 +10,7 @@ Eight subcommands, run in this order:
     report                         -> summary.json and the trend plots
     analyze-confidence-deciles     -> the confidence-decile experiment over the two artifacts
     analyze-corruption-sensitivity -> that experiment re-cut into quintiles too, and compared
+    analyze-within-image-contrast  -> one image scored against itself, from that bundle alone
 
 Argument validation lives here rather than in `pipeline`, so a typo in a policy name,
 an unreadable checkpoint, or a negative batch size fails at parse time instead of an
@@ -171,6 +172,43 @@ def _name_list(kind: str):
     return convert
 
 
+_CONTRAST_EPILOG = """\
+One image, one moment, two of its own confidence percentile ranges -- and nothing else. The
+score for an image is built by comparing a low-confidence reference range against a
+mid-confidence responsive range measured on that same image at that same timestamp, so there is
+no comparison bank to consult, no neighbour set to search, and no second image involved in
+scoring the first.
+
+This command reads a finished `analyze-corruption-sensitivity` output directory and nothing
+else. Every number it needs is already in that bundle's `per_scene.csv`; it runs no detector
+forward pass, extracts no fingerprints, builds no bank and searches no bank. That is why it is
+seconds on a CPU, and it is also why re-running it can only ever re-describe the run it was
+given rather than quietly produce a different one.
+
+Four arms, and two of them are not the same kind of claim as the other two. The two anchored
+arms were declared before any tuning number was read; the two differential arms were chosen
+after the completed deployment analysis showed which decile moved hardest. Anchored and
+differential are reported as two separate verdicts for that reason, and a differential number
+is a selection estimate that may motivate a held-out test and may not stand in for one.
+
+Each candidate is compared against three controls scored over the same images: its own raw
+responsive range, its own raw reference range, and a confidence-only twin built the same way
+from the detector's own confidence. A contrast that cannot beat all three has not earned its
+machinery, and the report says so in those words.
+
+Tuning results only. There is deliberately no `--partition` switch, and a source whose
+`source_partition` is anything but `tuning` is refused, so the held-out test images cannot be
+spent from the command line. What the report publishes is a ranking statistic -- an AUROC
+separating clean scenes from corrupted ones -- and not a corruption probability; nothing here
+is fitted against a corruption label.
+
+`--output` must not already exist. The nine artifacts are written into a staging directory
+beside it and renamed into place in one step, so a run that fails leaves no `--output` at all --
+not a partial bundle and not an empty directory -- and a directory that does exist is a finished
+report, which is never overwritten.
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="scene_uncertainty",
@@ -283,6 +321,16 @@ def build_parser() -> argparse.ArgumentParser:
                             help="tuning CSV written by evaluate-knn")
     corruption.add_argument("--output", required=True, type=Path,
                             help="corruption-sensitivity report directory; must not exist")
+
+    contrast = add(
+        "analyze-within-image-contrast",
+        "Score corruption from one image using one percentile range against another.",
+        _CONTRAST_EPILOG,
+    )
+    contrast.add_argument("--source", required=True, type=Path,
+                          help="completed analyze-corruption-sensitivity output directory")
+    contrast.add_argument("--output", required=True, type=Path,
+                          help="within-image contrast report directory; must not exist")
     return parser
 
 
