@@ -322,6 +322,7 @@ def _extractor(
         lambda *_args, **_kwargs: capture,
     )
     config = ExperimentConfig.for_tests(
+        image_size=(8, 8),
         class_count=2,
         query_count=10,
         persistence_dim=5,
@@ -364,6 +365,71 @@ def test_extractor_rejects_identity_and_sample_batch_mismatch_before_forward(
     assert capture.take_count == 0
 
 
+def test_extractor_rejects_a_non_tensor_before_model_execution(monkeypatch):
+    extractor, model, capture = _extractor(monkeypatch)
+
+    with pytest.raises(TypeError, match="samples must be a Tensor"):
+        extractor.extract_batch([("a", 0)], [[[1.0]]])
+
+    assert model.last_samples is None
+    assert capture.take_count == 0
+
+
+def test_extractor_moves_samples_without_requiring_the_input_device(monkeypatch):
+    extractor, model, capture = _extractor(monkeypatch, fail=True)
+    extractor.device = torch.device("meta")
+
+    with pytest.raises(RuntimeError, match="forward failed"):
+        extractor.extract_batch(
+            [("a", 0), ("b", 0)],
+            torch.zeros(2, 3, 8, 8),
+        )
+
+    assert model.last_samples.device.type == "meta"
+    assert capture.take_count == 0
+
+
+@pytest.mark.parametrize(
+    ("samples", "identities", "message"),
+    [
+        (torch.empty(0, 3, 8, 8), [], "sample batch must be nonempty"),
+        (
+            torch.zeros(3, 8, 8),
+            [("a", 0), ("b", 0), ("c", 0)],
+            "samples must be a 4D NCHW tensor",
+        ),
+        (
+            torch.zeros(2, 1, 8, 8),
+            [("a", 0), ("b", 0)],
+            "samples must have 3 channels",
+        ),
+        (
+            torch.zeros(2, 3, 7, 8),
+            [("a", 0), ("b", 0)],
+            r"sample spatial size \(7, 8\).*configured \(8, 8\)",
+        ),
+        (
+            torch.zeros(2, 3, 8, 8, dtype=torch.int64),
+            [("a", 0), ("b", 0)],
+            "samples must use a floating dtype",
+        ),
+    ],
+)
+def test_extractor_rejects_invalid_samples_before_model_execution(
+    samples,
+    identities,
+    message,
+    monkeypatch,
+):
+    extractor, model, capture = _extractor(monkeypatch)
+
+    with pytest.raises(ValueError, match=message):
+        extractor.extract_batch(identities, samples)
+
+    assert model.last_samples is None
+    assert capture.take_count == 0
+
+
 @pytest.mark.parametrize(
     ("output_batch", "feature_batch", "message"),
     [
@@ -395,6 +461,7 @@ def test_extractor_enforces_configured_query_and_persistence_dimensions(
 ):
     extractor, _model, _capture = _extractor(monkeypatch)
     extractor.config = ExperimentConfig.for_tests(
+        image_size=(8, 8),
         class_count=2,
         query_count=10,
         persistence_dim=6,
@@ -450,6 +517,7 @@ def test_extractor_context_closes_real_hooks_when_inference_fails(
     model.decoder.dec_score_head = nn.ModuleList([nn.Linear(4, 2), nn.Linear(4, 2)])
     monkeypatch.setattr(extraction, "load_frozen_detector", lambda *_args: model)
     config = ExperimentConfig.for_tests(
+        image_size=(8, 8),
         query_count=10,
         persistence_dim=5,
         persistence_layer=1,

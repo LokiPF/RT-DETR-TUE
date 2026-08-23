@@ -190,8 +190,22 @@ class RTDETRExtractor:
         identities: list[tuple[str, int]],
         samples: Tensor,
     ) -> list[dict[str, object]]:
-        if samples.ndim == 0:
-            raise ValueError("samples must have a batch dimension")
+        if not isinstance(samples, Tensor):
+            raise TypeError("samples must be a Tensor")
+        if samples.ndim != 4:
+            raise ValueError("samples must be a 4D NCHW tensor")
+        if samples.shape[0] == 0:
+            raise ValueError("sample batch must be nonempty")
+        if samples.shape[1] != 3:
+            raise ValueError("samples must have 3 channels")
+        spatial_size = tuple(samples.shape[2:])
+        if spatial_size != self.config.image_size:
+            raise ValueError(
+                f"sample spatial size {spatial_size} does not match "
+                f"configured {self.config.image_size}"
+            )
+        if not torch.is_floating_point(samples):
+            raise ValueError("samples must use a floating dtype")
         identity_count = len(identities)
         sample_count = samples.shape[0]
         if identity_count != sample_count:
