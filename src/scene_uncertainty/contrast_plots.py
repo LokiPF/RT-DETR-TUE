@@ -1,4 +1,10 @@
-"""Four figures, and the axis ranges they were actually drawn on.
+"""Four figures, and the span of what each one actually drew.
+
+`figure_spans` is the key `summary.json` records these under, and `span` rather than `limit` is
+the spec's word for three of the four: only the AUROC figure pins its panels, and the range
+returned for the other three describes the data drawn rather than an axis imposed on it. The
+one that *is* a limit is named `AUROC_LIMITS` and says so.
+
 
 Panels are grouped by what shares a meaning, not by what fits. The anchor panels put reference
 and responsive on one axis because they are the same quantity in the same units; the contrast
@@ -574,6 +580,14 @@ def _auroc_figure(candidates: list[dict]):
     for axis, (arm_name, aggregation) in panels:
         axis.tick_params(labelsize=7)
         axis.set_title(_panel_title(arm_name, aggregation), fontsize=7)
+        # Applied before anything is drawn, and above the empty-panel guard below rather than
+        # after it. The returned span claims that every panel of this figure carries
+        # `AUROC_LIMITS`, and a panel that took the `continue` would instead be keeping
+        # matplotlib's default range -- which is `(0.0, 1.0)` today, so the two coincide and
+        # nothing in the drawing would say the claim had stopped being true. Move the declared
+        # interval off the default and an empty panel would silently disagree with the number
+        # `summary.json` records for it.
+        axis.set_ylim(*AUROC_LIMITS)
         missing: list[str] = []
         painted = False
         for method in SCORE_METHODS:
@@ -609,7 +623,6 @@ def _auroc_figure(candidates: list[dict]):
             )
             continue
         axis.axhline(CHANCE, color=CHANCE_COLOUR, linestyle=CHANCE_STYLE, linewidth=0.9)
-        axis.set_ylim(*AUROC_LIMITS)
         axis.set_xlim(corrupted[0], corrupted[-1])
         axis.set_xticks(corrupted)
         if missing:
@@ -645,7 +658,7 @@ def _auroc_figure(candidates: list[dict]):
 def _contrast_figures(
     candidates: list[dict], controls: list[dict], rows: list[dict], fits: dict
 ) -> tuple[dict[str, object], dict[str, list[float]]]:
-    """All four figures, keyed as `PLOT_FILENAMES` is, and the ranges they were drawn on.
+    """All four figures, keyed as `PLOT_FILENAMES` is, and the span each one covers.
 
     Every figure is built before any of them is written, so a directory that cannot be written
     to fails with all four files still absent rather than after two of them exist.
@@ -688,16 +701,19 @@ def write_contrast_plots(
     rows: list[dict],
     fits: dict,
 ) -> dict[str, list[float]]:
-    """Write the four figures into `directory` and return the ranges they were drawn on.
+    """Write the four figures into `directory` and return the span each one covers.
 
-    The return value is `{key: [lower, upper]}` over the same four keys as `PLOT_FILENAMES`.
-    `"auroc"` is `list(AUROC_LIMITS)` -- the interval every one of its twelve panels was given,
-    not a second computation over the curves. The other three are `[min, max]` over every value
-    that figure drew; their panels autoscale, for the reason this module's docstring gives, so
-    those three are the span of the drawn data rather than a limit applied to any one panel.
-    Task 8 records the dictionary in `summary.json` verbatim and never recomputes it, which is
-    what stops the recorded range and the drawn one disagreeing with nothing to say so. Lists
-    rather than tuples because that is what survives a JSON round trip unchanged.
+    The return value is `{key: [lower, upper]}` over the same four keys as `PLOT_FILENAMES`,
+    and it is what Task 8 records under `summary.json`'s `figure_spans`. `"auroc"` is
+    `list(AUROC_LIMITS)` -- the interval every one of its twelve panels was given, including
+    the panels that drew nothing, and not a second computation over the curves. The other three
+    are `[min, max]` over every value that figure drew; their panels autoscale, for the reason
+    this module's docstring gives, so those three are the span of the drawn data rather than a
+    limit applied to any one panel. The spec's word is `span` for exactly that reason, and the
+    report must not call the three of them limits. Task 8 records the dictionary verbatim and
+    never recomputes it, which is what stops the recorded span and the drawn one disagreeing
+    with nothing to say so. Lists rather than tuples because that is what survives a JSON round
+    trip unchanged.
 
     Nothing here writes into `candidates`, `controls`, `rows` or `fits`. A candidate dictionary
     is the one object the ranking, the CSV, the report and these figures all hold, so a
@@ -710,7 +726,7 @@ def write_contrast_plots(
     time in a directory that already claims to hold a finished result.
     """
     directory = Path(directory)
-    figures, limits = _contrast_figures(candidates, controls, rows, fits)
+    figures, spans = _contrast_figures(candidates, controls, rows, fits)
     # `finally`, not a close after each `savefig`: the whole set is open before the first file
     # is written, so a write that fails part-way -- an unwritable or absent directory is the
     # obvious one -- would otherwise leave the untried figures open.
@@ -720,4 +736,4 @@ def write_contrast_plots(
     finally:
         for figure in figures.values():
             plt.close(figure)
-    return limits
+    return spans

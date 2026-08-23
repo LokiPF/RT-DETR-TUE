@@ -148,19 +148,44 @@ def level(arm: str, aggregation: str, method: str) -> float:
     )
 
 
+MEAN_OFFSET = 1000.0
+"""How far this fixture's mean sits from its median, and why it is absurd rather than small.
+
+`summarize_contrast_candidates` publishes both, and every caption on these figures says median.
+A fixture whose mean equals its median cannot tell the two apart at all, and one whose mean sits
+*inside* `q25`..`q75` -- which is where a real mean nearly always sits, and where the six-image
+bundle's 486 means all sit -- cannot tell them apart either, because the recorded span is taken
+over the median and both quartiles and comes out byte-identical whichever of the two was drawn.
+So the fixture puts the mean a thousand units outside the band, where reading it instead of the
+median changes both the drawn curve and the span by an amount no rounding could hide.
+"""
+
+
 def statistics(values, *, unscored=()):
     """A six-severity `severity_statistics`, with `count == 0` at the severities named.
 
     The quartiles are deliberately asymmetric about the median -- one below and two above -- so
-    a band drawn from `q75`/`q25` the wrong way round, or from the mean, is a different polygon
-    and not merely a differently sized one.
+    a band drawn from the median to either quartile is a different band from the one drawn
+    between them, and the two edges cannot be confused with the line they surround.
+
+    What the asymmetry does NOT buy, measured rather than assumed: it cannot separate
+    `fill_between(x, q25, q75)` from `fill_between(x, q75, q25)`. That artist is symmetric in
+    its two y arguments -- it fills the region between them either way -- so the exchange
+    renders 208 of 307,200 pixels different by one part in 255 along the antialiased boundary
+    and covers the identical band. No assertion over the drawn figure can see it, and
+    `band_bounds` pools each severity's vertices for exactly that reason. It is an equivalent
+    mutation, recorded here rather than left for a later reader to re-derive.
+
+    `mean` is `MEAN_OFFSET` away from the median for the reason that constant gives, and
+    `variance` is a number nothing draws, present so that a candidate handed to these figures
+    has the shape `summarize_contrast_candidates` gives it.
     """
     return {
         severity: (
             {"count": 0, "mean": None, "variance": None,
              "median": None, "q25": None, "q75": None}
             if severity in unscored
-            else {"count": IMAGES, "mean": value, "variance": 1.0,
+            else {"count": IMAGES, "mean": value + MEAN_OFFSET, "variance": 1.0,
                   "median": value, "q25": value - 1.0, "q75": value + 2.0}
         )
         for severity, value in zip(EXPECTED_SEVERITIES, values)
@@ -274,11 +299,11 @@ def drawn(bundle):
     off an axis is what the file holds. Closed on the way out: matplotlib warns once more than
     twenty figures are open, and this file opens four per test.
     """
-    figures, limits = plots_module._contrast_figures(
+    figures, spans = plots_module._contrast_figures(
         bundle["candidates"], bundle["controls"], bundle["rows"], bundle["fits"]
     )
     try:
-        yield figures, limits
+        yield figures, spans
     finally:
         for figure in figures.values():
             plt.close(figure)
@@ -327,6 +352,20 @@ def band_bounds(collection, severities=EXPECTED_SEVERITIES):
         if at.size:
             lower[severity], upper[severity] = float(at.min()), float(at.max())
     return lower, upper
+
+
+def legend_of(figure):
+    """The one figure-level legend, its labels and its handles, in the order it lists them."""
+    legend = figure.legends[0]
+    return (
+        [text.get_text() for text in legend.get_texts()],
+        list(legend.legend_handles),
+    )
+
+
+def styled(line):
+    """The three things about a line that carry meaning here, as one comparable tuple."""
+    return (line.get_color(), line.get_linestyle(), line.get_marker())
 
 
 def every_stat(bundle, key="candidates", *, methods=None, signal=DEPLOYABLE_SIGNAL):
@@ -423,8 +462,13 @@ def test_the_panel_plan_is_the_arm_table_in_order():
     assert expected[0] == ("decile_00_10__50_60", "mean")
     assert expected[-1] == ("decile_90_100__50_60__combined", "top20_mean")
     # Three lists, not three names for one: a caller editing the plan it was handed for one
-    # figure must not be editing the other two figures' plans.
-    assert plan["anchor"] is not plan["relationship"] is not plan["auroc"]
+    # figure must not be editing the other two figures' plans. Three pairwise comparisons and
+    # not `a is not b is not c`, which Python chains into `(a is not b) and (b is not c)` and
+    # never compares the anchor plan with the AUROC one at all.
+    assert len({id(plan["anchor"]), id(plan["relationship"]), id(plan["auroc"])}) == 3
+    assert plan["anchor"] is not plan["relationship"]
+    assert plan["relationship"] is not plan["auroc"]
+    assert plan["anchor"] is not plan["auroc"]
 
 
 def test_the_panel_counts_are_the_declared_ones(tmp_path, prepared):
@@ -538,22 +582,30 @@ def test_the_panels_are_laid_out_to_fit_rather_than_left_on_the_default_margins(
                 assert box.y0 >= legend.y1, key
 
 
-# --- the returned ranges -------------------------------------------------------------------------
+# --- the figure spans ------------------------------------------------------------------------
 
 
-def test_axis_limits_are_returned_for_every_figure(tmp_path, prepared):
-    limits = write_contrast_plots(tmp_path, **prepared)
-    assert set(limits) == set(PLOT_FILENAMES)
-    for key, value in limits.items():
+def test_a_figure_span_is_returned_for_every_figure(tmp_path, prepared):
+    """Named `span` and not `limit`, which is the spec's word and the `summary.json` key.
+
+    Three of the four are the range of the data drawn on an autoscaled panel and are not limits
+    imposed on anything; Task 8 reads this name when it records them under `figure_spans`.
+    """
+    spans = write_contrast_plots(tmp_path, **prepared)
+    assert set(spans) == set(PLOT_FILENAMES)
+    for key, value in spans.items():
         assert isinstance(value, list) and len(value) == 2
         assert value[0] <= value[1]
-    # AUROC panels always span the full interval, because that is what makes them comparable
-    assert limits["auroc"] == [0.0, 1.0]
+    # AUROC panels always span the full interval, because that is what makes them comparable.
+    # The literal, not `AUROC_LIMITS`: reading the constant on both sides is the comparison that
+    # let the swapped `PLOT_FILENAMES` through, and it would pass on any interval whatever.
+    assert spans["auroc"] == [0.0, 1.0]
+    assert AUROC_LIMITS == [0.0, 1.0]
 
 
-def test_axis_limits_survive_a_json_round_trip(tmp_path, prepared):
-    limits = write_contrast_plots(tmp_path, **prepared)
-    assert json.loads(json.dumps(limits)) == limits
+def test_the_figure_spans_survive_a_json_round_trip(tmp_path, prepared):
+    spans = write_contrast_plots(tmp_path, **prepared)
+    assert json.loads(json.dumps(spans)) == spans
 
 
 def test_the_anchor_range_is_the_smallest_and_largest_value_it_drew(tmp_path, prepared):
@@ -563,25 +615,25 @@ def test_the_anchor_range_is_the_smallest_and_largest_value_it_drew(tmp_path, pr
     candidates and the `raw_reference` controls, and a range stretched to a `relative_gap`
     candidate it never plots would be a number no panel is a claim about.
     """
-    limits = write_contrast_plots(tmp_path, **prepared)
+    spans = write_contrast_plots(tmp_path, **prepared)
 
     values = every_stat(prepared, methods={RESPONSIVE_CONTROL_METHOD}) + every_stat(
         prepared, "controls"
     )
-    assert limits["anchor"] == [min(values), max(values)]
-    assert limits["anchor"] != limits["contrast"]
+    assert spans["anchor"] == [min(values), max(values)]
+    assert spans["anchor"] != spans["contrast"]
 
 
 def test_the_contrast_range_is_the_smallest_and_largest_value_it_drew(tmp_path, prepared):
-    limits = write_contrast_plots(tmp_path, **prepared)
+    spans = write_contrast_plots(tmp_path, **prepared)
 
     values = every_stat(prepared)
-    assert limits["contrast"] == [min(values), max(values)]
+    assert spans["contrast"] == [min(values), max(values)]
 
 
 def test_the_relationship_range_covers_both_axes_of_the_scatter(tmp_path, prepared):
     """Both axes, because a reference and a responsive distance are one quantity in one unit."""
-    limits = write_contrast_plots(tmp_path, **prepared)
+    spans = write_contrast_plots(tmp_path, **prepared)
 
     scattered = [
         row[field]
@@ -591,17 +643,38 @@ def test_the_relationship_range_covers_both_axes_of_the_scatter(tmp_path, prepar
         and row["method"] == RESPONSIVE_CONTROL_METHOD
         for field in ("reference", "responsive")
     ]
-    assert limits["relationship"][0] <= min(scattered)
-    assert limits["relationship"][1] >= max(scattered)
+    assert spans["relationship"][0] <= min(scattered)
+    assert spans["relationship"][1] >= max(scattered)
     with drawn(prepared) as (figures, live):
-        assert live["relationship"] == limits["relationship"]
+        assert live["relationship"] == spans["relationship"]
         drawn_values = [
             value
             for axis in figures["relationship"].axes
             for line in axis.get_lines()
             for value in line.get_ydata()
         ] + scattered
-        assert limits["relationship"] == [min(drawn_values), max(drawn_values)]
+        assert spans["relationship"] == [min(drawn_values), max(drawn_values)]
+
+
+def test_the_relationship_span_reaches_the_fitted_line_and_not_only_the_scatter():
+    """On a real run the fit sits inside its own cloud, so the scatter alone gives the answer.
+
+    Which means the pipeline fixture cannot say whether the line was measured at all. The
+    synthetic fits put every line far above its points, so a span taken over the scatter alone
+    is a different pair of numbers -- and the line is the half of this figure that a reader
+    compares the points against.
+    """
+    bundle = synthetic_bundle()
+    with drawn(bundle) as (figures, spans):
+        scattered, fitted = [], []
+        for axis in figures["relationship"].axes:
+            scattered.extend(axis.collections[0].get_offsets().reshape(-1).tolist())
+            fitted.extend(float(value) for line in axis.get_lines() for value in line.get_ydata())
+        assert max(fitted) > max(scattered)
+        assert spans["relationship"] == [
+            min(scattered + fitted), max(scattered + fitted)
+        ]
+        assert spans["relationship"] != [min(scattered), max(scattered)]
 
 
 def test_the_auroc_range_is_the_declared_interval_and_not_the_span_of_its_curves(
@@ -612,7 +685,7 @@ def test_the_auroc_range_is_the_declared_interval_and_not_the_span_of_its_curves
     The fixture's AUROCs reach neither 0 nor 1 -- asserted, because a fixture that happened to
     touch both would make the two answers the same number and the assertion vacuous.
     """
-    limits = write_contrast_plots(tmp_path, **prepared)
+    spans = write_contrast_plots(tmp_path, **prepared)
 
     plotted = [
         value
@@ -622,23 +695,61 @@ def test_the_auroc_range_is_the_declared_interval_and_not_the_span_of_its_curves
         if vector is not None
         for value in vector.values()
     ]
-    assert min(plotted) > AUROC_LIMITS[0]
-    assert max(plotted) < AUROC_LIMITS[1]
-    assert limits["auroc"] == AUROC_LIMITS
-    assert limits["auroc"] is not AUROC_LIMITS
+    assert min(plotted) > 0.0
+    assert max(plotted) < 1.0
+    assert spans["auroc"] == [0.0, 1.0]
+    assert spans["auroc"] is not AUROC_LIMITS
 
     with drawn(prepared) as (figures, _):
         for axis in figures["auroc"].axes:
-            assert axis.get_ylim() == tuple(limits["auroc"])
+            assert axis.get_ylim() == (0.0, 1.0)
 
 
-def test_a_figure_that_drew_nothing_reports_an_empty_range_rather_than_a_plausible_one():
+def test_every_auroc_panel_is_pinned_to_the_declared_interval_including_the_empty_ones(
+    monkeypatch, prepared
+):
+    """Moves the declared interval off matplotlib's default, which is the only way to see it.
+
+    `AUROC_LIMITS` is `[0.0, 1.0]` and an axis nobody assigned is `(0.0, 1.0)`, so a panel that
+    skipped `set_ylim` is indistinguishable from one that received it -- and an empty panel is
+    exactly where the assignment is easiest to skip, because it sits after the guard that says
+    there was nothing to draw. With the interval monkeypatched to something matplotlib would
+    never pick, a skipped assignment is a panel that disagrees with the span `summary.json`
+    records for the figure it is in.
+
+    Run over both a full run and a run whose every candidate lost its AUROC, so the pinning is
+    asserted on twelve drawn panels and on twelve empty ones.
+    """
+    monkeypatch.setattr(plots_module, "AUROC_LIMITS", [0.4, 0.9])
+    blank = copy.deepcopy(prepared)
+    for candidate in blank["candidates"]:
+        candidate["auroc_by_severity"] = None
+        candidate["twin_auroc_by_severity"] = None
+
+    for label, bundle, expect_curves in (("drawn", prepared, True), ("empty", blank, False)):
+        with drawn(bundle) as (figures, spans):
+            assert spans["auroc"] == [0.4, 0.9], label
+            assert len(figures["auroc"].axes) == 12, label
+            for axis in figures["auroc"].axes:
+                assert axis.get_ylim() == (0.4, 0.9), label
+                assert bool(axis.get_lines()) is expect_curves, label
+
+
+def test_a_figure_that_drew_nothing_reports_an_empty_span_rather_than_a_plausible_one():
+    """The literal `[0.0, 0.0]`, not `EMPTY_SPAN`.
+
+    `EMPTY_SPAN`'s own docstring names `[0, 1]` as the wrong answer it exists to avoid -- a unit
+    interval nobody measured, which a reader of `summary.json` cannot tell from a real one. A
+    comparison against the constant reads the mutated value on both sides and passes on any
+    value at all, including the one the constant was written to rule out.
+    """
     empty = {"candidates": [], "controls": [], "rows": [], "fits": {}}
-    with drawn(empty) as (figures, limits) :
-        assert limits["anchor"] == EMPTY_SPAN
-        assert limits["relationship"] == EMPTY_SPAN
-        assert limits["contrast"] == EMPTY_SPAN
-        assert limits["auroc"] == AUROC_LIMITS
+    with drawn(empty) as (figures, spans):
+        assert spans["anchor"] == [0.0, 0.0]
+        assert spans["relationship"] == [0.0, 0.0]
+        assert spans["contrast"] == [0.0, 0.0]
+        assert spans["auroc"] == [0.0, 1.0]
+        assert EMPTY_SPAN == [0.0, 0.0]
         for key in ("anchor", "relationship", "auroc"):
             assert len(figures[key].axes) == 12, key
             for axis in figures[key].axes:
@@ -712,7 +823,7 @@ def test_a_candidate_whose_distance_falls_is_drawn_falling():
         for aggregation in AGGREGATIONS
         for method in SCORE_METHODS
     ]
-    with drawn(synthetic_bundle(candidates=falling)) as (figures, limits):
+    with drawn(synthetic_bundle(candidates=falling)) as (figures, spans):
         axis = panel(figures["anchor"], ARM_NAMES[0], "mean")
         responsive = list(axis.get_lines()[1].get_ydata())
         assert responsive == curve(
@@ -734,11 +845,43 @@ def test_the_anchor_panels_carry_the_severity_ladder_and_no_shared_range():
 
 def test_the_anchor_legend_says_which_colour_is_which_range():
     with drawn(synthetic_bundle()) as (figures, _):
-        labels = [text.get_text() for text in figures["anchor"].legends[0].get_texts()]
+        labels, handles = legend_of(figures["anchor"])
         assert labels == [
             "reference range: median and interquartile band",
             "responsive range: median and interquartile band",
         ]
+        # The handles, not only the words beside them. A legend whose swatches are decoupled
+        # from the series they name is a legend that describes a different figure.
+        assert [handle.get_color() for handle in handles] == [
+            plots_module.ANCHOR_COLOURS["reference"],
+            plots_module.ANCHOR_COLOURS["responsive"],
+        ]
+        # And the literals, which is a separate claim from the one above. Reading the constant
+        # on both sides passes on any assignment at all, including the exchange the module's
+        # own docstring rules out -- "the reference is the greyer of the two, because it is the
+        # baseline being cleared, not the measurement". Swapped, every panel and this legend
+        # move together, so the figure stays self-consistent and stops following the convention
+        # `corruption_plots` shares with it, with nothing anywhere saying so. Third constant
+        # this round after `AUROC_LIMITS` and `EMPTY_SPAN`; the class is the constant read on
+        # both sides of its own comparison, and it is closed one constant at a time.
+        assert plots_module.ANCHOR_COLOURS == {"reference": "0.35", "responsive": "tab:blue"}
+
+
+def test_the_two_anchor_series_are_drawn_in_two_different_colours():
+    """Reference and responsive are the same quantity on one axis, so colour is all that separates
+    them. Collapse the two and the panel becomes one curve crossing itself."""
+    assert plots_module.ANCHOR_COLOURS["reference"] != plots_module.ANCHOR_COLOURS["responsive"]
+
+    with drawn(synthetic_bundle()) as (figures, _):
+        for arm in ARM_NAMES:
+            for aggregation in AGGREGATIONS:
+                axis = panel(figures["anchor"], arm, aggregation)
+                reference, responsive = axis.get_lines()
+                assert reference.get_color() == plots_module.ANCHOR_COLOURS["reference"]
+                assert responsive.get_color() == plots_module.ANCHOR_COLOURS["responsive"]
+                assert reference.get_color() != responsive.get_color()
+                bands = [collection.get_facecolor()[0].tolist() for collection in axis.collections]
+                assert bands[0] != bands[1]
 
 
 @pytest.mark.parametrize(
@@ -767,7 +910,11 @@ def test_an_anchor_panel_says_which_of_its_two_series_never_arrived(drop, expect
 
     with drawn(bundle) as (figures, _):
         axis = panel(figures["anchor"], *target)
-        assert expected in message(axis)
+        # The whole note, not a substring of it. The *fact* of an absence is bound by the
+        # missing curve; what is worth binding here is the diagnosis, and a note naming the
+        # wrong arm, the wrong summary or the wrong one of the two series is a diagnosis that
+        # sends a reader to inspect something that is not broken.
+        assert message(axis) == f"{target[0]} / {target[1]}: {expected}"
         assert len(axis.get_lines()) == (0 if drop == "both" else 1)
         # The panel keeps its place: its neighbours are untouched and still complete.
         neighbour = panel(figures["anchor"], ARM_NAMES[1], "mean")
@@ -788,7 +935,9 @@ def test_a_series_that_scored_no_image_is_said_differently_from_one_that_never_a
     ]
     with drawn(synthetic_bundle(candidates=candidates)) as (figures, _):
         axis = panel(figures["anchor"], *target)
-        assert "responsive scored no image at any severity" in message(axis)
+        assert message(axis) == (
+            f"{target[0]} / {target[1]}: responsive scored no image at any severity"
+        )
         assert "no responsive candidate" not in message(axis)
         assert len(axis.get_lines()) == 1
 
@@ -806,7 +955,7 @@ def test_a_severity_no_image_scored_is_a_gap_in_the_line_and_not_a_missing_panel
         else item
         for item in synthetic_candidates()
     ]
-    with drawn(synthetic_bundle(candidates=candidates)) as (figures, limits):
+    with drawn(synthetic_bundle(candidates=candidates)) as (figures, spans):
         axis = panel(figures["anchor"], *target)
         assert len(axis.get_lines()) == 2
         assert message(axis) == ""
@@ -815,7 +964,7 @@ def test_a_severity_no_image_scored_is_a_gap_in_the_line_and_not_a_missing_panel
         assert not np.isnan(np.array(responsive[:2] + responsive[3:])).any()
         assert list(axis.get_xticks()) == list(EXPECTED_SEVERITIES)
         # A `nan` never reaches the returned range.
-        assert all(np.isfinite(value) for value in limits["anchor"])
+        assert all(np.isfinite(value) for value in spans["anchor"])
 
 
 # --- the relationship figure ---------------------------------------------------------------------
@@ -902,6 +1051,102 @@ def test_the_relationship_caption_says_the_published_residuals_used_fold_lines(p
         assert "final" in caption
 
 
+EXPECTED_CAPTIONS = {
+    "anchor": (
+        "Raw un-oriented reference and responsive distance against blur severity, one panel "
+        "per arm and scene summary\n"
+        "Both ranges share one axis per panel; panels do not share a range with each other, "
+        "because layer_2 distances and combined z-scores are different quantities. A break in "
+        "a line is a severity no image scored."
+    ),
+    "relationship": (
+        "Severity-zero reference against responsive, one point per image, with the final "
+        "robust line fitted on all clean images.\n"
+        "The published residual metrics are cross-fitted: every reported clean_residual comes "
+        "from its image's fold line, not from this final line, which is the line a deployment "
+        "would store."
+    ),
+    "contrast": (
+        "Raw un-oriented contrast score against blur severity, one panel per score method\n"
+        "Median and interquartile band across images; one line per arm and scene summary. The "
+        "four methods have different units, which is why they are four panels."
+    ),
+    "auroc": (
+        "Oriented AUROC against blur severity, one panel per arm and scene summary\n"
+        "Solid is the persistence candidate, dashed its confidence twin in the same colour; "
+        "every panel spans 0.0 to 1.0 so the panels can be read against each other."
+    ),
+}
+"""Every caption, word for word, because a caption is a claim about the code beneath it.
+
+Written out here rather than compared against the module's own strings: reading the caption
+from the module on both sides of the comparison passes on any wording at all, including the
+four that were caught surviving -- an anchor caption saying `Oriented` when nothing is oriented,
+an anchor caption with the "panels do not share a range" sentence removed, a contrast caption
+claiming the four methods share one unit, and an AUROC caption with solid and dashed swapped so
+that it contradicts the linestyles the panels actually carry. A wrong caption is the most
+readable falsehood one of these figures can carry, and it is the only part of a figure a reader
+cannot check against anything else on the page.
+
+The cost is that rewording a caption fails this test. That is the intended cost: the wording is
+load-bearing, so a change to it is a change that should have to be made in two places.
+"""
+
+
+@pytest.mark.parametrize("key", list(EXPECTED_CAPTIONS))
+def test_each_figure_carries_its_caption_word_for_word(prepared, key):
+    with drawn(prepared) as (figures, _):
+        assert figures[key]._suptitle.get_text() == EXPECTED_CAPTIONS[key]
+
+
+def test_no_caption_claims_the_scores_were_oriented_or_that_the_panels_share_a_scale():
+    """The two claims the three score figures exist to deny, checked as claims and not as text.
+
+    `Raw un-oriented` and `Oriented` differ by five characters and a substring test for
+    `oriented` matches both, which is how a caption can be inverted without a single assertion
+    noticing. The AUROC caption is the one that may say `Oriented`, because its numbers are.
+    """
+    with drawn(synthetic_bundle()) as (figures, _):
+        for key in ("anchor", "contrast"):
+            caption = figures[key]._suptitle.get_text()
+            assert caption.startswith("Raw un-oriented"), key
+            assert not caption.startswith("Oriented"), key
+        assert figures["auroc"]._suptitle.get_text().startswith("Oriented AUROC")
+        anchor = figures["anchor"]._suptitle.get_text()
+        assert "panels do not share a range with each other" in anchor
+        contrast = figures["contrast"]._suptitle.get_text()
+        assert "have different units" in contrast
+        assert "share one unit" not in contrast
+        auroc = figures["auroc"]._suptitle.get_text()
+        assert "Solid is the persistence candidate, dashed its confidence twin" in auroc
+        assert "Dashed is the persistence candidate" not in auroc
+
+
+def test_the_fitted_line_is_a_different_colour_from_the_points_it_is_fitted_to():
+    """The whole reading of this panel is a point's distance from the line, so the two must part.
+
+    Also binds the legend's two swatches to the two artists, because a legend that names a red
+    line and a blue dot while the figure draws both in blue describes a figure nobody drew.
+    """
+    assert plots_module.SCATTER_COLOUR != plots_module.FIT_COLOUR
+
+    with drawn(synthetic_bundle()) as (figures, _):
+        for axis in figures["relationship"].axes:
+            points = axis.collections[0].get_facecolor()[0].tolist()
+            line = axis.get_lines()[0]
+            assert line.get_color() == plots_module.FIT_COLOUR
+            assert points != matplotlib.colors.to_rgba(plots_module.FIT_COLOUR)
+            assert points == list(matplotlib.colors.to_rgba(plots_module.SCATTER_COLOUR))
+        labels, handles = legend_of(figures["relationship"])
+        assert labels == [
+            "one clean image at severity 0",
+            "final robust line, fitted on every clean image",
+        ]
+        assert handles[0].get_color() == plots_module.SCATTER_COLOUR
+        assert handles[0].get_linestyle() == "None"
+        assert handles[1].get_color() == plots_module.FIT_COLOUR
+
+
 def test_a_panel_with_no_fitted_line_still_scatters_and_says_the_line_is_missing():
     fits = synthetic_fits()
     fits[(ARM_NAMES[3], DEPLOYABLE_SIGNAL, "mean")] = {"final_line": None}
@@ -920,7 +1165,9 @@ def test_a_panel_with_no_clean_rows_keeps_its_place_and_says_it_is_empty():
     with drawn(synthetic_bundle(rows=rows)) as (figures, _):
         axis = panel(figures["relationship"], ARM_NAMES[0], "q90")
         assert len(axis.collections) == 0
-        assert "no severity-zero" in message(axis)
+        assert message(axis) == (
+            f"{ARM_NAMES[0]} / q90: no severity-zero {RESPONSIVE_CONTROL_METHOD} rows"
+        )
         assert axis.get_xticks().size == 0
         assert len(figures["relationship"].axes) == 12
         assert panel(figures["relationship"], ARM_NAMES[0], "mean").collections
@@ -947,6 +1194,66 @@ def test_each_contrast_panel_holds_one_line_per_arm_and_summary(prepared):
         assert counts == {
             "raw_responsive": 12, "raw_gap": 12, "relative_gap": 9, "clean_residual": 12
         }
+
+
+def test_the_contrast_lines_encode_their_arm_as_colour_and_their_summary_as_dashes():
+    """Twelve lines in one panel, and the only thing telling them apart is how they are drawn.
+
+    Collapse `ARM_COLOURS` to one colour or `AGGREGATION_STYLES` to one dash and the panel
+    becomes twelve indistinguishable curves under a legend still claiming four colours and three
+    dashes -- a figure a reader would not question and could not read, which is the same
+    argument that makes the AUROC figure's dashed twin worth a test. Each line is identified by
+    its y-data, which the synthetic levels make unique per cell, and only then is its colour and
+    linestyle checked; so this binds the encoding rather than the drawing order.
+    """
+    assert len(set(plots_module.ARM_COLOURS.values())) == len(ARMS)
+    assert set(plots_module.ARM_COLOURS) == set(ARM_NAMES)
+    assert len(set(plots_module.AGGREGATION_STYLES.values())) == len(AGGREGATIONS)
+    assert set(plots_module.AGGREGATION_STYLES) == set(AGGREGATIONS)
+
+    with drawn(synthetic_bundle()) as (figures, _):
+        for method in SCORE_METHODS:
+            axis = figures["contrast"].axes[SCORE_METHODS.index(method)]
+            by_curve = {tuple(line.get_ydata()): line for line in axis.get_lines()}
+            assert len(by_curve) == 12, method
+            for arm in ARM_NAMES:
+                for aggregation in AGGREGATIONS:
+                    key = tuple(curve(level(arm, aggregation, method)))
+                    assert key in by_curve, (method, arm, aggregation)
+                    line = by_curve[key]
+                    assert line.get_color() == plots_module.ARM_COLOURS[arm]
+                    assert line.get_linestyle() == plots_module.AGGREGATION_STYLES[aggregation]
+
+
+def test_the_contrast_legend_names_every_arm_with_the_scope_it_is_scored_at():
+    """The scope is the mitigation for the one place these figures mix two unlike quantities.
+
+    Three arms are `layer_2` distances and the fourth a `combined` z-score, and the spec puts
+    them on one axis. Naming each arm's scope in the legend is what lets a reader see that the
+    red curve is not measured in the same unit as the other three; a legend that dropped it
+    would leave the mixing invisible.
+    """
+    with drawn(synthetic_bundle()) as (figures, _):
+        labels, handles = legend_of(figures["contrast"])
+        assert labels == [
+            f"{arm.name} ({arm.score_scope})" for arm in ARMS
+        ] + list(AGGREGATIONS)
+        assert labels[3] == "decile_90_100__50_60__combined (combined)"
+        arm_handles, summary_handles = handles[:len(ARMS)], handles[len(ARMS):]
+        assert [handle.get_color() for handle in arm_handles] == [
+            plots_module.ARM_COLOURS[arm.name] for arm in ARMS
+        ]
+        assert [handle.get_linestyle() for handle in summary_handles] == [
+            plots_module.AGGREGATION_STYLES[aggregation] for aggregation in AGGREGATIONS
+        ]
+
+
+def test_the_contrast_panels_carry_the_severity_ladder(prepared):
+    """`_severity_axis` is called on these panels and nothing was reading the result."""
+    with drawn(prepared) as (figures, _):
+        for axis in figures["contrast"].axes:
+            assert axis.get_xlim() == (0, 5)
+            assert list(axis.get_xticks()) == list(EXPECTED_SEVERITIES)
 
 
 def test_the_contrast_panels_draw_the_raw_median_and_its_interquartile_band():
@@ -983,7 +1290,9 @@ def test_a_method_no_arm_produced_gets_a_labelled_empty_panel():
     with drawn(synthetic_bundle(candidates=candidates)) as (figures, _):
         axis = figures["contrast"].axes[SCORE_METHODS.index("clean_residual")]
         assert axis.get_lines() == []
-        assert "clean_residual" in message(axis)
+        assert message(axis) == (
+            f"no {DEPLOYABLE_SIGNAL} clean_residual candidate scored any severity"
+        )
         assert axis.get_xticks().size == 0
         assert len(figures["contrast"].axes) == 4
         assert len(figures["contrast"].axes[0].get_lines()) == 12
@@ -1007,10 +1316,11 @@ def test_each_auroc_panel_draws_each_method_solid_and_its_twin_dashed_in_one_col
                 for index, method in enumerate(SCORE_METHODS):
                     own, twin = lines[2 * index], lines[2 * index + 1]
                     base = level(arm, aggregation, method)
-                    assert own.get_linestyle() == "-"
-                    assert twin.get_linestyle() == "--"
-                    assert own.get_color() == METHOD_COLOURS[method]
-                    assert twin.get_color() == METHOD_COLOURS[method]
+                    # Colour, dash *and* marker, as one tuple: the marker is the half of the
+                    # distinction that survives a greyscale print and a colour-blind reader,
+                    # and swapping the two markers leaves every other assertion here true.
+                    assert styled(own) == (METHOD_COLOURS[method], "-", "o")
+                    assert styled(twin) == (METHOD_COLOURS[method], "--", "x")
                     assert list(own.get_xdata()) == list(CORRUPTED_SEVERITIES)
                     assert list(own.get_ydata()) == [
                         aurocs(base)[severity] for severity in CORRUPTED_SEVERITIES
@@ -1065,10 +1375,34 @@ def test_a_none_auroc_vector_leaves_a_labelled_panel_rather_than_crashing(tmp_pa
 
     with drawn(prepared) as (figures, _):
         assert len(figures["auroc"].axes) == 12
-        for axis in figures["auroc"].axes:
+        present = {
+            (item["arm"], item["aggregation"], item["method"])
+            for item in prepared["candidates"]
+            if item["signal"] == DEPLOYABLE_SIGNAL
+        }
+        for axis, (arm_name, aggregation) in zip(
+            figures["auroc"].axes, panel_plan([])["auroc"]
+        ):
             assert axis.get_lines() == []
-            assert "no AUROC and no confidence twin" in message(axis)
+            # The whole note. Its second line lists what was missing method by method, which is
+            # the part that tells an operator whether the AUROCs were withheld or the twins
+            # never attached or the candidate never existed -- three different repairs, and a
+            # note that collapsed them would send them to fix the wrong one.
+            reasons = []
+            for method in SCORE_METHODS:
+                if (arm_name, aggregation, method) not in present:
+                    reasons.append(f"{method}: no candidate")
+                else:
+                    reasons.extend([f"{method}: no AUROC", f"{method}: no twin"])
+            assert message(axis) == (
+                f"{arm_name} / {aggregation}: no AUROC and no confidence twin\n"
+                + "; ".join(reasons)
+            ), (arm_name, aggregation)
             assert axis.get_xticks().size == 0
+        # The combined arm is the panel where the three-way distinction actually fires.
+        combined = panel(figures["auroc"], "decile_90_100__50_60__combined", "mean")
+        assert "relative_gap: no candidate" in message(combined)
+        assert "relative_gap: no AUROC" not in message(combined)
 
 
 def test_a_candidate_with_an_auroc_and_no_twin_still_draws_its_own_curve():
@@ -1082,7 +1416,9 @@ def test_a_candidate_with_an_auroc_and_no_twin_still_draws_its_own_curve():
             assert len(lines) == len(SCORE_METHODS)
             assert {line.get_linestyle() for line in lines} == {"-"}
             assert len(chance_lines(axis)) == 1
-            assert "no twin" in message(axis)
+            assert message(axis) == "; ".join(
+                f"{method}: no twin" for method in SCORE_METHODS
+            )
 
 
 def test_a_twin_with_no_candidate_of_its_own_is_still_drawn_dashed():
@@ -1092,7 +1428,9 @@ def test_a_twin_with_no_candidate_of_its_own_is_still_drawn_dashed():
             lines = curves(axis)
             assert len(lines) == len(SCORE_METHODS)
             assert {line.get_linestyle() for line in lines} == {"--"}
-            assert "no AUROC" in message(axis)
+            assert message(axis) == "; ".join(
+                f"{method}: no AUROC" for method in SCORE_METHODS
+            )
 
 
 def test_a_method_with_no_candidate_at_all_is_named_in_the_panel_it_is_missing_from(prepared):
@@ -1101,7 +1439,7 @@ def test_a_method_with_no_candidate_at_all_is_named_in_the_panel_it_is_missing_f
     with drawn(prepared) as (figures, _):
         for aggregation in AGGREGATIONS:
             axis = panel(figures["auroc"], "decile_90_100__50_60__combined", aggregation)
-            assert "relative_gap: no candidate" in message(axis)
+            assert message(axis) == "relative_gap: no candidate"
             assert len(curves(axis)) == 2 * (len(SCORE_METHODS) - 1)
         untouched = panel(figures["auroc"], "decile_90_100__50_60", "mean")
         assert message(untouched) == ""
@@ -1110,10 +1448,17 @@ def test_a_method_with_no_candidate_at_all_is_named_in_the_panel_it_is_missing_f
 
 def test_the_auroc_legend_names_the_methods_the_twin_and_the_chance_line():
     with drawn(synthetic_bundle()) as (figures, _):
-        labels = [text.get_text() for text in figures["auroc"].legends[0].get_texts()]
+        labels, handles = legend_of(figures["auroc"])
         assert labels == list(SCORE_METHODS) + [
             "confidence twin of the same method", "chance (0.5)"
         ]
+        assert [handle.get_color() for handle in handles[:len(SCORE_METHODS)]] == [
+            METHOD_COLOURS[method] for method in SCORE_METHODS
+        ]
+        assert [handle.get_linestyle() for handle in handles[:len(SCORE_METHODS)]] == ["-"] * 4
+        assert handles[-2].get_linestyle() == "--"
+        assert handles[-2].get_marker() == "x"
+        assert handles[-1].get_linestyle() == ":"
 
 
 # --- what the figures may not do -----------------------------------------------------------------
@@ -1151,8 +1496,8 @@ def test_the_figures_are_drawn_although_nothing_in_the_run_is_deployable(tmp_pat
     assert rank_contrast_candidates(prepared["candidates"]) == []
     assert not any(candidate["deployable"] for candidate in prepared["candidates"])
 
-    limits = write_contrast_plots(tmp_path, **prepared)
-    assert limits["contrast"] != EMPTY_SPAN
+    spans = write_contrast_plots(tmp_path, **prepared)
+    assert spans["contrast"] != EMPTY_SPAN
     with drawn(prepared) as (figures, _):
         for key in ("anchor", "relationship", "auroc"):
             assert all(axis.get_lines() for axis in figures[key].axes), key
