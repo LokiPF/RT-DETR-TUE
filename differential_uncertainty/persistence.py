@@ -194,6 +194,7 @@ class Layer2Capture:
         for handle in self.handles:
             handle.remove()
         self.handles = []
+        self.captured = None
 
     def __enter__(self) -> Layer2Capture:
         return self

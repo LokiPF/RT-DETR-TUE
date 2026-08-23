@@ -168,10 +168,25 @@ def test_layer_2_capture_requires_a_linear_score_head():
 def test_layer_2_capture_close_is_idempotent_and_removes_the_hook():
     transformer = _Transformer()
     capture = Layer2Capture(transformer)
+    transformer(torch.ones(1, 4))
+    assert capture.captured is not None
     assert transformer.decoder.layers[2]._forward_hooks
 
     capture.close()
     capture.close()
 
+    assert capture.captured is None
+    assert not capture.handles
+    assert not transformer.decoder.layers[2]._forward_hooks
+
+
+def test_layer_2_capture_context_exit_discards_an_unconsumed_activation():
+    transformer = _Transformer()
+
+    with Layer2Capture(transformer) as capture:
+        transformer(torch.ones(1, 4))
+        assert capture.captured is not None
+
+    assert capture.captured is None
     assert not capture.handles
     assert not transformer.decoder.layers[2]._forward_hooks
