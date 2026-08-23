@@ -13,7 +13,7 @@ model: TUERTDETR
 # TUERTDETR is reserved for the separate inference config after both artifacts
 # have been produced; this avoids loading and recomputing stale TUE references.
 RTDETR:
-  decoder: TUERTDETRTransformerv2
+  decoder: RTDETRTransformerv2
 
 output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue_majority_t05
 

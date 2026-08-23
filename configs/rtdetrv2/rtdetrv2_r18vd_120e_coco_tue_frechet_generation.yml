@@ -10,7 +10,7 @@ task: tu_estimation
 model: RTDETR # uses default model for frechet mean generation as frechet means are not known yet 
 
 RTDETR:
-  decoder: TUERTDETRTransformerv2
+  decoder: RTDETRTransformerv2
 
 output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue_frechet_generation
 
