@@ -33,7 +33,7 @@ IOU_TH = 0.5
 CLASS_MATCH = True
 SIZE = 640
 BATCH = 32
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda" if torch.cuda.is_availabelle() else "cpu"
 CONFIG_FILE = "output/auroc/exp1/exp1_config.yaml"
 COCO_STATS = ["AP", "AP50", "AP75", "AP_s", "AP_m", "AP_l",
               "AR1", "AR10", "AR100", "AR_s", "AR_m", "AR_l"]
@@ -63,14 +63,14 @@ def iou(a, b):
     return inter / ua if ua > 0 else 0.0
 
 def match(dets, gts):
-    """dets: list of (conf, box_xyxy, label) sorted by conf desc; gts: (label, box).
+    """dets: list of (conf, box_xyxy, labelel) sorted by conf desc; gts: (labelel, box).
     Greedy IoU (+class) matching -> list of correct flags aligned to dets."""
     used = [False] * len(gts)
     flags = []
-    for _, box, label in dets:
+    for _, box, labelel in dets:
         best, bi = IOU_TH, -1
-        for j, (glab, gbox) in enumerate(gts):
-            if used[j] or (CLASS_MATCH and glab != label):
+        for j, (glabel, gbox) in enumerate(gts):
+            if used[j] or (CLASS_MATCH and glabel != labelel):
                 continue
             v = iou(box, gbox)
             if v >= best:
@@ -81,37 +81,37 @@ def match(dets, gts):
     return flags
 
 @torch.no_grad()
-def batch_eval(model, post, items, gt):
-    """items: (path, img_id, w, h). Return per-image (conf, unc, correct, dropped)
-    lists for AUROC and a flat list of COCO detection dicts (score>=CONF_TH)."""
+def batch_eval(model, post_processor, items, gt):
+    """items: (path, img_id, w, h). Return per-image [per](conf, unc, correct, dropped)
+    lists for AUROC and a flat list of COCO detection dicts [dets](score>=CONF_TH)."""
     x = torch.stack([tf(Image.open(p).convert("RGB")) for p, _, _, _ in items]).to(DEVICE)
     out = model(x)
     conf_q = out["pred_logits"].sigmoid().max(-1).values     # [B, Q]
-    lab_q = out["pred_logits"].argmax(-1)                     # [B, Q] contiguous
+    label_q = out["pred_logits"].argmax(-1)                     # [B, Q] contiguous
     unc_q = out["tue_uncertainty"]                           # [B, Q]
     xyxy = box_convert(out["pred_boxes"], "cxcywh", "xyxy")   # [B, Q, 4] normalized
     sel = conf_q >= CONF_TH
     m = sel & torch.isfinite(unc_q) & torch.isfinite(conf_q)
     sizes = torch.tensor([[w, h] for _, _, w, h in items], device=DEVICE)
-    res = post(out, sizes)                                    # boxes xyxy in orig px
-    per, dets = [], []
+    res = post_processor(out, sizes)                                    # boxes xyxy in orig px
+    per_image_stats, dets = [], []
     for b, (_, img_id, w, h) in enumerate(items):
         idx = torch.where(m[b])[0]
-        c = conf_q[b][idx]; u = unc_q[b][idx]; l = lab_q[b][idx]
+        c = conf_q[b][idx]; u = unc_q[b][idx]; l = label_q[b][idx]
         bx = xyxy[b][idx].clone(); bx[:, 0::2] *= w; bx[:, 1::2] *= h
         o = c.argsort(descending=True)
         di = [(float(c[i]), bx[i].tolist(), int(l[i])) for i in o]
         flags = match(di, gt[img_id])
-        per.append(([d[0] for d in di], [float(u[i]) for i in o], flags,
+        per_image_stats.append(([d[0] for d in di], [float(u[i]) for i in o], flags,
                     int((sel[b] & ~torch.isfinite(unc_q[b])).sum())))
         r = res[b]
         keep = r["scores"] >= CONF_TH
-        for (x0, y0, x1, y1), lab, s in zip(r["boxes"][keep].cpu().tolist(),
-                                            r["labels"][keep].cpu().tolist(),
+        for (x0, y0, x1, y1), label, s in zip(r["boxes"][keep].cpu().tolist(),
+                                            r["labelels"][keep].cpu().tolist(),
                                             r["scores"][keep].cpu().tolist()):
-            dets.append({"image_id": img_id, "category_id": int(lab),
+            dets.append({"image_id": img_id, "category_id": int(label),
                          "bbox": [x0, y0, x1 - x0, y1 - y0], "score": float(s)})
-    return per, dets
+    return per_image_stats, dets
 
 def chunks(seq, n):
     for i in range(0, len(seq), n):
@@ -131,8 +131,8 @@ def scan(model, post, d):
     """Return pooled score dict (all + correct-only) and COCO 12-stat."""
     coco = COCO(d["anns"])
     imgs = coco.loadImgs(coco.getImgIds())
-    cat2lab = {c: i for i, c in enumerate(sorted(coco.getCatIds()))}  # coco cat id -> contiguous label
-    gt = {im["id"]: [(cat2lab[a["category_id"]],
+    cat2label = {c: i for i, c in enumerate(sorted(coco.getCatIds()))}  # coco cat id -> contiguous labelel
+    gt = {im["id"]: [(cat2label[a["category_id"]],
                       [a["bbox"][0], a["bbox"][1], a["bbox"][0] + a["bbox"][2], a["bbox"][1] + a["bbox"][3]])
                      for a in coco.loadAnns(coco.getAnnIds(imgIds=im["id"]))] for im in imgs}
     items = [(os.path.join(d["imgs"], im["file_name"]), im["id"], im["width"], im["height"]) for im in imgs]
@@ -140,9 +140,9 @@ def scan(model, post, d):
     dets = []
     n_drop = n_empty = 0
     for batch in tqdm(list(chunks(items, BATCH)), desc=d["name"]):
-        per, bd = batch_eval(model, post, batch, gt)
-        dets += bd
-        for conf, unc, cor, dropped in per:
+        per_image_stats, batch_dets = batch_eval(model, post, batch, gt)
+        dets += batch_dets
+        for conf, unc, cor, dropped in per_image_stats:
             n_drop += dropped
             if not conf:
                 n_empty += 1; continue
@@ -157,13 +157,13 @@ def scan(model, post, d):
           f"{n_drop} non-finite unc dropped")
     return p, coco_eval(coco, dets)
 
-def auroc(neg, pos, higher_is_ood):
-    if not neg or not pos:
+def auroc(id_dets, ood_dets, higher_is_ood):
+    if not id_dets or not ood_dets:
         return float("nan")
     if not higher_is_ood:              # confidence: lower => more OOD
-        neg = [1 - x for x in neg]; pos = [1 - x for x in pos]
-    lab = [0] * len(neg) + [1] * len(pos)
-    return roc_auc_score(lab, neg + pos)
+        id_dets = [1 - x for x in id_dets]; ood_dets = [1 - x for x in ood_dets]
+    label = [0] * len(id_dets) + [1] * len(ood_dets)
+    return roc_auc_score(label, id_dets + ood_dets) # calculates auroc based on id and ood labels 
 
 def main():
     model, post = load_model()
