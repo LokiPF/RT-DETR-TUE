@@ -5,3 +5,5 @@ PyYAML
 tensorboard
 scipy
 supervisely
+matplotlib
+scipy
