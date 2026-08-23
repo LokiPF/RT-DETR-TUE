@@ -3,7 +3,7 @@ from dataclasses import FrozenInstanceError, replace
 import pytest
 
 from differential_uncertainty import __version__
-from differential_uncertainty.config import FIXED_CONFIG, ExperimentConfig
+from differential_uncertainty.config import BLUR_RADII, FIXED_CONFIG, ExperimentConfig
 
 
 def test_package_version_is_one_point_zero_point_zero():
@@ -29,6 +29,7 @@ def test_public_configuration_contains_every_approved_fixed_value():
     assert FIXED_CONFIG.bootstrap_samples == 10_000
     assert FIXED_CONFIG.bootstrap_seed == 20_260_821
     assert FIXED_CONFIG.blur_radii == (0.0, 1.0, 2.0, 4.0, 8.0, 12.0)
+    assert FIXED_CONFIG.blur_radii is BLUR_RADII
 
 
 def test_public_configuration_is_frozen():

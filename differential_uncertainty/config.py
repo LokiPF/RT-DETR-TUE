@@ -4,6 +4,9 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 
+BLUR_RADII: tuple[float, ...] = (0.0, 1.0, 2.0, 4.0, 8.0, 12.0)
+
+
 @dataclass(frozen=True)
 class ExperimentConfig:
     image_size: tuple[int, int] = (640, 640)
@@ -23,7 +26,7 @@ class ExperimentConfig:
     raw_reference_orientation: int = -1
     bootstrap_samples: int = 10_000
     bootstrap_seed: int = 20_260_821
-    blur_radii: tuple[float, ...] = (0.0, 1.0, 2.0, 4.0, 8.0, 12.0)
+    blur_radii: tuple[float, ...] = BLUR_RADII
 
     def __post_init__(self) -> None:
         if len(self.blur_radii) != 6 or self.blur_radii[0] != 0.0:

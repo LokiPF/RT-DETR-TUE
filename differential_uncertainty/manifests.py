@@ -26,6 +26,15 @@ def load_manifest(value: str | Path) -> tuple[ManifestEntry, ...]:
     seen_ids: set[str] = set()
     seen_paths: set[Path] = set()
     for number, row in enumerate(rows, start=2):
+        if (
+            None in row
+            or row.get("image_id") is None
+            or row.get("image_path") is None
+        ):
+            raise ValueError(
+                f"manifest row {number} is malformed: "
+                "expected exactly image_id,image_path values"
+            )
         image_id = row["image_id"].strip()
         if not image_id:
             raise ValueError(f"manifest row {number} has an empty image_id")

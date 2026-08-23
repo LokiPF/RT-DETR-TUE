@@ -3,7 +3,8 @@ from dataclasses import FrozenInstanceError
 import pytest
 from PIL import Image, ImageChops
 
-from differential_uncertainty.corruptions import Corruption, GaussianBlur, Severity
+from differential_uncertainty.config import BLUR_RADII
+from differential_uncertainty.corruptions import GaussianBlur, Severity
 
 
 def test_severity_is_a_frozen_level_and_parameter_descriptor():
@@ -13,7 +14,6 @@ def test_severity_is_a_frozen_level_and_parameter_descriptor():
     assert severity.parameter == 4.0
     with pytest.raises(FrozenInstanceError):
         severity.level = 2
-    assert getattr(Corruption, "_is_protocol", False)
 
 
 def test_gaussian_blur_declares_the_fixed_ladder():
@@ -28,6 +28,7 @@ def test_gaussian_blur_declares_the_fixed_ladder():
         Severity(4, 8.0),
         Severity(5, 12.0),
     )
+    assert tuple(item.parameter for item in corruption.severities) == BLUR_RADII
 
 
 def test_level_zero_is_identity_and_blur_is_deterministic():

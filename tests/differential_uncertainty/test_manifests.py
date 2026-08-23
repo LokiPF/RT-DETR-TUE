@@ -61,6 +61,29 @@ def test_manifest_errors_are_explicit(tmp_path, text, message):
         load_manifest(path)
 
 
+def test_manifest_rejects_a_row_with_an_extra_unquoted_field(tmp_path):
+    _image(tmp_path / "x.png")
+    path = tmp_path / "extra-field.csv"
+    path.write_text(
+        "image_id,image_path\na,x.png,ignored\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="manifest row 2 is malformed"):
+        load_manifest(path)
+
+
+def test_manifest_rejects_a_row_with_a_missing_image_path(tmp_path):
+    path = tmp_path / "missing-field.csv"
+    path.write_text(
+        "image_id,image_path\na\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="manifest row 2 is malformed"):
+        load_manifest(path)
+
+
 def test_reference_and_evaluation_cannot_repeat_an_image_id(tmp_path):
     _image(tmp_path / "reference.png")
     _image(tmp_path / "evaluation.png")

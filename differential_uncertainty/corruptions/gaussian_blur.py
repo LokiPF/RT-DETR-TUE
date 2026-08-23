@@ -1,5 +1,6 @@
 from PIL import Image, ImageFilter
 
+from ..config import BLUR_RADII
 from .base import Severity
 
 
@@ -7,7 +8,7 @@ class GaussianBlur:
     name = "gaussian_blur"
     severities = tuple(
         Severity(level, radius)
-        for level, radius in enumerate((0.0, 1.0, 2.0, 4.0, 8.0, 12.0))
+        for level, radius in enumerate(BLUR_RADII)
     )
 
     def apply(self, image: Image.Image, level: int) -> Image.Image:
