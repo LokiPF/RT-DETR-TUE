@@ -46,6 +46,17 @@ will appear only when they let a reader trace a statement back to the result fil
 - That differential result does not pass the mild-blur decision bars: its severity-one AUROC is
   about 0.512 versus the required 0.538, and severity two is about 0.569 versus the required
   0.570. No differential candidate qualifies for a held-out test.
+- The differential section must show Test 2 and its matched confidence-only baseline at all five
+  corrupted blur levels. Label the baseline `Plain softmax (confidence-only)` and state that it
+  uses the same two confidence ranges as Test 2, rather than an unmatched whole-image score.
+- The five Test 2 AUROCs are 0.512, 0.569, 0.669, 0.893, and 0.961. The corresponding plain
+  softmax AUROCs are 0.522, 0.567, 0.645, 0.806, and 0.895. Their macro AUROCs are 0.721 and
+  0.687, respectively.
+- The table must show Test 2 minus softmax differences of -0.010, +0.002, +0.024, +0.087, and
+  +0.066, plus their +0.034 macro difference in the average row. It must say plainly that
+  softmax was slightly better at blur level 1.
+- Only blur levels 1 and 2 have decision targets. Levels 3 through 5 are marked `Reported only`,
+  not as passes, because they were not part of the differential gate.
 - The anchored diagnostics show 28 of 30 measured stability ratios below 1.0, and all six
   anchored clean relationships beat their constant baselines. Counts that include differential
   arms must not be described as evidence about anchors.
