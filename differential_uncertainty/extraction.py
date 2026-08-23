@@ -204,8 +204,11 @@ class RTDETRExtractor:
                 f"sample spatial size {spatial_size} does not match "
                 f"configured {self.config.image_size}"
             )
-        if not torch.is_floating_point(samples):
-            raise ValueError("samples must use a floating dtype")
+        if samples.dtype != torch.float32:
+            raise ValueError(
+                "samples must have dtype torch.float32, "
+                f"got {samples.dtype}"
+            )
         identity_count = len(identities)
         sample_count = samples.shape[0]
         if identity_count != sample_count:

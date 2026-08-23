@@ -209,6 +209,50 @@ def test_prepare_image_honors_height_width_order_exactly():
     assert tensor.shape == (3, 6, 10)
 
 
+def test_prepare_image_rgb_conversion_precedes_resize_for_nonconstant_image():
+    image = Image.new("RGBA", (2, 2))
+    image.putdata(
+        [
+            (255, 0, 0, 0),
+            (0, 255, 0, 255),
+            (0, 0, 255, 255),
+            (255, 255, 255, 0),
+        ]
+    )
+
+    tensor = prepare_image(image, (4, 4))
+
+    corners = torch.stack(
+        [
+            tensor[:, 0, 0],
+            tensor[:, 0, -1],
+            tensor[:, -1, 0],
+            tensor[:, -1, -1],
+        ]
+    )
+    torch.testing.assert_close(
+        corners,
+        torch.tensor(
+            [
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 1.0],
+                [1.0, 1.0, 1.0],
+            ]
+        ),
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        tensor[:, 1, 1],
+        torch.tensor([159.0, 64.0, 64.0]) / 255.0,
+        rtol=0,
+        atol=1.0 / 255.0,
+    )
+    assert torch.all(tensor[:, 1, 1] > 0)
+    assert torch.all(tensor[:, 1, 1] < 1)
+
+
 def test_record_storage_matches_the_cache_dtypes_and_owns_cpu_values():
     logits = torch.randn(3, 2, dtype=torch.float16, requires_grad=True)
     boxes = torch.randn(3, 4, requires_grad=True)
@@ -411,7 +455,17 @@ def test_extractor_moves_samples_without_requiring_the_input_device(monkeypatch)
         (
             torch.zeros(2, 3, 8, 8, dtype=torch.int64),
             [("a", 0), ("b", 0)],
-            "samples must use a floating dtype",
+            "samples must have dtype torch.float32, got torch.int64",
+        ),
+        (
+            torch.zeros(2, 3, 8, 8, dtype=torch.float16),
+            [("a", 0), ("b", 0)],
+            "samples must have dtype torch.float32, got torch.float16",
+        ),
+        (
+            torch.zeros(2, 3, 8, 8, dtype=torch.float64),
+            [("a", 0), ("b", 0)],
+            "samples must have dtype torch.float32, got torch.float64",
         ),
     ],
 )
