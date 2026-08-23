@@ -739,6 +739,75 @@ def test_the_per_severity_differences_are_the_two_aurocs_subtracted():
     })
 
 
+def test_attach_controls_reads_its_three_lists_as_sets(tmp_path):
+    """Reversing `rows`, `candidates` or `controls` must change nothing at all.
+
+    Every lookup in `attach_controls` is a keyed one, and a keyed lookup does not care what order
+    its dictionary was filled in. A *scan* does. That is the difference this test exists to see,
+    and it is the only way to see part of it: the `signal` dimension of five of the lookups is
+    reached correctly by a signal-blind scan in the order the summaries happen to be emitted, so
+    the published number is right for the wrong reason and no assertion on that number can tell
+    the two apart. Reversing the input is what separates them -- a signal-blind control index
+    moves 36 of the 45 reference macro AUROCs when the controls arrive the other way round, and a
+    signal-blind own-curve scan moves 108 fields across the 81 candidates when the rows do.
+
+    Whole dictionaries rather than one field, because the comparison is exactly equal on every
+    field of all 81 candidates -- bootstraps included, since the draws depend only on the seed,
+    the sample count and the roster -- so binding one field would be leaving the other sixty-odd
+    unbound for nothing.
+    """
+    rows, _ = build_contrast_rows(loaded(tmp_path))
+
+    def attached(*, reverse_rows=False, reverse_candidates=False, reverse_controls=False):
+        ordered = list(reversed(rows)) if reverse_rows else list(rows)
+        candidates = summarize_contrast_candidates(ordered, expected_image_count=IMAGES)
+        controls = summarize_contrast_candidates(
+            reference_control_rows(ordered), expected_image_count=IMAGES
+        )
+        if reverse_candidates:
+            candidates = list(reversed(candidates))
+        if reverse_controls:
+            controls = list(reversed(controls))
+        attach_controls(candidates, controls, ordered, samples=FAST_SAMPLES)
+        return keyed(candidates)
+
+    baseline = attached()
+    assert len(baseline) == 81
+    for reversal in (
+        {"reverse_rows": True},
+        {"reverse_candidates": True},
+        {"reverse_controls": True},
+        {"reverse_rows": True, "reverse_candidates": True, "reverse_controls": True},
+    ):
+        assert attached(**reversal) == baseline, reversal
+
+    # each reversal can only separate a scan from a keyed lookup where more than one entry would
+    # match a relaxed predicate. One arm label carries 24 curves -- two signals, three summaries,
+    # four methods -- and three of the four arms carry a control at both signals, with different
+    # macro AUROCs at each.
+    under_one_arm = [key for key in index_curves(rows) if key[0] == "decile_00_10__50_60"]
+    assert len(under_one_arm) == 24
+    assert len({key[1] for key in under_one_arm}) == 2
+    assert len({key[2] for key in under_one_arm}) == 3
+    assert len({key[3] for key in under_one_arm}) == 4
+    controls = {
+        (item["arm"], item["signal"], item["aggregation"]): item
+        for item in summarize_contrast_candidates(
+            reference_control_rows(rows), expected_image_count=IMAGES
+        )
+    }
+    twinned = {
+        key[0] for key in controls
+        if key[1] == "confidence" and (key[0], "persistence", key[2]) in controls
+    }
+    assert len(twinned) == 3
+    for arm in twinned:
+        assert (
+            controls[(arm, "persistence", "mean")]["macro_auroc"]
+            != controls[(arm, "confidence", "mean")]["macro_auroc"]
+        )
+
+
 def test_each_arm_is_matched_to_its_own_reference_control(tmp_path):
     """The arm dimension of the reference control lookup, on the four-arm bundle.
 
@@ -767,36 +836,9 @@ def test_each_arm_is_matched_to_its_own_reference_control(tmp_path):
     # four arms, four different reference controls: an arm-blind lookup cannot satisfy the above
     assert set(by_arm) == {arm.name for arm in ARMS}
     assert len(set(by_arm.values())) == 4
-
-    # the *signal* of the control matters too, and three of the four arms carry a confidence
-    # control under the same label as their persistence one, with a different macro AUROC
-    twinned = [
-        arm for arm in by_arm
-        if (arm, "confidence", "mean") in control_by_key
-    ]
-    assert len(twinned) == 3
-    for arm in twinned:
-        assert (
-            control_by_key[(arm, "persistence", "mean")]["macro_auroc"]
-            != control_by_key[(arm, "confidence", "mean")]["macro_auroc"]
-        )
-    # a signal-blind index would land on whichever of the two the list happened to end on, so
-    # the same controls in the other order must produce the same answer
-    reversed_candidates, _, reversed_rows = prepared(tmp_path)
-    reversed_controls = summarize_contrast_candidates(
-        reference_control_rows(reversed_rows), expected_image_count=IMAGES
-    )
-    attach_controls(
-        reversed_candidates, list(reversed(reversed_controls)), reversed_rows,
-        samples=FAST_SAMPLES,
-    )
-    assert [
-        item["reference_control_macro_auroc"] for item in reversed_candidates
-        if item["signal"] == "persistence"
-    ] == [
-        item["reference_control_macro_auroc"] for item in candidates
-        if item["signal"] == "persistence"
-    ]
+    # the *signal* of the control is the one dimension no value here can bind, because in the
+    # order the summaries are emitted a signal-blind index reaches the right control anyway;
+    # `test_attach_controls_reads_its_three_lists_as_sets` is where that one is pinned
 
 
 def test_the_twin_severity_aurocs_are_a_copy_and_not_the_twin_own_dictionary(tmp_path):
