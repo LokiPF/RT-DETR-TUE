@@ -5,8 +5,11 @@ import fcntl
 import hashlib
 import json
 import os
+import secrets
 import stat
 import tempfile
+import threading
+import weakref
 from collections.abc import Iterator, Mapping
 from numbers import Integral
 from pathlib import Path
@@ -18,6 +21,12 @@ SCHEMA_VERSION = 1
 _MANIFEST_KEYS = frozenset(
     {"schema_version", "shard_size", "record_count", "shards", "shard_sha256"}
 )
+_ACTIVE_WRITERS: dict[tuple[int, int], weakref.ReferenceType] = {}
+_WRITER_REGISTRY_LOCK = threading.RLock()
+_FORK_LOCKED_WRITERS: list["ShardWriter"] = []
+_PENDING_LOCK_FDS: set[int] = set()
+_TRANSFER_PARTICIPANTS: list["ShardWriter"] = []
+_FORK_GENERATION = 0
 
 
 def _json_snapshot(value):
@@ -144,11 +153,143 @@ def atomic_torch(value, path: str | Path) -> None:
         raise
 
 
+def _secure_temporary_file_at(
+    directory_fd: int,
+    target_name: str,
+) -> tuple[int, str]:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    for _attempt in range(100):
+        name = f".{target_name}.{secrets.token_hex(16)}.tmp"
+        try:
+            descriptor = os.open(
+                name,
+                flags,
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except FileExistsError:
+            continue
+        return descriptor, name
+    raise FileExistsError("could not allocate a unique artifact staging file")
+
+
+def _discard_temporary_at(
+    descriptor: int | None,
+    name: str,
+    directory_fd: int,
+) -> None:
+    if descriptor is not None:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+
+
+def _atomic_json_at(value: Mapping, name: str, directory_fd: int) -> None:
+    text = json.dumps(
+        dict(value), indent=2, sort_keys=True, allow_nan=False
+    ) + "\n"
+    descriptor, temporary = _secure_temporary_file_at(directory_fd, name)
+    try:
+        handle = os.fdopen(descriptor, "w", encoding="utf-8")
+        descriptor = None
+        with handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except BaseException:
+        _discard_temporary_at(descriptor, temporary, directory_fd)
+        raise
+
+
+def _atomic_torch_at(value, name: str, directory_fd: int) -> None:
+    descriptor, temporary = _secure_temporary_file_at(directory_fd, name)
+    try:
+        handle = os.fdopen(descriptor, "wb")
+        descriptor = None
+        with handle:
+            torch.save(value, handle)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(
+            temporary,
+            name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        os.fsync(directory_fd)
+    except BaseException:
+        _discard_temporary_at(descriptor, temporary, directory_fd)
+        raise
+
+
+def _path_exists_at(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _read_json_at(directory_fd: int, name: str):
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"artifact file {name!r} must be a regular file")
+        handle = os.fdopen(descriptor, "r", encoding="utf-8")
+        descriptor = None
+        with handle:
+            return json.load(handle)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def _unlink_at(directory_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
+        pass
+
+
 def _sha256_stream(handle, chunk_size: int) -> str:
     digest = hashlib.sha256()
     while chunk := handle.read(chunk_size):
         digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_file_at(directory_fd: int, name: str) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(name, flags, dir_fd=directory_fd)
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise ValueError(f"artifact file {name!r} must be a regular file")
+        handle = os.fdopen(descriptor, "rb")
+        descriptor = None
+        with handle:
+            return _sha256_stream(handle, 1024 * 1024)
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def sha256_file(
@@ -341,12 +482,21 @@ def _safe_load_shard(
     root: Path,
     name: str,
     expected_sha256: str,
+    *,
+    directory_fd: int | None = None,
 ) -> list[dict]:
     path = _shard_path(root, name)
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     descriptor: int | None
     try:
-        descriptor = os.open(path, flags)
+        if directory_fd is None:
+            descriptor = os.open(path, flags)
+        else:
+            descriptor = os.open(
+                name,
+                flags,
+                dir_fd=directory_fd,
+            )
     except OSError as error:
         if error.errno in (errno.ELOOP, errno.ENOENT, errno.ENOTDIR):
             raise ValueError(
@@ -376,21 +526,75 @@ def _safe_load_shard(
     return records
 
 
-def _acquire_directory_lock(directory: Path) -> int:
+def _open_directory(directory: Path) -> tuple[int, tuple[int, int]]:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    while True:
+        generation = _FORK_GENERATION
+        descriptor = os.open(directory, flags)
+        _PENDING_LOCK_FDS.add(descriptor)
+        if generation == _FORK_GENERATION:
+            break
+        _PENDING_LOCK_FDS.discard(descriptor)
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+    try:
+        state = os.fstat(descriptor)
+    except BaseException:
+        _PENDING_LOCK_FDS.discard(descriptor)
+        os.close(descriptor)
+        raise
+    return descriptor, (state.st_dev, state.st_ino)
+
+
+def _acquire_directory_lock(
+    directory: Path,
+    *,
+    descriptor: int | None = None,
+) -> int:
     # The kernel owns this lock through the open descriptor, so process death
     # releases it without leaving a stale lock file that needs manual recovery.
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(directory, flags)
+    if descriptor is None:
+        descriptor, _identity = _open_directory(directory)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as error:
+    except BaseException as error:
+        _PENDING_LOCK_FDS.discard(descriptor)
         os.close(descriptor)
-        if error.errno in (errno.EACCES, errno.EAGAIN):
+        if isinstance(error, OSError) and error.errno in (
+            errno.EACCES,
+            errno.EAGAIN,
+        ):
             raise RuntimeError(
                 f"artifact directory already has an active writer: {directory}"
             ) from error
         raise
     return descriptor
+
+
+def _registered_writer(identity: tuple[int, int]):
+    reference = _ACTIVE_WRITERS.get(identity)
+    if reference is None:
+        return None
+    writer = reference()
+    if writer is None:
+        _ACTIVE_WRITERS.pop(identity, None)
+        return None
+    if writer._owner_pid != os.getpid():
+        return None
+    return writer
+
+
+def _register_writer(writer: "ShardWriter") -> None:
+    identity = writer._directory_identity
+
+    def discard(reference) -> None:
+        with _WRITER_REGISTRY_LOCK:
+            if _ACTIVE_WRITERS.get(identity) is reference:
+                _ACTIVE_WRITERS.pop(identity, None)
+
+    _ACTIVE_WRITERS[identity] = weakref.ref(writer, discard)
 
 
 class ShardWriter:
@@ -412,34 +616,156 @@ class ShardWriter:
 
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._lock_fd: int | None = _acquire_directory_lock(self.directory)
-        self._closed = False
-        try:
-            self.final = self.directory / "manifest.json"
-            self.partial = self.directory / "partial_manifest.json"
-            self.buffer: list[dict] = []
-            self._buffer_keys: set[tuple[str, int]] = set()
+        self.directory = self.directory.resolve()
+        self.final = self.directory / "manifest.json"
+        self.partial = self.directory / "partial_manifest.json"
+        self.buffer: list[dict] = []
+        self._buffer_keys: set[tuple[str, int]] = set()
+        self._state_lock = threading.RLock()
+        self._superseded = False
+        self._closed = True
+        self._lock_fd: int | None = None
+        self._owner_pid = os.getpid()
+        self._directory_identity: tuple[int, int] | None = None
+        candidate_descriptor: int | None = None
 
-            if self.final.exists():
-                raise FileExistsError(f"artifact is already complete: {self.final}")
-            if self.partial.exists():
-                state = json.loads(self.partial.read_text(encoding="utf-8"))
-                self._resume(state)
-            else:
-                self.shards: list[str] = []
-                self.shard_sha256: dict[str, str] = {}
-                self.record_count = 0
-                self._published_keys: set[tuple[str, int]] = set()
-                self._publish_partial()
-        except BaseException:
-            self._release_lock()
-            raise
+        with _WRITER_REGISTRY_LOCK:
+            try:
+                descriptor = None
+                predecessor = None
+                if _ACTIVE_WRITERS:
+                    path_state = os.stat(self.directory)
+                    path_identity = (path_state.st_dev, path_state.st_ino)
+                    predecessor = _registered_writer(path_identity)
+                if predecessor is not None and predecessor is not self:
+                    # The predecessor fd pins the inode observed by stat.  No
+                    # second directory fd is needed, so handoff has no unused
+                    # descriptor whose close result could be ambiguous.
+                    self._directory_identity = path_identity
+                    descriptor = self._take_lock_from(predecessor)
+                if descriptor is None:
+                    (
+                        candidate_descriptor,
+                        self._directory_identity,
+                    ) = _open_directory(self.directory)
+                    descriptor = _acquire_directory_lock(
+                        self.directory,
+                        descriptor=candidate_descriptor,
+                    )
+                    self._lock_fd = descriptor
+                    candidate_descriptor = None
+                    self._closed = False
+                    _register_writer(self)
+                    _PENDING_LOCK_FDS.discard(descriptor)
+
+                if _path_exists_at(self._lock_fd, self.final.name):
+                    raise FileExistsError(f"artifact is already complete: {self.final}")
+                if _path_exists_at(self._lock_fd, self.partial.name):
+                    state = _read_json_at(
+                        self._lock_fd,
+                        self.partial.name,
+                    )
+                    self._resume(state)
+                else:
+                    self.shards: list[str] = []
+                    self.shard_sha256: dict[str, str] = {}
+                    self.record_count = 0
+                    self._published_keys: set[tuple[str, int]] = set()
+                    self._publish_partial()
+            except BaseException:
+                if (
+                    candidate_descriptor is not None
+                    and self._lock_fd != candidate_descriptor
+                ):
+                    _PENDING_LOCK_FDS.discard(candidate_descriptor)
+                    try:
+                        os.close(candidate_descriptor)
+                    except OSError:
+                        pass
+                self._closed = True
+                reference = _ACTIVE_WRITERS.get(self._directory_identity)
+                if reference is not None and reference() is self:
+                    _ACTIVE_WRITERS.pop(self._directory_identity, None)
+                self._release_lock()
+                raise
+
+    def _take_lock_from(self, predecessor: "ShardWriter") -> int | None:
+        with predecessor._state_lock:
+            if predecessor._closed or predecessor._lock_fd is None:
+                return None
+            if predecessor.buffer or predecessor._buffer_keys:
+                raise RuntimeError("cannot hand off writer with unpublished buffer")
+            if predecessor.shard_size != self.shard_size:
+                raise ValueError("cannot resume with a different shard_size")
+            _ensure_exact_mapping(
+                predecessor.metadata,
+                self.metadata,
+                label="partial artifact",
+            )
+            state = _read_json_at(
+                predecessor._lock_fd,
+                predecessor.partial.name,
+            )
+            if type(state) is not dict:
+                raise ValueError("partial artifact manifest must be a JSON object")
+            _ensure_exact_mapping(
+                state,
+                predecessor._partial_value(),
+                label="writer handoff",
+            )
+
+            descriptor = predecessor._lock_fd
+            previous_reference = _ACTIVE_WRITERS.get(
+                self._directory_identity
+            )
+            predecessor_closed = predecessor._closed
+            predecessor_superseded = predecessor._superseded
+            _TRANSFER_PARTICIPANTS.extend((predecessor, self))
+            try:
+                self._lock_fd = descriptor
+                self._closed = False
+                _register_writer(self)
+                predecessor._lock_fd = None
+                predecessor._closed = True
+                predecessor._superseded = True
+                return descriptor
+            except BaseException:
+                self._lock_fd = None
+                self._closed = True
+                predecessor._lock_fd = descriptor
+                predecessor._closed = predecessor_closed
+                predecessor._superseded = predecessor_superseded
+                if previous_reference is None:
+                    _ACTIVE_WRITERS.pop(self._directory_identity, None)
+                else:
+                    _ACTIVE_WRITERS[
+                        self._directory_identity
+                    ] = previous_reference
+                raise
+            finally:
+                del _TRANSFER_PARTICIPANTS[-2:]
+
+    def _require_active(self) -> None:
+        if self._superseded:
+            raise RuntimeError("artifact writer has been superseded")
+        if self._closed:
+            raise RuntimeError("artifact writer is closed")
+
+    def _unregister(self) -> None:
+        with _WRITER_REGISTRY_LOCK:
+            reference = _ACTIVE_WRITERS.get(self._directory_identity)
+            if reference is not None and reference() is self:
+                _ACTIVE_WRITERS.pop(self._directory_identity, None)
 
     def _release_lock(self) -> None:
         descriptor = getattr(self, "_lock_fd", None)
         if descriptor is None:
             return
         self._lock_fd = None
+        _PENDING_LOCK_FDS.discard(descriptor)
+        if getattr(self, "_owner_pid", os.getpid()) != os.getpid():
+            os.close(descriptor)
+            return
         try:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
@@ -487,6 +813,7 @@ class ShardWriter:
                 self.directory,
                 name,
                 shard_sha256[name],
+                directory_fd=self._lock_fd,
             )
             actual_count += len(records)
             for record in records:
@@ -530,95 +857,202 @@ class ShardWriter:
         shards: list[str] | None = None,
         shard_sha256: dict[str, str] | None = None,
     ) -> None:
-        atomic_json(
-            self._partial_value(
-                shards=shards,
-                shard_sha256=shard_sha256,
-            ),
-            self.partial,
-        )
+        with self._state_lock:
+            self._require_active()
+            descriptor = self._lock_fd
+            assert descriptor is not None
+            _atomic_json_at(
+                self._partial_value(
+                    shards=shards,
+                    shard_sha256=shard_sha256,
+                ),
+                self.partial.name,
+                descriptor,
+            )
 
     def existing_keys(self) -> set[tuple[str, int]]:
-        return set(self._published_keys)
+        with self._state_lock:
+            return set(self._published_keys)
 
     def add(self, record: dict) -> None:
-        if self._closed:
-            raise RuntimeError("cannot add to a closed artifact writer")
-        if type(record) is not dict:
-            raise TypeError("artifact records must be dictionaries")
-        _validate_safe_artifact_value(record)
-        key = _record_key(record)
-        if key in self._published_keys or key in self._buffer_keys:
-            raise ValueError(f"duplicate record key: {key!r}")
+        with self._state_lock:
+            self._require_active()
+            if type(record) is not dict:
+                raise TypeError("artifact records must be dictionaries")
+            _validate_safe_artifact_value(record)
+            key = _record_key(record)
+            if key in self._published_keys or key in self._buffer_keys:
+                raise ValueError(f"duplicate record key: {key!r}")
 
-        self.buffer.append(dict(record))
-        self._buffer_keys.add(key)
-        self.record_count += 1
-        if len(self.buffer) >= self.shard_size:
-            self._flush()
+            self.buffer.append(dict(record))
+            self._buffer_keys.add(key)
+            self.record_count += 1
+            if len(self.buffer) >= self.shard_size:
+                self._flush()
 
     def _flush(self) -> None:
-        if not self.buffer:
-            return
-        for record in self.buffer:
-            _validate_safe_artifact_value(record)
-        name = f"shard_{len(self.shards):05d}.pt"
-        path = self.directory / name
-        atomic_torch(self.buffer, path)
-        next_shards = [*self.shards, name]
-        next_sha256 = {**self.shard_sha256, name: sha256_file(path)}
-        self._publish_partial(
-            shards=next_shards,
-            shard_sha256=next_sha256,
-        )
-        self.shards = next_shards
-        self.shard_sha256 = next_sha256
-        self._published_keys.update(self._buffer_keys)
-        self.buffer = []
-        self._buffer_keys = set()
+        with self._state_lock:
+            self._require_active()
+            if not self.buffer:
+                return
+            for record in self.buffer:
+                _validate_safe_artifact_value(record)
+            name = f"shard_{len(self.shards):05d}.pt"
+            descriptor = self._lock_fd
+            assert descriptor is not None
+            _atomic_torch_at(self.buffer, name, descriptor)
+            next_shards = [*self.shards, name]
+            next_sha256 = {
+                **self.shard_sha256,
+                name: _sha256_file_at(descriptor, name),
+            }
+            self._publish_partial(
+                shards=next_shards,
+                shard_sha256=next_sha256,
+            )
+            self.shards = next_shards
+            self.shard_sha256 = next_sha256
+            self._published_keys.update(self._buffer_keys)
+            self.buffer = []
+            self._buffer_keys = set()
 
     def close(self) -> None:
-        if self._closed:
-            return
         try:
-            self._flush()
-            atomic_json(
-                {
-                    **self.metadata,
-                    "schema_version": SCHEMA_VERSION,
-                    "record_count": self.record_count,
-                    "shards": self.shards,
-                    "shard_sha256": self.shard_sha256,
-                },
-                self.final,
-            )
-            self.partial.unlink(missing_ok=True)
-        except BaseException:
-            self._closed = True
-            self._release_lock()
-            raise
-        self._closed = True
-        self._release_lock()
+            with self._state_lock:
+                if self._closed:
+                    return
+                try:
+                    self._flush()
+                    descriptor = self._lock_fd
+                    assert descriptor is not None
+                    _atomic_json_at(
+                        {
+                            **self.metadata,
+                            "schema_version": SCHEMA_VERSION,
+                            "record_count": self.record_count,
+                            "shards": self.shards,
+                            "shard_sha256": self.shard_sha256,
+                        },
+                        self.final.name,
+                        descriptor,
+                    )
+                    _unlink_at(descriptor, self.partial.name)
+                except BaseException:
+                    self._closed = True
+                    self._release_lock()
+                    raise
+                self._closed = True
+                self._release_lock()
+        finally:
+            if getattr(self, "_closed", False):
+                self._unregister()
 
     def __enter__(self) -> "ShardWriter":
-        if self._closed:
-            raise RuntimeError("cannot enter a closed artifact writer")
-        return self
+        with self._state_lock:
+            self._require_active()
+            return self
 
     def __exit__(self, exc_type, *_exc) -> None:
         if exc_type is None:
             self.close()
             return
-        self.buffer = []
-        self._buffer_keys = set()
-        self._closed = True
-        self._release_lock()
+        try:
+            with self._state_lock:
+                if self._closed:
+                    return
+                self.buffer = []
+                self._buffer_keys = set()
+                self._closed = True
+                self._release_lock()
+        finally:
+            if getattr(self, "_closed", False):
+                self._unregister()
 
     def __del__(self) -> None:
         try:
-            self._release_lock()
+            state_lock = getattr(self, "_state_lock", None)
+            if state_lock is None:
+                self._closed = True
+                self._release_lock()
+            else:
+                with state_lock:
+                    self._closed = True
+                    self._release_lock()
+            self._unregister()
         except Exception:
             pass
+
+
+def _prepare_writer_registry_for_fork() -> None:
+    global _FORK_LOCKED_WRITERS
+
+    _WRITER_REGISTRY_LOCK.acquire()
+    locked: list[ShardWriter] = []
+    try:
+        for reference in list(_ACTIVE_WRITERS.values()):
+            writer = reference()
+            if writer is None or writer._owner_pid != os.getpid():
+                continue
+            writer._state_lock.acquire()
+            locked.append(writer)
+    except BaseException:
+        for writer in reversed(locked):
+            writer._state_lock.release()
+        _WRITER_REGISTRY_LOCK.release()
+        raise
+    _FORK_LOCKED_WRITERS = locked
+
+
+def _release_writer_registry_after_fork() -> None:
+    global _FORK_GENERATION, _FORK_LOCKED_WRITERS
+
+    _FORK_GENERATION += 1
+    for writer in reversed(_FORK_LOCKED_WRITERS):
+        writer._state_lock.release()
+    _FORK_LOCKED_WRITERS = []
+    _WRITER_REGISTRY_LOCK.release()
+
+
+def _reset_writer_registry_after_fork() -> None:
+    """Drop inherited process-local ownership without unlocking the parent."""
+    global _ACTIVE_WRITERS, _FORK_GENERATION, _FORK_LOCKED_WRITERS
+    global _PENDING_LOCK_FDS
+    global _TRANSFER_PARTICIPANTS, _WRITER_REGISTRY_LOCK
+
+    _FORK_GENERATION += 1
+    writers: list[ShardWriter] = []
+    for candidate in [*_FORK_LOCKED_WRITERS, *_TRANSFER_PARTICIPANTS]:
+        if not any(candidate is writer for writer in writers):
+            writers.append(candidate)
+
+    descriptors = set(_PENDING_LOCK_FDS)
+    descriptors.update(
+        writer._lock_fd for writer in writers if writer._lock_fd is not None
+    )
+    for descriptor in descriptors:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+    for writer in writers:
+        writer._lock_fd = None
+        writer._closed = True
+        writer._superseded = True
+        writer._state_lock = threading.RLock()
+    _ACTIVE_WRITERS = {}
+    _FORK_LOCKED_WRITERS = []
+    _PENDING_LOCK_FDS = set()
+    _TRANSFER_PARTICIPANTS = []
+    _WRITER_REGISTRY_LOCK = threading.RLock()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        before=_prepare_writer_registry_for_fork,
+        after_in_parent=_release_writer_registry_after_fork,
+        after_in_child=_reset_writer_registry_after_fork,
+    )
 
 
 def load_manifest(directory: str | Path) -> dict:

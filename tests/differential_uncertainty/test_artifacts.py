@@ -1,6 +1,9 @@
 import hashlib
+import inspect
 import json
+import os
 import pickle
+import sys
 import threading
 from pathlib import Path
 
@@ -355,10 +358,8 @@ def test_completed_shards_publish_a_final_manifest_and_iterate_in_order(tmp_path
 def test_partial_shards_resume_from_published_record_keys(tmp_path):
     root = tmp_path / "cache"
     metadata = {"stage": "reference", "input_id": "abc"}
-    with pytest.raises(RuntimeError, match="interrupted"):
-        with ShardWriter(root, metadata, shard_size=1) as interrupted:
-            interrupted.add(_record("a"))
-            raise RuntimeError("interrupted")
+    writer = ShardWriter(root, metadata, shard_size=1)
+    writer.add(_record("a"))
 
     resumed = ShardWriter(root, metadata, shard_size=1)
     assert resumed.existing_keys() == {("a", 0)}
@@ -386,17 +387,649 @@ def test_exceptional_context_keeps_only_full_shards_resumable(tmp_path):
     assert [record["image_id"] for record in iter_records(root)] == ["a", "b"]
 
 
-def test_second_live_writer_is_refused_without_mutating_the_artifact(tmp_path):
+def test_same_process_handoff_invalidates_the_predecessor(tmp_path):
     root = tmp_path / "cache"
     metadata = {"stage": "evaluation"}
+    writer = ShardWriter(root, metadata, shard_size=1)
+    writer.add(_record("a"))
 
-    with ShardWriter(root, metadata, shard_size=1) as writer:
-        partial_before = (root / "partial_manifest.json").read_bytes()
-        with pytest.raises(RuntimeError, match="active writer"):
-            ShardWriter(root, metadata, shard_size=1)
-        assert (root / "partial_manifest.json").read_bytes() == partial_before
+    resumed = ShardWriter(root, metadata, shard_size=1)
+
+    with pytest.raises(RuntimeError, match="superseded"):
+        writer.add(_record("stale-add"))
+    with pytest.raises(RuntimeError, match="superseded"):
+        writer._flush()
+    with pytest.raises(RuntimeError, match="superseded"):
+        writer._publish_partial()
+    writer.close()
+    assert not (root / "manifest.json").exists()
+
+    resumed.add(_record("b"))
+    resumed.close()
+    assert [record["image_id"] for record in iter_records(root)] == ["a", "b"]
+
+
+def test_handoff_refuses_unpublished_buffer_without_invalidating_writer(tmp_path):
+    root = tmp_path / "cache"
+    metadata = {"stage": "evaluation"}
+    writer = ShardWriter(root, metadata, shard_size=2)
+    writer.add(_record("a"))
+    partial_before = (root / "partial_manifest.json").read_bytes()
+
+    with pytest.raises(RuntimeError, match="unpublished buffer"):
+        ShardWriter(root, metadata, shard_size=2)
+
+    assert (root / "partial_manifest.json").read_bytes() == partial_before
+    writer.add(_record("b"))
+    resumed = ShardWriter(root, metadata, shard_size=2)
+    resumed.close()
+    assert [record["image_id"] for record in iter_records(root)] == ["a", "b"]
+
+
+def test_failed_handoff_metadata_check_leaves_predecessor_active(tmp_path):
+    root = tmp_path / "cache"
+    metadata = {"stage": "reference", "input_id": "abc"}
+    writer = ShardWriter(root, metadata, shard_size=1)
+    writer.add(_record("a"))
+
+    with pytest.raises(ValueError, match="input_id"):
+        ShardWriter(
+            root,
+            {"stage": "reference", "input_id": "different"},
+            shard_size=1,
+        )
+
+    writer.add(_record("b"))
+    writer.close()
+    assert [record["image_id"] for record in iter_records(root)] == ["a", "b"]
+
+
+def test_concurrent_handoff_and_close_do_not_deadlock_or_publish_twice(tmp_path):
+    for index in range(20):
+        root = tmp_path / f"cache-{index}"
+        metadata = {"stage": "evaluation"}
+        writer = ShardWriter(root, metadata, shard_size=1)
         writer.add(_record("a"))
+        barrier = threading.Barrier(2)
+        successors = []
+        errors = []
 
+        def close_predecessor():
+            try:
+                barrier.wait()
+                writer.close()
+            except BaseException as error:
+                errors.append(error)
+
+        def attempt_handoff():
+            try:
+                barrier.wait()
+                successors.append(
+                    ShardWriter(root, metadata, shard_size=1)
+                )
+            except FileExistsError:
+                pass
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=close_predecessor),
+            threading.Thread(target=attempt_handoff),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        assert not any(thread.is_alive() for thread in threads)
+        assert errors == []
+        for successor in successors:
+            successor.close()
+        assert [record["image_id"] for record in iter_records(root)] == ["a"]
+
+
+def test_post_transfer_constructor_failure_releases_ownership(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    metadata = {"stage": "evaluation"}
+    writer = ShardWriter(root, metadata, shard_size=1)
+    writer.add(_record("a"))
+    original_resume = ShardWriter._resume
+
+    def fail_resume(_self, _state):
+        raise RuntimeError("resume failed")
+
+    monkeypatch.setattr(ShardWriter, "_resume", fail_resume)
+    with pytest.raises(RuntimeError, match="resume failed"):
+        ShardWriter(root, metadata, shard_size=1)
+    monkeypatch.setattr(ShardWriter, "_resume", original_resume)
+
+    with pytest.raises(RuntimeError, match="superseded"):
+        writer.add(_record("stale"))
+
+    resumed = ShardWriter(root, metadata, shard_size=1)
+    resumed.close()
+    assert [record["image_id"] for record in iter_records(root)] == ["a"]
+
+
+def test_handoff_uses_directory_identity_across_symlink_aliases(tmp_path):
+    root = tmp_path / "cache"
+    alias = tmp_path / "cache-alias"
+    metadata = {"stage": "evaluation"}
+    writer = ShardWriter(root, metadata, shard_size=1)
+    writer.add(_record("a"))
+    alias.symlink_to(root, target_is_directory=True)
+
+    resumed = ShardWriter(alias, metadata, shard_size=1)
+
+    with pytest.raises(RuntimeError, match="superseded"):
+        writer.add(_record("stale"))
+    resumed.close()
+
+    assert [record["image_id"] for record in iter_records(root)] == ["a"]
+
+
+def test_writer_io_stays_bound_to_the_locked_directory_after_rename(tmp_path):
+    root = tmp_path / "cache"
+    moved = tmp_path / "moved-cache"
+    metadata = {"stage": "evaluation"}
+    writer = ShardWriter(root, metadata, shard_size=1)
+    root.rename(moved)
+    replacement = ShardWriter(root, metadata, shard_size=1)
+
+    writer.add(_record("old-directory"))
+    replacement.add(_record("new-directory"))
+    writer.close()
+    replacement.close()
+
+    assert [record["image_id"] for record in iter_records(moved)] == [
+        "old-directory"
+    ]
+    assert [record["image_id"] for record in iter_records(root)] == [
+        "new-directory"
+    ]
+
+
+def test_writer_identity_is_derived_from_the_same_directory_fd_it_locks(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    moved = tmp_path / "moved-cache"
+    metadata = {"stage": "evaluation"}
+    original_acquire = artifacts._acquire_directory_lock
+    replaced = False
+
+    def replace_path_before_acquire(directory, **kwargs):
+        nonlocal replaced
+        if not replaced:
+            Path(directory).rename(moved)
+            Path(directory).mkdir()
+            replaced = True
+        return original_acquire(directory, **kwargs)
+
+    monkeypatch.setattr(
+        artifacts,
+        "_acquire_directory_lock",
+        replace_path_before_acquire,
+    )
+    writer = ShardWriter(root, metadata, shard_size=1)
+    writer.add(_record("a"))
+    monkeypatch.setattr(
+        artifacts,
+        "_acquire_directory_lock",
+        original_acquire,
+    )
+
+    resumed = ShardWriter(moved, metadata, shard_size=1)
+    resumed.add(_record("b"))
+    resumed.close()
+    replacement = ShardWriter(root, metadata, shard_size=1)
+    replacement.add(_record("replacement"))
+    replacement.close()
+
+    assert [record["image_id"] for record in iter_records(moved)] == ["a", "b"]
+    assert [record["image_id"] for record in iter_records(root)] == [
+        "replacement"
+    ]
+
+
+def test_directory_open_is_serialized_with_the_fork_registry(tmp_path, monkeypatch):
+    class TrackingRLock:
+        def __init__(self):
+            self._lock = threading.RLock()
+            self._local = threading.local()
+
+        def acquire(self, *args, **kwargs):
+            acquired = self._lock.acquire(*args, **kwargs)
+            if acquired:
+                self._local.depth = getattr(self._local, "depth", 0) + 1
+            return acquired
+
+        def release(self):
+            self._local.depth -= 1
+            self._lock.release()
+
+        def __enter__(self):
+            self.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            self.release()
+
+        def held_by_current_thread(self):
+            return getattr(self._local, "depth", 0) > 0
+
+    tracking_lock = TrackingRLock()
+    original_open_directory = artifacts._open_directory
+    observed = []
+
+    def observe_registry_boundary(directory):
+        observed.append(tracking_lock.held_by_current_thread())
+        return original_open_directory(directory)
+
+    monkeypatch.setattr(
+        artifacts,
+        "_WRITER_REGISTRY_LOCK",
+        tracking_lock,
+    )
+    monkeypatch.setattr(
+        artifacts,
+        "_open_directory",
+        observe_registry_boundary,
+    )
+    writer = ShardWriter(
+        tmp_path / "cache",
+        {"stage": "evaluation"},
+        shard_size=1,
+    )
+    writer.close()
+
+    assert observed == [True]
+
+
+def test_lock_helper_return_exception_releases_caller_owned_fd(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    original_acquire = artifacts._acquire_directory_lock
+
+    def acquire_then_interrupt(directory, **kwargs):
+        original_acquire(directory, **kwargs)
+        raise KeyboardInterrupt("interrupted after helper return")
+
+    monkeypatch.setattr(
+        artifacts,
+        "_acquire_directory_lock",
+        acquire_then_interrupt,
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt, match="after helper return"):
+            ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+        assert artifacts._PENDING_LOCK_FDS == set()
+        monkeypatch.setattr(
+            artifacts,
+            "_acquire_directory_lock",
+            original_acquire,
+        )
+        recovered = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+        recovered.close()
+    finally:
+        monkeypatch.setattr(
+            artifacts,
+            "_acquire_directory_lock",
+            original_acquire,
+        )
+        for descriptor in list(artifacts._PENDING_LOCK_FDS):
+            artifacts.fcntl.flock(descriptor, artifacts.fcntl.LOCK_UN)
+            os.close(descriptor)
+            artifacts._PENDING_LOCK_FDS.discard(descriptor)
+
+
+@pytest.mark.parametrize(
+    "target_statement",
+    ["self._lock_fd = descriptor", "candidate_descriptor = None"],
+)
+def test_lock_result_transfer_is_async_exception_safe(
+    tmp_path,
+    target_statement,
+):
+    root = tmp_path / "cache"
+    source_lines, first_line = inspect.getsourcelines(ShardWriter.__init__)
+    acquire_offset = next(
+        offset
+        for offset, line in enumerate(source_lines)
+        if "descriptor = _acquire_directory_lock(" in line
+    )
+    ownership_line = first_line + next(
+        offset
+        for offset, line in enumerate(source_lines[acquire_offset:], acquire_offset)
+        if line.strip() == target_statement
+    )
+    interrupted = False
+
+    def interrupt_before_writer_ownership(frame, event, _argument):
+        nonlocal interrupted
+        if (
+            frame.f_code is ShardWriter.__init__.__code__
+            and event == "line"
+            and frame.f_lineno == ownership_line
+        ):
+            interrupted = True
+            raise KeyboardInterrupt("interrupted before writer ownership")
+        return interrupt_before_writer_ownership
+
+    original_flock = artifacts.fcntl.flock
+    try:
+        sys.settrace(interrupt_before_writer_ownership)
+        with pytest.raises(KeyboardInterrupt, match="before writer ownership"):
+            ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+        sys.settrace(None)
+
+        assert interrupted
+        assert artifacts._PENDING_LOCK_FDS == set()
+        recovered = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+        recovered.close()
+    finally:
+        sys.settrace(None)
+        for descriptor in list(artifacts._PENDING_LOCK_FDS):
+            original_flock(descriptor, artifacts.fcntl.LOCK_UN)
+            os.close(descriptor)
+            artifacts._PENDING_LOCK_FDS.discard(descriptor)
+
+
+def test_same_process_handoff_does_not_open_an_unused_candidate(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    metadata = {"stage": "evaluation"}
+    writer = ShardWriter(root, metadata, shard_size=1)
+    writer.add(_record("a"))
+
+    def unexpected_open(_directory):
+        raise AssertionError("handoff opened an unused candidate descriptor")
+
+    monkeypatch.setattr(artifacts, "_open_directory", unexpected_open)
+    resumed = ShardWriter(root, metadata, shard_size=1)
+    resumed.close()
+
+
+def test_handoff_never_double_closes_a_reused_candidate_fd(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    metadata = {"stage": "evaluation"}
+    writer = ShardWriter(root, metadata, shard_size=1)
+    writer.add(_record("a"))
+    original_open = artifacts._open_directory
+    original_close = artifacts.os.close
+    candidate_fds = []
+    replacement_fd = None
+
+    def capture_candidate(directory):
+        descriptor, identity = original_open(directory)
+        candidate_fds.append(descriptor)
+        return descriptor, identity
+
+    def close_reuse_and_interrupt(descriptor):
+        nonlocal replacement_fd
+        if (
+            replacement_fd is None
+            and candidate_fds
+            and descriptor == candidate_fds[0]
+        ):
+            original_close(descriptor)
+            replacement_fd = os.open(os.devnull, os.O_RDONLY)
+            assert replacement_fd == descriptor
+            raise KeyboardInterrupt("close completed before interruption")
+        original_close(descriptor)
+
+    monkeypatch.setattr(artifacts, "_open_directory", capture_candidate)
+    monkeypatch.setattr(artifacts.os, "close", close_reuse_and_interrupt)
+    resumed = None
+    try:
+        try:
+            resumed = ShardWriter(root, metadata, shard_size=1)
+        except KeyboardInterrupt as error:
+            assert str(error) == "close completed before interruption"
+        monkeypatch.setattr(artifacts.os, "close", original_close)
+
+        assert artifacts._PENDING_LOCK_FDS == set()
+        if replacement_fd is None:
+            assert resumed is not None
+        else:
+            os.fstat(replacement_fd)
+    finally:
+        monkeypatch.setattr(artifacts.os, "close", original_close)
+        if resumed is not None:
+            resumed.close()
+        if replacement_fd is not None:
+            try:
+                original_close(replacement_fd)
+            except OSError:
+                pass
+
+
+def test_lock_acquisition_base_exception_releases_pending_fd(tmp_path, monkeypatch):
+    root = tmp_path / "cache"
+    original_flock = artifacts.fcntl.flock
+
+    def lock_then_interrupt(descriptor, operation):
+        original_flock(descriptor, operation)
+        if operation & artifacts.fcntl.LOCK_EX:
+            raise KeyboardInterrupt("interrupted after lock acquisition")
+
+    monkeypatch.setattr(artifacts.fcntl, "flock", lock_then_interrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="after lock acquisition"):
+            ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+        assert artifacts._PENDING_LOCK_FDS == set()
+        monkeypatch.setattr(artifacts.fcntl, "flock", original_flock)
+        recovered = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+        recovered.close()
+    finally:
+        monkeypatch.setattr(artifacts.fcntl, "flock", original_flock)
+        for descriptor in list(artifacts._PENDING_LOCK_FDS):
+            original_flock(descriptor, artifacts.fcntl.LOCK_UN)
+            os.close(descriptor)
+            artifacts._PENDING_LOCK_FDS.discard(descriptor)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_during_handoff_closes_the_transferred_fd_in_the_child(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    metadata = {"stage": "evaluation"}
+    writer = ShardWriter(root, metadata, shard_size=1)
+    writer.add(_record("a"))
+    original_take = ShardWriter._take_lock_from
+    child_exit_codes = []
+
+    def fork_after_transfer(successor, predecessor):
+        descriptor = original_take(successor, predecessor)
+        process_id = os.fork()
+        if process_id == 0:
+            try:
+                os.fstat(descriptor)
+            except OSError as error:
+                os._exit(0 if error.errno == artifacts.errno.EBADF else 2)
+            os._exit(1)
+        _waited_id, status = os.waitpid(process_id, 0)
+        child_exit_codes.append(os.waitstatus_to_exitcode(status))
+        return descriptor
+
+    monkeypatch.setattr(ShardWriter, "_take_lock_from", fork_after_transfer)
+    resumed = ShardWriter(root, metadata, shard_size=1)
+    resumed.close()
+
+    assert child_exit_codes == [0]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_after_fresh_lock_acquisition_closes_the_fd_in_the_child(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    original_acquire = artifacts._acquire_directory_lock
+    child_exit_codes = []
+
+    def fork_after_acquire(directory, **kwargs):
+        descriptor = original_acquire(directory, **kwargs)
+        process_id = os.fork()
+        if process_id == 0:
+            try:
+                os.fstat(descriptor)
+            except OSError as error:
+                os._exit(0 if error.errno == artifacts.errno.EBADF else 2)
+            os._exit(1)
+        _waited_id, status = os.waitpid(process_id, 0)
+        child_exit_codes.append(os.waitstatus_to_exitcode(status))
+        return descriptor
+
+    monkeypatch.setattr(
+        artifacts,
+        "_acquire_directory_lock",
+        fork_after_acquire,
+    )
+    writer = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+    writer.close()
+
+    assert child_exit_codes == [0]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_during_transfer_invalidates_both_child_participants(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    metadata = {"stage": "evaluation"}
+    predecessor = ShardWriter(root, metadata, shard_size=1)
+    predecessor.add(_record("a"))
+    original_register = artifacts._register_writer
+    child_exit_codes = []
+
+    def register_then_fork(successor):
+        original_register(successor)
+        if successor is predecessor or child_exit_codes:
+            return
+        process_id = os.fork()
+        if process_id == 0:
+            predecessor_invalid = (
+                predecessor._closed and predecessor._lock_fd is None
+            )
+            successor_invalid = successor._closed and successor._lock_fd is None
+            os._exit(0 if predecessor_invalid and successor_invalid else 1)
+        _waited_id, status = os.waitpid(process_id, 0)
+        child_exit_codes.append(os.waitstatus_to_exitcode(status))
+
+    monkeypatch.setattr(artifacts, "_register_writer", register_then_fork)
+    resumed = ShardWriter(root, metadata, shard_size=1)
+    resumed.close()
+
+    assert child_exit_codes == [0]
+
+
+def test_transfer_registration_failure_restores_the_predecessor(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    metadata = {"stage": "evaluation"}
+    predecessor = ShardWriter(root, metadata, shard_size=1)
+    predecessor.add(_record("a"))
+    original_register = artifacts._register_writer
+
+    def register_then_fail(successor):
+        original_register(successor)
+        if successor is not predecessor:
+            raise RuntimeError("registration failed")
+
+    monkeypatch.setattr(artifacts, "_register_writer", register_then_fail)
+    with pytest.raises(RuntimeError, match="registration failed"):
+        ShardWriter(root, metadata, shard_size=1)
+    monkeypatch.setattr(artifacts, "_register_writer", original_register)
+
+    predecessor.add(_record("b"))
+    predecessor.close()
+    assert [record["image_id"] for record in iter_records(root)] == ["a", "b"]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_forked_child_drops_inherited_handoff_ownership(tmp_path):
+    root = tmp_path / "cache"
+    metadata = {"stage": "evaluation"}
+    writer = ShardWriter(root, metadata, shard_size=1)
+    writer.add(_record("a"))
+
+    process_id = os.fork()
+    if process_id == 0:
+        try:
+            inherited_is_invalid = writer._closed and writer._lock_fd is None
+            if not inherited_is_invalid:
+                os._exit(1)
+            try:
+                ShardWriter(root, metadata, shard_size=1)
+            except RuntimeError as error:
+                if "active writer" in str(error):
+                    os._exit(0)
+                os._exit(2)
+            else:
+                os._exit(3)
+        except BaseException:
+            os._exit(4)
+
+    _waited_id, status = os.waitpid(process_id, 0)
+    exit_code = os.waitstatus_to_exitcode(status)
+    assert exit_code == 0
+
+    writer.add(_record("b"))
+    writer.close()
+    assert [record["image_id"] for record in iter_records(root)] == ["a", "b"]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_cross_process_writer_lock_is_exclusive_and_recovers_after_exit(tmp_path):
+    root = tmp_path / "cache"
+    metadata = {"stage": "evaluation"}
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    process_id = os.fork()
+
+    if process_id == 0:
+        os.close(ready_read)
+        os.close(release_write)
+        try:
+            child_writer = ShardWriter(root, metadata, shard_size=1)
+            child_writer.add(_record("a"))
+            os.write(ready_write, b"1")
+            os.read(release_read, 1)
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+
+    os.close(ready_write)
+    os.close(release_read)
+    assert os.read(ready_read, 1) == b"1"
+    with pytest.raises(RuntimeError, match="active writer"):
+        ShardWriter(root, metadata, shard_size=1)
+
+    os.write(release_write, b"1")
+    os.close(release_write)
+    _waited_id, status = os.waitpid(process_id, 0)
+    assert os.waitstatus_to_exitcode(status) == 0
+
+    resumed = ShardWriter(root, metadata, shard_size=1)
+    assert resumed.existing_keys() == {("a", 0)}
+    resumed.close()
     assert [record["image_id"] for record in iter_records(root)] == ["a"]
 
 
