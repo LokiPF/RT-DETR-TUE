@@ -24,6 +24,7 @@ _MANIFEST_KEYS = frozenset(
 _ACTIVE_WRITERS: dict[tuple[int, int], weakref.ReferenceType] = {}
 _WRITER_REGISTRY_LOCK = threading.RLock()
 _FORK_LOCKED_WRITERS: list["ShardWriter"] = []
+_CONSTRUCTING_WRITERS: list["ShardWriter"] = []
 _PENDING_LOCK_FDS: set[int] = set()
 _TRANSFER_PARTICIPANTS: list["ShardWriter"] = []
 _FORK_GENERATION = 0
@@ -548,6 +549,38 @@ def _open_directory(directory: Path) -> tuple[int, tuple[int, int]]:
     return descriptor, (state.st_dev, state.st_ino)
 
 
+def _mark_lock_descriptor(descriptor: int) -> int:
+    # ShardWriter never iterates this private directory fd; its seek offset is
+    # therefore a stable open-file-description marker on supported Linux fds.
+    marker = secrets.randbelow((1 << 62) - 1) + 1
+    try:
+        actual = os.lseek(descriptor, marker, os.SEEK_SET)
+    except OSError as error:
+        raise RuntimeError(
+            "artifact directory fd does not support ownership markers"
+        ) from error
+    if actual != marker:
+        raise RuntimeError(
+            "artifact directory fd did not retain its ownership marker"
+        )
+    return marker
+
+
+def _matches_lock_descriptor(
+    descriptor: int,
+    identity: tuple[int, int] | None,
+    marker: int | None,
+) -> bool:
+    if identity is None or marker is None:
+        return False
+    try:
+        state = os.fstat(descriptor)
+        offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+    except OSError:
+        return False
+    return (state.st_dev, state.st_ino) == identity and offset == marker
+
+
 def _acquire_directory_lock(
     directory: Path,
     *,
@@ -625,11 +658,13 @@ class ShardWriter:
         self._superseded = False
         self._closed = True
         self._lock_fd: int | None = None
+        self._lock_fd_marker: int | None = None
         self._owner_pid = os.getpid()
         self._directory_identity: tuple[int, int] | None = None
         candidate_descriptor: int | None = None
 
         with _WRITER_REGISTRY_LOCK:
+            _CONSTRUCTING_WRITERS.append(self)
             try:
                 descriptor = None
                 predecessor = None
@@ -652,10 +687,24 @@ class ShardWriter:
                         self.directory,
                         descriptor=candidate_descriptor,
                     )
+                    if self._owner_pid != os.getpid() or self._superseded:
+                        raise RuntimeError(
+                            "artifact writer construction invalidated by fork"
+                        )
+                    marker = _mark_lock_descriptor(descriptor)
+                    if self._owner_pid != os.getpid() or self._superseded:
+                        raise RuntimeError(
+                            "artifact writer construction invalidated by fork"
+                        )
                     self._lock_fd = descriptor
+                    self._lock_fd_marker = marker
                     candidate_descriptor = None
                     self._closed = False
                     _register_writer(self)
+                    if self._owner_pid != os.getpid() or self._superseded:
+                        raise RuntimeError(
+                            "artifact writer construction invalidated by fork"
+                        )
                     _PENDING_LOCK_FDS.discard(descriptor)
 
                 if _path_exists_at(self._lock_fd, self.final.name):
@@ -675,6 +724,7 @@ class ShardWriter:
             except BaseException:
                 if (
                     candidate_descriptor is not None
+                    and self._owner_pid == os.getpid()
                     and self._lock_fd != candidate_descriptor
                 ):
                     _PENDING_LOCK_FDS.discard(candidate_descriptor)
@@ -686,8 +736,13 @@ class ShardWriter:
                 reference = _ACTIVE_WRITERS.get(self._directory_identity)
                 if reference is not None and reference() is self:
                     _ACTIVE_WRITERS.pop(self._directory_identity, None)
-                self._release_lock()
+                self._release_lock_safely()
                 raise
+            finally:
+                for index, writer in enumerate(_CONSTRUCTING_WRITERS):
+                    if writer is self:
+                        del _CONSTRUCTING_WRITERS[index]
+                        break
 
     def _take_lock_from(self, predecessor: "ShardWriter") -> int | None:
         with predecessor._state_lock:
@@ -715,6 +770,9 @@ class ShardWriter:
             )
 
             descriptor = predecessor._lock_fd
+            marker = predecessor._lock_fd_marker
+            if marker is None:
+                raise RuntimeError("active artifact writer has no lock marker")
             previous_reference = _ACTIVE_WRITERS.get(
                 self._directory_identity
             )
@@ -722,17 +780,35 @@ class ShardWriter:
             predecessor_superseded = predecessor._superseded
             _TRANSFER_PARTICIPANTS.extend((predecessor, self))
             try:
+                if self._owner_pid != os.getpid() or self._superseded:
+                    raise RuntimeError(
+                        "artifact writer construction invalidated by fork"
+                    )
                 self._lock_fd = descriptor
+                self._lock_fd_marker = marker
                 self._closed = False
                 _register_writer(self)
+                if self._owner_pid != os.getpid() or self._superseded:
+                    raise RuntimeError(
+                        "artifact writer construction invalidated by fork"
+                    )
                 predecessor._lock_fd = None
+                predecessor._lock_fd_marker = None
                 predecessor._closed = True
                 predecessor._superseded = True
                 return descriptor
             except BaseException:
                 self._lock_fd = None
+                self._lock_fd_marker = None
                 self._closed = True
+                if self._owner_pid != os.getpid() or self._superseded:
+                    predecessor._lock_fd = None
+                    predecessor._lock_fd_marker = None
+                    predecessor._closed = True
+                    predecessor._superseded = True
+                    raise
                 predecessor._lock_fd = descriptor
+                predecessor._lock_fd_marker = marker
                 predecessor._closed = predecessor_closed
                 predecessor._superseded = predecessor_superseded
                 if previous_reference is None:
@@ -758,18 +834,58 @@ class ShardWriter:
                 _ACTIVE_WRITERS.pop(self._directory_identity, None)
 
     def _release_lock(self) -> None:
+        if (
+            getattr(self, "_owner_pid", os.getpid()) != os.getpid()
+            or getattr(self, "_superseded", False)
+        ):
+            self._lock_fd = None
+            self._lock_fd_marker = None
+            return
+        # Keep the first trace boundary inside the exception table.
+        try: self._release_lock_once()
+        except BaseException:
+            self._reconcile_lock_release()
+            raise
+
+    def _release_lock_safely(self) -> None:
+        """Give interrupted reconciliation one final idempotent cleanup pass."""
+        try: self._release_lock()
+        except BaseException:
+            if (
+                getattr(self, "_owner_pid", os.getpid()) != os.getpid()
+                or getattr(self, "_superseded", False)
+            ):
+                self._lock_fd = None
+                self._lock_fd_marker = None
+            else:
+                self._reconcile_lock_release()
+            raise
+
+    def _release_lock_once(self) -> None:
         descriptor = getattr(self, "_lock_fd", None)
         if descriptor is None:
             return
+        os.closerange(descriptor, descriptor + 1)
         self._lock_fd = None
+        self._lock_fd_marker = None
         _PENDING_LOCK_FDS.discard(descriptor)
-        if getattr(self, "_owner_pid", os.getpid()) != os.getpid():
-            os.close(descriptor)
+
+    def _reconcile_lock_release(self) -> None:
+        descriptor = getattr(self, "_lock_fd", None)
+        if descriptor is None:
             return
-        try:
-            fcntl.flock(descriptor, fcntl.LOCK_UN)
-        finally:
-            os.close(descriptor)
+        # This fd is private and release runs under _state_lock.  Artifact
+        # code cannot replace it between this validation and closerange; the
+        # marker distinguishes only an ambiguous completed close/reuse.
+        if _matches_lock_descriptor(
+            descriptor,
+            self._directory_identity,
+            self._lock_fd_marker,
+        ):
+            os.closerange(descriptor, descriptor + 1)
+        self._lock_fd = None
+        self._lock_fd_marker = None
+        _PENDING_LOCK_FDS.discard(descriptor)
 
     def _resume(self, state) -> None:
         if not isinstance(state, dict):
@@ -939,10 +1055,10 @@ class ShardWriter:
                     _unlink_at(descriptor, self.partial.name)
                 except BaseException:
                     self._closed = True
-                    self._release_lock()
+                    self._release_lock_safely()
                     raise
                 self._closed = True
-                self._release_lock()
+                self._release_lock_safely()
         finally:
             if getattr(self, "_closed", False):
                 self._unregister()
@@ -963,7 +1079,7 @@ class ShardWriter:
                 self.buffer = []
                 self._buffer_keys = set()
                 self._closed = True
-                self._release_lock()
+                self._release_lock_safely()
         finally:
             if getattr(self, "_closed", False):
                 self._unregister()
@@ -973,11 +1089,11 @@ class ShardWriter:
             state_lock = getattr(self, "_state_lock", None)
             if state_lock is None:
                 self._closed = True
-                self._release_lock()
+                self._release_lock_safely()
             else:
                 with state_lock:
                     self._closed = True
-                    self._release_lock()
+                    self._release_lock_safely()
             self._unregister()
         except Exception:
             pass
@@ -989,9 +1105,14 @@ def _prepare_writer_registry_for_fork() -> None:
     _WRITER_REGISTRY_LOCK.acquire()
     locked: list[ShardWriter] = []
     try:
-        for reference in list(_ACTIVE_WRITERS.values()):
-            writer = reference()
+        candidates = [
+            *(reference() for reference in _ACTIVE_WRITERS.values()),
+            *_CONSTRUCTING_WRITERS,
+        ]
+        for writer in candidates:
             if writer is None or writer._owner_pid != os.getpid():
+                continue
+            if any(writer is existing for existing in locked):
                 continue
             writer._state_lock.acquire()
             locked.append(writer)
@@ -1015,7 +1136,8 @@ def _release_writer_registry_after_fork() -> None:
 
 def _reset_writer_registry_after_fork() -> None:
     """Drop inherited process-local ownership without unlocking the parent."""
-    global _ACTIVE_WRITERS, _FORK_GENERATION, _FORK_LOCKED_WRITERS
+    global _ACTIVE_WRITERS, _CONSTRUCTING_WRITERS, _FORK_GENERATION
+    global _FORK_LOCKED_WRITERS
     global _PENDING_LOCK_FDS
     global _TRANSFER_PARTICIPANTS, _WRITER_REGISTRY_LOCK
 
@@ -1037,10 +1159,12 @@ def _reset_writer_registry_after_fork() -> None:
 
     for writer in writers:
         writer._lock_fd = None
+        writer._lock_fd_marker = None
         writer._closed = True
         writer._superseded = True
         writer._state_lock = threading.RLock()
     _ACTIVE_WRITERS = {}
+    _CONSTRUCTING_WRITERS = []
     _FORK_LOCKED_WRITERS = []
     _PENDING_LOCK_FDS = set()
     _TRANSFER_PARTICIPANTS = []

@@ -840,6 +840,322 @@ def test_lock_acquisition_base_exception_releases_pending_fd(tmp_path, monkeypat
             artifacts._PENDING_LOCK_FDS.discard(descriptor)
 
 
+def test_release_lock_recovers_from_every_line_boundary(tmp_path):
+    probe = ShardWriter(
+        tmp_path / "line-probe",
+        {"stage": "evaluation"},
+        shard_size=1,
+    )
+    executed_lines = []
+    release_codes = {
+        ShardWriter._release_lock.__code__,
+        ShardWriter._release_lock_safely.__code__,
+        ShardWriter._release_lock_once.__code__,
+    }
+
+    def record_release_lines(frame, event, _argument):
+        if frame.f_code in release_codes and event == "line":
+            executed_lines.append((frame.f_code, frame.f_lineno))
+        return record_release_lines
+
+    sys.settrace(record_release_lines)
+    try:
+        probe.__exit__(RuntimeError, None, None)
+    finally:
+        sys.settrace(None)
+    boundaries = list(dict.fromkeys(executed_lines))
+    assert boundaries
+
+    original_flock = artifacts.fcntl.flock
+    original_close = artifacts.os.close
+    for index, (target_code, target_line) in enumerate(boundaries):
+        root = tmp_path / f"boundary-{index}"
+        writer = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+        writer.add(_record("a"))
+        descriptor = writer._lock_fd
+        interrupted = False
+
+        def interrupt_at_boundary(frame, event, _argument):
+            nonlocal interrupted
+            if (
+                not interrupted
+                and frame.f_code is target_code
+                and event == "line"
+                and frame.f_lineno == target_line
+            ):
+                interrupted = True
+                raise KeyboardInterrupt(f"interrupted at line {target_line}")
+            return interrupt_at_boundary
+
+        try:
+            sys.settrace(interrupt_at_boundary)
+            with pytest.raises(KeyboardInterrupt, match="interrupted at line"):
+                writer.__exit__(RuntimeError, None, None)
+            sys.settrace(None)
+
+            assert interrupted
+            recovered = ShardWriter(
+                root,
+                {"stage": "evaluation"},
+                shard_size=1,
+            )
+            assert recovered.existing_keys() == {("a", 0)}
+            recovered.close()
+        finally:
+            sys.settrace(None)
+            writer._lock_fd = None
+            if descriptor is not None:
+                try:
+                    original_flock(descriptor, artifacts.fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                try:
+                    original_close(descriptor)
+                except OSError:
+                    pass
+
+
+def test_release_reconciliation_recovers_from_every_line_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    release_codes = {
+        ShardWriter._release_lock.__code__,
+        ShardWriter._release_lock_safely.__code__,
+        ShardWriter._release_lock_once.__code__,
+        ShardWriter._reconcile_lock_release.__code__,
+    }
+
+    def record_lines(target):
+        def record(frame, event, _argument):
+            if frame.f_code in release_codes and event == "line":
+                target.append((frame.f_code, frame.f_lineno))
+            return record
+
+        return record
+
+    normal_lines = []
+    normal_probe = ShardWriter(
+        tmp_path / "normal-reconciliation-probe",
+        {"stage": "evaluation"},
+        shard_size=1,
+    )
+    sys.settrace(record_lines(normal_lines))
+    try:
+        normal_probe.__exit__(RuntimeError, None, None)
+    finally:
+        sys.settrace(None)
+
+    original_closerange = artifacts.os.closerange
+    exception_lines = []
+    close_calls = 0
+
+    def interrupt_first_close(first, last):
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise RuntimeError("enter release reconciliation")
+        original_closerange(first, last)
+
+    exception_probe = ShardWriter(
+        tmp_path / "exception-reconciliation-probe",
+        {"stage": "evaluation"},
+        shard_size=1,
+    )
+    monkeypatch.setattr(artifacts.os, "closerange", interrupt_first_close)
+    sys.settrace(record_lines(exception_lines))
+    try:
+        with pytest.raises(RuntimeError, match="enter release reconciliation"):
+            exception_probe.__exit__(RuntimeError, None, None)
+    finally:
+        sys.settrace(None)
+        monkeypatch.setattr(
+            artifacts.os,
+            "closerange",
+            original_closerange,
+        )
+
+    normal_boundaries = set(normal_lines)
+    boundaries = [
+        boundary
+        for boundary in dict.fromkeys(exception_lines)
+        if boundary not in normal_boundaries
+    ]
+    assert boundaries
+    assert any(
+        code is ShardWriter._reconcile_lock_release.__code__
+        for code, _line in boundaries
+    )
+
+    for index, (target_code, target_line) in enumerate(boundaries):
+        root = tmp_path / f"reconciliation-boundary-{index}"
+        writer = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+        writer.add(_record("a"))
+        descriptor = writer._lock_fd
+        close_calls = 0
+        interrupted = False
+
+        def interrupt_at_boundary(frame, event, _argument):
+            nonlocal interrupted
+            if (
+                not interrupted
+                and frame.f_code is target_code
+                and event == "line"
+                and frame.f_lineno == target_line
+            ):
+                interrupted = True
+                raise KeyboardInterrupt(f"interrupted at line {target_line}")
+            return interrupt_at_boundary
+
+        monkeypatch.setattr(artifacts.os, "closerange", interrupt_first_close)
+        sys.settrace(interrupt_at_boundary)
+        try:
+            with pytest.raises(KeyboardInterrupt, match="interrupted at line"):
+                writer.__exit__(RuntimeError, None, None)
+            sys.settrace(None)
+            monkeypatch.setattr(
+                artifacts.os,
+                "closerange",
+                original_closerange,
+            )
+
+            assert interrupted
+            recovered = ShardWriter(
+                root,
+                {"stage": "evaluation"},
+                shard_size=1,
+            )
+            assert recovered.existing_keys() == {("a", 0)}
+            recovered.close()
+        finally:
+            sys.settrace(None)
+            monkeypatch.setattr(
+                artifacts.os,
+                "closerange",
+                original_closerange,
+            )
+            writer._lock_fd = None
+            if descriptor is not None:
+                original_closerange(descriptor, descriptor + 1)
+
+
+@pytest.mark.parametrize("reuse_same_directory", [False, True])
+def test_release_close_exception_never_recloses_a_reused_fd(
+    tmp_path,
+    monkeypatch,
+    reuse_same_directory,
+):
+    root = tmp_path / "cache"
+    writer = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+    writer.add(_record("a"))
+    original_closerange = artifacts.os.closerange
+    replacement_fd = None
+    close_calls = 0
+
+    def close_reuse_and_interrupt(first, last):
+        nonlocal close_calls, replacement_fd
+        close_calls += 1
+        assert last == first + 1
+        original_closerange(first, last)
+        replacement = root if reuse_same_directory else os.devnull
+        flags = os.O_RDONLY
+        if reuse_same_directory:
+            flags |= getattr(os, "O_DIRECTORY", 0)
+        replacement_fd = os.open(replacement, flags)
+        assert replacement_fd == first
+        raise KeyboardInterrupt("close completed before interruption")
+
+    monkeypatch.setattr(artifacts.os, "closerange", close_reuse_and_interrupt)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="close completed"):
+            writer.__exit__(RuntimeError, None, None)
+        monkeypatch.setattr(artifacts.os, "closerange", original_closerange)
+
+        assert close_calls == 1
+        assert replacement_fd is not None
+        os.fstat(replacement_fd)
+        recovered = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+        assert recovered.existing_keys() == {("a", 0)}
+        recovered.close()
+    finally:
+        monkeypatch.setattr(artifacts.os, "closerange", original_closerange)
+        if replacement_fd is not None:
+            try:
+                os.close(replacement_fd)
+            except OSError:
+                pass
+
+
+def test_lock_descriptor_marker_is_nonzero_and_stable(tmp_path):
+    writer = ShardWriter(
+        tmp_path / "cache",
+        {"stage": "evaluation"},
+        shard_size=1,
+    )
+    descriptor = writer._lock_fd
+    marker = writer._lock_fd_marker
+
+    assert descriptor is not None
+    assert marker is not None and marker > 0
+    assert os.lseek(descriptor, 0, os.SEEK_CUR) == marker
+    writer.add(_record("a"))
+    assert os.lseek(descriptor, 0, os.SEEK_CUR) == marker
+    writer.close()
+
+
+def test_unsupported_lock_descriptor_marker_fails_cleanly(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    original_lseek = artifacts.os.lseek
+
+    def reject_marker(descriptor, offset, whence):
+        if whence == os.SEEK_SET and offset != 0:
+            raise OSError(artifacts.errno.EINVAL, "marker unsupported")
+        return original_lseek(descriptor, offset, whence)
+
+    monkeypatch.setattr(artifacts.os, "lseek", reject_marker)
+    with pytest.raises(RuntimeError, match="does not support ownership markers"):
+        ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+    monkeypatch.setattr(artifacts.os, "lseek", original_lseek)
+
+    recovered = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+    recovered.close()
+
+
+def test_release_retries_when_close_did_not_start(tmp_path, monkeypatch):
+    root = tmp_path / "cache"
+    writer = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+    writer.add(_record("a"))
+    descriptor = writer._lock_fd
+    original_closerange = artifacts.os.closerange
+    close_calls = 0
+
+    def interrupt_before_close(first, last):
+        nonlocal close_calls
+        close_calls += 1
+        if close_calls == 1:
+            raise KeyboardInterrupt("interrupted before close")
+        original_closerange(first, last)
+
+    monkeypatch.setattr(artifacts.os, "closerange", interrupt_before_close)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="before close"):
+            writer.__exit__(RuntimeError, None, None)
+        monkeypatch.setattr(artifacts.os, "closerange", original_closerange)
+
+        assert close_calls == 2
+        recovered = ShardWriter(root, {"stage": "evaluation"}, shard_size=1)
+        assert recovered.existing_keys() == {("a", 0)}
+        recovered.close()
+    finally:
+        monkeypatch.setattr(artifacts.os, "closerange", original_closerange)
+        writer._lock_fd = None
+        if descriptor is not None:
+            original_closerange(descriptor, descriptor + 1)
+
+
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
 def test_fork_during_handoff_closes_the_transferred_fd_in_the_child(
     tmp_path,
@@ -903,6 +1219,285 @@ def test_fork_after_fresh_lock_acquisition_closes_the_fd_in_the_child(
     writer.close()
 
     assert child_exit_codes == [0]
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_before_lock_assignment_cannot_close_a_reused_fd(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    metadata = {"stage": "evaluation"}
+    original_acquire = artifacts._acquire_directory_lock
+    child_process_id = None
+    in_child = False
+    reused_descriptor = None
+
+    def fork_before_assignment(directory, **kwargs):
+        nonlocal child_process_id, in_child, reused_descriptor
+        descriptor = original_acquire(directory, **kwargs)
+        process_id = os.fork()
+        if process_id == 0:
+            in_child = True
+            child_process_id = 0
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            reused_descriptor = os.open(unrelated, flags)
+            if reused_descriptor != descriptor:
+                os._exit(20)
+            return descriptor
+        child_process_id = process_id
+        return descriptor
+
+    monkeypatch.setattr(
+        artifacts,
+        "_acquire_directory_lock",
+        fork_before_assignment,
+    )
+    try:
+        try:
+            writer = ShardWriter(root, metadata, shard_size=1)
+        except RuntimeError as error:
+            if not in_child:
+                raise
+            clean_failure = "fork" in str(error)
+            descriptor_was_not_reclosed = True
+            try:
+                os.fstat(reused_descriptor)
+            except OSError:
+                descriptor_was_not_reclosed = False
+            os._exit(0 if clean_failure and descriptor_was_not_reclosed else 21)
+
+        if in_child:
+            os._exit(22)
+
+        assert child_process_id is not None
+        _waited_id, status = os.waitpid(child_process_id, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        writer.add(_record("parent"))
+        writer.close()
+        assert [record["image_id"] for record in iter_records(root)] == [
+            "parent"
+        ]
+        assert not any(unrelated.iterdir())
+    finally:
+        if in_child:
+            os._exit(23)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+@pytest.mark.parametrize("reuse_same_directory", [False, True])
+def test_fork_after_lock_marker_cannot_close_a_reused_fd(
+    tmp_path,
+    monkeypatch,
+    reuse_same_directory,
+):
+    root = tmp_path / "cache"
+    metadata = {"stage": "evaluation"}
+    original_mark = artifacts._mark_lock_descriptor
+    child_process_id = None
+    in_child = False
+    reused_descriptor = None
+
+    def mark_then_fork(descriptor):
+        nonlocal child_process_id, in_child, reused_descriptor
+        marker = original_mark(descriptor)
+        process_id = os.fork()
+        if process_id == 0:
+            in_child = True
+            child_process_id = 0
+            replacement = root if reuse_same_directory else os.devnull
+            flags = os.O_RDONLY
+            if reuse_same_directory:
+                flags |= getattr(os, "O_DIRECTORY", 0)
+            replacement_descriptor = os.open(replacement, flags)
+            if replacement_descriptor != descriptor:
+                os.dup2(replacement_descriptor, descriptor)
+                os.close(replacement_descriptor)
+            reused_descriptor = descriptor
+            return marker
+        child_process_id = process_id
+        return marker
+
+    monkeypatch.setattr(artifacts, "_mark_lock_descriptor", mark_then_fork)
+    try:
+        try:
+            writer = ShardWriter(root, metadata, shard_size=1)
+        except RuntimeError as error:
+            if not in_child:
+                raise
+            clean_failure = "fork" in str(error)
+            descriptor_was_not_reclosed = True
+            try:
+                os.fstat(reused_descriptor)
+            except OSError:
+                descriptor_was_not_reclosed = False
+            os._exit(0 if clean_failure and descriptor_was_not_reclosed else 31)
+
+        if in_child:
+            os._exit(32)
+
+        assert child_process_id is not None
+        _waited_id, status = os.waitpid(child_process_id, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        writer.add(_record("parent"))
+        writer.close()
+        assert [record["image_id"] for record in iter_records(root)] == [
+            "parent"
+        ]
+    finally:
+        if in_child:
+            os._exit(33)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_before_handoff_assignment_cannot_reuse_the_writer_fd(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    metadata = {"stage": "evaluation"}
+    predecessor = ShardWriter(root, metadata, shard_size=1)
+    predecessor.add(_record("a"))
+    child_process_id = None
+    in_child = False
+    reused_descriptor = None
+
+    class ForkAfterExtend(list):
+        def extend(self, values):
+            nonlocal child_process_id, in_child, reused_descriptor
+            super().extend(values)
+            descriptor = predecessor._lock_fd
+            assert descriptor is not None
+            process_id = os.fork()
+            if process_id == 0:
+                in_child = True
+                child_process_id = 0
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                replacement_descriptor = os.open(unrelated, flags)
+                if replacement_descriptor != descriptor:
+                    os.dup2(replacement_descriptor, descriptor)
+                    os.close(replacement_descriptor)
+                reused_descriptor = descriptor
+                return
+            child_process_id = process_id
+
+    monkeypatch.setattr(
+        artifacts,
+        "_TRANSFER_PARTICIPANTS",
+        ForkAfterExtend(),
+    )
+    try:
+        try:
+            resumed = ShardWriter(root, metadata, shard_size=1)
+        except RuntimeError as error:
+            if not in_child:
+                raise
+            clean_failure = "fork" in str(error)
+            descriptor_was_not_reclosed = True
+            try:
+                os.fstat(reused_descriptor)
+            except OSError:
+                descriptor_was_not_reclosed = False
+            unrelated_is_clean = not any(unrelated.iterdir())
+            os._exit(
+                0
+                if clean_failure
+                and descriptor_was_not_reclosed
+                and unrelated_is_clean
+                else 41
+            )
+
+        if in_child:
+            os._exit(42)
+
+        assert child_process_id is not None
+        _waited_id, status = os.waitpid(child_process_id, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        resumed.add(_record("b"))
+        resumed.close()
+        assert [record["image_id"] for record in iter_records(root)] == [
+            "a",
+            "b",
+        ]
+    finally:
+        if in_child:
+            os._exit(43)
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_fork_before_registration_cannot_reuse_the_writer_fd(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    unrelated = tmp_path / "unrelated"
+    unrelated.mkdir()
+    metadata = {"stage": "evaluation"}
+    original_register = artifacts._register_writer
+    child_process_id = None
+    in_child = False
+    reused_descriptor = None
+
+    def fork_before_registration(writer):
+        nonlocal child_process_id, in_child, reused_descriptor
+        descriptor = writer._lock_fd
+        assert descriptor is not None
+        process_id = os.fork()
+        if process_id == 0:
+            in_child = True
+            child_process_id = 0
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            reused_descriptor = os.open(unrelated, flags)
+            if reused_descriptor != descriptor:
+                os._exit(10)
+            original_register(writer)
+            return
+        child_process_id = process_id
+        original_register(writer)
+
+    monkeypatch.setattr(artifacts, "_register_writer", fork_before_registration)
+    try:
+        try:
+            writer = ShardWriter(root, metadata, shard_size=1)
+        except RuntimeError as error:
+            if not in_child:
+                raise
+            clean_failure = "fork" in str(error)
+            unrelated_is_clean = not any(unrelated.iterdir())
+            descriptor_was_not_reclosed = True
+            try:
+                os.fstat(reused_descriptor)
+            except OSError:
+                descriptor_was_not_reclosed = False
+            os._exit(
+                0
+                if clean_failure
+                and unrelated_is_clean
+                and descriptor_was_not_reclosed
+                else 11
+            )
+
+        if in_child:
+            writer.add(_record("child"))
+            writer.close()
+            os._exit(12 if (unrelated / "manifest.json").exists() else 13)
+
+        assert child_process_id is not None
+        _waited_id, status = os.waitpid(child_process_id, 0)
+        assert os.waitstatus_to_exitcode(status) == 0
+        writer.add(_record("parent"))
+        writer.close()
+        assert [record["image_id"] for record in iter_records(root)] == [
+            "parent"
+        ]
+        assert not any(unrelated.iterdir())
+    finally:
+        if in_child:
+            os._exit(14)
 
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
