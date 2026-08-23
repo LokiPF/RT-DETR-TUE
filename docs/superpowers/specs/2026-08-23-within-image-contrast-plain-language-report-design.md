@@ -49,7 +49,7 @@ will appear only when they let a reader trace a statement back to the result fil
 - The anchored diagnostics show 28 of 30 measured stability ratios below 1.0, and all six
   anchored clean relationships beat their constant baselines. Counts that include differential
   arms must not be described as evidence about anchors.
-- Twenty of 45 derived contrasts beat both raw input ranges. Eight of 45 persistence candidates
+- Twenty of 33 derived contrasts beat both raw input ranges. Eight of 45 persistence candidates
   fail the confidence-only control.
 
 ## Language and interpretation rules
