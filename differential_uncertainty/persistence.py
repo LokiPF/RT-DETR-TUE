@@ -136,6 +136,11 @@ def batched_persistence(
     if layer_inputs.shape[1] != weight_matrix.shape[1]:
         raise ValueError("persistence input and score-head dimensions do not match")
 
+    if weight_matrix.shape[1] == 0:
+        raise ValueError("persistence graph must contain at least one input vertex")
+    if weight_matrix.shape[0] == 0:
+        raise ValueError("persistence graph must contain at least one output vertex")
+
     if layer_inputs.shape[0] == 0:
         diagram_width = weight_matrix.shape[0] + weight_matrix.shape[1] - 1
         return torch.empty(

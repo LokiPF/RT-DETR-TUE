@@ -3,6 +3,8 @@ import torch
 from torch import nn
 
 from differential_uncertainty.persistence import Layer2Capture, batched_persistence
+# Transitional oracle: the later legacy-prune task must freeze this behavior in
+# a self-contained fixture before src.misc is removed.
 from src.misc.tue_utils import get_persistence_diagrams_batched
 
 
@@ -19,9 +21,26 @@ def test_batched_persistence_matches_the_legacy_implementation_exactly():
     assert torch.all(actual[:, :-1] >= actual[:, 1:])
 
 
-def test_batched_persistence_uses_input_device_and_float32_computation():
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=pytest.mark.skipif(
+                not torch.cuda.is_available(),
+                reason="CUDA is unavailable",
+            ),
+        ),
+    ],
+)
+def test_batched_persistence_uses_input_device_and_float32_computation(device):
     weight = torch.tensor([[1.0, -2.0], [-3.0, 4.0]], dtype=torch.float64)
-    inputs = torch.tensor([[2.0, -1.0]], dtype=torch.float64)
+    inputs = torch.tensor(
+        [[2.0, -1.0]],
+        dtype=torch.float64,
+        device=device,
+    )
 
     diagrams = batched_persistence(weight, inputs)
 
@@ -29,7 +48,11 @@ def test_batched_persistence_uses_input_device_and_float32_computation():
     assert diagrams.dtype == torch.float32
     torch.testing.assert_close(
         diagrams,
-        torch.tensor([[6.0, 4.0, 2.0]], dtype=torch.float32),
+        torch.tensor(
+            [[6.0, 4.0, 2.0]],
+            dtype=torch.float32,
+            device=device,
+        ),
         rtol=0,
         atol=0,
     )
@@ -56,6 +79,24 @@ def test_batched_persistence_preserves_empty_query_shape_dtype_and_device():
     ],
 )
 def test_batched_persistence_rejects_invalid_tensor_shapes(weight, inputs, message):
+    with pytest.raises(ValueError, match=message):
+        batched_persistence(weight, inputs)
+
+
+@pytest.mark.parametrize(
+    ("weight", "inputs", "message"),
+    [
+        (torch.empty(2, 0), torch.empty(1, 0), "at least one input vertex"),
+        (torch.empty(0, 2), torch.empty(1, 2), "at least one output vertex"),
+        (torch.empty(0, 0), torch.empty(0, 0), "at least one input vertex"),
+        (torch.empty(0, 1), torch.empty(1, 1), "at least one output vertex"),
+    ],
+)
+def test_batched_persistence_rejects_empty_graph_partitions(
+    weight,
+    inputs,
+    message,
+):
     with pytest.raises(ValueError, match=message):
         batched_persistence(weight, inputs)
 
