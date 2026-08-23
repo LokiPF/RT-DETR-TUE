@@ -740,6 +740,9 @@ def test_refuses_incomplete_coverage(tmp_path):
     source = write_source_bundle(tmp_path / "source")
     rows = (source / "per_scene.csv").read_text().splitlines()
     (source / "per_scene.csv").write_text("\n".join(rows[:-1]) + "\n")
+    summary = json.loads((source / "summary.json").read_text())
+    summary["validation"]["per_scene_row_count"] -= 1
+    (source / "summary.json").write_text(json.dumps(summary))
     with pytest.raises(ContrastInputError, match=f"expected {RETAINED} retained rows, found"):
         load_contrast_inputs(source, expected_image_count=6)
 
@@ -753,9 +756,42 @@ def test_refuses_provenance_disagreement_between_csv_and_json(tmp_path):
         load_contrast_inputs(source, expected_image_count=6)
 
 
+def test_refuses_a_summary_whose_published_row_count_disagrees_with_the_csv(tmp_path):
+    source = write_source_bundle(tmp_path / "source")
+    summary = json.loads((source / "summary.json").read_text())
+    summary["validation"]["per_scene_row_count"] += 1
+    (source / "summary.json").write_text(json.dumps(summary))
+
+    with pytest.raises(ContrastInputError, match="per_scene_row_count"):
+        load_contrast_inputs(source, expected_image_count=6)
+
+
 def test_refuses_a_severity_range_that_is_not_the_six(tmp_path):
     source = write_source_bundle(tmp_path / "source", severities=range(5))
     with pytest.raises(ContrastInputError, match="needs severities"):
+        load_contrast_inputs(source, expected_image_count=6)
+
+
+def test_refuses_an_unexpected_retained_severity_even_when_the_row_count_matches(tmp_path):
+    """A severity-6 row cannot replace a missing severity-5 row behind the same product count."""
+    source = write_source_bundle(tmp_path / "source")
+    rows = read_rows(source)
+    replaced = next(
+        row for row in rows
+        if row["severity"] == "5"
+        and row["signal"] == "persistence"
+        and row["confidence_bin"] == "decile_50_60"
+        and row["aggregation"] == "mean"
+        and row["score_scope"] == "layer_2"
+        and row["image_id"] == "1"
+    )
+    replaced["severity"] = "6"
+    with (source / "per_scene.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with pytest.raises(ContrastInputError, match=r"unexpected.*severity.*6"):
         load_contrast_inputs(source, expected_image_count=6)
 
 
@@ -763,6 +799,40 @@ def test_refuses_a_summary_that_is_not_valid_json(tmp_path):
     source = write_source_bundle(tmp_path / "source")
     (source / "summary.json").write_text("{not json,")
     with pytest.raises(ContrastInputError, match="is not valid JSON"):
+        load_contrast_inputs(source, expected_image_count=6)
+
+
+def test_refuses_a_per_scene_csv_with_an_unknown_schema(tmp_path):
+    source = write_source_bundle(tmp_path / "source")
+    rows = read_rows(source)
+    for row in rows:
+        row.pop("score")
+    with (source / "per_scene.csv").open("w", newline="") as handle:
+        fieldnames = [name for name in rows[0] if name != "score"]
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with pytest.raises(ContrastInputError, match=r"schema.*score"):
+        load_contrast_inputs(source, expected_image_count=6)
+
+
+def test_refuses_a_bucket_scheme_that_disagrees_with_its_bin(tmp_path):
+    source = write_source_bundle(tmp_path / "source")
+    rows = read_rows(source)
+    mismatched = next(
+        row for row in rows
+        if row["confidence_bin"] == "decile_50_60"
+        and row["signal"] == "persistence"
+        and row["score_scope"] == "layer_2"
+    )
+    mismatched["bucket_scheme"] = "quintile"
+    with (source / "per_scene.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with pytest.raises(ContrastInputError, match=r"bucket_scheme.*decile_50_60"):
         load_contrast_inputs(source, expected_image_count=6)
 
 

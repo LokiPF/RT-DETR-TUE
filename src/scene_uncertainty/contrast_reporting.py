@@ -55,8 +55,12 @@ from .contrast_analysis import (
     RESIDUAL_METHOD,
 )
 from .contrast_controls import BOOTSTRAP_PERCENTILES, CORRUPTED_SEVERITIES
-from .contrast_inputs import ARMS, EXPECTED_SEVERITIES
+from .contrast_inputs import ARMS, EXPECTED_SEVERITIES, FULL_TUNING_IMAGE_COUNT
 from .contrast_plots import PLOT_FILENAMES, write_contrast_plots
+
+DIFFERENTIAL_MILD_BLUR_BARS = {1: 0.538, 2: 0.570}
+"""Outside maxima from the completed deployment sweep, not values selected by this run."""
+
 
 DATA_FILES = (
     "per_scene_contrasts.csv",
@@ -304,6 +308,127 @@ def _bootstrap_settings(candidates: list[dict]) -> dict:
     }
 
 
+def _candidate_identity(candidate: dict) -> dict:
+    """The three coordinates that identify a persistence candidate in a verdict."""
+    return {
+        "arm": candidate["arm"],
+        "aggregation": candidate["aggregation"],
+        "method": candidate["method"],
+    }
+
+
+def _full_tuning_coverage(candidate: dict) -> bool:
+    """True only for a complete measurement of the declared 250-image roster."""
+    return bool(
+        candidate.get("complete")
+        and candidate.get("expected_image_count") == FULL_TUNING_IMAGE_COUNT
+        and candidate.get("image_count") == FULL_TUNING_IMAGE_COUNT
+        and candidate.get("macro_auroc") is not None
+    )
+
+
+def _interval_is_above_zero(candidate: dict, field: str) -> bool:
+    interval = candidate.get(field)
+    return bool(interval is not None and interval.get("low") is not None
+                and interval["low"] > 0.0)
+
+
+def _hypothesis_verdicts(diagnostics: list[dict], candidates: list[dict]) -> dict:
+    """Apply the design's two success bars without letting ranking substitute for either.
+
+    Ranking answers which eligible candidate has the highest tuning AUROC. These verdicts ask
+    narrower scientific questions. The anchored bar additionally requires a stable reference
+    and, for a residual, a predictive clean relationship. The differential bar admits only the
+    two signed gap methods and requires both mild-blur AUROCs to clear the outside maxima from
+    the completed deployment sweep.
+    """
+    diagnostic_by_key = {
+        (entry["arm"], entry["signal"], entry["aggregation"]): entry
+        for entry in diagnostics
+    }
+    anchored: list[dict] = []
+    differential: list[dict] = []
+    for candidate in candidates:
+        if candidate.get("signal") != DEPLOYABLE_SIGNAL:
+            continue
+        diagnostic = diagnostic_by_key.get(
+            (candidate["arm"], DEPLOYABLE_SIGNAL, candidate["aggregation"])
+        )
+        if diagnostic is None:
+            continue
+
+        if candidate.get("arm_family") == "anchored":
+            ratios = [
+                (_at(diagnostic.get("spread"), severity) or {}).get(
+                    "stability_to_spread"
+                )
+                for severity in CORRUPTED_SEVERITIES
+            ]
+            severity_one_difference = _at(
+                candidate.get("responsive_control_auroc_difference_by_severity"), 1
+            )
+            residual_predictive = (
+                candidate.get("method") != RESIDUAL_METHOD
+                or diagnostic.get("relationship", {}).get("predictive") is True
+            )
+            if (
+                candidate.get("method") in {"raw_gap", "relative_gap", RESIDUAL_METHOD}
+                and _full_tuning_coverage(candidate)
+                and all(value is not None and value < 1.0 for value in ratios)
+                and candidate.get("beats_both_inputs") is True
+                and _interval_is_above_zero(
+                    candidate, "responsive_control_bootstrap"
+                )
+                and _interval_is_above_zero(
+                    candidate, "reference_control_bootstrap"
+                )
+                and severity_one_difference is not None
+                and severity_one_difference >= 0.0
+                and candidate.get("confidence_redundant") is False
+                and residual_predictive
+            ):
+                anchored.append(_candidate_identity(candidate))
+
+        elif candidate.get("arm_family") == "differential":
+            aurocs = candidate.get("auroc_by_severity")
+            severity_one = _at(aurocs, 1)
+            severity_two = _at(aurocs, 2)
+            if (
+                candidate.get("method") in {"raw_gap", "relative_gap"}
+                and _full_tuning_coverage(candidate)
+                and candidate.get("beats_both_inputs") is True
+                and candidate.get("confidence_redundant") is False
+                and _interval_is_above_zero(candidate, "twin_bootstrap")
+                and severity_one is not None
+                and severity_one > DIFFERENTIAL_MILD_BLUR_BARS[1]
+                and severity_two is not None
+                and severity_two > DIFFERENTIAL_MILD_BLUR_BARS[2]
+            ):
+                differential.append(_candidate_identity(candidate))
+
+    order = lambda item: (item["arm"], item["aggregation"], item["method"])
+    anchored.sort(key=order)
+    differential.sort(key=order)
+    return {
+        "anchored": {
+            "supported_on_tuning": bool(anchored),
+            "verdict": (
+                "supported on tuning" if anchored else "not supported on tuning"
+            ),
+            "qualifying_candidates": anchored,
+        },
+        "differential": {
+            "carry_to_held_out": bool(differential),
+            "verdict": (
+                "worth carrying to a held-out test"
+                if differential else "not worth carrying to a held-out test"
+            ),
+            "mild_blur_bars": dict(DIFFERENTIAL_MILD_BLUR_BARS),
+            "qualifying_candidates": differential,
+        },
+    }
+
+
 def build_contrast_summary(
     *,
     inputs,
@@ -350,6 +475,7 @@ def build_contrast_summary(
         "anchor_diagnostics": diagnostics,
         "candidates": candidates,
         "reference_controls": controls,
+        "hypothesis_verdicts": _hypothesis_verdicts(diagnostics, candidates),
         "ranking": [
             {
                 "arm": candidate["arm"],
@@ -682,6 +808,22 @@ def _families_section(summary: dict) -> list[str]:
         "",
         "The distinction is a property of the design and is stated whether or not a "
         "differential arm won anything here.",
+        "",
+    ]
+    verdicts = summary["hypothesis_verdicts"]
+    anchored_verdict = verdicts["anchored"]
+    differential_verdict = verdicts["differential"]
+    lines += [
+        f"Anchored verdict: {anchored_verdict['verdict']}. "
+        "Support requires one predeclared anchored candidate to clear the stability, "
+        "predictiveness when applicable, both-input, both-interval, mild-blur and confidence "
+        "conditions together.",
+        "",
+        f"Differential verdict: {differential_verdict['verdict']}. "
+        "This bar admits only raw_gap or relative_gap, requires the candidate to beat both "
+        "inputs and confidence with the confidence interval above zero, and requires severity "
+        f"1 above {DIFFERENTIAL_MILD_BLUR_BARS[1]:.3f} and severity 2 above "
+        f"{DIFFERENTIAL_MILD_BLUR_BARS[2]:.3f}.",
         "",
     ]
     for family, members in (("anchored", anchored), ("differential", differential)):

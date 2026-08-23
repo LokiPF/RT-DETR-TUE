@@ -53,6 +53,14 @@ non-negative inputs.
 
 AGGREGATIONS = ("mean", "q90", "top20_mean")
 
+REQUIRED_SOURCE_COLUMNS = (
+    "image_id", "severity", "signal", "bucket_scheme", "confidence_bin",
+    "membership_mode", "padding_mode", "aggregation", "score_scope",
+    "source_partition", "score",
+)
+"""The source columns selection and validation read; missing one is an unknown schema."""
+
+
 SCORE_KEY = ("image_id", "severity", "signal", "confidence_bin", "aggregation", "score_scope")
 """What makes two retained scores measurements of different things.
 
@@ -225,17 +233,41 @@ def load_contrast_inputs(
             f"within-image contrast reads the tuning partition only; {source} reports "
             f"source_partition={run.get('source_partition')!r}"
         )
+    validation = summary.get("validation", {})
+    reported_row_count = validation.get("per_scene_row_count")
+    if type(reported_row_count) is not int or reported_row_count < 0:
+        raise ContrastInputError(
+            f"{SUMMARY_FILE} has no valid validation.per_scene_row_count; "
+            "the source schema is unfinished or unknown"
+        )
 
     wanted = set(REQUIRED_SERIES)
     scores: dict[tuple, float] = {}
     images: set[int] = set()
     seen_series: set[tuple[str, str, str]] = set()
+    source_row_count = 0
     with (source / PER_SCENE_FILE).open(newline="") as handle:
-        for index, row in enumerate(csv.DictReader(handle)):
+        reader = csv.DictReader(handle)
+        missing_columns = sorted(
+            set(REQUIRED_SOURCE_COLUMNS) - set(reader.fieldnames or ())
+        )
+        if missing_columns:
+            raise ContrastInputError(
+                f"{PER_SCENE_FILE} schema is missing required columns: {missing_columns}"
+            )
+        for index, row in enumerate(reader):
+            source_row_count += 1
             if row["source_partition"] != SOURCE_PARTITION:
                 raise ContrastInputError(
                     f"{PER_SCENE_FILE} row {index} is outside the tuning partition: "
                     f"source_partition={row['source_partition']!r}"
+                )
+            expected_scheme = row["confidence_bin"].split("_", 1)[0]
+            if (expected_scheme not in {"decile", "quintile"}
+                    or row["bucket_scheme"] != expected_scheme):
+                raise ContrastInputError(
+                    f"{PER_SCENE_FILE} row {index} has bucket_scheme="
+                    f"{row['bucket_scheme']!r}, inconsistent with {row['confidence_bin']!r}"
                 )
             entry = (row["signal"], row["confidence_bin"], row["score_scope"])
             if entry not in wanted:
@@ -264,6 +296,11 @@ def load_contrast_inputs(
             images.add(key[0])
             seen_series.add(entry)
 
+    if source_row_count != reported_row_count:
+        raise ContrastInputError(
+            f"{SUMMARY_FILE} reports per_scene_row_count={reported_row_count} but "
+            f"{PER_SCENE_FILE} contains {source_row_count} rows"
+        )
     missing = [entry for entry in REQUIRED_SERIES if entry not in seen_series]
     if missing:
         described = ", ".join(f"{signal}/{name}/{scope}" for signal, name, scope in missing)
@@ -292,6 +329,31 @@ def load_contrast_inputs(
             f"source coverage is incomplete: expected {expected} retained rows, found "
             f"{len(scores)}; every required series must cover every image at every severity"
         )
+
+    expected_keys = {
+        (image_id, severity, signal, confidence_bin, aggregation, scope)
+        for image_id in image_ids
+        for severity in EXPECTED_SEVERITIES
+        for signal, confidence_bin, scope in REQUIRED_SERIES
+        for aggregation in AGGREGATIONS
+    }
+    actual_keys = set(scores)
+    if actual_keys != expected_keys:
+        def describe(keys):
+            return "; ".join(
+                f"image={key[0]}, severity={key[1]}, signal={key[2]}, "
+                f"bin={key[3]}, aggregation={key[4]}, scope={key[5]}"
+                for key in sorted(keys)[:3]
+            )
+
+        unexpected = actual_keys - expected_keys
+        missing_keys = expected_keys - actual_keys
+        details = []
+        if unexpected:
+            details.append(f"unexpected retained row keys: {describe(unexpected)}")
+        if missing_keys:
+            details.append(f"missing retained row keys: {describe(missing_keys)}")
+        raise ContrastInputError("; ".join(details))
 
     return ContrastInputs(
         scores=scores,

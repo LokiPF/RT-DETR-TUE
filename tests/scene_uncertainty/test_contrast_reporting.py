@@ -16,6 +16,7 @@ draw. `test_the_summary_records_the_spans_it_was_handed` passes an absurd one fo
 
 import csv
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -718,6 +719,100 @@ def test_the_selection_debt_is_stated_whether_or_not_a_differential_arm_won(
         assert DECLARED_SECTIONS[6] in text
     assert "Nothing is ranked" in empty
     assert "Nothing is ranked" not in ranked
+
+
+def _make_both_hypotheses_pass(bundle_inputs):
+    """Isolate one qualifying candidate per family from the shared measured bundle."""
+    prepared = deepcopy(bundle_inputs)
+    for candidate in prepared["candidates"]:
+        if candidate["signal"] != DEPLOYABLE_SIGNAL:
+            continue
+        candidate["complete"] = False
+        candidate["beats_both_inputs"] = False
+        candidate["confidence_redundant"] = True
+        candidate["responsive_control_bootstrap"]["low"] = -1.0
+        candidate["reference_control_bootstrap"]["low"] = -1.0
+        candidate["twin_bootstrap"]["low"] = -1.0
+
+    for entry in prepared["diagnostics"]:
+        if entry["signal"] != DEPLOYABLE_SIGNAL:
+            continue
+        for severity in range(1, 6):
+            entry["spread"][severity]["stability_to_spread"] = 2.0
+        entry["relationship"]["predictive"] = False
+
+    anchored = next(
+        candidate for candidate in prepared["candidates"]
+        if candidate["arm"] == "decile_00_10__50_60"
+        and candidate["signal"] == DEPLOYABLE_SIGNAL
+        and candidate["aggregation"] == "mean"
+        and candidate["method"] == "raw_gap"
+    )
+    anchored.update({
+        "complete": True,
+        "expected_image_count": FULL_TUNING_IMAGE_COUNT,
+        "image_count": FULL_TUNING_IMAGE_COUNT,
+        "beats_both_inputs": True,
+        "confidence_redundant": False,
+    })
+    anchored["responsive_control_bootstrap"]["low"] = 0.01
+    anchored["reference_control_bootstrap"]["low"] = 0.02
+    anchored["responsive_control_auroc_difference_by_severity"][1] = 0.0
+    anchored_diagnostic = next(
+        entry for entry in prepared["diagnostics"]
+        if entry["arm"] == anchored["arm"]
+        and entry["signal"] == DEPLOYABLE_SIGNAL
+        and entry["aggregation"] == anchored["aggregation"]
+    )
+    for severity in range(1, 6):
+        anchored_diagnostic["spread"][severity]["stability_to_spread"] = 0.5
+
+    differential = next(
+        candidate for candidate in prepared["candidates"]
+        if candidate["arm"] == "decile_90_100__50_60"
+        and candidate["signal"] == DEPLOYABLE_SIGNAL
+        and candidate["aggregation"] == "mean"
+        and candidate["method"] == "raw_gap"
+    )
+    differential.update({
+        "complete": True,
+        "expected_image_count": FULL_TUNING_IMAGE_COUNT,
+        "image_count": FULL_TUNING_IMAGE_COUNT,
+        "beats_both_inputs": True,
+        "confidence_redundant": False,
+    })
+    differential["twin_bootstrap"]["low"] = 0.01
+    differential["auroc_by_severity"][1] = 0.539
+    differential["auroc_by_severity"][2] = 0.571
+    return prepared, anchored, differential
+
+
+def test_summary_and_report_publish_the_two_composite_hypothesis_verdicts(
+    tmp_path, bundle_inputs
+):
+    prepared, anchored, differential = _make_both_hypotheses_pass(bundle_inputs)
+    summary = _summary_for(tmp_path, prepared, figure_spans=WRONG_SPANS)
+
+    verdicts = summary["hypothesis_verdicts"]
+    assert verdicts["anchored"]["supported_on_tuning"] is True
+    assert verdicts["anchored"]["qualifying_candidates"] == [{
+        "arm": anchored["arm"],
+        "aggregation": anchored["aggregation"],
+        "method": anchored["method"],
+    }]
+    assert verdicts["differential"]["carry_to_held_out"] is True
+    assert verdicts["differential"]["qualifying_candidates"] == [{
+        "arm": differential["arm"],
+        "aggregation": differential["aggregation"],
+        "method": differential["method"],
+    }]
+
+    section = render_contrast_report(summary).split(
+        DECLARED_SECTIONS[6], 1
+    )[1].split("\n## ", 1)[0]
+    assert "Anchored verdict: supported on tuning" in section
+    assert "Differential verdict: worth carrying to a held-out test" in section
+    assert "0.538" in section and "0.570" in section
 
 
 def test_the_report_names_a_redundant_candidate_as_adding_nothing(tmp_path, bundle_inputs):
