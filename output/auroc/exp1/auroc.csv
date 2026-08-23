@@ -1,0 +1,5 @@
+ood_dataset,level,score,auroc
+Weather Split of COCO-O,per-detection,uncertainty,0.5096
+Weather Split of COCO-O,per-detection,1-confidence,0.5138
+Weather Split of COCO-O,per-image,uncertainty,0.5075
+Weather Split of COCO-O,per-image,1-confidence,0.5680
