@@ -1,0 +1,16 @@
+description: "Description"
+
+config: "configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_tue_calibration.yml"
+checkpoint: "pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth"
+
+datasets:
+  - dataset:
+      name: "Name of Dataset"
+      imgs: "/home/philip/datasets/ood_coco/cartoon/val2017"
+      anns: "/home/philip/datasets/ood_coco/cartoon/annotations/instances_val2017.json"
+      ood: false
+  - dataset:
+      name: "Name of Dataset"
+      imgs: "/home/philip/datasets/ood_coco/cartoon/val2017"
+      anns: "/home/philip/datasets/ood_coco/cartoon/annotations/instances_val2017.json"
+      ood: false

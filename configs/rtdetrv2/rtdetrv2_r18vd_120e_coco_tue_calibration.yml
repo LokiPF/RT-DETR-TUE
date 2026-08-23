@@ -1,5 +1,5 @@
 __include__: [
-  '../dataset/coco_detection_home.yml',
+  '../dataset/coco_detection.yml',
   '../runtime.yml',
   './include/dataloader.yml',
   './include/optimizer.yml',
@@ -21,7 +21,7 @@ TUERTDETR:
   backbone: PResNet
   encoder: HybridEncoder
   decoder: TUERTDETRTransformerv2
-  frechet_means: output/rtdetrv2_r18vd_120e_coco_tue_majority_t05/frechet_means.pth
+  frechet_means: pretrained_weights/rtdetrv2_r18vd_120e_coco_tue/calibrated_frechet_means.pth
   conformal_distances: output/rtdetrv2_r18vd_120e_coco_tue_majority_t05/conformal_distances.pth
   decoder_layers: null
   tue_confidence_threshold: 0.5
