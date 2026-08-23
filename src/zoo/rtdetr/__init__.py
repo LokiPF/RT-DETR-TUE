@@ -2,17 +2,16 @@
 """
 
 
-from .rtdetr import RTDETR
-from .matcher import HungarianMatcher
 from .hybrid_encoder import HybridEncoder
-from .rtdetr_decoder import RTDETRTransformer
+from .matcher import HungarianMatcher
+from .rtdetr import RTDETR
 from .rtdetr_criterion import RTDETRCriterion
+from .rtdetr_decoder import RTDETRTransformer
 from .rtdetr_postprocessor import RTDETRPostProcessor
+from .rtdetrv2_criterion import RTDETRCriterionv2
 
 # v2
 from .rtdetrv2_decoder import RTDETRTransformerv2
-from .rtdetrv2_criterion import RTDETRCriterionv2
 
 # uncertaity estimation
-from .tue_rtdetrv2_decoder import TUERTDETRTransformerv2
 from .tue_rtdetr import TUERTDETR
