@@ -14,6 +14,8 @@ from .tue_engine import evaluate, collect_persistence_one_epoch
 
 from supervisely.nn.training import train_logger
 
+from .tue_split import load_split, subset_dataloader
+
 
 class TUESolver(BaseSolver):
 
@@ -46,6 +48,18 @@ class TUESolver(BaseSolver):
         start_time = time.time()
 
         data_loader = self.train_dataloader
+
+        split_path = args.yaml_cfg.get("train_calibration_split_path")
+        if split_path is not None:
+            split = load_split(split_path)
+            data_loader = subset_dataloader(
+                self.train_dataloader,
+                split["frechet_indices"],
+            )
+            print(
+                "Fitting Fréchet means on the Fréchet partition "
+                f"({len(split['frechet_indices'])} images from {split_path})."
+            )
 
         # Makes distributed sampling deterministic.
         if hasattr(data_loader, "set_epoch"):

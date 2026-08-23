@@ -4,14 +4,13 @@ import math
 from collections.abc import Iterable
 
 import torch
-import torch.nn as nn
+from torch import nn
 
+from ..misc import MetricLogger, SmoothedValue
 from ..misc.tue_utils import (
     get_captured_persistence_diagrams,
     hook_decoder_layers,
 )
-from ..misc import MetricLogger, SmoothedValue
-
 
 CALIBRATION_POPULATIONS = ("correct", "predicted")
 
