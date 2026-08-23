@@ -12,7 +12,7 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
-csv_path = sys.argv[1] if len(sys.argv) > 1 else "output/auroc/exp1/benchmark.csv"
+csv_path = sys.argv[1] if len(sys.argv) > 1 else "output/auroc/exp4/benchmark.csv"
 out_png = Path(csv_path).with_name("benchmark_plot.png")
 
 # metric label -> (all col, correct col, color, marker)

@@ -12,6 +12,7 @@ model: TUERTDETR # uses default model for frechet mean generation as frechet mea
 TUERTDETR:
   decoder: RTDETRTransformerv2
   frechet_means: output/rtdetrv2_r18vd_120e_coco_tue_frechet_generation/frechet_means.pth
+  tue_topk: 1
 
 output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue_frechet_generation
 
