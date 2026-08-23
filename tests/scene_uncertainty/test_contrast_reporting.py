@@ -636,7 +636,7 @@ def test_every_section_renders_when_nothing_is_deployable(tmp_path, bundle_input
 def test_the_report_reports_control_comparisons_even_with_an_empty_ranking(
     tmp_path, bundle_inputs
 ):
-    """Sections 3 to 5 read every candidate that produced a macro AUROC, not `ranking`.
+    """Sections 3 to 5 read every applicable result, not only `ranking`.
 
     `ranking` names the winner; it is not the set of results. A report whose control
     comparisons vanished on a run where nothing cleared the roster gate would hide exactly the
@@ -645,14 +645,15 @@ def test_the_report_reports_control_comparisons_even_with_an_empty_ranking(
     assert bundle_inputs["ranking"] == []
     text = render_contrast_report(_summary_for(tmp_path, bundle_inputs))
 
-    measured = [
+    measured_contrasts = [
         candidate for candidate in bundle_inputs["candidates"]
         if candidate["signal"] == DEPLOYABLE_SIGNAL
         and candidate.get("macro_auroc") is not None
+        and candidate["method"] != "raw_responsive"
     ]
-    assert measured
+    assert measured_contrasts
     beat_both = text.split(DECLARED_SECTIONS[2], 1)[1].split("\n## ", 1)[0]
-    assert str(len(measured)) in beat_both
+    assert str(len(measured_contrasts)) in beat_both
     severities = text.split(DECLARED_SECTIONS[4], 1)[1].split("\n## ", 1)[0]
     assert "severity 1" in severities and "severity 5" in severities
 
@@ -912,3 +913,123 @@ def test_the_report_is_built_from_the_summary_and_nothing_else(tmp_path, bundle_
 
     assert render_contrast_report(reloaded) == published
     assert render_contrast_report(reloaded) == render_contrast_report(reloaded)
+
+
+def test_anchor_opening_sections_use_anchored_diagnostics_only(tmp_path, bundle_inputs):
+    summary = _summary_for(tmp_path, bundle_inputs, figure_spans=WRONG_SPANS)
+    text = render_contrast_report(summary)
+    anchor = text.split(DECLARED_SECTIONS[0], 1)[1].split("\n## ", 1)[0]
+    relationship = text.split(DECLARED_SECTIONS[1], 1)[1].split("\n## ", 1)[0]
+
+    assert "6 persistence configurations" in anchor
+    assert "6 configurations" in relationship
+    for arm in ARMS:
+        if arm.family == "differential":
+            assert arm.name not in relationship
+
+
+def test_both_inputs_section_does_not_count_the_raw_responsive_control_as_a_contrast(
+    tmp_path, bundle_inputs
+):
+    prepared = deepcopy(bundle_inputs)
+    for candidate in prepared["candidates"]:
+        if candidate["signal"] == DEPLOYABLE_SIGNAL:
+            candidate["macro_auroc"] = 0.6 if candidate["method"] == "raw_responsive" else None
+    summary = _summary_for(tmp_path, prepared, figure_spans=WRONG_SPANS)
+    section = render_contrast_report(summary).split(DECLARED_SECTIONS[2], 1)[1].split("\n## ", 1)[0]
+
+    assert "0 measured contrasts" in section
+    assert "Strongest measured candidate" not in section
+
+
+def test_confidence_section_states_the_twin_result_for_every_measured_candidate(
+    tmp_path, bundle_inputs
+):
+    summary = _summary_for(tmp_path, bundle_inputs, figure_spans=WRONG_SPANS)
+    section = render_contrast_report(summary).split(DECLARED_SECTIONS[3], 1)[1].split("\n## ", 1)[0]
+    reported = [
+        item for item in summary["candidates"]
+        if item["signal"] == DEPLOYABLE_SIGNAL and item["macro_auroc"] is not None
+    ]
+    assert len(reported) > 5
+    for candidate in reported:
+        label = (
+            f"`{candidate['arm']}` / {candidate['aggregation']} / {candidate['method']}"
+        )
+        conclusion = next(line for line in section.splitlines() if label in line)
+        assert "beats its confidence-only twin" in conclusion or "adds nothing" in conclusion
+
+
+def test_bootstrap_section_itemises_all_three_comparisons_for_each_actual_contrast(
+    tmp_path, bundle_inputs
+):
+    prepared = deepcopy(bundle_inputs)
+    target = next(
+        candidate for candidate in prepared["candidates"]
+        if candidate["signal"] == DEPLOYABLE_SIGNAL and candidate["method"] == "raw_gap"
+    )
+    for candidate in prepared["candidates"]:
+        if candidate["signal"] == DEPLOYABLE_SIGNAL and candidate is not target:
+            candidate["macro_auroc"] = None
+    summary = _summary_for(tmp_path, prepared, figure_spans=WRONG_SPANS)
+    section = render_contrast_report(summary).split(DECLARED_SECTIONS[5], 1)[1].split("\n## ", 1)[0]
+    label = f"`{target['arm']}` / {target['aggregation']} / {target['method']}"
+    conclusion = next(line for line in section.splitlines() if label in line)
+
+    for comparison in ("responsive control", "reference control", "confidence twin"):
+        assert comparison in conclusion
+    for field in ("responsive_control_bootstrap", "reference_control_bootstrap", "twin_bootstrap"):
+        assert target[field]["verdict"] in conclusion
+
+
+def test_summary_publishes_the_fixed_analysis_configuration(tmp_path, bundle_inputs):
+    summary = _summary_for(tmp_path, bundle_inputs, figure_spans=WRONG_SPANS)
+    configuration = summary["configuration"]
+
+    assert configuration["expected_image_count"] == 250
+    assert configuration["severities"] == [0, 1, 2, 3, 4, 5]
+    assert configuration["aggregations"] == ["mean", "q90", "top20_mean"]
+    assert configuration["score_methods"] == [
+        "raw_responsive", "raw_gap", "relative_gap", "clean_residual",
+    ]
+    assert configuration["fold_count"] == 5
+    assert configuration["membership_mode"] == "dynamic"
+    assert configuration["padding_mode"] == "filtered"
+    assert configuration["bootstrap"] == summary["bootstrap"]
+
+
+def test_summary_materialises_every_figure_panel_series_and_clean_point(tmp_path, bundle_inputs):
+    summary = _summary_for(tmp_path, bundle_inputs, figure_spans=WRONG_SPANS)
+    figure_data = summary["figure_data"]
+
+    assert set(figure_data) == {"panel_plan", "anchor", "relationship", "contrast", "auroc"}
+    assert len(figure_data["panel_plan"]["anchor"]) == 12
+    assert len(figure_data["panel_plan"]["relationship"]) == 12
+    assert len(figure_data["panel_plan"]["contrast"]) == 4
+    assert len(figure_data["panel_plan"]["auroc"]) == 12
+    assert [panel["method"] for panel in figure_data["panel_plan"]["contrast"]] == [
+        "raw_responsive", "raw_gap", "relative_gap", "clean_residual",
+    ]
+
+    relationship = figure_data["relationship"]
+    assert len(relationship) == 12
+    assert all(len(panel["points"]) == IMAGES for panel in relationship)
+    assert sum(len(panel["points"]) for panel in relationship) == 12 * IMAGES
+    first = relationship[0]
+    assert set(first["points"][0]) == {"image_id", "reference", "responsive"}
+    fit = next(
+        item for item in summary["fits"]
+        if (item["arm"], item["signal"], item["aggregation"])
+        == (first["arm"], DEPLOYABLE_SIGNAL, first["aggregation"])
+    )
+    assert first["final_line"] == fit["final_line"]
+
+    anchor = figure_data["anchor"][0]
+    assert {series["name"] for series in anchor["series"]} == {"reference", "responsive"}
+    raw_gap = next(panel for panel in figure_data["contrast"] if panel["method"] == "raw_gap")
+    assert len(raw_gap["series"]) == 12
+    auroc = figure_data["auroc"][0]
+    assert auroc["chance"] == 0.5 and auroc["limits"] == [0.0, 1.0]
+    assert {series["method"] for series in auroc["series"]} == {
+        "raw_responsive", "raw_gap", "relative_gap", "clean_residual",
+    }

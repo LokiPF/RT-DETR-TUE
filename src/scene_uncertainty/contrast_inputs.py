@@ -57,6 +57,8 @@ REQUIRED_SOURCE_COLUMNS = (
     "image_id", "severity", "signal", "bucket_scheme", "confidence_bin",
     "membership_mode", "padding_mode", "aggregation", "score_scope",
     "source_partition", "score",
+    "selected_count", "clean_overlap", "fully_measured",
+    "signed_spearman", "absolute_spearman", "direction",
 )
 """The source columns selection and validation read; missing one is an unknown schema."""
 
@@ -80,8 +82,8 @@ told apart, which is one more than there should be.
 class ContrastInputError(ValueError):
     """A source bundle this command will not read.
 
-    A `ValueError` so `pipeline.command_analyze_within_image_contrast` turns it into one line
-    on stderr through the same `except ValueError` its siblings use, rather than a traceback
+    A `ValueError` so `contrast_command.command_analyze_within_image_contrast` turns it into one
+    line on stderr through the same `except ValueError` its siblings use, rather than a traceback
     through frames the operator did not write.
     """
 
@@ -186,11 +188,16 @@ def _require_finished_bundle(source: Path) -> None:
 
 def _read_summary(source: Path) -> dict:
     try:
-        return json.loads((source / SUMMARY_FILE).read_text())
+        summary = json.loads((source / SUMMARY_FILE).read_text())
     except json.JSONDecodeError as error:
         raise ContrastInputError(
             f"{SUMMARY_FILE} in {source} is not valid JSON: {error}"
         ) from error
+    if not isinstance(summary, dict):
+        raise ContrastInputError(
+            f"{SUMMARY_FILE} in {source} must contain a JSON object"
+        )
+    return summary
 
 
 def load_contrast_inputs(
@@ -227,13 +234,24 @@ def load_contrast_inputs(
     source = Path(source_value)
     _require_finished_bundle(source)
     summary = _read_summary(source)
-    run = summary.get("run", {})
+    run = summary.get("run")
+    if not isinstance(run, dict):
+        raise ContrastInputError(f"{SUMMARY_FILE} run must be an object")
     if run.get("source_partition") != SOURCE_PARTITION:
         raise ContrastInputError(
             f"within-image contrast reads the tuning partition only; {source} reports "
             f"source_partition={run.get('source_partition')!r}"
         )
-    validation = summary.get("validation", {})
+    reported_severities = run.get("severities")
+    if (not isinstance(reported_severities, list)
+            or any(type(value) is not int for value in reported_severities)):
+        raise ContrastInputError(
+            f"{SUMMARY_FILE} run.severities must be an array of integers"
+        )
+
+    validation = summary.get("validation")
+    if not isinstance(validation, dict):
+        raise ContrastInputError(f"{SUMMARY_FILE} validation must be an object")
     reported_row_count = validation.get("per_scene_row_count")
     if type(reported_row_count) is not int or reported_row_count < 0:
         raise ContrastInputError(
@@ -257,6 +275,13 @@ def load_contrast_inputs(
             )
         for index, row in enumerate(reader):
             source_row_count += 1
+            missing_values = [
+                name for name in REQUIRED_SOURCE_COLUMNS if row.get(name) is None
+            ]
+            if missing_values:
+                raise ContrastInputError(
+                    f"{PER_SCENE_FILE} row {index} has a missing value in {missing_values}"
+                )
             if row["source_partition"] != SOURCE_PARTITION:
                 raise ContrastInputError(
                     f"{PER_SCENE_FILE} row {index} is outside the tuning partition: "
@@ -276,7 +301,12 @@ def load_contrast_inputs(
                 continue
             if row["aggregation"] not in AGGREGATIONS:
                 continue
-            score = float(row["score"])
+            try:
+                score = float(row["score"])
+            except (TypeError, ValueError) as error:
+                raise ContrastInputError(
+                    f"{PER_SCENE_FILE} row {index} has an invalid score: {row['score']!r}"
+                ) from error
             if not math.isfinite(score):
                 raise ContrastInputError(
                     f"{PER_SCENE_FILE} row {index} has a non-finite score: {row['score']!r}"
@@ -286,10 +316,16 @@ def load_contrast_inputs(
                     f"{PER_SCENE_FILE} row {index} has a negative {row['signal']} score at "
                     f"scope {row['score_scope']}: {score}; only {COMBINED_SCOPE} is signed"
                 )
-            key = (
-                int(row["image_id"]), int(row["severity"]), row["signal"],
-                row["confidence_bin"], row["aggregation"], row["score_scope"],
-            )
+            try:
+                image_id = int(row["image_id"])
+                severity = int(row["severity"])
+            except (TypeError, ValueError) as error:
+                raise ContrastInputError(
+                    f"{PER_SCENE_FILE} row {index} has invalid image_id={row['image_id']!r} "
+                    f"or severity={row['severity']!r}"
+                ) from error
+            key = (image_id, severity, row["signal"], row["confidence_bin"],
+                   row["aggregation"], row["score_scope"])
             if key in scores:
                 raise ContrastInputError(f"duplicate source row key: {key}")
             scores[key] = score
@@ -317,7 +353,7 @@ def load_contrast_inputs(
             f"{SUMMARY_FILE} reports image_count={run.get('image_count')} but {PER_SCENE_FILE} "
             f"contains {len(image_ids)} images"
         )
-    if tuple(run.get("severities", ())) != EXPECTED_SEVERITIES:
+    if tuple(reported_severities) != EXPECTED_SEVERITIES:
         raise ContrastInputError(
             f"within-image contrast needs severities {list(EXPECTED_SEVERITIES)}; "
             f"{source} reports {run.get('severities')}"

@@ -42,18 +42,6 @@ from src.zoo.rtdetr.matcher import HungarianMatcher
 
 from .artifacts import ShardWriter, assert_compatible, iter_records, load_manifest, manifest_id
 from .bank import deterministic_reservoir, streaming_coverage_bank
-from .contrast_analysis import (
-    build_anchor_diagnostics,
-    build_contrast_rows,
-    summarize_contrast_candidates,
-)
-from .contrast_controls import (
-    attach_controls,
-    rank_contrast_candidates,
-    reference_control_rows,
-)
-from .contrast_inputs import load_contrast_inputs
-from .contrast_reporting import write_contrast_report
 from .corruption_analysis import analyze_corruption_sensitivity, load_corruption_inputs
 from .corruption_reporting import write_corruption_report
 from .dataset import make_coco_loader
@@ -844,73 +832,6 @@ def command_analyze_corruption_sensitivity(args) -> None:
     )
 
 
-def command_analyze_within_image_contrast(args) -> None:
-    """The corruption-sensitivity bundle read back as within-image contrasts.
-
-    Nine calls and a line on stderr, and it reads one directory. Everything this command
-    publishes was computed by `analyze-corruption-sensitivity` and saved; the arithmetic here is
-    a re-description of that bundle's `per_scene.csv`, which is why it runs no detector, builds
-    no bank and searches no bank. `test_contrast_integration` replaces all twenty-three
-    expensive entry points with charges that raise and requires the command to finish, so that
-    claim is checked rather than written down.
-
-    **No existence pre-check on `--source`.** It arrives as a `Path` from the parser and goes
-    straight into `load_contrast_inputs`, which refuses an absent directory, a bundle missing
-    either of its two files, a partition that is not tuning, a roster that is not the 250-image
-    tuning set, a series the four arms need and the bundle does not carry, and a disagreement
-    between the two files -- naming the path or the missing thing each time. A second copy of
-    those checks here would be a second place for the rules to drift.
-
-    **No finished-report guard either.** `write_contrast_report` refuses an `--output` that
-    already exists before it computes anything, and publishes by renaming a staging directory
-    into place, so there is no half-published state for a marker file to tell apart from a
-    finished one. `FileExistsError` is one of the three exceptions `cli.main` turns into a
-    single line.
-
-    **`except ValueError`, for the reason the sibling above gives.** `ContrastInputError` and
-    `ContrastAnalysisError` are both `ValueError` and neither is a `PipelineError`, and so are
-    the plain `ValueError`s `contrast_scores` raises for a negative or non-finite distance.
-    Catching `ValueError` is what turns all of them into the one line `cli.main` prints instead
-    of twenty frames of traceback.
-
-    What that deliberately does not swallow: `FileExistsError` is an `OSError`, so the rerun
-    refusal passes through to the handler in `cli.main` that already knows it, and
-    `write_contrast_report`'s file-set check raises `RuntimeError`, which also passes through --
-    a bundle that staged the wrong files is a bug in this package, not an operator's mistake,
-    and it should look like one.
-
-    `expected_image_count` is taken from the loader's own provenance rather than from the
-    constant, because the loader has already refused every roster but the declared one. Reading
-    the constant here would be a second statement of the same rule, and the two could disagree
-    only by one of them being wrong.
-
-    **No `_report` line, unlike every sibling in this module.** Those commands run for minutes
-    to hours and a line on stderr is how an operator knows which stage they are in; this one
-    reads a CSV and returns, and its counts are all in the `summary.json` it just wrote. A
-    successful run is silent, which is what lets a caller treat any stderr output from it as a
-    problem -- `test_contrast_integration` asserts exactly that.
-    """
-    try:
-        inputs = load_contrast_inputs(args.source)
-        image_count = inputs.provenance["image_count"]
-        rows, fits = build_contrast_rows(inputs)
-        diagnostics = build_anchor_diagnostics(inputs)
-        candidates = summarize_contrast_candidates(
-            rows, expected_image_count=image_count
-        )
-        controls = summarize_contrast_candidates(
-            reference_control_rows(rows), expected_image_count=image_count
-        )
-        attach_controls(candidates, controls, rows)
-        ranking = rank_contrast_candidates(candidates)
-        write_contrast_report(
-            args.output, inputs=inputs, rows=rows, fits=fits, diagnostics=diagnostics,
-            candidates=candidates, controls=controls, ranking=ranking,
-        )
-    except ValueError as error:
-        raise PipelineError(f"Cannot analyze within-image contrast: {error}") from error
-
-
 COMMANDS = {
     "select": command_select,
     "extract-reference": command_extract_reference,
@@ -920,5 +841,4 @@ COMMANDS = {
     "report": command_report,
     "analyze-confidence-deciles": command_analyze_confidence_deciles,
     "analyze-corruption-sensitivity": command_analyze_corruption_sensitivity,
-    "analyze-within-image-contrast": command_analyze_within_image_contrast,
 }

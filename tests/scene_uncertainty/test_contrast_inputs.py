@@ -899,3 +899,68 @@ def test_refuses_an_unfinished_source(tmp_path, missing):
     (source / missing).unlink()
     with pytest.raises(ContrastInputError, match=f"{missing} missing from"):
         load_contrast_inputs(source, expected_image_count=6)
+
+
+def test_refuses_a_source_missing_a_producer_column_the_contrast_does_not_read(tmp_path):
+    source = write_source_bundle(tmp_path / "source")
+    rows = read_rows(source)
+    for row in rows:
+        row.pop("selected_count")
+    with (source / "per_scene.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with pytest.raises(ContrastInputError, match=r"schema.*selected_count"):
+        load_contrast_inputs(source, expected_image_count=6)
+
+
+def test_refuses_valid_json_whose_top_level_shape_is_not_an_object(tmp_path):
+    source = write_source_bundle(tmp_path / "source")
+    (source / "summary.json").write_text("[]\n")
+
+    with pytest.raises(ContrastInputError, match=r"summary.json.*object"):
+        load_contrast_inputs(source, expected_image_count=6)
+
+
+def test_refuses_a_summary_whose_run_record_is_not_an_object(tmp_path):
+    source = write_source_bundle(tmp_path / "source")
+    summary = json.loads((source / "summary.json").read_text())
+    summary["run"] = []
+    (source / "summary.json").write_text(json.dumps(summary))
+
+    with pytest.raises(ContrastInputError, match=r"run.*object"):
+        load_contrast_inputs(source, expected_image_count=6)
+
+
+def test_refuses_a_summary_whose_severities_are_not_an_array(tmp_path):
+    source = write_source_bundle(tmp_path / "source")
+    summary = json.loads((source / "summary.json").read_text())
+    summary["run"]["severities"] = 5
+    (source / "summary.json").write_text(json.dumps(summary))
+
+    with pytest.raises(ContrastInputError, match=r"run\.severities.*array"):
+        load_contrast_inputs(source, expected_image_count=6)
+
+
+def test_refuses_a_truncated_csv_row_even_when_every_consumed_cell_is_present(tmp_path):
+    source = write_source_bundle(tmp_path / "source")
+    lines = (source / "per_scene.csv").read_text().splitlines()
+    lines[1] = ",".join(lines[1].split(",")[:11])
+    (source / "per_scene.csv").write_text("\n".join(lines) + "\n")
+
+    with pytest.raises(ContrastInputError, match=r"row 0.*missing value"):
+        load_contrast_inputs(source, expected_image_count=6)
+
+
+def test_refuses_a_nonnumeric_image_id_as_a_clean_input_error(tmp_path):
+    source = write_source_bundle(tmp_path / "source")
+    rows = read_rows(source)
+    rows[0]["image_id"] = "not-an-integer"
+    with (source / "per_scene.csv").open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+
+    with pytest.raises(ContrastInputError, match=r"row 0.*image_id"):
+        load_contrast_inputs(source, expected_image_count=6)

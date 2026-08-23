@@ -58,8 +58,8 @@ a value that would come out odd -- it is the arm table agreeing with the maths i
 class ContrastAnalysisError(ValueError):
     """A source that loaded cleanly but cannot be turned into the declared candidates.
 
-    A `ValueError` so `pipeline.command_analyze_within_image_contrast` turns it into one line on
-    stderr through the same `except ValueError` its siblings use, matching `ContrastInputError`.
+    A `ValueError` so `contrast_command.command_analyze_within_image_contrast` turns it into one
+    line on stderr through the same `except ValueError` its siblings use.
     """
 
 
@@ -82,6 +82,8 @@ CONTRAST_ROW_FIELDS = (
     "arm_family", "declared_before_data", "score_scope",
     "reference_bin", "responsive_bin", "reference", "responsive", "score",
     "fold", "fit_slope", "fit_offset",
+    "fully_measured", "signed_spearman", "absolute_spearman", "direction",
+    "adjacent_consistency", "max_blur_above_clean",
 )
 """Every column a contrast row carries, key first, in the order a CSV should publish them.
 
@@ -520,6 +522,7 @@ def summarize_contrast_candidates(
     the surviving half's agreement as unanimity.
     """
     index: dict[tuple, dict] = {}
+    row_index: dict[tuple, dict] = {}
     provenance: dict[tuple, dict] = {}
     seen: set[tuple] = set()
     for position, row in enumerate(rows):
@@ -534,6 +537,9 @@ def summarize_contrast_candidates(
         index.setdefault(candidate_key, {}).setdefault(row["image_id"], {})[
             row["severity"]
         ] = row["score"]
+        row_index.setdefault(candidate_key, {}).setdefault(row["image_id"], {})[
+            row["severity"]
+        ] = row
         carried = {field: row[field] for field in _CANDIDATE_PROVENANCE}
         established = provenance.setdefault(candidate_key, carried)
         if established != carried:
@@ -566,14 +572,15 @@ def summarize_contrast_candidates(
         measured = sum(1 for trend in trends.values() if trend["fully_measured"])
         complete = measured == len(by_image) == expected_image_count
 
-        oriented = [
-            oriented_curve_metrics(
+        oriented_by_image = {
+            image_id: oriented_curve_metrics(
                 [by_image[image_id][severity] for severity in sorted(by_image[image_id])],
                 orientation,
             )
             for image_id in image_ids
             if orientation in (-1, 1) and trends[image_id]["fully_measured"]
-        ]
+        }
+        oriented = list(oriented_by_image.values())
 
         auroc_by_severity = macro = None
         if orientation in (-1, 1) and complete:
@@ -633,5 +640,14 @@ def summarize_contrast_candidates(
             candidate["negative_fraction"],
             candidate["flat_fraction"],
         )
+        for image_id in image_ids:
+            oriented_trend = oriented_by_image.get(image_id, {
+                "adjacent_consistency": None,
+                "max_blur_above_clean": None,
+            })
+            annotation = {**trends[image_id], **oriented_trend}
+            for source_row in row_index[candidate_key][image_id].values():
+                source_row.update(annotation)
+
         candidates.append(candidate)
     return candidates

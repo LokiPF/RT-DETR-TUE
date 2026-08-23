@@ -160,8 +160,11 @@ def test_the_row_key_and_columns_are_what_a_published_table_needs(tmp_path):
         "arm_family", "declared_before_data", "score_scope",
         "reference_bin", "responsive_bin", "reference", "responsive", "score",
         "fold", "fit_slope", "fit_offset",
+        "fully_measured", "signed_spearman", "absolute_spearman", "direction",
+        "adjacent_consistency", "max_blur_above_clean",
     )
     rows, _ = build_contrast_rows(loaded(tmp_path))
+    summarize_contrast_candidates(rows, expected_image_count=IMAGES)
     assert all(tuple(row) == CONTRAST_ROW_FIELDS for row in rows)
 
 
@@ -853,6 +856,20 @@ def candidate_rows(curves, *, arm="decile_00_10__50_60", signal="persistence",
 
 def test_candidate_key_is_arm_signal_aggregation_method():
     assert CONTRAST_CANDIDATE_KEY == ("arm", "signal", "aggregation", "method")
+
+
+def test_summarising_repeats_each_images_trend_audit_fields_on_its_rows():
+    falling = [5.0, 4.0, 3.0, 2.0, 1.0, 0.0]
+    rows = candidate_rows({1: falling, 2: falling})
+    summarize_contrast_candidates(rows, expected_image_count=2)
+
+    for row in rows:
+        assert row["fully_measured"] is True
+        assert row["signed_spearman"] == pytest.approx(-1.0)
+        assert row["absolute_spearman"] == pytest.approx(1.0)
+        assert row["direction"] == "decreasing"
+        assert row["adjacent_consistency"] == pytest.approx(1.0)
+        assert row["max_blur_above_clean"] is True
 
 
 def test_every_declared_candidate_appears(tmp_path):

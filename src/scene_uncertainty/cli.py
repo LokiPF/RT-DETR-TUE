@@ -344,11 +344,24 @@ def main(argv=None) -> int:
     like one.
     """
     args = build_parser().parse_args(argv)
-    from .pipeline import COMMANDS, PipelineError
+
+    if args.command == "analyze-within-image-contrast":
+        from .contrast_command import (
+            ContrastCommandError,
+            command_analyze_within_image_contrast,
+        )
+
+        command = command_analyze_within_image_contrast
+        operator_errors = (ContrastCommandError, FileExistsError, FileNotFoundError)
+    else:
+        from .pipeline import COMMANDS, PipelineError
+
+        command = COMMANDS[args.command]
+        operator_errors = (PipelineError, FileExistsError, FileNotFoundError)
 
     try:
-        COMMANDS[args.command](args)
-    except (PipelineError, FileExistsError, FileNotFoundError) as error:
+        command(args)
+    except operator_errors as error:
         print(f"scene_uncertainty {args.command}: error: {error}", file=sys.stderr)
         return 2
     return 0

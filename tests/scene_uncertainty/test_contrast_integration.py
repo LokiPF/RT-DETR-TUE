@@ -11,6 +11,8 @@ that raise, and the command is required to complete without touching any of them
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -107,6 +109,61 @@ def test_no_model_bank_or_knn_entry_point_is_reachable(tmp_path: Path, monkeypat
 
     assert _run(_full_source(tmp_path), output) == 0
     assert sorted(path.name for path in output.iterdir()) == list(CONTRAST_REPORT_FILES)
+
+
+def test_the_reporting_only_command_does_not_import_the_inference_stack(tmp_path: Path):
+    """A fresh process blocks imports, not only calls on modules already imported by pytest."""
+    source = tmp_path / "absent"
+    output = tmp_path / "contrast"
+    script = f"""
+import importlib.abc
+import sys
+
+blocked = (
+    "torch",
+    "src.zoo",
+    "scene_uncertainty.artifacts",
+    "scene_uncertainty.bank",
+    "scene_uncertainty.dataset",
+    "scene_uncertainty.evaluate",
+    "scene_uncertainty.extractor",
+    "scene_uncertainty.knn",
+    "scene_uncertainty.runtime",
+)
+
+class BlockInferenceImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if any(fullname == name or fullname.startswith(name + ".") for name in blocked):
+            raise RuntimeError("forbidden inference import: " + fullname)
+        return None
+
+sys.meta_path.insert(0, BlockInferenceImports())
+import runpy
+sys.argv = [
+    "tools/scene_uncertainty.py",
+    "analyze-within-image-contrast",
+    "--source", {str(source)!r},
+    "--output", {str(output)!r},
+]
+try:
+    runpy.run_path("tools/scene_uncertainty.py", run_name="__main__")
+except SystemExit as error:
+    status = error.code
+else:
+    status = 0
+raise SystemExit(0 if status == 2 else status or 7)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).parents[2],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "forbidden inference import" not in completed.stderr
+    assert not output.exists()
 
 
 def test_the_detonation_covers_every_site_the_sibling_command_guards(tmp_path: Path):
@@ -234,12 +291,12 @@ def test_any_value_error_from_the_analysis_becomes_one_line_and_not_a_traceback(
     one line and exit 2. Patching one step to raise a bare `ValueError` is the honest way to
     ask that, and it is what the narrower clause fails.
     """
-    import src.scene_uncertainty.pipeline as pipeline
+    import src.scene_uncertainty.contrast_command as contrast_command
 
     def explode(*args, **kwargs):
         raise ValueError("a plain value error from inside the analysis")
 
-    monkeypatch.setattr(pipeline, "build_contrast_rows", explode)
+    monkeypatch.setattr(contrast_command, "build_contrast_rows", explode)
     output = tmp_path / "contrast"
 
     assert _run(_full_source(tmp_path), output) == 2

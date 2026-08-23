@@ -54,9 +54,23 @@ from .contrast_analysis import (
     DEPLOYABLE_SIGNAL,
     RESIDUAL_METHOD,
 )
-from .contrast_controls import BOOTSTRAP_PERCENTILES, CORRUPTED_SEVERITIES
-from .contrast_inputs import ARMS, EXPECTED_SEVERITIES, FULL_TUNING_IMAGE_COUNT
-from .contrast_plots import PLOT_FILENAMES, write_contrast_plots
+from .contrast_controls import (
+    BOOTSTRAP_PERCENTILES,
+    CORRUPTED_SEVERITIES,
+    RESPONSIVE_CONTROL_METHOD,
+    REFERENCE_CONTROL_METHOD,
+)
+from .contrast_inputs import (
+    AGGREGATIONS,
+    ARMS,
+    EXPECTED_SEVERITIES,
+    FULL_TUNING_IMAGE_COUNT,
+)
+from .contrast_plots import (
+    AUROC_LIMITS, CHANCE, PLOT_FILENAMES, panel_plan, write_contrast_plots,
+)
+from .contrast_scores import FOLD_COUNT, SCORE_METHODS
+
 
 DIFFERENTIAL_MILD_BLUR_BARS = {1: 0.538, 2: 0.570}
 """Outside maxima from the completed deployment sweep, not values selected by this run."""
@@ -429,6 +443,132 @@ def _hypothesis_verdicts(diagnostics: list[dict], candidates: list[dict]) -> dic
     }
 
 
+def _figure_data(*, candidates: list[dict], controls: list[dict], rows: list[dict], fits: dict) -> dict:
+    """Materialise the panel selections and values from which all four figures are drawn."""
+    indexed = {
+        (item["arm"], item["signal"], item["aggregation"], item["method"]): item
+        for item in candidates
+    }
+    references = {
+        (item["arm"], item["signal"], item["aggregation"], item["method"]): item
+        for item in controls
+    }
+    planned = panel_plan(candidates)
+    serialised_plan = {
+        "anchor": [
+            {"arm": arm, "aggregation": aggregation}
+            for arm, aggregation in planned["anchor"]
+        ],
+        "relationship": [
+            {"arm": arm, "aggregation": aggregation}
+            for arm, aggregation in planned["relationship"]
+        ],
+        "contrast": [{"method": method} for (method,) in planned["contrast"]],
+        "auroc": [
+            {"arm": arm, "aggregation": aggregation}
+            for arm, aggregation in planned["auroc"]
+        ],
+    }
+
+    anchor = []
+    for arm_name, aggregation in planned["anchor"]:
+        series = []
+        for name, item in (
+            ("reference", references.get((
+                arm_name, DEPLOYABLE_SIGNAL, aggregation, REFERENCE_CONTROL_METHOD
+            ))),
+            ("responsive", indexed.get((
+                arm_name, DEPLOYABLE_SIGNAL, aggregation, RESPONSIVE_CONTROL_METHOD
+            ))),
+        ):
+            if item is not None:
+                series.append({
+                    "name": name,
+                    "severity_statistics": item["severity_statistics"],
+                })
+        anchor.append({"arm": arm_name, "aggregation": aggregation, "series": series})
+
+    clean: dict[tuple[str, str], dict[int, dict]] = {}
+    for row in rows:
+        if (
+            row["severity"] == EXPECTED_SEVERITIES[0]
+            and row["signal"] == DEPLOYABLE_SIGNAL
+            and row["method"] == RESPONSIVE_CONTROL_METHOD
+        ):
+            clean.setdefault((row["arm"], row["aggregation"]), {})[row["image_id"]] = {
+                "image_id": row["image_id"],
+                "reference": row["reference"],
+                "responsive": row["responsive"],
+            }
+    relationship = []
+    for arm_name, aggregation in planned["relationship"]:
+        points = [
+            point for _, point in sorted(clean.get((arm_name, aggregation), {}).items())
+        ]
+        fit = fits.get((arm_name, DEPLOYABLE_SIGNAL, aggregation))
+        final_line = None if fit is None else fit["final_line"]
+        line_points = []
+        if points and final_line is not None:
+            slope, offset = final_line
+            edges = (
+                min(point["reference"] for point in points),
+                max(point["reference"] for point in points),
+            )
+            line_points = [
+                {"reference": edge, "responsive": offset + slope * edge}
+                for edge in edges
+            ]
+        relationship.append({
+            "arm": arm_name,
+            "aggregation": aggregation,
+            "points": points,
+            "final_line": final_line,
+            "line_points": line_points,
+        })
+
+    contrast = []
+    for (method,) in planned["contrast"]:
+        series = []
+        for arm in ARMS:
+            for aggregation in AGGREGATIONS:
+                candidate = indexed.get((
+                    arm.name, DEPLOYABLE_SIGNAL, aggregation, method
+                ))
+                if candidate is not None:
+                    series.append({
+                        "arm": arm.name,
+                        "aggregation": aggregation,
+                        "severity_statistics": candidate["severity_statistics"],
+                    })
+        contrast.append({"method": method, "series": series})
+
+    auroc = []
+    for arm_name, aggregation in planned["auroc"]:
+        series = []
+        for method in SCORE_METHODS:
+            candidate = indexed.get((arm_name, DEPLOYABLE_SIGNAL, aggregation, method))
+            if candidate is not None:
+                series.append({
+                    "method": method,
+                    "candidate": candidate["auroc_by_severity"],
+                    "confidence_twin": candidate.get("twin_auroc_by_severity"),
+                })
+        auroc.append({
+            "arm": arm_name,
+            "aggregation": aggregation,
+            "chance": CHANCE,
+            "limits": list(AUROC_LIMITS),
+            "series": series,
+        })
+    return {
+        "panel_plan": serialised_plan,
+        "anchor": anchor,
+        "relationship": relationship,
+        "contrast": contrast,
+        "auroc": auroc,
+    }
+
+
 def build_contrast_summary(
     *,
     inputs,
@@ -452,8 +592,21 @@ def build_contrast_summary(
     winners whole would give each of them a second copy in the same file, and two copies of one
     candidate can disagree after any later edit to either.
     """
+    bootstrap = _bootstrap_settings(candidates)
     return {
         "provenance": dict(inputs.provenance),
+        "configuration": {
+            "expected_image_count": FULL_TUNING_IMAGE_COUNT,
+            "severities": list(EXPECTED_SEVERITIES),
+            "corrupted_severities": list(CORRUPTED_SEVERITIES),
+            "aggregations": list(AGGREGATIONS),
+            "score_methods": list(SCORE_METHODS),
+            "fold_count": FOLD_COUNT,
+            "membership_mode": inputs.provenance["membership_mode"],
+            "padding_mode": inputs.provenance["padding_mode"],
+            "differential_mild_blur_bars": dict(DIFFERENTIAL_MILD_BLUR_BARS),
+            "bootstrap": bootstrap,
+        },
         "arms": [
             {
                 "name": arm.name,
@@ -486,6 +639,9 @@ def build_contrast_summary(
             for candidate in ranking
         ],
         "figure_spans": figure_spans,
+        "figure_data": _figure_data(
+            candidates=candidates, controls=controls, rows=rows, fits=fits
+        ),
         "row_counts": {
             "per_scene_contrasts": len(rows),
             "anchor_diagnostics": len(diagnostics),
@@ -493,7 +649,7 @@ def build_contrast_summary(
             "reference_controls": len(controls),
             "ranked": len(ranking),
         },
-        "bootstrap": _bootstrap_settings(candidates),
+        "bootstrap": bootstrap,
     }
 
 
@@ -525,6 +681,14 @@ def _reported(summary: dict) -> list[dict]:
         candidate for candidate in summary["candidates"]
         if candidate["signal"] == DEPLOYABLE_SIGNAL
         and candidate.get("macro_auroc") is not None
+    ]
+
+
+def _reported_contrasts(summary: dict) -> list[dict]:
+    """Measured derived scores only; the unchanged responsive range is their control."""
+    return [
+        candidate for candidate in _reported(summary)
+        if candidate["method"] != RESPONSIVE_CONTROL_METHOD
     ]
 
 
@@ -563,6 +727,7 @@ def _anchor_section(summary: dict) -> list[str]:
     entries = [
         entry for entry in summary["anchor_diagnostics"]
         if entry["signal"] == DEPLOYABLE_SIGNAL
+        and entry["arm_family"] == "anchored"
     ]
     ratios = [
         (_at(entry["spread"], severity) or {}).get("stability_to_spread")
@@ -606,6 +771,7 @@ def _relationship_section(summary: dict) -> list[str]:
     entries = [
         entry for entry in summary["anchor_diagnostics"]
         if entry["signal"] == DEPLOYABLE_SIGNAL
+        and entry["arm_family"] == "anchored"
     ]
     predictive = [entry for entry in entries if entry["relationship"]["predictive"]]
     lines = [
@@ -637,8 +803,8 @@ def _relationship_section(summary: dict) -> list[str]:
 
 def _beats_both_section(summary: dict) -> list[str]:
     """Section 3. Is the contrast worth more than either of the two ranges it is built from?"""
-    reported = _reported(summary)
-    winners = [item for item in reported if item.get("beats_both_inputs")]
+    contrasts = _reported_contrasts(summary)
+    winners = [item for item in contrasts if item.get("beats_both_inputs")]
     lines = [
         SECTION_TITLES[2],
         "",
@@ -647,20 +813,20 @@ def _beats_both_section(summary: dict) -> list[str]:
         "two controls, scored on the same images, at the same blur levels, in each control's "
         "own direction.",
         "",
-        f"{len(winners)} of {_count(len(reported), 'measured candidate')} beat both of their "
+        f"{len(winners)} of {_count(len(contrasts), 'measured contrast')} beat both of their "
         "inputs.",
         "",
     ]
-    best = _best(reported)
+    best = _best(contrasts)
     if best is None:
         lines += [
-            "No candidate produced a macro AUROC, so there is nothing to compare against "
-            "either control.",
+            "No contrast produced a macro AUROC, so there is nothing to compare against either "
+            "control.",
             "",
         ]
         return lines
     lines += [
-        f"Strongest measured candidate: {_name(best)}, macro AUROC "
+        f"Strongest measured contrast: {_name(best)}, macro AUROC "
         f"{_plain(best['macro_auroc'])}.",
         f"Against its responsive range: "
         f"{_signed(best.get('responsive_control_macro_difference'))}. "
@@ -686,28 +852,19 @@ def _twin_section(summary: dict) -> list[str]:
         f"{len(redundant)} of {_count(len(reported), 'measured candidate')} fail this control.",
         "",
     ]
-    if redundant:
-        lines += [
-            "Failing this control means the candidate adds nothing over the detector's own "
-            "confidence. Named plainly because it is the finding most easily mistaken for a "
-            "success: the AUROC can be high and the contrast still be redundant.",
-            "",
-        ]
-        for candidate in redundant[:5]:
-            lines.append(
-                f"- {_name(candidate)}: macro {_plain(candidate['macro_auroc'])} against its "
-                f"twin's {_plain(candidate.get('twin_macro_auroc'))}."
+    for candidate in reported:
+        if candidate.get("confidence_redundant"):
+            conclusion = (
+                "does not beat its confidence-only twin and adds nothing over the detector's "
+                "own confidence"
             )
-        if len(redundant) > 5:
-            lines.append(f"- and {_count(len(redundant) - 5, 'other')}.")
-        lines.append("")
-    else:
-        lines += [
-            "Every measured candidate is ahead of its confidence-only twin by more than the "
-            "twin's own measurement, so none of them is the detector's confidence in "
-            "disguise.",
-            "",
-        ]
+        else:
+            conclusion = "beats its confidence-only twin"
+        lines.append(
+            f"- {_name(candidate)}: {conclusion}; macro {_plain(candidate['macro_auroc'])} "
+            f"against the twin's {_plain(candidate.get('twin_macro_auroc'))}."
+        )
+    lines.append("")
     return lines
 
 
@@ -751,13 +908,8 @@ def _severity_section(summary: dict) -> list[str]:
 
 def _bootstrap_section(summary: dict) -> list[str]:
     """Section 6. How much of the gap survives resampling the images?"""
-    reported = _reported(summary)
+    reported = _reported_contrasts(summary)
     settings = summary["bootstrap"]
-    verdicts: dict[str, int] = {}
-    for candidate in reported:
-        entry = candidate.get("responsive_control_bootstrap")
-        if entry is not None:
-            verdicts[entry["verdict"]] = verdicts.get(entry["verdict"], 0) + 1
     lines = [
         SECTION_TITLES[5],
         "",
@@ -769,11 +921,29 @@ def _bootstrap_section(summary: dict) -> list[str]:
         f"interval {settings['percentiles'][0]} to {settings['percentiles'][1]} per cent.",
         "",
     ]
-    if not verdicts:
+    if not reported:
         lines += ["No comparison was resampled, so there is no interval to report.", ""]
         return lines
-    for verdict, count in sorted(verdicts.items()):
-        lines.append(f"- {verdict}: {_count(count, 'candidate')}.")
+    comparisons = (
+        ("responsive control", "responsive_control_bootstrap"),
+        ("reference control", "reference_control_bootstrap"),
+        ("confidence twin", "twin_bootstrap"),
+    )
+    for candidate in reported:
+        parts = []
+        for label, field in comparisons:
+            entry = candidate.get(field)
+            if entry is None:
+                value = "not measured"
+            else:
+                value = (
+                    f"{entry['verdict']} [{_signed(entry['low'])}, "
+                    f"{_signed(entry['high'])}]"
+                )
+            parts.append(f"{label}: {value}")
+        lines.append(
+            f"- {_name(candidate)}: " + "; ".join(parts) + "."
+        )
     lines += [
         "",
         "Neither label is a held-out claim. The arms, the score methods and the scene "
