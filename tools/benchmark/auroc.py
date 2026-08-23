@@ -107,7 +107,7 @@ def batch_eval(model, post_processor, items, gt):
         r = res[b]
         keep = r["scores"] >= CONF_TH
         for (x0, y0, x1, y1), label, s in zip(r["boxes"][keep].cpu().tolist(),
-                                            r["labelels"][keep].cpu().tolist(),
+                                            r["labels"][keep].cpu().tolist(),
                                             r["scores"][keep].cpu().tolist()):
             dets.append({"image_id": img_id, "category_id": int(label),
                          "bbox": [x0, y0, x1 - x0, y1 - y0], "score": float(s)})
