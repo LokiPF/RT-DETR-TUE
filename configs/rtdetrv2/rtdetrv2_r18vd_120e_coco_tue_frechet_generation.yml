@@ -1,5 +1,5 @@
 __include__: [
-  '../dataset/coco_detection_home.yml',
+  '../dataset/coco_detection.yml',
   '../runtime.yml',
   './include/dataloader.yml',
   './include/optimizer.yml',
@@ -7,19 +7,17 @@ __include__: [
 ]
 
 task: tu_estimation
-model: TUERTDETR
+model: RTDETR # uses default model for frechet mean generation as frechet means are not known yet 
 
-# tu_estimation (TUESolver.fit) collects persistence diagrams to build
-# frechet_means.pth in the first place, so it must run the plain RTDETR
-# model here -- TUERTDETR requires an already-built frechet_means.pth to
-# even construct, which does not exist yet at this stage. Point a
-# separate config at TUERTDETR (see include/rtdetrv2_r50vd.yml) once
-# frechet_means.pth has been produced by this run.
 RTDETR:
   decoder: TUERTDETRTransformerv2
 
-output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue
+output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue_frechet_generation
 
+train_calibration_split_path: /home/philip/datasets/coco/annotations/instances_train_calibration_split.json
+
+persistence_confidence_threshold: 0.5
+persistence_decoder_layers: null
 
 PResNet:
   depth: 18
@@ -58,14 +56,18 @@ optimizer:
       weight_decay: 0.
 
 
-train_dataloader: 
-  dataset: 
+train_dataloader:
+  dataset:
     transforms:
+      ops:
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: float32, scale: True}
+        - {type: ConvertBoxes, fmt: cxcywh, normalize: True}
       policy:
-        epoch: 117
+        name: default
   collate_fn:
-    scales: ~
+    scales: null
   total_batch_size: 16
-
 val_dataloader:
-  total_batch_size: 64
+  total_batch_size: 16
