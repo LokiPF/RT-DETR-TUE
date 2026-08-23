@@ -1,4 +1,32 @@
 ood_dataset,level,score,auroc
+Cartoon Split of COCO-O,per-detection,uncertainty,0.4875
+Cartoon Split of COCO-O,per-detection,1-confidence,0.5921
+Cartoon Split of COCO-O,per-image,uncertainty,0.5052
+Cartoon Split of COCO-O,per-image,1-confidence,0.7344
+Construction Split of COCO-O,per-detection,uncertainty,0.6215
+Construction Split of COCO-O,per-detection,1-confidence,0.4610
+Construction Split of COCO-O,per-image,uncertainty,0.6914
+Construction Split of COCO-O,per-image,1-confidence,0.5142
+Dusty Construction Split of COCO-O,per-detection,uncertainty,0.6269
+Dusty Construction Split of COCO-O,per-detection,1-confidence,0.4880
+Dusty Construction Split of COCO-O,per-image,uncertainty,0.6854
+Dusty Construction Split of COCO-O,per-image,1-confidence,0.5696
+Handmake Split of COCO-O,per-detection,uncertainty,0.5023
+Handmake Split of COCO-O,per-detection,1-confidence,0.5458
+Handmake Split of COCO-O,per-image,uncertainty,0.4994
+Handmake Split of COCO-O,per-image,1-confidence,0.6482
+Painting Split of COCO-O,per-detection,uncertainty,0.5144
+Painting Split of COCO-O,per-detection,1-confidence,0.5595
+Painting Split of COCO-O,per-image,uncertainty,0.5060
+Painting Split of COCO-O,per-image,1-confidence,0.6430
+Sketch Split of COCO-O,per-detection,uncertainty,0.5540
+Sketch Split of COCO-O,per-detection,1-confidence,0.5939
+Sketch Split of COCO-O,per-image,uncertainty,0.5654
+Sketch Split of COCO-O,per-image,1-confidence,0.7086
+Tattoo Split of COCO-O,per-detection,uncertainty,0.6722
+Tattoo Split of COCO-O,per-detection,1-confidence,0.5374
+Tattoo Split of COCO-O,per-image,uncertainty,0.7461
+Tattoo Split of COCO-O,per-image,1-confidence,0.6143
 Weather Split of COCO-O,per-detection,uncertainty,0.5096
 Weather Split of COCO-O,per-detection,1-confidence,0.5138
 Weather Split of COCO-O,per-image,uncertainty,0.5075
