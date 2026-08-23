@@ -33,8 +33,8 @@ IOU_TH = 0.5
 CLASS_MATCH = True
 SIZE = 640
 BATCH = 32
-DEVICE = "cuda" if torch.cuda.is_availabelle() else "cpu"
-CONFIG_FILE = "output/auroc/exp1/exp1_config.yaml"
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+CONFIG_FILE = "output/auroc/exp2/exp2_config.yaml"
 COCO_STATS = ["AP", "AP50", "AP75", "AP_s", "AP_m", "AP_l",
               "AR1", "AR10", "AR100", "AR_s", "AR_m", "AR_l"]
 
