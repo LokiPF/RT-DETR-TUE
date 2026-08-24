@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping
+from contextlib import closing
+from math import isfinite
 from pathlib import Path
 from typing import Any
 
@@ -14,8 +17,27 @@ from src.zoo.rtdetr.hybrid_encoder import HybridEncoder
 from src.zoo.rtdetr.rtdetr import RTDETR
 from src.zoo.rtdetr.rtdetrv2_decoder import RTDETRTransformerv2
 
+from .artifacts import (
+    ShardWriter,
+    iter_records,
+    load_manifest as load_artifact_manifest,
+)
 from .config import FIXED_CONFIG, ExperimentConfig
+from .corruptions.base import Corruption, Severity
+from .manifests import ManifestEntry
 from .persistence import Layer2Capture, batched_persistence
+
+
+CLEAN_ONLY = (Severity(0, 0.0),)
+_ARTIFACT_MANIFEST_KEYS = frozenset(
+    {
+        "schema_version",
+        "shard_size",
+        "record_count",
+        "shards",
+        "shard_sha256",
+    }
+)
 
 
 def build_fixed_detector() -> RTDETR:
@@ -132,13 +154,319 @@ def load_frozen_detector(
     return model
 
 
+def resize_image(
+    image: Image.Image,
+    image_size: tuple[int, int],
+) -> Image.Image:
+    return vision.resize(image.convert("RGB"), list(image_size), antialias=True)
+
+
+def image_tensor(resized: Image.Image) -> Tensor:
+    return vision.pil_to_tensor(resized).to(torch.float32).div_(255.0)
+
+
 def prepare_image(
     image: Image.Image,
     image_size: tuple[int, int],
 ) -> Tensor:
-    rgb = image.convert("RGB")
-    resized = vision.resize(rgb, list(image_size), antialias=True)
-    return vision.pil_to_tensor(resized).to(torch.float32).div_(255.0)
+    return image_tensor(resize_image(image, image_size))
+
+
+def _positive_integer(value: object, *, name: str) -> int:
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _validated_image_size(value: object) -> tuple[int, int]:
+    if (
+        type(value) is not tuple
+        or len(value) != 2
+        or any(type(item) is not int or item <= 0 for item in value)
+    ):
+        raise ValueError("image_size must be two positive integers")
+    return value
+
+
+def _validated_entries(value: object) -> tuple[ManifestEntry, ...]:
+    if type(value) is not tuple or not value:
+        raise ValueError("entries must be a nonempty tuple")
+    seen_ids: set[str] = set()
+    seen_paths: set[Path] = set()
+    for entry in value:
+        if not isinstance(entry, ManifestEntry):
+            raise ValueError("entries must contain only ManifestEntry values")
+        if type(entry.image_id) is not str or not entry.image_id.strip():
+            raise ValueError("each extraction entry needs a nonempty image_id")
+        if entry.image_id in seen_ids:
+            raise ValueError(f"duplicate extraction image_id {entry.image_id!r}")
+        if not isinstance(entry.path, Path) or not entry.path.is_absolute():
+            raise ValueError("each extraction entry path must be an absolute Path")
+        if not entry.path.is_file():
+            raise ValueError(f"extraction image does not exist: {entry.path}")
+        if entry.path in seen_paths:
+            raise ValueError(f"duplicate extraction image path: {entry.path}")
+        seen_ids.add(entry.image_id)
+        seen_paths.add(entry.path)
+    return value
+
+
+def _validated_metadata(value: object) -> dict:
+    if type(value) is not dict:
+        raise TypeError("extraction metadata must be a dictionary")
+    reserved = sorted(_ARTIFACT_MANIFEST_KEYS.intersection(value))
+    if reserved:
+        raise ValueError(f"extraction metadata uses reserved key: {reserved[0]}")
+    try:
+        return json.loads(
+            json.dumps(value, separators=(",", ":"), allow_nan=False)
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError("extraction metadata must be JSON serializable") from error
+
+
+def _validated_severities(
+    corruption: Corruption | None,
+) -> tuple[Severity, ...]:
+    if corruption is None:
+        return CLEAN_ONLY
+    severities = getattr(corruption, "severities", None)
+    if type(severities) is not tuple or not all(
+        isinstance(item, Severity) for item in severities
+    ):
+        raise ValueError("corruption severities must be a tuple of Severity values")
+    levels = [item.level for item in severities]
+    if any(type(level) is not int for level in levels) or levels != list(range(6)):
+        raise ValueError(
+            "corruption severity levels must be exactly 0 through 5"
+        )
+    if any(
+        type(item.parameter) not in (int, float)
+        or isinstance(item.parameter, bool)
+        or not isfinite(item.parameter)
+        for item in severities
+    ):
+        raise ValueError("corruption severity parameters must be finite numbers")
+    if not callable(getattr(corruption, "apply", None)):
+        raise ValueError("corruption must provide an apply method")
+    return severities
+
+
+def _expected_keys(
+    entries: tuple[ManifestEntry, ...],
+    severities: tuple[Severity, ...],
+) -> list[tuple[str, int]]:
+    return [
+        (entry.image_id, severity.level)
+        for entry in entries
+        for severity in severities
+    ]
+
+
+def _record_identity(record: object, *, index: int) -> tuple[str, int]:
+    if type(record) is not dict:
+        raise RuntimeError(f"extractor record {index} must be a dictionary")
+    image_id = record.get("image_id")
+    if type(image_id) is not str:
+        raise RuntimeError(
+            f"extractor record {index} must contain a string image_id"
+        )
+    severity = record.get("severity")
+    if type(severity) is not int:
+        raise RuntimeError(
+            f"extractor record {index} must contain an integer severity"
+        )
+    return image_id, severity
+
+
+def _validated_records(
+    records: object,
+    identities: list[tuple[str, int]],
+) -> list[dict]:
+    if type(records) is not list:
+        raise RuntimeError("extractor must return a list of records")
+    if len(records) != len(identities):
+        raise RuntimeError(
+            f"extractor returned {len(records)} records; "
+            f"expected {len(identities)}"
+        )
+
+    actual_keys: list[tuple[str, int]] = []
+    batch_query_count: int | None = None
+    for index, record in enumerate(records):
+        actual_keys.append(_record_identity(record, index=index))
+        assert type(record) is dict
+        tensors: dict[str, Tensor] = {}
+        for name in ("logits", "boxes", "persistence"):
+            tensor = record.get(name)
+            if not isinstance(tensor, Tensor):
+                raise RuntimeError(
+                    f"extractor record {index} must contain tensor {name}"
+                )
+            tensors[name] = tensor
+        for name in ("logits", "persistence"):
+            if tensors[name].ndim != 2:
+                raise RuntimeError(
+                    f"extractor record {index} {name} must have rank 2"
+                )
+        boxes = tensors["boxes"]
+        if boxes.ndim != 2 or boxes.shape[1] != 4:
+            raise RuntimeError(
+                f"extractor record {index} boxes must have shape (queries, 4)"
+            )
+        query_counts = {
+            tensors["logits"].shape[0],
+            boxes.shape[0],
+            tensors["persistence"].shape[0],
+        }
+        if len(query_counts) != 1:
+            raise RuntimeError("extractor record query counts must match")
+        query_count = query_counts.pop()
+        if query_count <= 0:
+            raise RuntimeError("extractor record query count must be positive")
+        if batch_query_count is None:
+            batch_query_count = query_count
+        elif query_count != batch_query_count:
+            raise RuntimeError(
+                "extractor record query counts must match within a batch"
+            )
+    if actual_keys != identities:
+        raise RuntimeError(
+            f"extractor returned keys {actual_keys!r}; expected {identities!r}"
+        )
+    return records
+
+
+def _pending_samples(
+    entries: tuple[ManifestEntry, ...],
+    corruption: Corruption | None,
+    severities: tuple[Severity, ...],
+    existing: set[tuple[str, int]],
+    image_size: tuple[int, int],
+):
+    expected_size = (image_size[1], image_size[0])
+    for entry in entries:
+        with Image.open(entry.path) as opened:
+            resized = resize_image(opened, image_size)
+            for severity in severities:
+                key = (entry.image_id, int(severity.level))
+                if key in existing:
+                    continue
+                changed = (
+                    resized
+                    if corruption is None
+                    else corruption.apply(resized, severity.level)
+                )
+                if not isinstance(changed, Image.Image):
+                    raise RuntimeError("corruption must return a PIL image")
+                if changed.size != expected_size:
+                    raise RuntimeError(
+                        "corruption changed image size: "
+                        f"got {changed.size}, expected {expected_size}"
+                    )
+                if changed.mode != "RGB":
+                    raise RuntimeError("corruption must return an RGB image")
+                yield key, image_tensor(changed)
+
+
+def extract_manifest(
+    entries: tuple[ManifestEntry, ...],
+    directory: str | Path,
+    metadata: dict,
+    extractor,
+    corruption: Corruption | None,
+    *,
+    image_size: tuple[int, int],
+    batch_size: int,
+    shard_size: int,
+) -> None:
+    entries = _validated_entries(entries)
+    metadata = _validated_metadata(metadata)
+    image_size = _validated_image_size(image_size)
+    batch_size = _positive_integer(batch_size, name="batch_size")
+    shard_size = _positive_integer(shard_size, name="shard_size")
+    severities = _validated_severities(corruption)
+    if not callable(getattr(extractor, "extract_batch", None)):
+        raise ValueError("extractor must provide an extract_batch method")
+    expected_keys = _expected_keys(entries, severities)
+    expected_set = set(expected_keys)
+    expected_count = len(expected_keys)
+    root = Path(directory)
+    final = root / "manifest.json"
+    if final.exists():
+        actual = load_artifact_manifest(root)
+        actual_metadata = {
+            key: value
+            for key, value in actual.items()
+            if key not in _ARTIFACT_MANIFEST_KEYS
+        }
+        if actual_metadata != metadata:
+            raise ValueError(
+                "completed extraction metadata mismatch: "
+                f"actual={actual_metadata!r}, expected={metadata!r}"
+            )
+        actual_count = actual.get("record_count")
+        if type(actual_count) is not int or actual_count != expected_count:
+            raise RuntimeError(
+                "completed extraction has "
+                f"{actual_count!r} records; expected {expected_count}"
+            )
+        actual_keys = [
+            _record_identity(record, index=index)
+            for index, record in enumerate(iter_records(root))
+        ]
+        if len(actual_keys) != expected_count or set(actual_keys) != expected_set:
+            raise RuntimeError(
+                "completed extraction record roster does not match the input"
+            )
+        return
+
+    with ShardWriter(root, metadata, shard_size=shard_size) as writer:
+        existing = writer.existing_keys()
+        unexpected = existing - expected_set
+        if unexpected:
+            raise RuntimeError(
+                "partial extraction record roster contains unexpected keys: "
+                f"{sorted(unexpected)!r}"
+            )
+        if writer.record_count != len(existing):
+            raise RuntimeError(
+                "partial extraction record count does not match its roster"
+            )
+        identities: list[tuple[str, int]] = []
+        tensors: list[Tensor] = []
+
+        def flush_batch() -> None:
+            batch_identities = list(identities)
+            records = extractor.extract_batch(
+                list(batch_identities),
+                torch.stack(tensors),
+            )
+            records = _validated_records(records, batch_identities)
+            for record in records:
+                writer.add(record)
+
+        pending = _pending_samples(
+            entries,
+            corruption,
+            severities,
+            existing,
+            image_size,
+        )
+        with closing(pending):
+            for identity, tensor in pending:
+                identities.append(identity)
+                tensors.append(tensor)
+                if len(tensors) == batch_size:
+                    flush_batch()
+                    identities, tensors = [], []
+        if tensors:
+            flush_batch()
+        if writer.record_count != expected_count:
+            raise RuntimeError(
+                f"extraction wrote {writer.record_count} records; "
+                f"expected {expected_count}"
+            )
 
 
 def record_from_outputs(

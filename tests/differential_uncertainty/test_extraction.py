@@ -6,15 +6,24 @@ from PIL import Image
 from torch import Tensor, nn
 
 import differential_uncertainty.extraction as extraction
+from differential_uncertainty.artifacts import (
+    ShardWriter,
+    iter_records,
+    load_manifest as load_artifact_manifest,
+)
 from differential_uncertainty.config import ExperimentConfig
+from differential_uncertainty.corruptions.base import Severity
+from differential_uncertainty.corruptions.gaussian_blur import GaussianBlur
 from differential_uncertainty.extraction import (
     RTDETRExtractor,
     build_fixed_detector,
     checkpoint_state,
+    extract_manifest,
     load_frozen_detector,
     prepare_image,
     record_from_outputs,
 )
+from differential_uncertainty.manifests import ManifestEntry
 from src.core import YAMLConfig
 
 
@@ -591,3 +600,587 @@ def test_extractor_close_is_safe_to_repeat(monkeypatch):
     extractor.close()
 
     assert capture.close_count == 2
+
+
+class FakeExtractor:
+    def __init__(self):
+        self.calls = 0
+
+    def extract_batch(self, identities, samples):
+        self.calls += 1
+        records = []
+        for (image_id, severity), sample in zip(identities, samples):
+            value = float(sample.mean()) + severity
+            records.append(
+                {
+                    "image_id": image_id,
+                    "severity": severity,
+                    "boxes": torch.full((20, 4), value),
+                    "logits": torch.full((20, 80), value),
+                    "persistence": torch.full((20, 7), value),
+                }
+            )
+        return records
+
+
+def test_evaluation_cache_has_six_records_and_completed_cache_is_reused(
+    tmp_path: Path,
+):
+    path = tmp_path / "image.png"
+    Image.effect_noise((19, 11), 80).convert("RGB").save(path)
+    entries = (ManifestEntry("scene", path.resolve()),)
+    cache = tmp_path / "evaluation"
+    extractor = FakeExtractor()
+    metadata = {"stage": "evaluation", "input_id": "fixed"}
+
+    extract_manifest(
+        entries,
+        cache,
+        metadata,
+        extractor,
+        GaussianBlur(),
+        image_size=(640, 640),
+        batch_size=2,
+        shard_size=2,
+    )
+
+    assert [
+        (record["image_id"], record["severity"])
+        for record in iter_records(cache)
+    ] == [
+        ("scene", 0),
+        ("scene", 1),
+        ("scene", 2),
+        ("scene", 3),
+        ("scene", 4),
+        ("scene", 5),
+    ]
+    assert load_artifact_manifest(cache)["record_count"] == 6
+
+    calls = extractor.calls
+    extract_manifest(
+        entries,
+        cache,
+        metadata,
+        extractor,
+        GaussianBlur(),
+        image_size=(640, 640),
+        batch_size=2,
+        shard_size=2,
+    )
+
+    assert extractor.calls == calls
+
+
+class ObservedCorruption:
+    name = "observed"
+    severities = tuple(Severity(level, float(level)) for level in range(6))
+
+    def __init__(self):
+        self.inputs = []
+
+    def apply(self, image, level):
+        self.inputs.append((image.mode, image.size, level))
+        return image.copy()
+
+
+class SampleShapeExtractor(FakeExtractor):
+    def __init__(self):
+        super().__init__()
+        self.sample_shapes = []
+
+    def extract_batch(self, identities, samples):
+        self.sample_shapes.append(tuple(samples.shape))
+        return super().extract_batch(identities, samples)
+
+
+def test_images_are_resized_to_rgb_before_each_corruption_is_applied(tmp_path: Path):
+    path = tmp_path / "asymmetric.png"
+    Image.new("L", (13, 9), 100).save(path)
+    entries = (ManifestEntry("scene", path.resolve()),)
+    corruption = ObservedCorruption()
+    extractor = SampleShapeExtractor()
+
+    extract_manifest(
+        entries,
+        tmp_path / "cache",
+        {"stage": "evaluation"},
+        extractor,
+        corruption,
+        image_size=(5, 7),
+        batch_size=6,
+        shard_size=6,
+    )
+
+    assert corruption.inputs == [
+        ("RGB", (7, 5), level) for level in range(6)
+    ]
+    assert extractor.sample_shapes == [(6, 3, 5, 7)]
+
+
+class WrongIdentityExtractor(FakeExtractor):
+    def extract_batch(self, identities, samples):
+        records = super().extract_batch(identities, samples)
+        records[0]["image_id"] = "wrong"
+        return records
+
+
+def test_wrong_extractor_identity_never_publishes_a_complete_cache(tmp_path: Path):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (9, 7)).save(path)
+    entries = (ManifestEntry("scene", path.resolve()),)
+    cache = tmp_path / "bad-reference"
+
+    with pytest.raises(RuntimeError, match="extractor returned keys"):
+        extract_manifest(
+            entries,
+            cache,
+            {"stage": "reference"},
+            WrongIdentityExtractor(),
+            None,
+            image_size=(640, 640),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert not (cache / "manifest.json").exists()
+    assert (cache / "partial_manifest.json").exists()
+
+
+class IntegerIdentityExtractor(FakeExtractor):
+    def extract_batch(self, identities, samples):
+        records = super().extract_batch(identities, samples)
+        records[0]["image_id"] = 123
+        return records
+
+
+def test_extractor_identity_must_be_a_string_without_coercion(tmp_path: Path):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (9, 7)).save(path)
+    cache = tmp_path / "bad-output-type"
+
+    with pytest.raises(RuntimeError, match="string image_id"):
+        extract_manifest(
+            (ManifestEntry("123", path.resolve()),),
+            cache,
+            {"stage": "reference"},
+            IntegerIdentityExtractor(),
+            None,
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert not (cache / "manifest.json").exists()
+    assert (cache / "partial_manifest.json").exists()
+
+
+class InterruptedExtractor(FakeExtractor):
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    def extract_batch(self, identities, samples):
+        self.attempts += 1
+        if self.attempts == 2:
+            raise RuntimeError("simulated interruption")
+        return super().extract_batch(identities, samples)
+
+
+def test_partial_cache_resumes_only_the_missing_severities(tmp_path: Path):
+    path = tmp_path / "image.png"
+    Image.effect_noise((11, 7), 40).convert("RGB").save(path)
+    entries = (ManifestEntry("scene", path.resolve()),)
+    cache = tmp_path / "resumable"
+    metadata = {"stage": "evaluation", "input_id": "fixed"}
+    interrupted = InterruptedExtractor()
+
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        extract_manifest(
+            entries,
+            cache,
+            metadata,
+            interrupted,
+            GaussianBlur(),
+            image_size=(8, 8),
+            batch_size=2,
+            shard_size=2,
+        )
+
+    assert not (cache / "manifest.json").exists()
+    assert (cache / "partial_manifest.json").exists()
+
+    resumed = FakeExtractor()
+    extract_manifest(
+        entries,
+        cache,
+        metadata,
+        resumed,
+        GaussianBlur(),
+        image_size=(8, 8),
+        batch_size=2,
+        shard_size=2,
+    )
+
+    assert interrupted.calls == 1
+    assert resumed.calls == 2
+    assert [
+        (record["image_id"], record["severity"])
+        for record in iter_records(cache)
+    ] == [("scene", level) for level in range(6)]
+    assert load_artifact_manifest(cache)["record_count"] == 6
+
+
+def _write_complete_cache(cache: Path, metadata: dict, identities):
+    with ShardWriter(cache, metadata, shard_size=6) as writer:
+        for image_id, severity in identities:
+            writer.add({"image_id": image_id, "severity": severity})
+
+
+def test_completed_cache_requires_exact_metadata_without_extra_keys(tmp_path: Path):
+    cache = tmp_path / "extra-metadata"
+    metadata = {"stage": "evaluation"}
+    _write_complete_cache(
+        cache,
+        {**metadata, "unexpected": "stale"},
+        [("scene", level) for level in range(6)],
+    )
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+
+    with pytest.raises(ValueError, match="completed extraction metadata mismatch"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            metadata,
+            FakeExtractor(),
+            GaussianBlur(),
+            image_size=(8, 8),
+            batch_size=2,
+            shard_size=2,
+        )
+
+
+def test_completed_cache_requires_the_exact_record_roster(tmp_path: Path):
+    cache = tmp_path / "wrong-roster"
+    metadata = {"stage": "evaluation"}
+    _write_complete_cache(
+        cache,
+        metadata,
+        [
+            ("scene", 0),
+            ("scene", 1),
+            ("scene", 2),
+            ("scene", 3),
+            ("scene", 4),
+            ("other", 5),
+        ],
+    )
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+
+    with pytest.raises(RuntimeError, match="completed extraction record roster"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            metadata,
+            FakeExtractor(),
+            GaussianBlur(),
+            image_size=(8, 8),
+            batch_size=2,
+            shard_size=2,
+        )
+
+
+def test_partial_cache_rejects_an_unexpected_record_before_extraction(tmp_path: Path):
+    cache = tmp_path / "wrong-partial-roster"
+    metadata = {"stage": "reference"}
+    with pytest.raises(RuntimeError, match="leave partial"):
+        with ShardWriter(cache, metadata, shard_size=1) as writer:
+            writer.add({"image_id": "other", "severity": 0})
+            raise RuntimeError("leave partial")
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    extractor = FakeExtractor()
+
+    with pytest.raises(RuntimeError, match="partial extraction record roster"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            metadata,
+            extractor,
+            None,
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert extractor.calls == 0
+    assert not (cache / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("batch_size", [True, 1.0, 0, -1])
+def test_batch_size_must_be_a_positive_integer(tmp_path: Path, batch_size):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    cache = tmp_path / "bad-batch"
+
+    with pytest.raises(ValueError, match="batch_size must be a positive integer"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            {"stage": "reference"},
+            FakeExtractor(),
+            None,
+            image_size=(8, 8),
+            batch_size=batch_size,
+            shard_size=1,
+        )
+
+    assert not cache.exists()
+
+
+@pytest.mark.parametrize(
+    "image_size",
+    [[8, 8], (True, 8), (8.0, 8), (8,), (0, 8), (-1, 8)],
+)
+def test_image_size_must_be_two_positive_integers(tmp_path: Path, image_size):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    cache = tmp_path / "bad-size"
+
+    with pytest.raises(ValueError, match="image_size must be two positive integers"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            {"stage": "reference"},
+            FakeExtractor(),
+            None,
+            image_size=image_size,
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert not cache.exists()
+
+
+class BadSeverityCorruption:
+    name = "bad"
+    severities = (Severity(0, 0.0), Severity(2, 1.0))
+
+    def apply(self, image, level):
+        return image
+
+
+def test_corruption_must_describe_exactly_levels_zero_through_five(tmp_path: Path):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    cache = tmp_path / "bad-severities"
+
+    with pytest.raises(ValueError, match="severity levels must be exactly 0 through 5"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            {"stage": "evaluation"},
+            FakeExtractor(),
+            BadSeverityCorruption(),
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert not cache.exists()
+
+
+def test_duplicate_entry_identities_fail_before_creating_a_cache(tmp_path: Path):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    Image.new("RGB", (4, 4)).save(first)
+    Image.new("RGB", (4, 4)).save(second)
+    extractor = FakeExtractor()
+    cache = tmp_path / "duplicate-entries"
+
+    with pytest.raises(ValueError, match="duplicate extraction image_id"):
+        extract_manifest(
+            (
+                ManifestEntry("scene", first.resolve()),
+                ManifestEntry("scene", second.resolve()),
+            ),
+            cache,
+            {"stage": "reference"},
+            extractor,
+            None,
+            image_size=(8, 8),
+            batch_size=2,
+            shard_size=2,
+        )
+
+    assert extractor.calls == 0
+    assert not cache.exists()
+
+
+@pytest.mark.parametrize("shard_size", [True, 1.0, 0, -1])
+def test_shard_size_must_be_a_positive_integer(tmp_path: Path, shard_size):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    cache = tmp_path / "bad-shard"
+
+    with pytest.raises(ValueError, match="shard_size must be a positive integer"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            {"stage": "reference"},
+            FakeExtractor(),
+            None,
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=shard_size,
+        )
+
+    assert not cache.exists()
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        (),
+        [],
+        (ManifestEntry("", Path("/unused")),),
+        (ManifestEntry("   ", Path("/unused")),),
+    ],
+)
+def test_entry_roster_must_be_a_nonempty_tuple_of_named_entries(
+    tmp_path: Path,
+    entries,
+):
+    cache = tmp_path / "bad-entries"
+
+    with pytest.raises(ValueError, match="nonempty tuple|nonempty image_id"):
+        extract_manifest(
+            entries,
+            cache,
+            {"stage": "reference"},
+            FakeExtractor(),
+            None,
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert not cache.exists()
+
+
+class MalformedOutputExtractor(FakeExtractor):
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+
+    def extract_batch(self, identities, samples):
+        records = super().extract_batch(identities, samples)
+        if self.kind == "short_batch":
+            return records[:-1]
+        if self.kind == "not_list":
+            return tuple(records)
+        if self.kind == "missing_tensor":
+            del records[0]["persistence"]
+        elif self.kind == "logits_rank":
+            records[0]["logits"] = records[0]["logits"].unsqueeze(0)
+        elif self.kind == "box_width":
+            records[0]["boxes"] = records[0]["boxes"][:, :3]
+        elif self.kind == "query_count":
+            records[0]["persistence"] = records[0]["persistence"][:-1]
+        return records
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("short_batch", "returned 1 records; expected 2"),
+        ("not_list", "must return a list"),
+        ("missing_tensor", "must contain tensor persistence"),
+        ("logits_rank", "logits must have rank 2"),
+        ("box_width", "boxes must have shape"),
+        ("query_count", "query counts must match"),
+    ],
+)
+def test_malformed_extractor_records_never_publish_a_complete_cache(
+    tmp_path: Path,
+    kind,
+    message,
+):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    Image.new("RGB", (4, 4)).save(first)
+    Image.new("RGB", (4, 4)).save(second)
+    cache = tmp_path / f"bad-output-{kind}"
+
+    with pytest.raises(RuntimeError, match=message):
+        extract_manifest(
+            (
+                ManifestEntry("first", first.resolve()),
+                ManifestEntry("second", second.resolve()),
+            ),
+            cache,
+            {"stage": "reference"},
+            MalformedOutputExtractor(kind),
+            None,
+            image_size=(8, 8),
+            batch_size=2,
+            shard_size=2,
+        )
+
+    assert not (cache / "manifest.json").exists()
+    assert (cache / "partial_manifest.json").exists()
+
+
+class WrongSizeCorruption(ObservedCorruption):
+    def apply(self, image, level):
+        super().apply(image, level)
+        return image.resize((1, 1))
+
+
+def test_corruption_cannot_change_the_resized_image_dimensions(tmp_path: Path):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    cache = tmp_path / "wrong-corruption-size"
+
+    with pytest.raises(RuntimeError, match="corruption changed image size"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            {"stage": "evaluation"},
+            FakeExtractor(),
+            WrongSizeCorruption(),
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert not (cache / "manifest.json").exists()
+    assert (cache / "partial_manifest.json").exists()
+
+
+class AlwaysFailsExtractor(FakeExtractor):
+    def extract_batch(self, identities, samples):
+        raise RuntimeError("inference failed")
+
+
+def test_failed_extraction_releases_writer_for_a_later_resume(tmp_path: Path):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    entries = (ManifestEntry("scene", path.resolve()),)
+    cache = tmp_path / "released-writer"
+    metadata = {"stage": "reference"}
+
+    with pytest.raises(RuntimeError, match="inference failed"):
+        extract_manifest(
+            entries, cache, metadata, AlwaysFailsExtractor(), None,
+            image_size=(8, 8), batch_size=1, shard_size=1,
+        )
+
+    extract_manifest(
+        entries, cache, metadata, FakeExtractor(), None,
+        image_size=(8, 8), batch_size=1, shard_size=1,
+    )
+
+    assert load_artifact_manifest(cache)["record_count"] == 1
