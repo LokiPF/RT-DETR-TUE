@@ -19,6 +19,7 @@ from src.zoo.rtdetr.rtdetrv2_decoder import RTDETRTransformerv2
 
 from .artifacts import (
     ShardWriter,
+    _safe_load_shard,
     iter_records,
     load_manifest as load_artifact_manifest,
 )
@@ -337,6 +338,25 @@ def _validated_records(
     return records
 
 
+def _published_record_keys(writer: ShardWriter) -> list[tuple[str, int]]:
+    directory_fd = writer._lock_fd
+    if directory_fd is None:
+        raise RuntimeError("artifact writer has no active directory descriptor")
+    identities: list[tuple[str, int]] = []
+    for name in writer.shards:
+        records = _safe_load_shard(
+            writer.directory,
+            name,
+            writer.shard_sha256[name],
+            directory_fd=directory_fd,
+        )
+        identities.extend(
+            _record_identity(record, index=len(identities) + index)
+            for index, record in enumerate(records)
+        )
+    return identities
+
+
 def _pending_samples(
     entries: tuple[ManifestEntry, ...],
     corruption: Corruption | None,
@@ -415,7 +435,7 @@ def extract_manifest(
             _record_identity(record, index=index)
             for index, record in enumerate(iter_records(root))
         ]
-        if len(actual_keys) != expected_count or set(actual_keys) != expected_set:
+        if actual_keys != expected_keys:
             raise RuntimeError(
                 "completed extraction record roster does not match the input"
             )
@@ -423,6 +443,15 @@ def extract_manifest(
 
     with ShardWriter(root, metadata, shard_size=shard_size) as writer:
         existing = writer.existing_keys()
+        published_keys = _published_record_keys(writer)
+        if set(published_keys) != existing:
+            raise RuntimeError(
+                "partial extraction record roster does not match its shards"
+            )
+        if published_keys != expected_keys[: len(published_keys)]:
+            raise RuntimeError(
+                "partial extraction record roster is not a canonical prefix"
+            )
         unexpected = existing - expected_set
         if unexpected:
             raise RuntimeError(

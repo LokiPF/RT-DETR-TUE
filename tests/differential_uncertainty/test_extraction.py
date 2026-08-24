@@ -892,6 +892,33 @@ def test_completed_cache_requires_the_exact_record_roster(tmp_path: Path):
         )
 
 
+def test_completed_cache_requires_the_canonical_record_order(tmp_path: Path):
+    cache = tmp_path / "reversed-roster"
+    metadata = {"stage": "evaluation"}
+    _write_complete_cache(
+        cache,
+        metadata,
+        [("scene", level) for level in reversed(range(6))],
+    )
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    extractor = FakeExtractor()
+
+    with pytest.raises(RuntimeError, match="completed extraction record roster"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            metadata,
+            extractor,
+            GaussianBlur(),
+            image_size=(8, 8),
+            batch_size=2,
+            shard_size=2,
+        )
+
+    assert extractor.calls == 0
+
+
 def test_partial_cache_rejects_an_unexpected_record_before_extraction(tmp_path: Path):
     cache = tmp_path / "wrong-partial-roster"
     metadata = {"stage": "reference"}
@@ -917,6 +944,34 @@ def test_partial_cache_rejects_an_unexpected_record_before_extraction(tmp_path: 
 
     assert extractor.calls == 0
     assert not (cache / "manifest.json").exists()
+
+
+def test_partial_cache_must_be_a_canonical_prefix_before_resume(tmp_path: Path):
+    cache = tmp_path / "out-of-order-partial"
+    metadata = {"stage": "evaluation"}
+    with pytest.raises(RuntimeError, match="leave partial"):
+        with ShardWriter(cache, metadata, shard_size=1) as writer:
+            writer.add({"image_id": "scene", "severity": 5})
+            raise RuntimeError("leave partial")
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    extractor = FakeExtractor()
+
+    with pytest.raises(RuntimeError, match="canonical prefix"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            metadata,
+            extractor,
+            GaussianBlur(),
+            image_size=(8, 8),
+            batch_size=2,
+            shard_size=1,
+        )
+
+    assert extractor.calls == 0
+    assert not (cache / "manifest.json").exists()
+    assert (cache / "partial_manifest.json").exists()
 
 
 @pytest.mark.parametrize("batch_size", [True, 1.0, 0, -1])
