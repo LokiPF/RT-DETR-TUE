@@ -6,6 +6,7 @@ import html
 import json
 import math
 import os
+import re
 import stat
 import tempfile
 import threading
@@ -248,9 +249,114 @@ def _validate_provenance(provenance) -> dict:
             "provenance scientific config feature_normalization must be raw"
         )
 
+    runtime = normalized.get("runtime")
+    if not isinstance(runtime, dict) or set(runtime) != {
+        "device", "batch_size", "shard_size", "libraries", "cuda"
+    }:
+        raise ValueError("provenance runtime must have the exact fixed fields")
+    device = runtime["device"]
+    if not isinstance(device, dict) or set(device) != {"type", "index"}:
+        raise ValueError("provenance runtime device is invalid")
+    _validated_text(
+        device.get("type"),
+        name="provenance runtime device type",
+        maximum_length=32,
+    )
+    device_index = device.get("index")
+    if (
+        device_index is not None
+        and (
+            isinstance(device_index, bool)
+            or not isinstance(device_index, int)
+            or device_index < 0
+        )
+    ):
+        raise ValueError("provenance runtime device index is invalid")
+    if device["type"] == "cpu" and device_index is not None:
+        raise ValueError("CPU provenance runtime device index must be null")
+    for key in ("batch_size", "shard_size"):
+        value = runtime[key]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"provenance runtime {key} is invalid")
+    libraries = runtime["libraries"]
+    library_keys = {
+        "python",
+        "pytorch",
+        "torchvision",
+        "numpy",
+        "scipy",
+        "pillow",
+    }
+    if not isinstance(libraries, dict) or set(libraries) != library_keys:
+        raise ValueError("provenance runtime libraries are invalid")
+    for key, value in libraries.items():
+        _validated_text(
+            value,
+            name=f"provenance runtime library {key}",
+            maximum_length=256,
+        )
+    cuda = runtime["cuda"]
+    cuda_keys = {"runtime", "cudnn", "gpu_name", "compute_capability"}
+    if not isinstance(cuda, dict) or set(cuda) != cuda_keys:
+        raise ValueError("provenance runtime CUDA fields are invalid")
+    if device["type"] == "cuda":
+        if device_index is None:
+            raise ValueError("CUDA provenance runtime needs a device index")
+        _validated_text(
+            cuda["runtime"],
+            name="provenance CUDA runtime",
+            maximum_length=256,
+        )
+        if cuda["cudnn"] is not None and (
+            isinstance(cuda["cudnn"], bool)
+            or not isinstance(cuda["cudnn"], int)
+            or cuda["cudnn"] < 0
+        ):
+            raise ValueError("provenance cuDNN version is invalid")
+        _validated_text(
+            cuda["gpu_name"],
+            name="provenance GPU name",
+            maximum_length=256,
+        )
+        capability = cuda["compute_capability"]
+        if (
+            not isinstance(capability, list)
+            or len(capability) != 2
+            or any(
+                isinstance(item, bool) or not isinstance(item, int) or item < 0
+                for item in capability
+            )
+        ):
+            raise ValueError("provenance compute capability is invalid")
+    elif any(value is not None for value in cuda.values()):
+        raise ValueError("non-CUDA provenance must use null CUDA fields")
+
     corruption = normalized.get("corruption")
     if not isinstance(corruption, dict):
         raise ValueError("provenance needs a corruption mapping")
+    if set(corruption) != {"name", "severities", "implementation"}:
+        raise ValueError(
+            "provenance corruption must have the exact fixed fields"
+        )
+    implementation = corruption["implementation"]
+    if not isinstance(implementation, dict) or set(implementation) != {
+        "module", "qualname", "source_sha256"
+    }:
+        raise ValueError("provenance corruption implementation is invalid")
+    for key in ("module", "qualname"):
+        _validated_text(
+            implementation[key],
+            name=f"provenance corruption implementation {key}",
+            maximum_length=512,
+        )
+    source_sha256 = implementation["source_sha256"]
+    if (
+        not isinstance(source_sha256, str)
+        or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+    ):
+        raise ValueError(
+            "provenance corruption implementation source_sha256 is invalid"
+        )
     _validated_text(
         corruption.get("name"),
         name="provenance corruption name",
@@ -732,6 +838,20 @@ def render_report(
     )
     example_id = _markdown_code(str(example["image_id"]))
     checkpoint = _markdown_code(provenance["checkpoint_sha256"])
+    runtime = provenance["runtime"]
+    runtime_device_value = runtime["device"]["type"]
+    if runtime["device"]["index"] is not None:
+        runtime_device_value += f":{runtime['device']['index']}"
+    runtime_device = _markdown_code(runtime_device_value)
+    runtime_libraries = ", ".join(
+        f"{name} {runtime['libraries'][name]}"
+        for name in sorted(runtime["libraries"])
+    )
+    implementation = provenance["corruption"]["implementation"]
+    implementation_name = _markdown_code(
+        f"{implementation['module']}.{implementation['qualname']}"
+    )
+    implementation_sha = _markdown_code(implementation["source_sha256"])
     reference_range = (
         f"{10 * config['reference_decile']}-"
         f"{10 * (config['reference_decile'] + 1)}%"
@@ -896,9 +1016,15 @@ from earlier tuning. Fresh numbers may differ from the historical run
 because this clean workflow also removes padded queries from the reference
 bank.
 
+## Reproducibility
+
+This run used device {runtime_device}, batch size {runtime["batch_size"]}, and
+shard size {runtime["shard_size"]}. Library versions were:
+{runtime_libraries}. The corruption implementation was {implementation_name},
+with source SHA-256 {implementation_sha}. Checkpoint SHA-256: {checkpoint}.
+
 The complete per-image rows, metric tables, bootstrap comparisons, figures, and
-reproducibility details are stored beside this report. Checkpoint SHA-256:
-{checkpoint}.
+reproducibility details are stored beside this report.
 """
 
 

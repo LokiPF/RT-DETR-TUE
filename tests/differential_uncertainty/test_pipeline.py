@@ -133,6 +133,16 @@ class InvertCorruption(Corruption):
         )
 
 
+class AlternateInvertCorruption(Corruption):
+    name = "invert"
+    severities = tuple(Severity(level, float(level)) for level in range(6))
+
+    def apply(self, image, level):
+        if level not in range(6):
+            raise ValueError(f"unknown invert severity {level}")
+        return image.copy()
+
+
 class FalseyInvertCorruption(InvertCorruption):
     def __init__(self):
         self.apply_calls = []
@@ -178,6 +188,7 @@ def _corruption_stub(**overrides):
             Severity(level, float(level)) for level in range(6)
         ),
         "apply": _copy_corruption_image,
+        "implementation_sha256": "1" * 64,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -622,6 +633,9 @@ def test_pipeline_snapshots_mutable_plugin_identity_and_apply_callable(
     checkpoint.write_bytes(b"fake checkpoint content")
     output = tmp_path / "mutable-run"
     corruption = MutatingInvertCorruption()
+    expected_implementation = cli._snapshot_corruption(
+        corruption, small_config
+    ).implementation
 
     run_pipeline(
         reference,
@@ -644,6 +658,7 @@ def test_pipeline_snapshots_mutable_plugin_identity_and_apply_callable(
     assert corruption.apply_calls == list(range(6)) * 2
     assert corruption.name == "mutated-name"
     assert provenance["corruption"] == {
+        "implementation": expected_implementation,
         "name": "mutable-invert",
         "severities": [
             {"level": level, "parameter": float(level)}
@@ -680,6 +695,95 @@ def test_interrupted_extraction_resumes_at_the_next_canonical_record(
     assert (partial / "manifest.json").is_file()
     assert ("e1", 0) not in FakeExtractor.identities
     assert ("e1", 1) not in FakeExtractor.identities
+
+
+def test_partial_extraction_refuses_resume_with_a_different_batch_regime(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    with pytest.raises(RuntimeError, match="simulated extraction interruption"):
+        _run(inputs, small_config, extractor_factory=InterruptingExtractor)
+    before = _tree_state(inputs[-1])
+
+    with pytest.raises(ValueError, match="provenance|runtime|batch_size"):
+        run_pipeline(
+            *inputs,
+            device="cpu",
+            batch_size=1,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+        )
+
+    assert _tree_state(inputs[-1]) == before
+
+
+def test_same_path_image_overwrite_refuses_completed_stage_reuse(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    output = inputs[-1]
+    before_tree = _tree_state(output)
+    before_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    evaluation_image = tmp_path / "evaluation-0.png"
+    Image.new("RGB", (17, 13), (240, 240, 240)).save(evaluation_image)
+
+    with pytest.raises(ValueError, match="provenance|manifest|image"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    after_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    assert _tree_state(output) == before_tree
+    assert after_metadata == before_metadata
+
+
+def test_same_named_corruption_with_different_code_refuses_cache_reuse(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    run_pipeline(
+        *inputs,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=FakeExtractor,
+        corruption=InvertCorruption(),
+    )
+    output = inputs[-1]
+    before_tree = _tree_state(output)
+    before_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+
+    with pytest.raises(ValueError, match="provenance|corruption|implementation"):
+        run_pipeline(
+            *inputs,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+            corruption=AlternateInvertCorruption(),
+        )
+
+    after_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    assert _tree_state(output) == before_tree
+    assert after_metadata == before_metadata
 
 
 def test_completed_extraction_is_validated_before_extractor_construction(
@@ -1946,3 +2050,392 @@ def test_terminal_sweep_rejects_leaf_mutated_from_a_later_audit_hook(
 
     with pytest.raises((ValueError, RuntimeError)):
         _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+
+def test_concurrent_image_replacement_while_hashing_fails_before_output(
+    tmp_path, small_config, monkeypatch
+):
+    import differential_uncertainty.manifests as manifests
+
+    inputs = _inputs(tmp_path)
+    target = tmp_path / "reference-0.png"
+    replacement = tmp_path / "replacement.png"
+    Image.new("RGB", (17, 13), (200, 200, 200)).save(replacement)
+    original = manifests._digest
+    replaced = False
+
+    def replace_after_hash(handle):
+        nonlocal replaced
+        digest = original(handle)
+        if not replaced:
+            replaced = True
+            os.replace(replacement, target)
+        return digest
+
+    monkeypatch.setattr(manifests, "_digest", replace_after_hash)
+    with pytest.raises(ValueError, match="image.*changed|does not exist"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    assert replaced
+    assert not inputs[-1].exists()
+    assert FakeExtractor.instances == 0
+
+
+def test_terminal_sweep_catches_artifact_mutated_during_full_input_audit(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    target = inputs[-1] / "artifacts" / "scores.csv"
+    original = cli._validate_input_images
+    calls = 0
+
+    def mutate_after_full_input_audit(*groups):
+        nonlocal calls
+        calls += 1
+        result = original(*groups)
+        if calls == 3:
+            target.write_bytes(b"artifact mutation during input audit")
+        return result
+
+    monkeypatch.setattr(
+        cli, "_validate_input_images", mutate_after_full_input_audit
+    )
+    with pytest.raises(ValueError, match="score artifact|terminal audit"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    assert calls == 3
+
+
+def test_terminal_lightweight_check_catches_input_mutated_during_artifact_sweep(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    target = tmp_path / "evaluation-0.png"
+    replacement = tmp_path / "late-replacement.png"
+    Image.new("RGB", (17, 13), (210, 210, 210)).save(replacement)
+    original = cli._regular_file_snapshot
+    provenance_reads = 0
+
+    def replace_during_terminal_sweep(path, *, label):
+        nonlocal provenance_reads
+        result = original(path, label=label)
+        if label == "run provenance":
+            provenance_reads += 1
+            if provenance_reads == 3:
+                os.replace(replacement, target)
+        return result
+
+    monkeypatch.setattr(cli, "_regular_file_snapshot", replace_during_terminal_sweep)
+    with pytest.raises(ValueError, match="image changed after it was audited"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    assert provenance_reads == 3
+
+
+def test_runtime_mapping_normalizes_devices_and_records_cuda_details(monkeypatch):
+    assert cli._runtime_device("cpu") == torch.device("cpu")
+    assert cli._runtime_device("cpu:7") == torch.device("cpu")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    assert cli._runtime_device("cuda") == torch.device("cuda:3")
+
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda index: f"GPU-{index}")
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda index: (8, 9))
+    monkeypatch.setattr(torch.backends.cudnn, "version", lambda: 9010)
+    monkeypatch.setattr(torch.version, "cuda", "12.test")
+    runtime = cli._runtime_provenance(
+        torch.device("cuda:3"), batch_size=4, shard_size=5
+    )
+
+    assert runtime["device"] == {"type": "cuda", "index": 3}
+    assert runtime["batch_size"] == 4
+    assert runtime["shard_size"] == 5
+    assert set(runtime["libraries"]) == {
+        "python", "pytorch", "torchvision", "numpy", "scipy", "pillow"
+    }
+    assert all(
+        type(value) is str for value in runtime["libraries"].values()
+    )
+    assert runtime["cuda"] == {
+        "runtime": "12.test",
+        "cudnn": 9010,
+        "gpu_name": "GPU-3",
+        "compute_capability": [8, 9],
+    }
+
+
+def test_runtime_mapping_is_published_and_equivalent_cpu_spelling_resumes(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    expected = cli._runtime_provenance(
+        torch.device("cpu"), batch_size=2, shard_size=2
+    )
+    provenance = json.loads(
+        (inputs[-1] / "artifacts" / "provenance.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert provenance["runtime"] == expected
+    report = (inputs[-1] / "report" / "report.md").read_text(encoding="utf-8")
+    assert "batch size 2" in report
+    assert "shard size 2" in report
+    assert "device `cpu`" in report
+    artifacts = inputs[-1] / "artifacts"
+    before_tree = _tree_state(inputs[-1])
+    before_metadata = {
+        str(path.relative_to(artifacts)): _directory_metadata(path)
+        for path in (artifacts, *sorted(artifacts.rglob("*")))
+        if path.is_dir()
+    }
+
+    run_pipeline(
+        *inputs,
+        device="cpu:7",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=RejectingExtractor,
+    )
+
+    after_metadata = {
+        str(path.relative_to(artifacts)): _directory_metadata(path)
+        for path in (artifacts, *sorted(artifacts.rglob("*")))
+        if path.is_dir()
+    }
+    assert _tree_state(inputs[-1]) == before_tree
+    assert after_metadata == before_metadata
+
+
+def test_every_runtime_field_mismatch_refuses_before_cache_access_and_mutation(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    output = inputs[-1]
+    before_tree = _tree_state(output)
+    before_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    original = cli._runtime_provenance
+    mutations = (
+        (("device", "type"), "other"),
+        (("device", "index"), 7),
+        (("batch_size",), 99),
+        (("shard_size",), 99),
+        (("libraries", "python"), "different"),
+        (("libraries", "pytorch"), "different"),
+        (("libraries", "torchvision"), "different"),
+        (("libraries", "numpy"), "different"),
+        (("libraries", "scipy"), "different"),
+        (("libraries", "pillow"), "different"),
+        (("cuda", "runtime"), "different"),
+        (("cuda", "cudnn"), 999),
+        (("cuda", "gpu_name"), "different"),
+        (("cuda", "compute_capability"), [9, 9]),
+    )
+
+    def forbid_cache(*_args, **_kwargs):
+        raise AssertionError("runtime mismatch reached extraction cache access")
+
+    monkeypatch.setattr(cli, "validate_extraction_cache", forbid_cache)
+    for path, replacement in mutations:
+        def changed_runtime(device, *, batch_size, shard_size):
+            value = json.loads(json.dumps(original(
+                device, batch_size=batch_size, shard_size=shard_size
+            )))
+            target = value
+            for key in path[:-1]:
+                target = target[key]
+            target[path[-1]] = replacement
+            return value
+
+        with monkeypatch.context() as local:
+            local.setattr(cli, "_runtime_provenance", changed_runtime)
+            with pytest.raises(ValueError, match="provenance"):
+                _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+        after_metadata = {
+            str(item.relative_to(output)): _directory_metadata(item)
+            for item in (output, *sorted(output.rglob("*")))
+            if item.is_dir()
+        }
+        assert _tree_state(output) == before_tree
+        assert after_metadata == before_metadata
+
+
+@pytest.mark.parametrize("digest", (None, "A" * 64, "1" * 63))
+def test_source_unavailable_plugin_requires_lowercase_64_hex_identity(
+    tmp_path, small_config, digest
+):
+    inputs = _inputs(tmp_path)
+    corruption = _corruption_stub(implementation_sha256=digest)
+    if digest is None:
+        delattr(corruption, "implementation_sha256")
+
+    with pytest.raises(ValueError, match="implementation_sha256|lowercase 64-hex"):
+        run_pipeline(
+            *inputs,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+            corruption=corruption,
+        )
+
+    assert not inputs[-1].exists()
+    assert FakeExtractor.instances == 0
+
+
+def test_explicit_plugin_implementation_change_refuses_before_cache_access(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    first = _corruption_stub(implementation_sha256="1" * 64)
+    run_pipeline(
+        *inputs,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=FakeExtractor,
+        corruption=first,
+    )
+    output = inputs[-1]
+    before_tree = _tree_state(output)
+    before_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+
+    def forbid_cache(*_args, **_kwargs):
+        raise AssertionError("plugin mismatch reached extraction cache access")
+
+    monkeypatch.setattr(cli, "validate_extraction_cache", forbid_cache)
+    second = _corruption_stub(implementation_sha256="2" * 64)
+    with pytest.raises(ValueError, match="provenance"):
+        run_pipeline(
+            *inputs,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+            corruption=second,
+        )
+
+    after_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    assert _tree_state(output) == before_tree
+    assert after_metadata == before_metadata
+
+
+_REAL_CHECKPOINT = Path(
+    os.environ.get(
+        "UE_RTDETRV2_CHECKPOINT",
+        "/home/yuchen/YuchenZ/UE/RT-DETRv2-UE/pretrained_weights/"
+        "rtdetrv2_r18vd_120e_coco_rerun_48.1.pth",
+    )
+)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA unavailable")
+@pytest.mark.skipif(not _REAL_CHECKPOINT.is_file(), reason="checkpoint unavailable")
+def test_real_gpu_run_binds_batch_regime_and_refuses_cross_regime_resume(
+    tmp_path,
+):
+    reference = _manifest(tmp_path, "reference.csv", (("r1", 40),))
+    evaluation = _manifest(tmp_path, "evaluation.csv", (("e1", 110),))
+    output = tmp_path / "real-gpu-run"
+    real_config = ExperimentConfig.for_tests(
+        bank_capacity=20,
+        k=5,
+        query_count=300,
+        persistence_dim=335,
+        bootstrap_samples=20,
+    )
+
+    run_pipeline(
+        reference,
+        evaluation,
+        _REAL_CHECKPOINT,
+        output,
+        device="cuda",
+        batch_size=1,
+        shard_size=10,
+        config=real_config,
+    )
+    provenance = json.loads(
+        (output / "artifacts" / "provenance.json").read_text(encoding="utf-8")
+    )
+    assert provenance["runtime"]["device"] == {"type": "cuda", "index": 0}
+    assert provenance["runtime"]["batch_size"] == 1
+    before_tree = _tree_state(output)
+    before_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+
+    with pytest.raises(ValueError, match="provenance"):
+        run_pipeline(
+            reference,
+            evaluation,
+            _REAL_CHECKPOINT,
+            output,
+            device="cuda:0",
+            batch_size=2,
+            shard_size=10,
+            config=real_config,
+        )
+
+    after_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    assert _tree_state(output) == before_tree
+    assert after_metadata == before_metadata
+
+
+def test_plugin_implementation_text_is_validated_before_output_or_extractor(
+    tmp_path, small_config
+):
+    plugin_class = type(
+        "UnsafePlugin",
+        (),
+        {
+            "__module__": "unsafe\nmodule",
+            "name": "unsafe-plugin",
+            "severities": tuple(
+                Severity(level, float(level)) for level in range(6)
+            ),
+            "implementation_sha256": "1" * 64,
+            "apply": lambda self, image, _level: image.copy(),
+        },
+    )
+    inputs = _inputs(tmp_path)
+
+    with pytest.raises(ValueError, match="implementation module"):
+        run_pipeline(
+            *inputs,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+            corruption=plugin_class(),
+        )
+
+    assert not inputs[-1].exists()
+    assert FakeExtractor.instances == 0

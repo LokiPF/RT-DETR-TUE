@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
+import inspect
+import json
 import fcntl
 import io
 import math
 import os
+import platform
 import re
 import stat
 import sys
+import textwrap
 import unicodedata
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
@@ -16,7 +21,11 @@ from numbers import Integral, Real
 from pathlib import Path
 from typing import Callable
 
+import numpy as np
+import scipy
 import torch
+import torchvision
+from PIL import __version__ as pillow_version
 
 from .artifacts import (
     _fsync_directory,
@@ -43,7 +52,13 @@ from .extraction import (
     extract_manifest,
     validate_extraction_cache,
 )
-from .manifests import load_manifest, manifest_digest, validate_disjoint
+from .manifests import (
+    load_manifest,
+    manifest_digest,
+    validate_disjoint,
+    validate_image_fingerprint,
+    validate_image_signature,
+)
 from .reporting import REPORT_FILES, _bundle_bytes, _DirectoryLease, write_report
 from .scoring import score_image_records
 
@@ -91,10 +106,65 @@ _DETECTOR_SOURCE_PATHS = (
 )
 
 
+def _normalized_source(value) -> str:
+    source = inspect.getsource(value)
+    normalized = textwrap.dedent(source).replace("\r\n", "\n")
+    return normalized.replace("\r", "\n").strip() + "\n"
+
+
+def _corruption_implementation(corruption, apply) -> dict[str, str]:
+    plugin_class = type(corruption)
+    module = getattr(plugin_class, "__module__", None)
+    qualname = getattr(plugin_class, "__qualname__", None)
+    for label, value in (("module", module), ("qualname", qualname)):
+        if (
+            not isinstance(value, str)
+            or not value
+            or len(value) > 512
+            or any(
+                unicodedata.category(character).startswith("C")
+                for character in value
+            )
+        ):
+            raise ValueError(
+                f"corruption implementation {label} is invalid"
+            )
+    try:
+        source_payload = {
+            "class": _normalized_source(plugin_class),
+            "apply": _normalized_source(apply),
+        }
+    except (OSError, TypeError):
+        try:
+            source_sha256 = corruption.implementation_sha256
+        except Exception as error:
+            raise ValueError(
+                "source-unavailable corruption needs implementation_sha256"
+            ) from error
+        if (
+            not isinstance(source_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
+        ):
+            raise ValueError(
+                "corruption implementation_sha256 must be lowercase 64-hex"
+            )
+    else:
+        encoded = json.dumps(
+            source_payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        source_sha256 = hashlib.sha256(encoded).hexdigest()
+    return {
+        "module": module,
+        "qualname": qualname,
+        "source_sha256": source_sha256,
+    }
+
+
 @dataclass(frozen=True)
 class _CorruptionSnapshot:
     name: str
     severities: tuple[Severity, ...]
+    implementation: dict[str, str]
     _apply: Callable
 
     def apply(self, image, level):
@@ -189,7 +259,10 @@ def _snapshot_corruption(
         raise ValueError(
             "corruption must provide a callable apply method"
         )
-    return _CorruptionSnapshot(name, tuple(frozen_severities), apply)
+    implementation = _corruption_implementation(corruption, apply)
+    return _CorruptionSnapshot(
+        name, tuple(frozen_severities), implementation, apply
+    )
 
 
 def _source_files(root: str | Path | None = None) -> list[Path]:
@@ -213,7 +286,7 @@ def _checkpoint_digest(path: Path) -> str:
 
 
 def _provenance(
-    reference, evaluation, checkpoint, config, corruption: Corruption
+    reference, evaluation, checkpoint, config, corruption: Corruption, runtime
 ):
     levels = [severity.level for severity in corruption.severities]
     if levels != list(range(6)):
@@ -226,7 +299,9 @@ def _provenance(
         "checkpoint_sha256": _checkpoint_digest(checkpoint),
         "source_sha256": source_digest(_source_files(), root=root),
         "config": config.scientific_dict(),
+        "runtime": runtime,
         "corruption": {
+            "implementation": corruption.implementation,
             "name": corruption.name,
             "severities": [
                 {
@@ -369,6 +444,7 @@ def _terminal_sweep(
     score_snapshot: tuple,
     report_path: Path,
     report_snapshot: tuple,
+    input_groups: tuple,
 ) -> None:
     checks = [
         (provenance_path, "run provenance", provenance_snapshot),
@@ -403,6 +479,9 @@ def _terminal_sweep(
     for path, label, expected in checks:
         if _regular_file_snapshot(path, label=label) != expected:
             raise ValueError(f"{label} changed during the terminal audit")
+    for entries in input_groups:
+        for entry in entries:
+            validate_image_signature(entry)
 
 
 def _absolute_output_path(value: str | Path) -> Path:
@@ -665,9 +744,57 @@ def _runtime_device(value: str) -> torch.device:
     if not isinstance(value, str) or not value.strip():
         raise ValueError("device must be a nonempty PyTorch device string")
     try:
-        return torch.device(value)
+        requested = torch.device(value)
     except RuntimeError as error:
         raise ValueError(f"device is invalid: {value!r}") from error
+    if requested.type == "cpu":
+        return torch.device("cpu")
+    if requested.type == "cuda":
+        index = (
+            torch.cuda.current_device()
+            if requested.index is None
+            else requested.index
+        )
+        return torch.device("cuda", index)
+    return requested
+
+
+def _runtime_provenance(
+    device: torch.device, *, batch_size: int, shard_size: int
+) -> dict:
+    libraries = {
+        "python": str(platform.python_version()),
+        "pytorch": str(torch.__version__),
+        "torchvision": str(torchvision.__version__),
+        "numpy": str(np.__version__),
+        "scipy": str(scipy.__version__),
+        "pillow": str(pillow_version),
+    }
+    if device.type == "cuda":
+        index = device.index
+        if index is None:
+            raise ValueError("CUDA device must have a resolved index")
+        capability = list(torch.cuda.get_device_capability(index))
+        cuda = {
+            "runtime": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "gpu_name": torch.cuda.get_device_name(index),
+            "compute_capability": capability,
+        }
+    else:
+        cuda = {
+            "runtime": None,
+            "cudnn": None,
+            "gpu_name": None,
+            "compute_capability": None,
+        }
+    return {
+        "device": {"type": device.type, "index": device.index},
+        "batch_size": batch_size,
+        "shard_size": shard_size,
+        "libraries": libraries,
+        "cuda": cuda,
+    }
 
 
 def _extraction_metadata(provenance: dict, *, stage: str) -> dict:
@@ -678,6 +805,7 @@ def _extraction_metadata(provenance: dict, *, stage: str) -> dict:
         "checkpoint_sha256": provenance["checkpoint_sha256"],
         "source_sha256": provenance["source_sha256"],
         "config": provenance["config"],
+        "runtime": provenance["runtime"],
     }
     if stage == "evaluation":
         metadata["corruption"] = provenance["corruption"]
@@ -902,6 +1030,8 @@ def _final_audit(
     if report_content != expected["report"]:
         raise ValueError("published report bundle changed")
 
+    _validate_input_images(reference, evaluation)
+
     _terminal_sweep(
         provenance_path=provenance_path,
         provenance_snapshot=provenance_snapshot,
@@ -917,7 +1047,14 @@ def _final_audit(
         score_snapshot=score_snapshot,
         report_path=report_path,
         report_snapshot=report_snapshot,
+        input_groups=(reference, evaluation),
     )
+
+
+def _validate_input_images(*groups) -> None:
+    for entries in groups:
+        for entry in entries:
+            validate_image_fingerprint(entry)
 
 
 def run_pipeline(
@@ -936,6 +1073,9 @@ def run_pipeline(
     batch_size = _positive_integer(batch_size, name="batch_size")
     shard_size = _positive_integer(shard_size, name="shard_size")
     runtime_device = _runtime_device(device)
+    runtime = _runtime_provenance(
+        runtime_device, batch_size=batch_size, shard_size=shard_size
+    )
     if not isinstance(config, ExperimentConfig):
         raise ValueError("config must be an ExperimentConfig")
     if corruption is None:
@@ -945,12 +1085,14 @@ def run_pipeline(
     reference = load_manifest(reference_manifest)
     evaluation = load_manifest(evaluation_manifest)
     validate_disjoint(reference, evaluation)
+    _validate_input_images(reference, evaluation)
     checkpoint = Path(checkpoint).resolve()
     output = _absolute_output_path(output_dir)
     provenance = _provenance(
-        reference, evaluation, checkpoint, config, corruption
+        reference, evaluation, checkpoint, config, corruption, runtime
     )
     with _coordinated_output(output) as (anchored_output, report_parent):
+        _validate_input_images(reference, evaluation)
         with _pinned_child_directory(
             report_parent,
             "artifacts",

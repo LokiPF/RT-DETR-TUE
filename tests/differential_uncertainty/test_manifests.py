@@ -147,6 +147,26 @@ def test_reference_and_evaluation_cannot_repeat_a_resolved_path(tmp_path):
         validate_disjoint(load_manifest(reference), load_manifest(evaluation))
 
 
+def test_reference_and_evaluation_cannot_use_hard_links_to_the_same_image(
+    tmp_path,
+):
+    _image(tmp_path / "reference.png")
+    (tmp_path / "evaluation.png").hardlink_to(tmp_path / "reference.png")
+    reference = tmp_path / "reference.csv"
+    evaluation = tmp_path / "evaluation.csv"
+    reference.write_text(
+        "image_id,image_path\nreference,reference.png\n",
+        encoding="utf-8",
+    )
+    evaluation.write_text(
+        "image_id,image_path\nevaluation,evaluation.png\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="same image|hard.link|file identity"):
+        validate_disjoint(load_manifest(reference), load_manifest(evaluation))
+
+
 def test_disjoint_manifests_are_accepted(tmp_path):
     _image(tmp_path / "reference.png")
     _image(tmp_path / "evaluation.png")
@@ -174,7 +194,11 @@ def test_manifest_digest_hashes_a_canonical_id_and_resolved_path_payload(tmp_pat
     )
     entries = load_manifest(manifest)
     payload = [
-        {"image_id": entry.image_id, "path": str(entry.path)}
+        {
+            "image_id": entry.image_id,
+            "path": str(entry.path),
+            "fingerprint": entry.fingerprint.as_dict(),
+        }
         for entry in entries
     ]
     expected = hashlib.sha256(
@@ -220,3 +244,16 @@ def test_manifest_accepts_a_safe_256_character_unicode_image_id(tmp_path):
     entries = load_manifest(manifest)
 
     assert entries[0].image_id == image_id
+
+
+def test_manifest_rejects_two_hard_link_paths_to_one_image(tmp_path):
+    _image(tmp_path / "first.png")
+    (tmp_path / "second.png").hardlink_to(tmp_path / "first.png")
+    manifest = tmp_path / "hard-links.csv"
+    manifest.write_text(
+        "image_id,image_path\nfirst,first.png\nsecond,second.png\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="hard link|file identity"):
+        load_manifest(manifest)

@@ -26,7 +26,12 @@ from .artifacts import (
 )
 from .config import FIXED_CONFIG, ExperimentConfig
 from .corruptions.base import Corruption, Severity
-from .manifests import ManifestEntry
+from .manifests import (
+    ManifestEntry,
+    fingerprint_image,
+    open_fingerprinted_image,
+    validate_image_fingerprint,
+)
 from .persistence import Layer2Capture, batched_persistence
 
 
@@ -221,6 +226,8 @@ def _validated_entries(value: object) -> tuple[ManifestEntry, ...]:
         raise ValueError("entries must be a nonempty tuple")
     seen_ids: set[str] = set()
     seen_paths: set[Path] = set()
+    seen_identities: set[tuple[int, int]] = set()
+    normalized = []
     for entry in value:
         if not isinstance(entry, ManifestEntry):
             raise ValueError("entries must contain only ManifestEntry values")
@@ -234,9 +241,18 @@ def _validated_entries(value: object) -> tuple[ManifestEntry, ...]:
             raise ValueError(f"extraction image does not exist: {entry.path}")
         if entry.path in seen_paths:
             raise ValueError(f"duplicate extraction image path: {entry.path}")
+        fingerprint = entry.fingerprint
+        if fingerprint is None:
+            fingerprint = fingerprint_image(entry.path)
+        else:
+            validate_image_fingerprint(entry)
+        if fingerprint.identity in seen_identities:
+            raise ValueError("duplicate extraction image file identity")
         seen_ids.add(entry.image_id)
         seen_paths.add(entry.path)
-    return value
+        seen_identities.add(fingerprint.identity)
+        normalized.append(ManifestEntry(entry.image_id, entry.path, fingerprint))
+    return tuple(normalized)
 
 
 def _validated_metadata(value: object) -> dict:
@@ -534,8 +550,10 @@ def _pending_samples(
 ):
     expected_size = (image_size[1], image_size[0])
     for entry in entries:
-        with Image.open(entry.path) as opened:
-            resized = resize_image(opened, image_size)
+        with open_fingerprinted_image(entry) as image_file:
+            with Image.open(image_file) as opened:
+                opened.load()
+                resized = resize_image(opened, image_size)
             try:
                 for severity in severities:
                     key = (entry.image_id, int(severity.level))

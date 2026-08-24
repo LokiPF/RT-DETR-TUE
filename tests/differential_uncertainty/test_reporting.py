@@ -52,7 +52,27 @@ def _inputs():
     provenance = {
         "checkpoint_sha256": "abc",
         "config": config.scientific_dict(),
+        "runtime": {
+            "device": {"type": "cpu", "index": None},
+            "batch_size": 2,
+            "shard_size": 2,
+            "libraries": {
+                "python": "3.test",
+                "pytorch": "2.test",
+                "torchvision": "0.test",
+                "numpy": "1.test",
+                "scipy": "1.test",
+                "pillow": "11.test",
+            },
+            "cuda": {"runtime": None, "cudnn": None, "gpu_name": None,
+                     "compute_capability": None},
+        },
         "corruption": {
+            "implementation": {
+                "module": "differential_uncertainty.corruptions.gaussian_blur",
+                "qualname": "GaussianBlur",
+                "source_sha256": "1" * 64,
+            },
             "name": "gaussian_blur",
             "severities": [
                 {"level": level, "parameter": radius}
@@ -1287,10 +1307,15 @@ def test_report_and_figure_labels_follow_the_validated_test_config(
     )
     rows = _rows()
     evaluation = evaluate_rows(rows, config)
+    default_provenance = _inputs()[2]
     provenance = {
         "checkpoint_sha256": "abc",
         "config": config.scientific_dict(),
+        "runtime": copy.deepcopy(default_provenance["runtime"]),
         "corruption": {
+            "implementation": copy.deepcopy(
+                default_provenance["corruption"]["implementation"]
+            ),
             "name": "gaussian_blur",
             "severities": [
                 {"level": level, "parameter": radius}
