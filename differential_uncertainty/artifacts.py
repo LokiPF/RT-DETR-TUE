@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import os
 import secrets
@@ -251,38 +253,73 @@ def _path_exists_at(directory_fd: int, name: str) -> bool:
     except FileNotFoundError:
         return False
     return True
+
+
 @contextmanager
 def _serialized_regular_file_acquisition():
     if getattr(_REGULAR_FILE_ACQUISITION, "active", False):
         raise RuntimeError("reentrant artifact file acquisition is not supported")
-    _REGULAR_FILE_ACQUISITION.active = True
     try:
+        _REGULAR_FILE_ACQUISITION.active = True
         yield
     finally:
         _REGULAR_FILE_ACQUISITION.active = False
-
 
 
 def _register_live_reader(handle, lease: "_RegularFileLease") -> None:
     reference = None
 
     def discard(_reference) -> None:
-        with _WRITER_REGISTRY_LOCK:
-            _LIVE_READER_LEASES.pop(reference, None)
+        registry = globals().get("_LIVE_READER_LEASES")
+        lock = globals().get("_WRITER_REGISTRY_LOCK")
+        if registry is None or lock is None:
+            return
+        with lock:
+            registry.pop(reference, None)
 
     reference = weakref.ref(handle, discard)
     _LIVE_READER_LEASES[reference] = weakref.ref(lease)
 
 
+class _RegularFileOpenFlags:
+    """Add the safety flags before the C opener creates any resource."""
+
+    @classmethod
+    def from_param(cls, value: int):
+        return ctypes.c_int(
+            value
+            | os.O_NONBLOCK
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC_OPEN = _LIBC.open
+_LIBC_OPEN.argtypes = (ctypes.c_char_p, _RegularFileOpenFlags)
+_LIBC_OPEN.restype = ctypes.c_int
+
+
+def _open_regular_file_object(path: Path):
+    """Open without exposing the descriptor to a Python ownership boundary.
+
+    FileIO audits the path before calling its opener, then adopts the C
+    opener's result inside the same C call.  The Python flag converter runs
+    before libc creates the descriptor, so interruption cannot strand it.
+    """
+    return io.FileIO(
+        os.fsencode(path),
+        mode="rb",
+        closefd=True,
+        opener=_LIBC_OPEN,
+    )
+
 
 class _RegularFileLease:
-    """Own one nonblocking, no-follow read descriptor through adoption."""
+    """Own one safely adopted regular-file reader through validation."""
 
-    def __init__(self, identity: tuple[int, int], snapshot: set[int]):
+    def __init__(self, identity: tuple[int, int]):
         self.identity = identity
-        self.snapshot = snapshot
-        self.descriptor: int | None = None
-        self.marker: int | None = None
         self.handle = None
         self.owner_pid = os.getpid()
         self.released = False
@@ -294,64 +331,14 @@ class _RegularFileLease:
             and self.fork_generation == _FORK_GENERATION
         )
 
-    def _matches_acquisition_signature(self, descriptor: int) -> bool:
-        try:
-            status_flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
-            descriptor_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
-        except OSError:
-            return False
-        return (
-            status_flags & os.O_ACCMODE == os.O_RDONLY
-            and bool(status_flags & os.O_NONBLOCK)
-            and bool(descriptor_flags & fcntl.FD_CLOEXEC)
-        )
-
-
-    def _recover_unassigned_descriptor(self) -> None:
-        for descriptor in _live_fd_snapshot() - self.snapshot:
-            try:
-                opened = os.fstat(descriptor)
-            except OSError:
-                continue
-            if (
-                (opened.st_dev, opened.st_ino) == self.identity
-                and self._matches_acquisition_signature(descriptor)
-            ):
-                os.closerange(descriptor, descriptor + 1)
-
-    def _matches_descriptor(self, descriptor: int) -> bool:
-        try:
-            opened = os.fstat(descriptor)
-            offset = os.lseek(descriptor, 0, os.SEEK_CUR)
-        except OSError:
-            return False
-        if (opened.st_dev, opened.st_ino) != self.identity:
-            return False
-        if self.marker is None:
-            return self._matches_acquisition_signature(descriptor)
-        return offset == self.marker
-
     def close(self) -> None:
         if self.released:
             return
         handle = self.handle
-        if handle is not None:
-            self.handle = None
-            self.descriptor = None
-            # The local file object remains the sole owner if tracing interrupts
-            # before close; frame unwinding then closes it exactly once.
-            self.released = True
-            handle.close()
-            return
-        descriptor = self.descriptor
-        if descriptor is not None:
-            if self._matches_descriptor(descriptor):
-                os.closerange(descriptor, descriptor + 1)
-            self.descriptor = None
-            self.released = True
-            return
-        self._recover_unassigned_descriptor()
+        self.handle = None
         self.released = True
+        if handle is not None:
+            handle.close()
 
     def acquire(
         self,
@@ -361,23 +348,14 @@ class _RegularFileLease:
         directory_fd: int | None,
         error_message: str,
     ) -> None:
-        flags = (
-            os.O_RDONLY
-            | os.O_NONBLOCK
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0)
-        )
-        descriptor = None
+        handle = None
         try:
-            descriptor = os.open(visible, flags)
-            self.descriptor = descriptor
-        except BaseException:
-            self._recover_unassigned_descriptor()
-            raise
-        try:
+            handle = _open_regular_file_object(visible)
+            self.handle = handle
             if not self._valid_process():
                 raise RuntimeError("artifact file acquisition crossed a fork")
-            opened = os.fstat(descriptor)
+            _register_live_reader(handle, self)
+            opened = os.fstat(handle.fileno())
             try:
                 current = _stat_entry(entry, directory_fd=directory_fd)
             except OSError as error:
@@ -390,24 +368,6 @@ class _RegularFileLease:
                 or opened_identity != (current.st_dev, current.st_ino)
             ):
                 raise ValueError(f"{error_message}; entry changed")
-            self.marker = secrets.randbelow((1 << 30) - 1) + 1
-            actual = os.lseek(descriptor, self.marker, os.SEEK_SET)
-            if actual != self.marker:
-                raise RuntimeError(
-                    "artifact file descriptor did not retain its ownership marker"
-                )
-            handle = None
-            try:
-                handle = os.fdopen(descriptor, "rb")
-                _register_live_reader(handle, self)
-                self.handle = handle
-                self.descriptor = None
-            except BaseException:
-                if handle is not None:
-                    self.handle = handle
-                    self.descriptor = None
-                raise
-            handle.seek(0)
             if not self._valid_process():
                 raise RuntimeError("artifact file acquisition crossed a fork")
         except BaseException:
@@ -459,9 +419,7 @@ def _open_regular_file(
             raise ValueError(error_message) from error
         if not stat.S_ISREG(before.st_mode):
             raise ValueError(error_message)
-        lease = _RegularFileLease(
-            (before.st_dev, before.st_ino), _live_fd_snapshot()
-        )
+        lease = _RegularFileLease((before.st_dev, before.st_ino))
         try:
             lease.acquire(
                 visible,
