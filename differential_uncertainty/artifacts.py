@@ -22,6 +22,8 @@ _MANIFEST_KEYS = frozenset(
     {"schema_version", "shard_size", "record_count", "shards", "shard_sha256"}
 )
 _ACTIVE_WRITERS: dict[tuple[int, int], weakref.ReferenceType] = {}
+_REGULAR_FILE_ACQUISITION = threading.local()
+_LIVE_READER_LEASES: dict[weakref.ReferenceType, weakref.ReferenceType] = {}
 _WRITER_REGISTRY_LOCK = threading.RLock()
 _FORK_LOCKED_WRITERS: list["ShardWriter"] = []
 _CONSTRUCTING_WRITERS: list["ShardWriter"] = []
@@ -249,6 +251,185 @@ def _path_exists_at(directory_fd: int, name: str) -> bool:
     except FileNotFoundError:
         return False
     return True
+@contextmanager
+def _serialized_regular_file_acquisition():
+    if getattr(_REGULAR_FILE_ACQUISITION, "active", False):
+        raise RuntimeError("reentrant artifact file acquisition is not supported")
+    _REGULAR_FILE_ACQUISITION.active = True
+    try:
+        yield
+    finally:
+        _REGULAR_FILE_ACQUISITION.active = False
+
+
+
+def _register_live_reader(handle, lease: "_RegularFileLease") -> None:
+    reference = None
+
+    def discard(_reference) -> None:
+        with _WRITER_REGISTRY_LOCK:
+            _LIVE_READER_LEASES.pop(reference, None)
+
+    reference = weakref.ref(handle, discard)
+    _LIVE_READER_LEASES[reference] = weakref.ref(lease)
+
+
+
+class _RegularFileLease:
+    """Own one nonblocking, no-follow read descriptor through adoption."""
+
+    def __init__(self, identity: tuple[int, int], snapshot: set[int]):
+        self.identity = identity
+        self.snapshot = snapshot
+        self.descriptor: int | None = None
+        self.marker: int | None = None
+        self.handle = None
+        self.owner_pid = os.getpid()
+        self.released = False
+        self.fork_generation = _FORK_GENERATION
+
+    def _valid_process(self) -> bool:
+        return (
+            self.owner_pid == os.getpid()
+            and self.fork_generation == _FORK_GENERATION
+        )
+
+    def _matches_acquisition_signature(self, descriptor: int) -> bool:
+        try:
+            status_flags = fcntl.fcntl(descriptor, fcntl.F_GETFL)
+            descriptor_flags = fcntl.fcntl(descriptor, fcntl.F_GETFD)
+        except OSError:
+            return False
+        return (
+            status_flags & os.O_ACCMODE == os.O_RDONLY
+            and bool(status_flags & os.O_NONBLOCK)
+            and bool(descriptor_flags & fcntl.FD_CLOEXEC)
+        )
+
+
+    def _recover_unassigned_descriptor(self) -> None:
+        for descriptor in _live_fd_snapshot() - self.snapshot:
+            try:
+                opened = os.fstat(descriptor)
+            except OSError:
+                continue
+            if (
+                (opened.st_dev, opened.st_ino) == self.identity
+                and self._matches_acquisition_signature(descriptor)
+            ):
+                os.closerange(descriptor, descriptor + 1)
+
+    def _matches_descriptor(self, descriptor: int) -> bool:
+        try:
+            opened = os.fstat(descriptor)
+            offset = os.lseek(descriptor, 0, os.SEEK_CUR)
+        except OSError:
+            return False
+        if (opened.st_dev, opened.st_ino) != self.identity:
+            return False
+        if self.marker is None:
+            return self._matches_acquisition_signature(descriptor)
+        return offset == self.marker
+
+    def close(self) -> None:
+        if self.released:
+            return
+        handle = self.handle
+        if handle is not None:
+            self.handle = None
+            self.descriptor = None
+            # The local file object remains the sole owner if tracing interrupts
+            # before close; frame unwinding then closes it exactly once.
+            self.released = True
+            handle.close()
+            return
+        descriptor = self.descriptor
+        if descriptor is not None:
+            if self._matches_descriptor(descriptor):
+                os.closerange(descriptor, descriptor + 1)
+            self.descriptor = None
+            self.released = True
+            return
+        self._recover_unassigned_descriptor()
+        self.released = True
+
+    def acquire(
+        self,
+        visible: Path,
+        entry,
+        *,
+        directory_fd: int | None,
+        error_message: str,
+    ) -> None:
+        flags = (
+            os.O_RDONLY
+            | os.O_NONBLOCK
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = None
+        try:
+            descriptor = os.open(visible, flags)
+            self.descriptor = descriptor
+        except BaseException:
+            self._recover_unassigned_descriptor()
+            raise
+        try:
+            if not self._valid_process():
+                raise RuntimeError("artifact file acquisition crossed a fork")
+            opened = os.fstat(descriptor)
+            try:
+                current = _stat_entry(entry, directory_fd=directory_fd)
+            except OSError as error:
+                raise ValueError(f"{error_message}; entry changed") from error
+            opened_identity = (opened.st_dev, opened.st_ino)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or opened_identity != self.identity
+                or opened_identity != (current.st_dev, current.st_ino)
+            ):
+                raise ValueError(f"{error_message}; entry changed")
+            self.marker = secrets.randbelow((1 << 30) - 1) + 1
+            actual = os.lseek(descriptor, self.marker, os.SEEK_SET)
+            if actual != self.marker:
+                raise RuntimeError(
+                    "artifact file descriptor did not retain its ownership marker"
+                )
+            handle = None
+            try:
+                handle = os.fdopen(descriptor, "rb")
+                _register_live_reader(handle, self)
+                self.handle = handle
+                self.descriptor = None
+            except BaseException:
+                if handle is not None:
+                    self.handle = handle
+                    self.descriptor = None
+                raise
+            handle.seek(0)
+            if not self._valid_process():
+                raise RuntimeError("artifact file acquisition crossed a fork")
+        except BaseException:
+            self.close()
+            raise
+
+    def release(self):
+        handle = self.handle
+        if handle is None:
+            raise RuntimeError("artifact file lease has no open handle")
+        if not self._valid_process():
+            self.close()
+            raise RuntimeError("artifact file acquisition crossed a fork")
+        self.released = True
+        self.handle = None
+        return handle
+
+    def __del__(self):
+        try:
+            self.close()
+        except BaseException:
+            pass
 
 
 def _open_regular_file(
@@ -265,40 +446,36 @@ def _open_regular_file(
         if not entry_name or Path(entry_name).name != entry_name:
             raise ValueError(error_message)
         visible = Path(f"/proc/self/fd/{directory_fd}") / entry_name
-    try:
-        before = _stat_entry(
-            visible if directory_fd is None else entry_name,
-            directory_fd=directory_fd,
-        )
-    except OSError as error:
-        raise ValueError(error_message) from error
-    if not stat.S_ISREG(before.st_mode):
-        raise ValueError(error_message)
-    try:
-        handle = open(visible, "rb")
-    except OSError as error:
-        raise ValueError(error_message) from error
-    try:
-        opened = os.fstat(handle.fileno())
+    entry = visible if directory_fd is None else entry_name
+    with (
+        _WRITER_REGISTRY_LOCK, _serialized_regular_file_acquisition()
+    ):
         try:
-            entry = _stat_entry(
-                visible if directory_fd is None else entry_name,
+            before = _stat_entry(
+                entry,
                 directory_fd=directory_fd,
             )
         except OSError as error:
-            raise ValueError(f"{error_message}; entry changed") from error
-        if (
-            not stat.S_ISREG(opened.st_mode)
-            or not stat.S_ISREG(entry.st_mode)
-            or (before.st_dev, before.st_ino)
-            != (opened.st_dev, opened.st_ino)
-            or (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino)
-        ):
-            raise ValueError(f"{error_message}; entry changed")
-    except BaseException:
-        handle.close()
-        raise
-    return handle
+            raise ValueError(error_message) from error
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError(error_message)
+        lease = _RegularFileLease(
+            (before.st_dev, before.st_ino), _live_fd_snapshot()
+        )
+        try:
+            lease.acquire(
+                visible,
+                entry,
+                directory_fd=directory_fd,
+                error_message=error_message,
+            )
+            return lease.release()
+        except OSError as error:
+            lease.close()
+            raise ValueError(error_message) from error
+        except BaseException:
+            lease.close()
+            raise
 
 
 def _read_json_at(directory_fd: int, name: str):
@@ -404,7 +581,10 @@ def ensure_provenance(run_directory: str | Path, expected: Mapping) -> Path:
     if _atomic_json_create(expected_dict, path):
         return path
 
-    actual = json.loads(path.read_text(encoding="utf-8"))
+    with _open_regular_file(
+        path, error_message="run provenance must be a regular file"
+    ) as handle:
+        actual = json.load(handle)
     if not isinstance(actual, dict):
         raise ValueError("run provenance must contain a JSON object")
     _ensure_exact_mapping(actual, expected_dict, label="run provenance")
@@ -1551,6 +1731,10 @@ def _release_writer_registry_after_fork() -> None:
     global _FORK_GENERATION, _FORK_LOCKED_WRITERS
 
     _FORK_GENERATION += 1
+    for lease_reference in list(_LIVE_READER_LEASES.values()):
+        lease = lease_reference()
+        if lease is not None and lease.owner_pid == os.getpid():
+            lease.fork_generation = _FORK_GENERATION
     leases = list(_PENDING_LOCK_LEASES)
     for writer in _FORK_LOCKED_WRITERS:
         lease = getattr(writer, "_candidate_lease", None)
@@ -1574,8 +1758,17 @@ def _reset_writer_registry_after_fork() -> None:
     global _FORK_LOCKED_WRITERS
     global _PENDING_LOCK_FDS, _PENDING_LOCK_LEASES
     global _TRANSFER_PARTICIPANTS, _WRITER_REGISTRY_LOCK
+    global _LIVE_READER_LEASES
 
     _FORK_GENERATION += 1
+    for handle_reference in list(_LIVE_READER_LEASES):
+        handle = handle_reference()
+        if handle is not None:
+            try:
+                handle.close()
+            except OSError:
+                pass
+    _LIVE_READER_LEASES = {}
     writers: list[ShardWriter] = []
     for candidate in [*_FORK_LOCKED_WRITERS, *_TRANSFER_PARTICIPANTS]:
         if not any(candidate is writer for writer in writers):
@@ -1635,9 +1828,11 @@ if hasattr(os, "register_at_fork"):
 
 
 def load_manifest(directory: str | Path) -> dict:
-    value = json.loads(
-        (Path(directory) / "manifest.json").read_text(encoding="utf-8")
-    )
+    path = Path(directory) / "manifest.json"
+    with _open_regular_file(
+        path, error_message="artifact manifest must be a regular file"
+    ) as handle:
+        value = json.load(handle)
     if type(value) is not dict:
         raise ValueError("artifact manifest must be a JSON object")
     _require_schema(value, label="artifact manifest")

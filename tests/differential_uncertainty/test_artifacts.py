@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import pickle
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -55,6 +56,48 @@ def _traceable(function):
     return getattr(function, "__wrapped__", function)
 
 
+def _interrupt_at_instruction(function, invoke, predicate, *, before_interrupt=None) -> None:
+    function = _traceable(function)
+    instructions = {
+        instruction.offset: instruction
+        for instruction in dis.get_instructions(function)
+    }
+    for _attempt in range(2):
+        interrupted = False
+
+        def interrupt(frame, event, _argument):
+            nonlocal interrupted
+            if frame.f_code is function.__code__:
+                frame.f_trace_opcodes = True
+                instruction = instructions.get(frame.f_lasti)
+                if (
+                    not interrupted
+                    and event == "opcode"
+                    and instruction is not None
+                    and predicate(frame, instruction)
+                ):
+                    interrupted = True
+                    if before_interrupt is not None:
+                        before_interrupt(frame, instruction)
+                    raise KeyboardInterrupt(
+                        "interrupted at file ownership boundary"
+                    )
+            return interrupt
+
+        try:
+            sys.settrace(interrupt)
+            invoke()
+        except KeyboardInterrupt as error:
+            if not interrupted:
+                raise
+            assert "file ownership boundary" in str(error)
+        finally:
+            sys.settrace(None)
+        if interrupted:
+            return
+    pytest.fail("ownership boundary was not executed")
+
+
 def _interrupt_at_opcode(
     function,
     opname,
@@ -71,24 +114,27 @@ def _interrupt_at_opcode(
         and (argval is None or instruction.argval == argval)
     ]
     target = targets[occurrence]
-    interrupted = False
+    _interrupt_at_instruction(
+        function,
+        invoke,
+        lambda _frame, instruction: instruction.offset == target,
+    )
 
-    def interrupt(frame, event, _argument):
-        nonlocal interrupted
-        if frame.f_code is function.__code__:
-            frame.f_trace_opcodes = True
-            if not interrupted and event == "opcode" and frame.f_lasti == target:
-                interrupted = True
-                raise KeyboardInterrupt("interrupted at file ownership boundary")
-        return interrupt
 
-    try:
-        sys.settrace(interrupt)
-        with pytest.raises(KeyboardInterrupt, match="file ownership boundary"):
-            invoke()
-    finally:
-        sys.settrace(None)
-    assert interrupted
+def _attribute_call_return_offsets(function, attribute: str) -> set[int]:
+    instructions = list(dis.get_instructions(_traceable(function)))
+    boundaries = set()
+    for index, instruction in enumerate(instructions):
+        if instruction.argval != attribute or instruction.opname not in (
+            "LOAD_ATTR",
+            "LOAD_METHOD",
+        ):
+            continue
+        for call_index in range(index + 1, len(instructions) - 1):
+            if instructions[call_index].opname.startswith("CALL"):
+                boundaries.add(instructions[call_index + 1].offset)
+                break
+    return boundaries
 
 
 def _temporary_entries(root: Path) -> list[Path]:
@@ -200,13 +246,28 @@ def test_staging_open_return_interrupt_has_no_raw_descriptor_or_file(
         monkeypatch.setattr(artifacts.os, "open", observed_open)
 
     try:
-        _interrupt_at_opcode(
-            target,
-            opname,
-            argval,
-            invoke,
-            occurrence=1 if hasattr(artifacts, "_staged_file") else 0,
-        )
+        if hasattr(artifacts, "_staged_file"):
+            def opened_handle_is_not_owned(frame, instruction):
+                if (
+                    instruction.opname != "STORE_FAST"
+                    or instruction.argval != "handle"
+                    or frame.f_locals.get("handle") is not None
+                ):
+                    return False
+                for descriptor, path in observed:
+                    try:
+                        os.fstat(descriptor)
+                    except OSError:
+                        continue
+                    if path.exists():
+                        return True
+                return False
+
+            _interrupt_at_instruction(
+                target, invoke, opened_handle_is_not_owned
+            )
+        else:
+            _interrupt_at_opcode(target, opname, argval, invoke)
         leaked = []
         for descriptor, _path in observed:
             try:
@@ -286,13 +347,19 @@ def test_staging_file_adoption_interrupt_never_recloses_a_reused_fd(
 
     monkeypatch.setattr(artifacts.os, "close", detect_stale_close)
     try:
-        _interrupt_at_opcode(
-            target,
-            "STORE_FAST",
-            "handle",
-            invoke,
-            occurrence=1 if hasattr(artifacts, "_staged_file") else 0,
-        )
+        if hasattr(artifacts, "_staged_file"):
+            _interrupt_at_instruction(
+                target,
+                invoke,
+                lambda frame, instruction: (
+                    instruction.opname == "STORE_FAST"
+                    and instruction.argval == "handle"
+                    and frame.f_locals.get("handle") is None
+                    and resource_fd is not None
+                ),
+            )
+        else:
+            _interrupt_at_opcode(target, "STORE_FAST", "handle", invoke)
         replacement_survived = True
         if replacement_fd is not None:
             try:
@@ -387,21 +454,10 @@ def test_staged_file_close_completion_never_recloses_a_reused_fd(
 ):
     root, directory_fd, invoke = _publication_case(tmp_path, kind)
     function = _traceable(artifacts._staged_file)
-    instructions = list(dis.get_instructions(function))
-    close_pops = [
-        instruction.offset
-        for index, instruction in enumerate(instructions)
-        if instruction.opname == "POP_TOP"
-        and index >= 3
-        and instructions[index - 1].opname == "CALL"
-        and instructions[index - 3].opname == "LOAD_METHOD"
-        and instructions[index - 3].argval == "close"
-    ]
-    close_pop = close_pops[1]
+    close_returns = _attribute_call_return_offsets(function, "close")
     original_builtin_open = builtins.open
     resource_fd = None
     replacement_fd = None
-    interrupted = False
 
     def observed_open(path, mode="r", *args, **kwargs):
         nonlocal resource_fd
@@ -410,29 +466,33 @@ def test_staged_file_close_completion_never_recloses_a_reused_fd(
             resource_fd = handle.fileno()
         return handle
 
-    def interrupt_after_close(frame, event, _argument):
-        nonlocal interrupted, replacement_fd
-        if frame.f_code is function.__code__:
-            frame.f_trace_opcodes = True
-            if not interrupted and event == "opcode" and frame.f_lasti == close_pop:
-                interrupted = True
-                replacement_fd = os.open(os.devnull, os.O_RDONLY)
-                assert replacement_fd == resource_fd
-                raise KeyboardInterrupt("interrupted after close completion")
-        return interrupt_after_close
+    def closed_resource(_frame, instruction):
+        if instruction.offset not in close_returns or resource_fd is None:
+            return False
+        try:
+            os.fstat(resource_fd)
+        except OSError:
+            return True
+        return False
+
+    def reuse_closed_descriptor(_frame, _instruction):
+        nonlocal replacement_fd
+        replacement_fd = os.open(os.devnull, os.O_RDONLY)
+        assert replacement_fd == resource_fd
 
     monkeypatch.setattr(builtins, "open", observed_open)
     try:
-        sys.settrace(interrupt_after_close)
-        with pytest.raises(KeyboardInterrupt, match="close completion"):
-            invoke()
+        _interrupt_at_instruction(
+            function,
+            invoke,
+            closed_resource,
+            before_interrupt=reuse_closed_descriptor,
+        )
     finally:
-        sys.settrace(None)
         monkeypatch.undo()
         if directory_fd is not None:
             os.close(directory_fd)
 
-    assert interrupted
     assert replacement_fd is not None
     os.fstat(replacement_fd)
     os.close(replacement_fd)
@@ -450,45 +510,25 @@ def test_read_open_return_interrupt_has_no_raw_descriptor(
     _root, directory_fd, invoke = _read_case(tmp_path, kind)
     original_close = os.close
     observed = []
-    if hasattr(artifacts, "_open_regular_file"):
-        target = artifacts._open_regular_file
-        opname, argval = "STORE_FAST", "handle"
-        original_open = builtins.open
+    target = artifacts._RegularFileLease.acquire
+    original_open = artifacts.os.open
 
-        def observed_open(path, mode="r", *args, **kwargs):
-            handle = original_open(path, mode, *args, **kwargs)
-            if mode == "rb":
-                observed.append(handle.fileno())
-            return handle
+    def observed_open(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+        observed.append(descriptor)
+        return descriptor
 
-        monkeypatch.setattr(builtins, "open", observed_open)
-    else:
-        target = {
-            "read_json": artifacts._read_json_at,
-            "sha256_at": artifacts._sha256_file_at,
-            "shard_path": artifacts._safe_load_shard,
-            "shard_at": artifacts._safe_load_shard,
-        }[kind]
-        opname, argval = "STORE_FAST", "descriptor"
-        original_open = artifacts.os.open
-
-        def observed_open(path, flags, *args, **kwargs):
-            descriptor = original_open(path, flags, *args, **kwargs)
-            observed.append(descriptor)
-            return descriptor
-
-        monkeypatch.setattr(artifacts.os, "open", observed_open)
+    monkeypatch.setattr(artifacts.os, "open", observed_open)
     try:
-        _interrupt_at_opcode(
+        _interrupt_at_instruction(
             target,
-            opname,
-            argval,
             invoke,
-            occurrence=(
-                1
-                if kind == "shard_at"
-                and not hasattr(artifacts, "_open_regular_file")
-                else 0
+            lambda frame, instruction: (
+                instruction.opname == "STORE_FAST"
+                and instruction.argval == "descriptor"
+                and frame.f_locals.get("descriptor") is None
+                and observed
+                and Path(f"/proc/self/fd/{observed[-1]}").exists()
             ),
         )
         leaked = []
@@ -528,16 +568,15 @@ def test_read_helper_return_interrupt_closes_owned_file(
         "shard_path": artifacts._safe_load_shard,
         "shard_at": artifacts._safe_load_shard,
     }[kind]
-    original_open = builtins.open
+    original_open = artifacts.os.open
     observed = []
 
-    def observed_open(path, mode="r", *args, **kwargs):
-        handle = original_open(path, mode, *args, **kwargs)
-        if mode == "rb":
-            observed.append(handle.fileno())
-        return handle
+    def observed_open(path, flags, *args, **kwargs):
+        descriptor = original_open(path, flags, *args, **kwargs)
+        observed.append(descriptor)
+        return descriptor
 
-    monkeypatch.setattr(builtins, "open", observed_open)
+    monkeypatch.setattr(artifacts.os, "open", observed_open)
     try:
         _interrupt_at_opcode(target, "BEFORE_WITH", None, invoke)
         leaked = []
@@ -568,34 +607,16 @@ def test_read_file_adoption_interrupt_never_recloses_a_reused_fd(
     original_open = os.open
     resource_fd = None
     replacement_fd = None
-    if hasattr(artifacts, "_open_regular_file"):
-        target = artifacts._open_regular_file
-        original_builtin_open = builtins.open
+    target = artifacts._RegularFileLease.acquire
+    original_fdopen = artifacts.os.fdopen
 
-        def observed_builtin_open(path, mode="r", *args, **kwargs):
-            nonlocal resource_fd
-            handle = original_builtin_open(path, mode, *args, **kwargs)
-            if mode == "rb":
-                resource_fd = handle.fileno()
-            return handle
+    def observed_fdopen(descriptor, *args, **kwargs):
+        nonlocal resource_fd
+        handle = original_fdopen(descriptor, *args, **kwargs)
+        resource_fd = handle.fileno()
+        return handle
 
-        monkeypatch.setattr(builtins, "open", observed_builtin_open)
-    else:
-        target = {
-            "read_json": artifacts._read_json_at,
-            "sha256_at": artifacts._sha256_file_at,
-            "shard_path": artifacts._safe_load_shard,
-            "shard_at": artifacts._safe_load_shard,
-        }[kind]
-        original_fdopen = artifacts.os.fdopen
-
-        def observed_fdopen(descriptor, *args, **kwargs):
-            nonlocal resource_fd
-            handle = original_fdopen(descriptor, *args, **kwargs)
-            resource_fd = handle.fileno()
-            return handle
-
-        monkeypatch.setattr(artifacts.os, "fdopen", observed_fdopen)
+    monkeypatch.setattr(artifacts.os, "fdopen", observed_fdopen)
 
     def detect_stale_close(descriptor):
         nonlocal replacement_fd
@@ -608,7 +629,16 @@ def test_read_file_adoption_interrupt_never_recloses_a_reused_fd(
 
     monkeypatch.setattr(artifacts.os, "close", detect_stale_close)
     try:
-        _interrupt_at_opcode(target, "STORE_FAST", "handle", invoke)
+        _interrupt_at_instruction(
+            target,
+            invoke,
+            lambda frame, instruction: (
+                instruction.opname == "STORE_FAST"
+                and instruction.argval == "handle"
+                and frame.f_locals.get("handle") is None
+                and resource_fd is not None
+            ),
+        )
         replacement_survived = True
         if replacement_fd is not None:
             try:
@@ -644,63 +674,59 @@ def test_validation_failure_close_completion_never_recloses_a_reused_fd(
         else None
     )
     source = target if directory_fd is None else target.name
-    function = artifacts._open_regular_file
-    instructions = list(dis.get_instructions(function))
-    close_pop = next(
-        instruction.offset
-        for index, instruction in enumerate(instructions)
-        if instruction.opname == "POP_TOP"
-        and index >= 3
-        and instructions[index - 1].opname == "CALL"
-        and instructions[index - 3].opname == "LOAD_METHOD"
-        and instructions[index - 3].argval == "close"
-    )
-    original_builtin_open = builtins.open
+    function = artifacts._RegularFileLease.close
+    close_returns = _attribute_call_return_offsets(function, "closerange")
+    original_open = artifacts.os.open
     original_fstat = artifacts.os.fstat
     resource_fd = None
     replacement_fd = None
-    interrupted = False
+    validation_failed = False
 
-    def observed_open(path, mode="r", *args, **kwargs):
+    def observed_open(path, flags, *args, **kwargs):
         nonlocal resource_fd
-        handle = original_builtin_open(path, mode, *args, **kwargs)
-        if mode == "rb":
-            resource_fd = handle.fileno()
-        return handle
+        resource_fd = original_open(path, flags, *args, **kwargs)
+        return resource_fd
 
     def fail_validation(descriptor):
-        if descriptor == resource_fd:
+        nonlocal validation_failed
+        if descriptor == resource_fd and not validation_failed:
+            validation_failed = True
             raise RuntimeError("validation failed")
         return original_fstat(descriptor)
 
-    def interrupt_after_close(frame, event, _argument):
-        nonlocal interrupted, replacement_fd
-        if frame.f_code is function.__code__:
-            frame.f_trace_opcodes = True
-            if not interrupted and event == "opcode" and frame.f_lasti == close_pop:
-                interrupted = True
-                replacement_fd = os.open(os.devnull, os.O_RDONLY)
-                assert replacement_fd == resource_fd
-                raise KeyboardInterrupt("interrupted after close completion")
-        return interrupt_after_close
+    def closed_resource(_frame, instruction):
+        if instruction.offset not in close_returns or resource_fd is None:
+            return False
+        try:
+            original_fstat(resource_fd)
+        except OSError:
+            return True
+        return False
 
-    monkeypatch.setattr(builtins, "open", observed_open)
+    def reuse_closed_descriptor(_frame, _instruction):
+        nonlocal replacement_fd
+        replacement_fd = os.open(os.devnull, os.O_RDONLY)
+        assert replacement_fd == resource_fd
+
+    monkeypatch.setattr(artifacts.os, "open", observed_open)
     monkeypatch.setattr(artifacts.os, "fstat", fail_validation)
     try:
-        sys.settrace(interrupt_after_close)
-        with pytest.raises(KeyboardInterrupt, match="close completion"):
-            artifacts._open_regular_file(
+        _interrupt_at_instruction(
+            function,
+            lambda: artifacts._open_regular_file(
                 source,
                 directory_fd=directory_fd,
                 error_message="invalid test file",
-            )
+            ),
+            closed_resource,
+            before_interrupt=reuse_closed_descriptor,
+        )
     finally:
-        sys.settrace(None)
         monkeypatch.undo()
         if directory_fd is not None:
             os.close(directory_fd)
 
-    assert interrupted
+    assert validation_failed
     assert replacement_fd is not None
     os.fstat(replacement_fd)
     os.close(replacement_fd)
@@ -809,6 +835,104 @@ def test_reads_reject_symlink_before_opening_its_fifo_target(
             invoke()
     finally:
         os.close(directory_fd)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "manifest_symlink",
+        "provenance_symlink",
+        "manifest_swap",
+        "manifest_fifo_swap",
+    ],
+)
+def test_fixed_public_json_reads_reject_fifo_entries_without_blocking(
+    tmp_path,
+    operation,
+):
+    root = tmp_path / operation
+    root.mkdir()
+    fifo = tmp_path / f"{operation}.fifo"
+    os.mkfifo(fifo)
+    if operation == "manifest_symlink":
+        (root / "manifest.json").symlink_to(fifo)
+    elif operation == "provenance_symlink":
+        artifacts_directory = root / "artifacts"
+        artifacts_directory.mkdir()
+        (artifacts_directory / "provenance.json").symlink_to(fifo)
+    else:
+        atomic_json(
+            {
+                "schema_version": 1,
+                "record_count": 0,
+                "shards": [],
+                "shard_sha256": {},
+            },
+            root / "manifest.json",
+        )
+
+    project_root = Path(artifacts.__file__).resolve().parent.parent
+    script = r"""
+import sys
+from pathlib import Path
+import differential_uncertainty.artifacts as artifacts
+
+operation = sys.argv[1]
+root = Path(sys.argv[2])
+fifo = Path(sys.argv[3])
+if operation in ("manifest_swap", "manifest_fifo_swap"):
+    manifest = root / "manifest.json"
+    original = artifacts._stat_entry
+    swapped = False
+
+    def swap_after_prevalidation(path, *, directory_fd):
+        global swapped
+        state = original(path, directory_fd=directory_fd)
+        if not swapped and Path(path).name == manifest.name:
+            manifest.rename(root / "manifest.original")
+            if operation == "manifest_fifo_swap":
+                fifo.rename(manifest)
+            else:
+                manifest.symlink_to(fifo)
+            swapped = True
+        return state
+
+    artifacts._stat_entry = swap_after_prevalidation
+
+try:
+    if operation == "provenance_symlink":
+        artifacts.ensure_provenance(root, {"schema_version": 1})
+    else:
+        artifacts.load_manifest(root)
+except ValueError:
+    raise SystemExit(0)
+raise SystemExit(3)
+"""
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = os.pathsep.join(
+        [
+            os.fspath(project_root),
+            environment.get("PYTHONPATH", ""),
+        ]
+    )
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            script,
+            operation,
+            os.fspath(root),
+            os.fspath(fifo),
+        ],
+        cwd=project_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_dirfd_torch_save_failure_closes_and_removes_staging_file(
@@ -4641,3 +4765,163 @@ def test_iter_records_does_not_execute_pickle_payloads(tmp_path):
         list(iter_records(root))
 
     assert _EXECUTED == []
+
+
+def test_regular_file_reader_uses_nonblocking_nofollow_descriptor(tmp_path, monkeypatch):
+    target = tmp_path / "value.json"
+    target.write_text('{"value": 1}\n', encoding="utf-8")
+    original_open = artifacts.os.open
+    observed_flags = []
+
+    def observe_open(path, flags, *args, **kwargs):
+        observed_flags.append(flags)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(artifacts.os, "open", observe_open)
+    with artifacts._open_regular_file(
+        target, error_message="invalid test file"
+    ) as handle:
+        assert json.load(handle) == {"value": 1}
+
+    assert observed_flags
+    assert observed_flags[-1] & os.O_NONBLOCK
+    assert observed_flags[-1] & os.O_NOFOLLOW
+
+
+def test_regular_file_raw_open_interrupt_recovers_only_new_target_fd(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "value.bin"
+    target.write_bytes(b"value")
+    original_open = artifacts.os.open
+    original_close = os.close
+    target_fd = None
+    unrelated_fd = None
+
+    def open_with_unrelated(path, flags, *args, **kwargs):
+        nonlocal target_fd, unrelated_fd
+        target_fd = original_open(path, flags, *args, **kwargs)
+        unrelated_fd = original_open(target, os.O_RDONLY)
+        return target_fd
+
+    monkeypatch.setattr(artifacts.os, "open", open_with_unrelated)
+    try:
+        _interrupt_at_instruction(
+            artifacts._RegularFileLease.acquire,
+            lambda: artifacts._open_regular_file(
+                target, error_message="invalid test file"
+            ),
+            lambda frame, instruction: (
+                instruction.opname == "STORE_FAST"
+                and instruction.argval == "descriptor"
+                and frame.f_locals.get("descriptor") is None
+                and target_fd is not None
+            ),
+        )
+        with pytest.raises(OSError):
+            os.fstat(target_fd)
+        os.fstat(unrelated_fd)
+    finally:
+        monkeypatch.undo()
+        if unrelated_fd is not None:
+            original_close(unrelated_fd)
+
+
+@pytest.mark.parametrize("same_inode", [False, True])
+def test_regular_file_fdopen_return_interrupt_does_not_close_reused_fd(
+    tmp_path, monkeypatch, same_inode
+):
+    target = tmp_path / "value.bin"
+    target.write_bytes(b"value")
+    original_fdopen = artifacts.os.fdopen
+    original_open = os.open
+    replacement_fd = None
+
+    def fdopen_then_reuse(descriptor, *args, **kwargs):
+        nonlocal replacement_fd
+        handle = original_fdopen(descriptor, *args, **kwargs)
+        original_number = handle.fileno()
+        handle.close()
+        replacement_fd = original_open(
+            target if same_inode else os.devnull,
+            os.O_RDONLY,
+        )
+        assert replacement_fd == original_number
+        return handle
+
+    monkeypatch.setattr(artifacts.os, "fdopen", fdopen_then_reuse)
+    with pytest.raises((KeyboardInterrupt, ValueError, RuntimeError)):
+        artifacts._open_regular_file(target, error_message="invalid test file")
+
+    assert replacement_fd is not None
+    os.fstat(replacement_fd)
+    os.close(replacement_fd)
+
+
+def test_regular_file_generation_change_after_open_closes_raw_candidate(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "value.bin"
+    target.write_bytes(b"value")
+    original_open = artifacts.os.open
+    original_generation = artifacts._FORK_GENERATION
+    descriptor = None
+
+    def open_across_generation_change(path, flags, *args, **kwargs):
+        nonlocal descriptor
+        descriptor = original_open(path, flags, *args, **kwargs)
+        artifacts._FORK_GENERATION += 1
+        return descriptor
+
+    monkeypatch.setattr(artifacts.os, "open", open_across_generation_change)
+    try:
+        with pytest.raises(RuntimeError, match="crossed a fork"):
+            artifacts._open_regular_file(
+                target,
+                error_message="invalid test file",
+            )
+        assert descriptor is not None
+        with pytest.raises(OSError):
+            os.fstat(descriptor)
+    finally:
+        monkeypatch.undo()
+        artifacts._FORK_GENERATION = original_generation
+
+
+def test_reentrant_regular_file_read_is_rejected_during_raw_open(
+    tmp_path, monkeypatch
+):
+    target = tmp_path / "value.bin"
+    target.write_bytes(b"value")
+    original_open = artifacts.os.open
+    outer_fd = None
+    nested_rejected = False
+
+    def interrupt_with_nested_read(path, flags, *args, **kwargs):
+        nonlocal outer_fd, nested_rejected
+        if outer_fd is not None:
+            return original_open(path, flags, *args, **kwargs)
+        outer_fd = original_open(path, flags, *args, **kwargs)
+        try:
+            artifacts._open_regular_file(
+                target,
+                error_message="invalid test file",
+            )
+        except RuntimeError as error:
+            nested_rejected = "reentrant" in str(error)
+        raise KeyboardInterrupt("interrupt outer acquisition")
+
+    monkeypatch.setattr(
+        artifacts.os,
+        "open",
+        interrupt_with_nested_read,
+    )
+    with pytest.raises(KeyboardInterrupt, match="outer acquisition"):
+        artifacts._open_regular_file(
+            target,
+            error_message="invalid test file",
+        )
+
+    assert nested_rejected
+    with pytest.raises(OSError):
+        os.fstat(outer_fd)
