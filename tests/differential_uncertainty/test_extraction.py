@@ -1729,3 +1729,60 @@ def test_fresh_extractor_records_must_have_exactly_five_keys(tmp_path: Path):
         )
 
     assert not (cache / "manifest.json").exists()
+
+
+class CastOverflowExtractor(FakeExtractor):
+    def __init__(self, field):
+        super().__init__()
+        self.field = field
+
+    def extract_batch(self, identities, samples):
+        records = super().extract_batch(identities, samples)
+        source = records[0][self.field].to(torch.float64)
+        source.fill_(1e300)
+        assert bool(torch.isfinite(source).all())
+        records[0][self.field] = source
+        return records
+
+
+@pytest.mark.parametrize("field", ["boxes", "logits", "persistence"])
+def test_canonical_cast_overflow_never_publishes_and_can_resume(
+    tmp_path: Path,
+    field,
+):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    cache = tmp_path / f"cast-overflow-{field}"
+    entries = (ManifestEntry("scene", path.resolve()),)
+    metadata = {"stage": "reference"}
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"normalized {field} must contain only finite values",
+    ):
+        extract_manifest(
+            entries,
+            cache,
+            metadata,
+            CastOverflowExtractor(field),
+            None,
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert not (cache / "manifest.json").exists()
+    assert (cache / "partial_manifest.json").exists()
+
+    extract_manifest(
+        entries,
+        cache,
+        metadata,
+        FakeExtractor(),
+        None,
+        image_size=(8, 8),
+        batch_size=1,
+        shard_size=1,
+    )
+
+    assert load_artifact_manifest(cache)["record_count"] == 1

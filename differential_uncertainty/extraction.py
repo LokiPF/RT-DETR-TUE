@@ -405,18 +405,24 @@ def _validated_records(
             require_cache_dtypes=False,
         )
         actual_keys.append(identity)
+        normalized_tensors: dict[str, Tensor] = {}
+        for name, tensor in tensors.items():
+            normalized_tensor = tensor.detach().to(
+                device="cpu",
+                dtype=_CACHE_TENSOR_DTYPES[name],
+                copy=True,
+            )
+            if not bool(torch.isfinite(normalized_tensor).all().item()):
+                raise RuntimeError(
+                    f"extractor record {index} normalized {name} "
+                    "must contain only finite values"
+                )
+            normalized_tensors[name] = normalized_tensor
         normalized.append(
             {
                 "image_id": identity[0],
                 "severity": identity[1],
-                **{
-                    name: tensor.detach().to(
-                        device="cpu",
-                        dtype=_CACHE_TENSOR_DTYPES[name],
-                        copy=True,
-                    )
-                    for name, tensor in tensors.items()
-                },
+                **normalized_tensors,
             }
         )
     if actual_keys != identities:
