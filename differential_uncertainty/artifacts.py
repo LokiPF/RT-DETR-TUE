@@ -25,9 +25,12 @@ _ACTIVE_WRITERS: dict[tuple[int, int], weakref.ReferenceType] = {}
 _WRITER_REGISTRY_LOCK = threading.RLock()
 _FORK_LOCKED_WRITERS: list["ShardWriter"] = []
 _CONSTRUCTING_WRITERS: list["ShardWriter"] = []
+_PENDING_LOCK_LEASES: set["_CandidateLease"] = set()
 _PENDING_LOCK_FDS: set[int] = set()
 _TRANSFER_PARTICIPANTS: list["ShardWriter"] = []
 _FORK_GENERATION = 0
+_DIRECTORY_ANCHOR = ".artifact_directory_anchor"
+_DIRECTORY_OPEN_ATTEMPTS = 3
 
 
 def _json_snapshot(value):
@@ -527,32 +530,423 @@ def _safe_load_shard(
     return records
 
 
-def _open_directory(directory: Path) -> tuple[int, tuple[int, int]]:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    while True:
-        generation = _FORK_GENERATION
-        descriptor = os.open(directory, flags)
-        _PENDING_LOCK_FDS.add(descriptor)
-        if generation == _FORK_GENERATION:
-            break
-        _PENDING_LOCK_FDS.discard(descriptor)
+def _live_fd_snapshot() -> set[int]:
+    """Return live process fds, excluding procfs's own transient listing fd."""
+    descriptors: set[int] = set()
+    for name in os.listdir("/proc/self/fd"):
         try:
-            os.close(descriptor)
+            descriptor = int(name)
+            os.fstat(descriptor)
+        except (OSError, ValueError):
+            continue
+        descriptors.add(descriptor)
+    return descriptors
+
+
+def _directory_fd_positions(
+    identity: tuple[int, int],
+) -> dict[int, int]:
+    """Read positions for live fds referring to one directory inode."""
+    positions: dict[int, int] = {}
+    for descriptor in _live_fd_snapshot():
+        try:
+            state = os.fstat(descriptor)
+            if (state.st_dev, state.st_ino) != identity:
+                continue
+            lines = Path(f"/proc/self/fdinfo/{descriptor}").read_text(
+                encoding="ascii"
+            ).splitlines()
+            position = next(
+                int(line.split()[1])
+                for line in lines
+                if line.startswith("pos:")
+            )
+        except (OSError, StopIteration, ValueError):
+            continue
+        positions[descriptor] = position
+    return positions
+
+
+def _ensure_directory_anchor(directory: Path) -> None:
+    """Keep scanners live after their one identification read."""
+    try:
+        os.mkdir(directory / _DIRECTORY_ANCHOR)
+    except FileExistsError:
+        # Any existing entry makes the directory nonempty, which is the only
+        # property needed here.  Artifact readers ignore unlisted entries.
+        pass
+
+
+class _DirectoryHandle:
+    """Retain C-level ownership of a directory fd across Python opcodes."""
+
+    def __init__(self, directory: Path) -> None:
+        state = os.stat(directory)
+        self._directory = directory
+        self._identity = (state.st_dev, state.st_ino)
+        self._owner = None
+        self._descriptor: int | None = None
+        self._planned_marker = _new_lock_marker()
+        self._marker: int | None = None
+        self._owner_pid = os.getpid()
+        self._fork_generation = _FORK_GENERATION
+        self._invalidated_by_fork = False
+
+    def open(self) -> int:
+        for _attempt in range(_DIRECTORY_OPEN_ATTEMPTS):
+            self._require_valid()
+            state = os.stat(self._directory)
+            identity = (state.st_dev, state.st_ino)
+            _ensure_directory_anchor(self._directory)
+            # ScandirIterator is a C-level RAII owner.  If an async exception
+            # lands after this call but before STORE_FAST, decref closes its
+            # directory fd.
+            owner = os.scandir(self._directory)
+            self._owner = owner
+            self._require_valid()
+            before = _directory_fd_positions(identity)
+            self._require_valid()
+            try:
+                next(owner)
+            except StopIteration:
+                # An empty path can result from replacement between anchoring
+                # and scanner acquisition.  Exhaustion closes the iterator.
+                owner.close()
+                self._owner = None
+                continue
+            self._require_valid()
+            after = _directory_fd_positions(identity)
+            self._require_valid()
+            candidates = [
+                descriptor
+                for descriptor, position in before.items()
+                if after.get(descriptor) != position
+                and descriptor in after
+            ]
+            if len(candidates) == 1:
+                descriptor = candidates[0]
+                self._identity = identity
+                self._descriptor = descriptor
+                self._require_valid()
+                self._marker = _mark_lock_descriptor(
+                    descriptor,
+                    self._planned_marker,
+                )
+                self._require_valid()
+                if self._fork_generation != _FORK_GENERATION:
+                    self._fork_generation = _FORK_GENERATION
+                return descriptor
+            if not candidates:
+                current = os.stat(self._directory)
+                if (current.st_dev, current.st_ino) != identity:
+                    owner.close()
+                    self._owner = None
+                    continue
+            raise RuntimeError(
+                "could not identify the owned artifact directory descriptor"
+            )
+        raise RuntimeError(
+            "could not identify the owned artifact directory descriptor"
+        )
+
+    def _require_valid(self) -> None:
+        if self._invalidated_by_fork or self._owner_pid != os.getpid():
+            raise RuntimeError("candidate descriptor invalidated by fork")
+
+    def plan_marker(self, marker: int) -> None:
+        self._require_valid()
+        if self._owner is not None or self._descriptor is not None:
+            raise RuntimeError("candidate descriptor marker is already fixed")
+        self._planned_marker = marker
+
+    def ownership(self, descriptor: int) -> tuple[tuple[int, int], int]:
+        self._require_valid()
+        marker = self._marker
+        if self._descriptor != descriptor or marker is None:
+            raise RuntimeError("candidate descriptor invalidated by fork")
+        if not _matches_lock_descriptor(descriptor, self._identity, marker):
+            raise RuntimeError("candidate descriptor invalidated by fork")
+        return self._identity, marker
+
+    def close(self) -> None:
+        owner = self._owner
+        if owner is None:
+            return
+        owner.close()
+        self._owner = None
+        self._descriptor = None
+        self._marker = None
+
+    def refresh_after_parent_fork(self, generation: int) -> None:
+        self._fork_generation = generation
+
+    def invalidate_after_child_fork(self, *, retain_bound: bool = False) -> None:
+        self._invalidated_by_fork = True
+        if retain_bound and self._descriptor is not None:
+            return
+        try:
+            self.close()
         except OSError:
             pass
-    try:
-        state = os.fstat(descriptor)
-    except BaseException:
+
+
+class _CandidateLease:
+    """Sole owner of a candidate fd until transactional writer transfer."""
+
+    def __init__(self) -> None:
+        self._descriptor: int | None = None
+        self._opening_descriptor: int | None = None
+        self._opened_pid: int | None = None
+        self._fork_generation: int | None = None
+        self._identity: tuple[int, int] | None = None
+        self._marker: int | None = None
+        self._planned_marker = _new_lock_marker()
+        self._invalidated_by_fork = False
+        self._directory_handle: _DirectoryHandle | None = None
+        self._owner_pid = os.getpid()
+        self._lock_acquired = False
+
+    def open(self, directory: Path) -> None:
+        self._require_valid()
+        self._directory_handle = _DirectoryHandle(directory)
+        try:
+            self._require_valid()
+            self._directory_handle.plan_marker(self._planned_marker)
+            descriptor = self._directory_handle.open()
+            self._require_valid()
+        except BaseException:
+            self.close()
+            raise
+        try: self._track_open_descriptor(descriptor)
+        except BaseException:
+            self.close()
+            raise
+        try: self._prepare_open_descriptor(descriptor)
+        except BaseException:
+            self.close()
+            raise
+
+    def _track_open_descriptor(self, descriptor: int) -> None:
+        self._require_valid()
+        handle = self._directory_handle
+        if handle is None:
+            state = os.fstat(descriptor)
+            self._identity = (state.st_dev, state.st_ino)
+            self._marker = _mark_lock_descriptor(
+                descriptor,
+                self._planned_marker,
+            )
+            self._opening_descriptor = descriptor
+            return
+        identity, marker = handle.ownership(descriptor)
+        self._require_valid()
+        self._identity = identity
+        self._marker = marker
+        self._opening_descriptor = descriptor
+
+    def _prepare_open_descriptor(self, descriptor: int) -> None:
+        self._require_valid()
+        identity = self.identity
+        marker = self.marker
+        if not _matches_lock_descriptor(descriptor, identity, marker):
+            self._invalidated_by_fork = True
+            raise RuntimeError("candidate descriptor invalidated by fork")
+        self._adopt_open_descriptor(descriptor, identity, marker)
+
+    def _adopt_open_descriptor(
+        self,
+        descriptor: int,
+        identity: tuple[int, int],
+        marker: int,
+    ) -> None:
+        self._require_valid()
+        self._opened_pid = os.getpid()
+        self._fork_generation = _FORK_GENERATION
+        self._identity = identity
+        self._marker = marker
+        self._descriptor = descriptor
+        _PENDING_LOCK_FDS.add(descriptor)
+        # Register the ownership-bearing lease last.  Once visible here, a
+        # child fork hook may invalidate it and no adoption line can
+        # resurrect the derived descriptor view afterward.
+        _PENDING_LOCK_LEASES.add(self)
+        self._require_valid()
+        if self._descriptor != descriptor or self._opened_pid != os.getpid():
+            raise RuntimeError("candidate descriptor invalidated by fork")
+
+    def _require_valid(self) -> None:
+        if self._invalidated_by_fork or self._owner_pid != os.getpid():
+            raise RuntimeError("candidate descriptor invalidated by fork")
+        handle = self._directory_handle
+        if handle is not None:
+            handle._require_valid()
+
+    @property
+    def descriptor(self) -> int:
+        self._require_valid()
+        descriptor = self._descriptor
+        if descriptor is None or self._opened_pid != os.getpid():
+            raise RuntimeError("candidate descriptor invalidated by fork")
+        if self._fork_generation != _FORK_GENERATION:
+            # An unregistered lease can miss the parent fork hook.  Matching
+            # PIDs prove parent ownership; children fail the check above.
+            self._fork_generation = _FORK_GENERATION
+        return descriptor
+
+    @property
+    def identity(self) -> tuple[int, int]:
+        if self._identity is None:
+            raise RuntimeError("candidate directory identity is unavailable")
+        return self._identity
+
+    @property
+    def marker(self) -> int:
+        if self._marker is None:
+            raise RuntimeError("candidate descriptor marker is unavailable")
+        return self._marker
+
+
+    def refresh_after_parent_fork(self, generation: int) -> None:
+        if self._directory_handle is not None:
+            self._directory_handle.refresh_after_parent_fork(generation)
+        if self._descriptor is not None:
+            self._fork_generation = generation
+
+    def invalidate_after_child_fork(self) -> None:
+        if self._directory_handle is not None:
+            self._directory_handle.invalidate_after_child_fork(
+                retain_bound=(
+                    self._directory_handle._descriptor is not None
+                    and not self._lock_acquired
+                ),
+            )
+        self._descriptor = None
+        self._opening_descriptor = None
+        self._marker = None
+        self._invalidated_by_fork = True
+
+    def close(self) -> None:
+        try: self._close_safely()
+        except BaseException:
+            self._reconcile_close()
+            raise
+
+    def _close_safely(self) -> None:
+        try: self._close_once()
+        except BaseException:
+            self._reconcile_close()
+            raise
+
+    def _close_once(self) -> None:
+        descriptor = self._descriptor
+        if descriptor is None:
+            descriptor = self._opening_descriptor
+        if descriptor is None:
+            if self._directory_handle is not None:
+                self._directory_handle.close()
+                self._directory_handle = None
+            _PENDING_LOCK_LEASES.discard(self)
+            return
+        if self._directory_handle is not None:
+            self._directory_handle.close()
+        elif self._descriptor is None:
+            if self._invalidated_by_fork:
+                self._consume(descriptor)
+                return
+            os.closerange(descriptor, descriptor + 1)
+        else:
+            os.close(descriptor)
+        self._consume(descriptor)
+
+    def _reconcile_close(self) -> None:
+        descriptor = self._descriptor
+        if descriptor is None:
+            descriptor = self._opening_descriptor
+        if descriptor is None:
+            if self._directory_handle is not None:
+                self._directory_handle.close()
+                self._directory_handle = None
+            _PENDING_LOCK_LEASES.discard(self)
+            return
+        if self._directory_handle is not None:
+            self._directory_handle.close()
+        if (
+            not self._invalidated_by_fork
+            and _matches_lock_descriptor(
+                descriptor,
+                self._identity,
+                self._marker,
+            )
+        ):
+            os.closerange(descriptor, descriptor + 1)
+        self._consume(descriptor)
+
+    def _consume(self, descriptor: int) -> None:
+        _PENDING_LOCK_LEASES.discard(self)
         _PENDING_LOCK_FDS.discard(descriptor)
-        os.close(descriptor)
+        self._descriptor = None
+        self._opening_descriptor = None
+        self._marker = None
+        self._directory_handle = None
+
+    def transfer_to(self, writer: "ShardWriter") -> int:
+        descriptor = self.descriptor
+        marker = self.marker
+        directory_handle = self._directory_handle
+        try:
+            writer._lock_fd = descriptor
+            writer._lock_fd_marker = marker
+            writer._lock_handle = directory_handle
+            if (
+                self._descriptor != descriptor
+                or writer._owner_pid != os.getpid()
+                or writer._superseded
+            ):
+                raise RuntimeError(
+                    "artifact writer construction invalidated by fork"
+                )
+            self._consume(descriptor)
+        except BaseException:
+            if self._descriptor is not None:
+                writer._lock_fd = None
+                writer._lock_fd_marker = None
+                writer._lock_handle = None
+            raise
+        if (
+            writer._lock_fd != descriptor
+            or writer._owner_pid != os.getpid()
+            or writer._superseded
+        ):
+            raise RuntimeError("artifact writer construction invalidated by fork")
+        return descriptor
+
+
+def _open_directory(
+    directory: Path,
+    *,
+    lease: _CandidateLease | None = None,
+) -> tuple[_CandidateLease, tuple[int, int]]:
+    if lease is None:
+        lease = _CandidateLease()
+    try:
+        lease.open(directory)
+    except BaseException:
+        lease.close()
         raise
-    return descriptor, (state.st_dev, state.st_ino)
+    return lease, lease.identity
 
 
-def _mark_lock_descriptor(descriptor: int) -> int:
+def _new_lock_marker() -> int:
+    return secrets.randbelow((1 << 62) - 1) + 1
+
+
+def _mark_lock_descriptor(
+    descriptor: int,
+    marker: int | None = None,
+) -> int:
     # ShardWriter never iterates this private directory fd; its seek offset is
     # therefore a stable open-file-description marker on supported Linux fds.
-    marker = secrets.randbelow((1 << 62) - 1) + 1
+    marker = _new_lock_marker() if marker is None else marker
     try:
         actual = os.lseek(descriptor, marker, os.SEEK_SET)
     except OSError as error:
@@ -584,17 +978,17 @@ def _matches_lock_descriptor(
 def _acquire_directory_lock(
     directory: Path,
     *,
-    descriptor: int | None = None,
-) -> int:
+    lease: _CandidateLease | None = None,
+) -> _CandidateLease:
     # The kernel owns this lock through the open descriptor, so process death
     # releases it without leaving a stale lock file that needs manual recovery.
-    if descriptor is None:
-        descriptor, _identity = _open_directory(directory)
+    if lease is None:
+        lease, _identity = _open_directory(directory)
     try:
-        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(lease.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lease._lock_acquired = True
     except BaseException as error:
-        _PENDING_LOCK_FDS.discard(descriptor)
-        os.close(descriptor)
+        lease.close()
         if isinstance(error, OSError) and error.errno in (
             errno.EACCES,
             errno.EAGAIN,
@@ -603,7 +997,7 @@ def _acquire_directory_lock(
                 f"artifact directory already has an active writer: {directory}"
             ) from error
         raise
-    return descriptor
+    return lease
 
 
 def _registered_writer(identity: tuple[int, int]):
@@ -659,9 +1053,11 @@ class ShardWriter:
         self._closed = True
         self._lock_fd: int | None = None
         self._lock_fd_marker: int | None = None
+        self._lock_handle: _DirectoryHandle | None = None
         self._owner_pid = os.getpid()
         self._directory_identity: tuple[int, int] | None = None
-        candidate_descriptor: int | None = None
+        candidate_lease = _CandidateLease()
+        self._candidate_lease: _CandidateLease | None = candidate_lease
 
         with _WRITER_REGISTRY_LOCK:
             _CONSTRUCTING_WRITERS.append(self)
@@ -680,32 +1076,27 @@ class ShardWriter:
                     descriptor = self._take_lock_from(predecessor)
                 if descriptor is None:
                     (
-                        candidate_descriptor,
+                        candidate_lease,
                         self._directory_identity,
-                    ) = _open_directory(self.directory)
-                    descriptor = _acquire_directory_lock(
+                    ) = _open_directory(
                         self.directory,
-                        descriptor=candidate_descriptor,
+                        lease=candidate_lease,
+                    )
+                    candidate_lease = _acquire_directory_lock(
+                        self.directory,
+                        lease=candidate_lease,
                     )
                     if self._owner_pid != os.getpid() or self._superseded:
                         raise RuntimeError(
                             "artifact writer construction invalidated by fork"
                         )
-                    marker = _mark_lock_descriptor(descriptor)
-                    if self._owner_pid != os.getpid() or self._superseded:
-                        raise RuntimeError(
-                            "artifact writer construction invalidated by fork"
-                        )
-                    self._lock_fd = descriptor
-                    self._lock_fd_marker = marker
-                    candidate_descriptor = None
+                    descriptor = candidate_lease.transfer_to(self)
                     self._closed = False
                     _register_writer(self)
                     if self._owner_pid != os.getpid() or self._superseded:
                         raise RuntimeError(
                             "artifact writer construction invalidated by fork"
                         )
-                    _PENDING_LOCK_FDS.discard(descriptor)
 
                 if _path_exists_at(self._lock_fd, self.final.name):
                     raise FileExistsError(f"artifact is already complete: {self.final}")
@@ -722,16 +1113,8 @@ class ShardWriter:
                     self._published_keys: set[tuple[str, int]] = set()
                     self._publish_partial()
             except BaseException:
-                if (
-                    candidate_descriptor is not None
-                    and self._owner_pid == os.getpid()
-                    and self._lock_fd != candidate_descriptor
-                ):
-                    _PENDING_LOCK_FDS.discard(candidate_descriptor)
-                    try:
-                        os.close(candidate_descriptor)
-                    except OSError:
-                        pass
+                if candidate_lease is not None:
+                    candidate_lease.close()
                 self._closed = True
                 reference = _ACTIVE_WRITERS.get(self._directory_identity)
                 if reference is not None and reference() is self:
@@ -771,8 +1154,11 @@ class ShardWriter:
 
             descriptor = predecessor._lock_fd
             marker = predecessor._lock_fd_marker
-            if marker is None:
-                raise RuntimeError("active artifact writer has no lock marker")
+            directory_handle = predecessor._lock_handle
+            if marker is None or directory_handle is None:
+                raise RuntimeError(
+                    "active artifact writer has incomplete lock ownership"
+                )
             previous_reference = _ACTIVE_WRITERS.get(
                 self._directory_identity
             )
@@ -786,6 +1172,7 @@ class ShardWriter:
                     )
                 self._lock_fd = descriptor
                 self._lock_fd_marker = marker
+                self._lock_handle = directory_handle
                 self._closed = False
                 _register_writer(self)
                 if self._owner_pid != os.getpid() or self._superseded:
@@ -794,21 +1181,25 @@ class ShardWriter:
                     )
                 predecessor._lock_fd = None
                 predecessor._lock_fd_marker = None
+                predecessor._lock_handle = None
                 predecessor._closed = True
                 predecessor._superseded = True
                 return descriptor
             except BaseException:
                 self._lock_fd = None
                 self._lock_fd_marker = None
+                self._lock_handle = None
                 self._closed = True
                 if self._owner_pid != os.getpid() or self._superseded:
                     predecessor._lock_fd = None
                     predecessor._lock_fd_marker = None
+                    predecessor._lock_handle = None
                     predecessor._closed = True
                     predecessor._superseded = True
                     raise
                 predecessor._lock_fd = descriptor
                 predecessor._lock_fd_marker = marker
+                predecessor._lock_handle = directory_handle
                 predecessor._closed = predecessor_closed
                 predecessor._superseded = predecessor_superseded
                 if previous_reference is None:
@@ -840,6 +1231,7 @@ class ShardWriter:
         ):
             self._lock_fd = None
             self._lock_fd_marker = None
+            self._lock_handle = None
             return
         # Keep the first trace boundary inside the exception table.
         try: self._release_lock_once()
@@ -857,6 +1249,7 @@ class ShardWriter:
             ):
                 self._lock_fd = None
                 self._lock_fd_marker = None
+                self._lock_handle = None
             else:
                 self._reconcile_lock_release()
             raise
@@ -865,15 +1258,23 @@ class ShardWriter:
         descriptor = getattr(self, "_lock_fd", None)
         if descriptor is None:
             return
-        os.closerange(descriptor, descriptor + 1)
+        handle = getattr(self, "_lock_handle", None)
+        if handle is None:
+            os.closerange(descriptor, descriptor + 1)
+        else:
+            handle.close()
         self._lock_fd = None
         self._lock_fd_marker = None
+        self._lock_handle = None
         _PENDING_LOCK_FDS.discard(descriptor)
 
     def _reconcile_lock_release(self) -> None:
         descriptor = getattr(self, "_lock_fd", None)
         if descriptor is None:
             return
+        handle = getattr(self, "_lock_handle", None)
+        if handle is not None:
+            handle.close()
         # This fd is private and release runs under _state_lock.  Artifact
         # code cannot replace it between this validation and closerange; the
         # marker distinguishes only an ambiguous completed close/reuse.
@@ -885,6 +1286,7 @@ class ShardWriter:
             os.closerange(descriptor, descriptor + 1)
         self._lock_fd = None
         self._lock_fd_marker = None
+        self._lock_handle = None
         _PENDING_LOCK_FDS.discard(descriptor)
 
     def _resume(self, state) -> None:
@@ -1128,6 +1530,17 @@ def _release_writer_registry_after_fork() -> None:
     global _FORK_GENERATION, _FORK_LOCKED_WRITERS
 
     _FORK_GENERATION += 1
+    leases = list(_PENDING_LOCK_LEASES)
+    for writer in _FORK_LOCKED_WRITERS:
+        lease = getattr(writer, "_candidate_lease", None)
+        if lease is not None and not any(lease is known for known in leases):
+            leases.append(lease)
+    for lease in leases:
+        lease.refresh_after_parent_fork(_FORK_GENERATION)
+    for writer in _FORK_LOCKED_WRITERS:
+        handle = getattr(writer, "_lock_handle", None)
+        if handle is not None:
+            handle.refresh_after_parent_fork(_FORK_GENERATION)
     for writer in reversed(_FORK_LOCKED_WRITERS):
         writer._state_lock.release()
     _FORK_LOCKED_WRITERS = []
@@ -1138,7 +1551,7 @@ def _reset_writer_registry_after_fork() -> None:
     """Drop inherited process-local ownership without unlocking the parent."""
     global _ACTIVE_WRITERS, _CONSTRUCTING_WRITERS, _FORK_GENERATION
     global _FORK_LOCKED_WRITERS
-    global _PENDING_LOCK_FDS
+    global _PENDING_LOCK_FDS, _PENDING_LOCK_LEASES
     global _TRANSFER_PARTICIPANTS, _WRITER_REGISTRY_LOCK
 
     _FORK_GENERATION += 1
@@ -1147,25 +1560,46 @@ def _reset_writer_registry_after_fork() -> None:
         if not any(candidate is writer for writer in writers):
             writers.append(candidate)
 
-    descriptors = set(_PENDING_LOCK_FDS)
+    leases = list(_PENDING_LOCK_LEASES)
+    for writer in writers:
+        lease = getattr(writer, "_candidate_lease", None)
+        if lease is not None and not any(lease is known for known in leases):
+            leases.append(lease)
+    descriptors = {
+        descriptor
+        for lease in leases
+        if getattr(lease, "_directory_handle", None) is None
+        if (descriptor := getattr(lease, "_descriptor", None)) is not None
+    }
     descriptors.update(
-        writer._lock_fd for writer in writers if writer._lock_fd is not None
+        writer._lock_fd
+        for writer in writers
+        if getattr(writer, "_lock_handle", None) is None
+        if writer._lock_fd is not None
     )
     for descriptor in descriptors:
         try:
             os.close(descriptor)
         except OSError:
             pass
+    for lease in leases:
+        lease.invalidate_after_child_fork()
+
 
     for writer in writers:
+        handle = getattr(writer, "_lock_handle", None)
+        if handle is not None:
+            handle.invalidate_after_child_fork()
         writer._lock_fd = None
         writer._lock_fd_marker = None
+        writer._lock_handle = None
         writer._closed = True
         writer._superseded = True
         writer._state_lock = threading.RLock()
     _ACTIVE_WRITERS = {}
     _CONSTRUCTING_WRITERS = []
     _FORK_LOCKED_WRITERS = []
+    _PENDING_LOCK_LEASES = set()
     _PENDING_LOCK_FDS = set()
     _TRANSFER_PARTICIPANTS = []
     _WRITER_REGISTRY_LOCK = threading.RLock()
