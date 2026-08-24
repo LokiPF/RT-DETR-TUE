@@ -269,6 +269,14 @@ def _corruption_implementation(corruption, apply):
         implementation_sha256 = source_sha256
         behavior_state = {}
         dependencies = {}
+        required_dependencies = _referenced_dependency_modules(
+            apply, set(module_files)
+        )
+        for dependency in sorted(required_dependencies):
+            identity, snapshot = _module_file_snapshot(dependency)
+            dependencies[dependency] = identity["sha256"]
+            module_files[dependency] = identity
+            module_snapshots[dependency] = snapshot
         kind = "internal"
     else:
         try:
@@ -619,7 +627,6 @@ def _terminal_sweep(
     report_path: Path,
     report_snapshot: tuple,
     input_groups: tuple,
-    corruption: _CorruptionSnapshot,
 ) -> None:
     checks = [
         (provenance_path, "run provenance", provenance_snapshot),
@@ -657,7 +664,6 @@ def _terminal_sweep(
     for entries in input_groups:
         for entry in entries:
             validate_image_signature(entry)
-    corruption.revalidate()
 
 
 def _absolute_output_path(value: str | Path) -> Path:
@@ -1207,8 +1213,10 @@ def _final_audit(
         raise ValueError("published report bundle changed")
 
     corruption.revalidate()
-    _validate_input_images(reference, evaluation)
-
+    try:
+        _validate_input_images(reference, evaluation)
+    except ValueError as error:
+        raise ValueError("image changed after it was audited") from error
     _terminal_sweep(
         provenance_path=provenance_path,
         provenance_snapshot=provenance_snapshot,
@@ -1225,7 +1233,6 @@ def _final_audit(
         report_path=report_path,
         report_snapshot=report_snapshot,
         input_groups=(reference, evaluation),
-        corruption=corruption,
     )
 
 

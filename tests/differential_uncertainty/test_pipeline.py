@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import gc
 import hashlib
+import importlib
 import importlib.util
 import json
 import multiprocessing
@@ -31,6 +32,10 @@ from differential_uncertainty.corruptions import (
     Severity,
 )
 from differential_uncertainty.reporting import REPORT_FILES
+
+gaussian_module = importlib.import_module(
+    "differential_uncertainty.corruptions.gaussian_blur"
+)
 
 
 class FakeExtractor:
@@ -2701,3 +2706,131 @@ def test_plugin_build_declaration_mutation_is_caught_by_terminal_revalidation(
 
     assert plugin.implementation_sha256 == "b" * 64
     assert plugin.apply_calls > 0
+
+
+def test_builtin_dependency_change_refuses_resume_before_cache_or_mutation(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    dependency_path = tmp_path / "ImageFilter.py"
+    dependency_path.write_text("GAUSSIAN_BEHAVIOR = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        gaussian_module.ImageFilter, "__file__", str(dependency_path)
+    )
+    _run(inputs, small_config)
+    extractor_instances = FakeExtractor.instances
+
+    output = inputs[-1]
+    before_tree = _tree_state(output)
+    before_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    dependency_path.write_text("GAUSSIAN_BEHAVIOR = 2\n", encoding="utf-8")
+    dependency_calls = 0
+
+    def changed_gaussian_blur(_radius):
+        nonlocal dependency_calls
+        dependency_calls += 1
+        raise AssertionError("changed built-in dependency was called")
+
+    def forbid_cache(*_args, **_kwargs):
+        raise AssertionError("built-in dependency mismatch reached cache validation")
+
+    monkeypatch.setattr(
+        gaussian_module.ImageFilter, "GaussianBlur", changed_gaussian_blur
+    )
+    monkeypatch.setattr(cli, "validate_extraction_cache", forbid_cache)
+
+    with pytest.raises(ValueError, match="corruption|provenance|dependency"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    after_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    assert dependency_calls == 0
+    assert FakeExtractor.instances == extractor_instances
+    assert _tree_state(output) == before_tree
+    assert after_metadata == before_metadata
+
+
+def test_builtin_dependency_mutation_during_apply_is_caught_terminally(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    dependency_path = tmp_path / "ImageFilter.py"
+    dependency_path.write_text("GAUSSIAN_BEHAVIOR = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        gaussian_module.ImageFilter, "__file__", str(dependency_path)
+    )
+    original_filter = gaussian_module.ImageFilter.GaussianBlur
+    mutated = False
+
+    def mutate_dependency(radius):
+        nonlocal mutated
+        if not mutated:
+            mutated = True
+            dependency_path.write_text(
+                "GAUSSIAN_BEHAVIOR = 2\n", encoding="utf-8"
+            )
+        return original_filter(radius)
+
+    monkeypatch.setattr(
+        gaussian_module.ImageFilter, "GaussianBlur", mutate_dependency
+    )
+    with pytest.raises(
+        ValueError, match="corruption implementation changed during the run"
+    ):
+        _run(inputs, small_config)
+
+    assert mutated
+
+
+def test_builtin_dependency_identity_is_automatic_and_needs_no_declarations(
+    tmp_path, small_config, monkeypatch
+):
+    dependency_path = tmp_path / "ImageFilter.py"
+    dependency_path.write_text("GAUSSIAN_BEHAVIOR = 1\n", encoding="utf-8")
+    monkeypatch.setattr(
+        gaussian_module.ImageFilter, "__file__", str(dependency_path)
+    )
+
+    snapshot = cli._snapshot_corruption(GaussianBlur(), small_config)
+
+    assert snapshot.implementation["kind"] == "internal"
+    assert snapshot.implementation["dependency_sha256"] == {
+        "PIL.ImageFilter": hashlib.sha256(dependency_path.read_bytes()).hexdigest()
+    }
+
+
+def test_no_plugin_revalidation_may_follow_final_input_signature(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    target = tmp_path / "evaluation-0.png"
+    replacement = tmp_path / "post-signature-replacement.png"
+    Image.new("RGB", (17, 13), (230, 230, 230)).save(replacement)
+    original = cli._CorruptionSnapshot.revalidate
+    calls = 0
+
+    def replace_during_terminal_revalidation(self):
+        nonlocal calls
+        result = original(self)
+        calls += 1
+        if calls == 1:
+            os.replace(replacement, target)
+        return result
+
+    monkeypatch.setattr(
+        cli._CorruptionSnapshot, "revalidate", replace_during_terminal_revalidation
+    )
+    with pytest.raises(
+        ValueError, match="image changed after it was audited"
+    ):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    assert calls == 1
