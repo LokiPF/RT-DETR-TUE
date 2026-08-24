@@ -204,7 +204,12 @@ def _absolute_output_path(value: str | Path) -> Path:
     return output
 
 
-def _ensure_output_entry(parent_fd: int, name: str) -> None:
+def _ensure_directory_entry(
+    parent_fd: int,
+    name: str,
+    *,
+    error_message: str,
+) -> None:
     try:
         state = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -213,11 +218,34 @@ def _ensure_output_entry(parent_fd: int, name: str) -> None:
             os.fsync(parent_fd)
             state = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except OSError as error:
-            raise ValueError("output directory must be a directory") from error
+            raise ValueError(error_message) from error
     except OSError as error:
-        raise ValueError("output directory must be a directory") from error
+        raise ValueError(error_message) from error
     if not stat.S_ISDIR(state.st_mode):
-        raise ValueError("output directory must be a directory")
+        raise ValueError(error_message)
+
+
+@contextmanager
+def _pinned_child_directory(
+    parent: _DirectoryLease,
+    name: str,
+    *,
+    label: str,
+):
+    message = f"{label} directory must be a stable directory"
+    parent.verify_path()
+    _ensure_directory_entry(parent.fd, name, error_message=message)
+    anchored_entry = Path(f"/proc/self/fd/{parent.fd}") / name
+    with _DirectoryLease(anchored_entry, message=message) as child:
+        parent.verify_path()
+        child.verify_entry(parent.fd, name)
+        try:
+            yield Path(f"/proc/self/fd/{child.fd}"), child
+        except BaseException:
+            raise
+        else:
+            parent.verify_path()
+            child.verify_entry(parent.fd, name)
 
 
 @contextmanager
@@ -227,7 +255,11 @@ def _coordinated_output(output: Path):
     with _DirectoryLease(output.parent, message=parent_message) as parent:
         fcntl.flock(parent.fd, fcntl.LOCK_EX)
         parent.verify_path()
-        _ensure_output_entry(parent.fd, output.name)
+        _ensure_directory_entry(
+            parent.fd,
+            output.name,
+            error_message="output directory must be a directory",
+        )
         anchored_output = Path(f"/proc/self/fd/{parent.fd}") / output.name
         with _DirectoryLease(
             anchored_output,
@@ -423,10 +455,10 @@ def _run_pipeline_stages(
     corruption: GaussianBlur,
     provenance: dict,
     report_parent: _DirectoryLease,
+    artifacts: Path,
+    reference_cache: Path,
+    evaluation_cache: Path,
 ) -> Path:
-    artifacts = output / "artifacts"
-    reference_cache = artifacts / "reference-extractions"
-    evaluation_cache = artifacts / "evaluation-extractions"
     reference_metadata = _extraction_metadata(provenance, stage="reference")
     evaluation_metadata = _extraction_metadata(provenance, stage="evaluation")
     reference_complete = validate_extraction_cache(
@@ -447,6 +479,7 @@ def _run_pipeline_stages(
                     image_size=config.image_size,
                     batch_size=batch_size,
                     shard_size=shard_size,
+                    anchored_directory=True,
                 )
             if not evaluation_complete:
                 extract_manifest(
@@ -458,6 +491,7 @@ def _run_pipeline_stages(
                     image_size=config.image_size,
                     batch_size=batch_size,
                     shard_size=shard_size,
+                    anchored_directory=True,
                 )
         del extractor
     validate_extraction_cache(
@@ -541,22 +575,48 @@ def run_pipeline(
         reference, evaluation, checkpoint, config, corruption
     )
     with _coordinated_output(output) as (anchored_output, report_parent):
-        ensure_provenance(anchored_output, provenance)
-        _run_pipeline_stages(
-            reference,
-            evaluation,
-            checkpoint,
-            anchored_output,
-            runtime_device=runtime_device,
-            batch_size=batch_size,
-            shard_size=shard_size,
-            config=config,
-            extractor_factory=extractor_factory,
-            corruption=corruption,
-            provenance=provenance,
-            report_parent=report_parent,
-        )
-        ensure_provenance(anchored_output, provenance)
+        with _pinned_child_directory(
+            report_parent,
+            "artifacts",
+            label="artifacts",
+        ) as (artifacts, artifacts_parent):
+            with _pinned_child_directory(
+                artifacts_parent,
+                "reference-extractions",
+                label="reference cache",
+            ) as (reference_cache, _reference_parent):
+                with _pinned_child_directory(
+                    artifacts_parent,
+                    "evaluation-extractions",
+                    label="evaluation cache",
+                ) as (evaluation_cache, _evaluation_parent):
+                    ensure_provenance(
+                        anchored_output,
+                        provenance,
+                        artifacts_directory=artifacts,
+                    )
+                    _run_pipeline_stages(
+                        reference,
+                        evaluation,
+                        checkpoint,
+                        anchored_output,
+                        runtime_device=runtime_device,
+                        batch_size=batch_size,
+                        shard_size=shard_size,
+                        config=config,
+                        extractor_factory=extractor_factory,
+                        corruption=corruption,
+                        provenance=provenance,
+                        report_parent=report_parent,
+                        artifacts=artifacts,
+                        reference_cache=reference_cache,
+                        evaluation_cache=evaluation_cache,
+                    )
+                    ensure_provenance(
+                        anchored_output,
+                        provenance,
+                        artifacts_directory=artifacts,
+                    )
     return output
 
 

@@ -1034,3 +1034,122 @@ def test_static_unsafe_provenance_is_rejected_before_stage_work(
 
     with pytest.raises(ValueError, match="provenance.*regular file"):
         _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+
+@pytest.mark.parametrize(
+    ("location", "entry_name"),
+    (
+        ("artifacts", "artifacts"),
+        ("reference cache", "reference-extractions"),
+        ("evaluation cache", "evaluation-extractions"),
+    ),
+)
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "fifo", "file"))
+def test_static_unsafe_nested_directory_fails_before_writes_or_detector(
+    tmp_path, small_config, location, entry_name, unsafe_kind
+):
+    inputs = _inputs(tmp_path)
+    output = inputs[-1]
+    output.mkdir()
+    if location == "artifacts":
+        parent = output
+    else:
+        parent = output / "artifacts"
+        parent.mkdir()
+    entry = parent / entry_name
+    outside = tmp_path / f"outside-{entry_name}"
+    if unsafe_kind == "symlink":
+        outside.mkdir()
+        entry.symlink_to(outside, target_is_directory=True)
+    elif unsafe_kind == "fifo":
+        os.mkfifo(entry)
+    else:
+        entry.write_bytes(b"not a directory")
+    constructed = 0
+
+    def reject_detector(*_args, **_kwargs):
+        nonlocal constructed
+        constructed += 1
+        raise AssertionError("unsafe nested output reached detector construction")
+
+    with pytest.raises(ValueError, match=f"{location}.*directory"):
+        _run(inputs, small_config, extractor_factory=reject_detector)
+
+    assert constructed == 0
+    if unsafe_kind == "symlink":
+        assert not any(outside.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("location", "entry_name"),
+    (
+        ("artifacts", "artifacts"),
+        ("reference cache", "reference-extractions"),
+        ("evaluation cache", "evaluation-extractions"),
+    ),
+)
+def test_runtime_nested_directory_replacement_stays_anchored_and_fails_closed(
+    tmp_path, small_config, monkeypatch, location, entry_name
+):
+    inputs = _inputs(tmp_path)
+    artifacts = inputs[-1] / "artifacts"
+    reference_cache = artifacts / "reference-extractions"
+    evaluation_cache = artifacts / "evaluation-extractions"
+    reference_cache.mkdir(parents=True)
+    evaluation_cache.mkdir()
+    original = cli._run_pipeline_stages
+    entered = threading.Event()
+    release = threading.Event()
+    observed_identity = []
+
+    def observed(*args, **kwargs):
+        if "artifacts" in kwargs:
+            paths = {
+                "artifacts": kwargs["artifacts"],
+                "reference-extractions": kwargs["reference_cache"],
+                "evaluation-extractions": kwargs["evaluation_cache"],
+            }
+        else:
+            ordinary_artifacts = args[3] / "artifacts"
+            paths = {
+                "artifacts": ordinary_artifacts,
+                "reference-extractions": ordinary_artifacts
+                / "reference-extractions",
+                "evaluation-extractions": ordinary_artifacts
+                / "evaluation-extractions",
+            }
+        stage_path = paths[entry_name]
+        before = os.stat(stage_path, follow_symlinks=False)
+        entered.set()
+        assert release.wait(timeout=10)
+        try:
+            return original(*args, **kwargs)
+        finally:
+            after = os.stat(stage_path, follow_symlinks=False)
+            observed_identity.append(
+                (
+                    (before.st_dev, before.st_ino),
+                    (after.st_dev, after.st_ino),
+                )
+            )
+
+    monkeypatch.setattr(cli, "_run_pipeline_stages", observed)
+    visible = inputs[-1] / entry_name if location == "artifacts" else artifacts / entry_name
+    displaced = tmp_path / f"displaced-{entry_name}"
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(_run, inputs, small_config)
+        assert entered.wait(timeout=10)
+        os.replace(visible, displaced)
+        visible.mkdir()
+        release.set()
+        outcome = _future_outcome(future)
+    finally:
+        release.set()
+        executor.shutdown(wait=True)
+
+    assert isinstance(outcome, ValueError)
+    assert "directory" in str(outcome)
+    assert observed_identity[0][0] == observed_identity[0][1]
+    assert not any(visible.iterdir())
+    assert any(displaced.rglob("*"))

@@ -589,6 +589,7 @@ def extract_manifest(
     image_size: tuple[int, int],
     batch_size: int,
     shard_size: int,
+    anchored_directory: bool = False,
 ) -> None:
     entries = _validated_entries(entries)
     metadata = _validated_metadata(metadata)
@@ -607,7 +608,12 @@ def extract_manifest(
         _validate_completed_extraction(entries, root, metadata, severities)
         return
 
-    with ShardWriter(root, metadata, shard_size=shard_size) as writer:
+    with ShardWriter(
+        root,
+        metadata,
+        shard_size=shard_size,
+        anchored_directory=anchored_directory,
+    ) as writer:
         existing = writer.existing_keys()
         published_keys, record_contract = _published_record_state(writer)
         if set(published_keys) != existing:

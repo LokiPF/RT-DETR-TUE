@@ -526,12 +526,22 @@ def _ensure_exact_mapping(
             raise ValueError(_mismatch_message(label, str(key), actual, expected))
 
 
-def ensure_provenance(run_directory: str | Path, expected: Mapping) -> Path:
+def ensure_provenance(
+    run_directory: str | Path,
+    expected: Mapping,
+    *,
+    artifacts_directory: str | Path | None = None,
+) -> Path:
     """Create run provenance or refuse any JSON-semantic mismatch."""
     if not isinstance(expected, Mapping):
         raise TypeError("expected provenance must be a mapping")
     expected_dict = _json_snapshot(dict(expected))
-    path = Path(run_directory) / "artifacts" / "provenance.json"
+    artifact_root = (
+        Path(run_directory) / "artifacts"
+        if artifacts_directory is None
+        else Path(artifacts_directory)
+    )
+    path = artifact_root / "provenance.json"
     if _atomic_json_create(expected_dict, path):
         return path
 
@@ -1187,6 +1197,8 @@ class ShardWriter:
         directory: str | Path,
         metadata: Mapping,
         shard_size: int = 50,
+        *,
+        anchored_directory: bool = False,
     ) -> None:
         if not isinstance(metadata, Mapping):
             raise TypeError("artifact metadata must be a mapping")
@@ -1197,8 +1209,30 @@ class ShardWriter:
             raise ValueError(f"artifact metadata uses reserved key: {reserved[0]}")
 
         self.directory = Path(directory)
-        self.directory.mkdir(parents=True, exist_ok=True)
-        self.directory = self.directory.resolve()
+        if anchored_directory:
+            proc_root = Path("/proc/self/fd")
+            if (
+                self.directory.parent != proc_root
+                or not self.directory.name.isascii()
+                or not self.directory.name.isdecimal()
+            ):
+                raise ValueError(
+                    "anchored artifact directory must be /proc/self/fd/<fd>"
+                )
+            try:
+                state = os.fstat(int(self.directory.name))
+                visible = os.stat(self.directory)
+            except OSError as error:
+                raise ValueError("anchored artifact directory is invalid") from error
+            if (
+                not stat.S_ISDIR(state.st_mode)
+                or (state.st_dev, state.st_ino)
+                != (visible.st_dev, visible.st_ino)
+            ):
+                raise ValueError("anchored artifact directory is invalid")
+        else:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            self.directory = self.directory.resolve()
         self.final = self.directory / "manifest.json"
         self.partial = self.directory / "partial_manifest.json"
         self.buffer: list[dict] = []

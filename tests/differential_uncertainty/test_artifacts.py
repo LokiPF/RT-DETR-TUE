@@ -15,6 +15,7 @@ import pytest
 import torch
 
 import differential_uncertainty.artifacts as artifacts
+import differential_uncertainty.reporting as reporting
 from differential_uncertainty.artifacts import (
     ShardWriter,
     atomic_json,
@@ -5438,3 +5439,37 @@ def test_live_reader_gc_cancellation_propagates_during_pruning(
         assert reference not in artifacts._LIVE_READER_LEASES
     finally:
         os.close(decoy_fd)
+
+
+def test_writer_keeps_a_procfd_anchored_cache_on_its_pinned_inode(
+    tmp_path,
+):
+    artifact_root = tmp_path / "artifacts"
+    cache = artifact_root / "cache"
+    displaced = artifact_root / "displaced-cache"
+    cache.mkdir(parents=True)
+
+    with reporting._DirectoryLease(
+        artifact_root,
+        message="artifact root changed",
+    ) as parent:
+        with reporting._DirectoryLease(
+            Path(f"/proc/self/fd/{parent.fd}") / "cache",
+            message="cache changed",
+        ) as pinned:
+            anchored = Path(f"/proc/self/fd/{pinned.fd}")
+            writer = ShardWriter(
+                anchored,
+                {"stage": "test"},
+                shard_size=1,
+                anchored_directory=True,
+            )
+            os.replace(cache, displaced)
+            cache.mkdir()
+            with writer:
+                writer.add(_record("scene"))
+
+            assert (displaced / "manifest.json").is_file()
+            assert not any(cache.iterdir())
+            with pytest.raises(ValueError, match="cache changed"):
+                pinned.verify_entry(parent.fd, "cache")
