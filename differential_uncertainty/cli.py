@@ -154,7 +154,9 @@ class _CorruptionSnapshot:
         return self._apply(image, level)
 
 
-def _snapshot_corruption(corruption: Corruption) -> _CorruptionSnapshot:
+def _snapshot_corruption(
+    corruption: Corruption, config: ExperimentConfig
+) -> _CorruptionSnapshot:
     try:
         name = corruption.name
     except Exception as error:
@@ -221,6 +223,13 @@ def _snapshot_corruption(corruption: Corruption) -> _CorruptionSnapshot:
     if levels != list(range(6)):
         raise ValueError(
             "corruption severity levels must be exactly 0 through 5"
+        )
+    if name == "gaussian_blur" and [
+        severity.parameter for severity in frozen_severities
+    ] != [float(radius) for radius in config.blur_radii]:
+        raise ValueError(
+            "Gaussian corruption parameters must match config "
+            "default_blur_radii"
         )
 
     try:
@@ -984,7 +993,7 @@ def run_pipeline(
         raise ValueError("config must be an ExperimentConfig")
     if corruption is None:
         corruption = GaussianBlur()
-    corruption = _snapshot_corruption(corruption)
+    corruption = _snapshot_corruption(corruption, config)
 
     reference = load_manifest(reference_manifest)
     evaluation = load_manifest(evaluation_manifest)

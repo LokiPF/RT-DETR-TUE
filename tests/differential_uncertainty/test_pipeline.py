@@ -527,6 +527,88 @@ def test_invalid_corruption_does_not_touch_a_preexisting_run(
     assert FakeExtractor.instances == extractor_instances
 
 
+def test_reserved_gaussian_parameters_are_checked_before_output_coordination(
+    tmp_path, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    config = ExperimentConfig.for_tests(
+        bank_capacity=20,
+        k=2,
+        query_count=20,
+        persistence_dim=7,
+        bootstrap_samples=20,
+        blur_radii=(0.0, 0.5, 1.5, 2.5, 3.5, 4.5),
+    )
+
+    def forbid_output_coordination(*_args, **_kwargs):
+        raise AssertionError(
+            "reserved corruption reached output coordination"
+        )
+
+    monkeypatch.setattr(cli, "_coordinated_output", forbid_output_coordination)
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Gaussian corruption parameters must match "
+            "config default_blur_radii"
+        ),
+    ):
+        run_pipeline(
+            *inputs,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=config,
+            extractor_factory=FakeExtractor,
+            corruption=GaussianBlur(),
+        )
+
+    assert not inputs[-1].exists()
+    assert FakeExtractor.instances == 0
+
+
+def test_mismatched_reserved_gaussian_does_not_touch_a_preexisting_run(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    output = inputs[-1]
+    before_tree = _tree_state(output)
+    before_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    mismatched = _corruption_stub(name="gaussian_blur")
+    extractor_instances = FakeExtractor.instances
+
+    with pytest.raises(
+        ValueError,
+        match=(
+            "Gaussian corruption parameters must match "
+            "config default_blur_radii"
+        ),
+    ):
+        run_pipeline(
+            *inputs,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+            corruption=mismatched,
+        )
+
+    after_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    assert _tree_state(output) == before_tree
+    assert after_metadata == before_metadata
+    assert FakeExtractor.instances == extractor_instances
+
+
 def test_pipeline_snapshots_mutable_plugin_identity_and_apply_callable(
     tmp_path, small_config
 ):
