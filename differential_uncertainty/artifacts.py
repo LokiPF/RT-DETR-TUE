@@ -268,19 +268,16 @@ def _serialized_regular_file_acquisition():
         _REGULAR_FILE_ACQUISITION.active = False
 
 
+def _prune_dead_live_readers() -> None:
+    """Prune dead reader keys while the caller holds the registry lock."""
+    for reference in list(_LIVE_READER_LEASES):
+        if reference() is None:
+            _LIVE_READER_LEASES.pop(reference, None)
+
+
 def _register_live_reader(handle, lease: "_RegularFileLease") -> None:
-    reference = None
-
-    def discard(_reference) -> None:
-        registry = globals().get("_LIVE_READER_LEASES")
-        lock = globals().get("_WRITER_REGISTRY_LOCK")
-        if registry is None or lock is None:
-            return
-        with lock:
-            registry.pop(reference, None)
-
-    reference = weakref.ref(handle, discard)
-    _LIVE_READER_LEASES[reference] = weakref.ref(lease)
+    _prune_dead_live_readers()
+    _LIVE_READER_LEASES[weakref.ref(handle)] = weakref.ref(lease)
 
 
 _REQUIRED_REGULAR_FILE_FLAGS = (
@@ -1665,6 +1662,7 @@ def _prepare_writer_registry_for_fork() -> None:
     _WRITER_REGISTRY_LOCK.acquire()
     locked: list[ShardWriter] = []
     try:
+        _prune_dead_live_readers()
         candidates = [
             *(reference() for reference in _ACTIVE_WRITERS.values()),
             *_CONSTRUCTING_WRITERS,

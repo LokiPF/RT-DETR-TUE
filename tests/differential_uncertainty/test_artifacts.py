@@ -4984,9 +4984,7 @@ def test_regular_reader_guard_is_not_poisoned_after_store_interrupt():
     invoke()
 
 
-def test_live_reader_weakref_callback_tolerates_module_teardown(
-    tmp_path, monkeypatch
-):
+def test_live_reader_weakrefs_are_callback_free_and_pruned(tmp_path):
     target = tmp_path / "value.bin"
     target.write_bytes(b"value")
     handle = artifacts._open_regular_file(
@@ -4997,12 +4995,16 @@ def test_live_reader_weakref_callback_tolerates_module_teardown(
         for reference in artifacts._LIVE_READER_LEASES
         if reference() is handle
     )
-    callback = reference.__callback__
+    assert reference.__callback__ is None
 
-    monkeypatch.setattr(artifacts, "_LIVE_READER_LEASES", None)
-    monkeypatch.setattr(artifacts, "_WRITER_REGISTRY_LOCK", None)
-    callback(reference)
     handle.close()
+    handle = None
+    gc.collect()
+
+    assert reference() is None
+    assert reference in artifacts._LIVE_READER_LEASES
+    _invoke_public_reader(target)
+    assert reference not in artifacts._LIVE_READER_LEASES
 
 
 @pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit])
@@ -5217,6 +5219,7 @@ def test_public_reader_signal_cancellation_is_never_swallowed(
     target = tmp_path / "value.bin"
     target.write_bytes(b"value")
     script = f"""
+import gc
 import os
 import signal
 import sys
@@ -5245,6 +5248,9 @@ for _ in range(4000):
             handle = artifacts._open_regular_file(
                 target, error_message="invalid test file"
             )
+            handle.close()
+            handle = None
+            gc.collect()
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
     except (KeyboardInterrupt, SystemExit) as error:
@@ -5359,5 +5365,70 @@ def test_reader_ownership_survives_every_method_boundary_without_finalizer(
             assert artifacts._live_fd_snapshot() == baseline
             os.fstat(decoy_fd)
             _invoke_public_reader(target)
+    finally:
+        os.close(decoy_fd)
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit])
+def test_live_reader_gc_cancellation_propagates_during_pruning(
+    tmp_path, exception_type
+):
+    target = tmp_path / f"gc-{exception_type.__name__}.bin"
+    target.write_bytes(b"value")
+    decoy_fd = os.open(target, os.O_RDONLY)
+    baseline = artifacts._live_fd_snapshot()
+    handle = artifacts._open_regular_file(
+        target, error_message="invalid test file"
+    )
+    reference = next(
+        reference
+        for reference in artifacts._LIVE_READER_LEASES
+        if reference() is handle
+    )
+    callback = reference.__callback__
+    prune = getattr(artifacts, "_prune_dead_live_readers", None)
+    trace_code = callback.__code__ if callback is not None else prune.__code__
+    interrupted = False
+    observed = None
+
+    def interrupt(frame, event, _argument):
+        nonlocal interrupted
+        if frame.f_code is trace_code:
+            frame.f_trace_opcodes = True
+            if not interrupted and event in ("line", "opcode"):
+                interrupted = True
+                raise exception_type("injected live-reader GC cancellation")
+        return interrupt
+
+    handle.close()
+    if callback is None:
+        handle = None
+        gc.collect()
+        assert reference() is None
+        assert reference in artifacts._LIVE_READER_LEASES
+    try:
+        sys.settrace(interrupt)
+        if callback is None:
+            _invoke_public_reader(target)
+        else:
+            handle = None
+            gc.collect()
+    except BaseException as error:
+        observed = error
+    finally:
+        sys.settrace(None)
+        handle = None
+        gc.collect()
+
+    try:
+        assert interrupted
+        assert type(observed) is exception_type
+        assert str(observed) == "injected live-reader GC cancellation"
+        observed.__traceback__ = None
+        gc.collect()
+        assert artifacts._live_fd_snapshot() == baseline
+        os.fstat(decoy_fd)
+        _invoke_public_reader(target)
+        assert reference not in artifacts._LIVE_READER_LEASES
     finally:
         os.close(decoy_fd)
