@@ -561,6 +561,19 @@ def _tree_state(root: Path) -> dict[str, tuple]:
     return result
 
 
+def _directory_metadata(path: Path) -> tuple[int, ...]:
+    """Capture directory identity and mutation-sensitive metadata."""
+    state = os.stat(path, follow_symlinks=False)
+    return (
+        state.st_dev,
+        state.st_ino,
+        state.st_mode,
+        state.st_size,
+        state.st_mtime_ns,
+        state.st_ctime_ns,
+    )
+
+
 def _process_run(inputs, config, gate, results):
     CoordinatedExtractor.gate = gate
     try:
@@ -1198,15 +1211,18 @@ def test_mismatched_provenance_refusal_does_not_change_the_existing_tree(
     value = json.loads(provenance.read_text(encoding="utf-8"))
     value["checkpoint_sha256"] = "0" * 64
     provenance.write_text(json.dumps(value), encoding="utf-8")
+    os.utime(artifacts, ns=(1_000_000_000, 1_000_000_000))
+    before_metadata = _directory_metadata(artifacts)
     before = _tree_state(output)
 
     with pytest.raises(ValueError, match="checkpoint_sha256"):
         _run(inputs, small_config, extractor_factory=RejectingExtractor)
 
     assert _tree_state(output) == before
+    assert _directory_metadata(artifacts) == before_metadata
 
 
-@pytest.mark.parametrize("unsafe_kind", ("symlink", "fifo"))
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "fifo", "directory"))
 def test_unsafe_provenance_refusal_does_not_change_the_existing_tree(
     tmp_path, small_config, unsafe_kind
 ):
@@ -1219,14 +1235,19 @@ def test_unsafe_provenance_refusal_does_not_change_the_existing_tree(
         outside = tmp_path / "outside-provenance.json"
         outside.write_text("{}", encoding="utf-8")
         provenance.symlink_to(outside)
-    else:
+    elif unsafe_kind == "fifo":
         os.mkfifo(provenance)
+    else:
+        provenance.mkdir()
+    os.utime(artifacts, ns=(1_000_000_000, 1_000_000_000))
+    before_metadata = _directory_metadata(artifacts)
     before = _tree_state(output)
 
     with pytest.raises(ValueError, match="provenance.*regular file"):
         _run(inputs, small_config, extractor_factory=RejectingExtractor)
 
     assert _tree_state(output) == before
+    assert _directory_metadata(artifacts) == before_metadata
 
 
 @pytest.mark.parametrize("location", ("early", "middle", "final"))
@@ -1381,3 +1402,71 @@ def test_leaf_mutation_after_last_normal_use_fails_the_final_audit(
 
     with pytest.raises((ValueError, RuntimeError)):
         _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+
+def test_identical_resume_preserves_artifacts_tree_and_directory_metadata(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    artifacts = inputs[-1] / "artifacts"
+    os.utime(artifacts, ns=(1_000_000_000, 1_000_000_000))
+    before_tree = _tree_state(artifacts)
+    before_metadata = _directory_metadata(artifacts)
+
+    assert _run(inputs, small_config, extractor_factory=RejectingExtractor)
+    assert _tree_state(artifacts) == before_tree
+    assert _directory_metadata(artifacts) == before_metadata
+
+
+def test_existing_provenance_disappearance_never_falls_back_to_creation(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    artifacts = inputs[-1] / "artifacts"
+    provenance = artifacts / "provenance.json"
+    original_validate = cli.validate_provenance
+    validation_calls = 0
+
+    def disappearing_validate(*args, **kwargs):
+        nonlocal validation_calls
+        validation_calls += 1
+        provenance.unlink()
+        return original_validate(*args, **kwargs)
+
+    def forbidden_ensure(*_args, **_kwargs):
+        raise AssertionError("existing provenance must not use creation")
+
+    monkeypatch.setattr(cli, "validate_provenance", disappearing_validate)
+    monkeypatch.setattr(cli, "ensure_provenance", forbidden_ensure)
+    with pytest.raises(ValueError, match="provenance.*regular file"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    assert validation_calls == 1
+    assert not provenance.exists()
+
+
+def test_existing_provenance_validation_interrupt_preserves_artifacts(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    artifacts = inputs[-1] / "artifacts"
+    os.utime(artifacts, ns=(1_000_000_000, 1_000_000_000))
+    before_tree = _tree_state(artifacts)
+    before_metadata = _directory_metadata(artifacts)
+
+    def interrupt_validation(*_args, **_kwargs):
+        raise KeyboardInterrupt("provenance validation interrupted")
+
+    def forbidden_ensure(*_args, **_kwargs):
+        raise AssertionError("existing provenance must not use creation")
+
+    monkeypatch.setattr(cli, "validate_provenance", interrupt_validation)
+    monkeypatch.setattr(cli, "ensure_provenance", forbidden_ensure)
+    with pytest.raises(KeyboardInterrupt, match="validation interrupted"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    assert _tree_state(artifacts) == before_tree
+    assert _directory_metadata(artifacts) == before_metadata

@@ -800,11 +800,28 @@ def run_pipeline(
             "artifacts",
             label="artifacts",
         ) as (artifacts, artifacts_parent):
-            ensure_provenance(
-                anchored_output,
-                provenance,
-                artifacts_directory=artifacts,
-            )
+            try:
+                os.stat(
+                    "provenance.json",
+                    dir_fd=artifacts_parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                ensure_provenance(
+                    anchored_output,
+                    provenance,
+                    artifacts_directory=artifacts,
+                )
+            except OSError as error:
+                raise ValueError(
+                    "run provenance must be a regular file"
+                ) from error
+            else:
+                validate_provenance(
+                    anchored_output,
+                    provenance,
+                    artifacts_directory=artifacts,
+                )
             with _pinned_child_directory(
                 artifacts_parent,
                 "reference-extractions",
