@@ -65,9 +65,14 @@ Each CSV must follow these rules:
 - Every image path must resolve to an existing file. Relative paths are resolved
   from the directory containing the manifest, not from the current terminal
   directory.
-- Two rows in one manifest may not resolve to the same image file.
+- Two rows in one manifest may not resolve to the same image file, including
+  through different hard-link paths to the same file identity.
 - The reference and evaluation manifests must be separate sets: they may not
-  share an image ID or a resolved image path.
+  share an image ID, a resolved image path, or hard links to the same file.
+- Preflight records each canonical path, content SHA-256, device/inode identity,
+  size, mode, and modification/change timestamps. Extraction reopens and fully
+  loads that exact fingerprinted file; concurrent replacement or mutation is
+  refused.
 
 ## Run or resume everything
 
@@ -99,13 +104,18 @@ Scientific choices are fixed in code: layer 2, 335 persistence features, a seede
 8, and 12.
 
 The command safely resumes compatible partial extraction. It refuses to mix changed
-manifests, checkpoint bytes, or source code into an existing run directory.
+image bytes or file identities, manifests, checkpoint bytes, source code, corruption
+plugin implementation, or runtime regime into an existing run directory. The runtime
+regime includes the resolved device and index, batch and shard sizes, Python and library
+versions, and CUDA/cuDNN/GPU details when CUDA is used. Therefore a partial run created
+with one batch size cannot be resumed with another batch size.
 
 ## Outputs
 
 `<output-dir>/artifacts/` contains provenance, raw feature caches, the clean reference
 bank, and per-image scores. `<output-dir>/report/` contains one plain-language Markdown
-report, machine-readable metric tables, a JSON summary, and four detailed figures. Re-run
+report, machine-readable metric tables, a JSON summary, and four detailed figures. The
+provenance and report record the runtime and corruption implementation identity. Re-run
 the same command after interruption; completed compatible stages are reused.
 
 ## What the score means

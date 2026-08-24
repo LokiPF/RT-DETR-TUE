@@ -14,7 +14,7 @@ The full branch-point commit is:
 The code commit tested immediately before this documentation change is:
 
 ```text
-bac41c132fd38df95c4869d34fd0b4abb1b5394f
+76aae05e687c372b6129f6a694cc5abaf1afc1b1
 ```
 
 ## Historical baseline
@@ -28,14 +28,19 @@ test run.
 The complete retained suite was run with:
 
 ```bash
-/home/yuchen/miniconda3/envs/UE/bin/python -m pytest tests/differential_uncertainty -q
+/home/yuchen/miniconda3/envs/UE/bin/python -m pytest tests/differential_uncertainty -q -rs
 ```
 
 Its exact summary was:
 
 ```text
-764 passed in 133.57s (0:02:13)
+781 passed in 141.79s (0:02:21)
 ```
+
+This full run includes the image-fingerprint, runtime-regime, plugin-identity,
+terminal-audit, and real-checkpoint GPU batch-resume tests. The real GPU check
+performed detector inference at batch size 1 and verified that a batch size 2
+resume was refused; it does not assert batch invariance.
 
 The two parity files were also run together with skip reasons enabled:
 
@@ -48,7 +53,7 @@ The two parity files were also run together with skip reasons enabled:
 Their exact combined summary was:
 
 ```text
-14 passed in 3.63s
+14 passed in 3.60s
 ```
 
 There was no skipped-test summary. The parity checks ran rather than being
@@ -59,7 +64,7 @@ hidden behind an unavailable-checkpoint or incompatible-platform skip.
 The detector test was run separately and reported:
 
 ```text
-11 passed in 2.91s
+11 passed in 2.96s
 ```
 
 `nvidia-smi` identified the local GPU as:
@@ -77,7 +82,7 @@ the recorded CUDA platform. It protects the fixed detector inference path.
 The archived-number test was run separately and reported:
 
 ```text
-3 passed in 0.80s
+3 passed in 0.82s
 ```
 
 This test reads the historical `per_scene_contrasts.csv`, checks the complete
@@ -116,10 +121,10 @@ find differential_uncertainty src tests/differential_uncertainty \
 Observed result:
 
 ```text
-21424 total
+22441 total
 ```
 
-That is **43 Python files and 21,424 lines** in the retained surface.
+That is **43 Python files and 22,441 lines** in the retained surface.
 
 ## Historical report bundle
 
@@ -146,10 +151,10 @@ per_scene_contrasts.csv
 summary.json
 ```
 
-## README repair evidence
+## Environment and documentation evidence
 
-The documentation repair was checked from parent commit
-`ae86ced498c684374d4c1368bc093794a6f25c60`. It changed no Python source, so
+This documentation update follows tested code commit
+`76aae05e687c372b6129f6a694cc5abaf1afc1b1`. It changes no Python source, so
 the tested code commit and retained Python counts recorded above remain the same.
 
 A fresh environment query returned:
