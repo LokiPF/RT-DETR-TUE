@@ -14,7 +14,7 @@ The full branch-point commit is:
 The code commit tested immediately before this documentation change is:
 
 ```text
-76aae05e687c372b6129f6a694cc5abaf1afc1b1
+f663b49837f7301610d82df2983454fcb3d5cd8c
 ```
 
 ## Historical baseline
@@ -34,13 +34,18 @@ The complete retained suite was run with:
 Its exact summary was:
 
 ```text
-781 passed in 141.79s (0:02:21)
+787 passed in 143.79s (0:02:23)
 ```
 
 This full run includes the image-fingerprint, runtime-regime, plugin-identity,
 terminal-audit, and real-checkpoint GPU batch-resume tests. The real GPU check
 performed detector inference at batch size 1 and verified that a batch size 2
 resume was refused; it does not assert batch invariance.
+
+The plugin checks bind authoritative build SHA-256, canonical behavior state,
+defining-module file hashes, and validated external dependency module hashes.
+They also reject defining-module, build-declaration, or behavior-state mutation
+mid-run.
 
 The two parity files were also run together with skip reasons enabled:
 
@@ -121,10 +126,10 @@ find differential_uncertainty src tests/differential_uncertainty \
 Observed result:
 
 ```text
-22441 total
+22933 total
 ```
 
-That is **43 Python files and 22,441 lines** in the retained surface.
+That is **43 Python files and 22,933 lines** in the retained surface.
 
 ## Historical report bundle
 
@@ -154,7 +159,7 @@ summary.json
 ## Environment and documentation evidence
 
 This documentation update follows tested code commit
-`76aae05e687c372b6129f6a694cc5abaf1afc1b1`. It changes no Python source, so
+`f663b49837f7301610d82df2983454fcb3d5cd8c`. It changes no Python source, so
 the tested code commit and retained Python counts recorded above remain the same.
 
 A fresh environment query returned:

@@ -105,18 +105,30 @@ Scientific choices are fixed in code: layer 2, 335 persistence features, a seede
 
 The command safely resumes compatible partial extraction. It refuses to mix changed
 image bytes or file identities, manifests, checkpoint bytes, source code, corruption
-plugin implementation, or runtime regime into an existing run directory. The runtime
-regime includes the resolved device and index, batch and shard sizes, Python and library
-versions, and CUDA/cuDNN/GPU details when CUDA is used. Therefore a partial run created
-with one batch size cannot be resumed with another batch size.
+plugin implementation, or runtime regime into an existing run directory. A plugin
+identity includes stable hashes of its defining module files, an authoritative build
+SHA-256, canonical behavior-affecting state, and validated hashes for declared external
+dependency modules. These values are checked before any completed cache is reused and
+again at the end of the run, so a plugin or module changed during inference is refused.
+
+The built-in Gaussian blur needs no extra configuration. A custom corruption plugin
+must declare `implementation_sha256` as lowercase 64-hex, `behavior_state` as canonical
+JSON data, and `dependency_sha256` as a module-name-to-lowercase-64-hex mapping. Helpers
+in the plugin's own defining modules are covered by the automatic module-file hashes;
+referenced helpers from other modules must appear in the dependency mapping.
+
+The runtime regime includes the resolved device and index, batch and shard sizes,
+Python and library versions, and CUDA/cuDNN/GPU details when CUDA is used. Therefore a
+partial run created with one batch size cannot be resumed with another batch size.
 
 ## Outputs
 
 `<output-dir>/artifacts/` contains provenance, raw feature caches, the clean reference
 bank, and per-image scores. `<output-dir>/report/` contains one plain-language Markdown
 report, machine-readable metric tables, a JSON summary, and four detailed figures. The
-provenance and report record the runtime and corruption implementation identity. Re-run
-the same command after interruption; completed compatible stages are reused.
+provenance and report record the runtime and complete corruption implementation
+identity, including module, build, state, and dependency hashes. Re-run the same command
+after interruption; completed compatible stages are reused.
 
 ## What the score means
 
