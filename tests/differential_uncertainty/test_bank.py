@@ -1,6 +1,9 @@
+import tempfile
+
 import pytest
 import torch
 
+import differential_uncertainty.bank as bank_module
 from differential_uncertainty.artifacts import atomic_torch
 from differential_uncertainty.bank import (
     build_reference_bank,
@@ -100,6 +103,85 @@ def test_bank_rejects_nonfinite_persistence_vectors():
         build_reference_bank([record], config)
 
 
+def test_bank_rejects_vectors_that_overflow_during_float32_conversion():
+    config = ExperimentConfig.for_tests(
+        bank_capacity=6, k=2, query_count=10, persistence_dim=7
+    )
+    record = _record("a", 0)
+    record["persistence"] = torch.full(
+        (10, 7), 1e300, dtype=torch.float64
+    )
+    with pytest.raises(ValueError, match="finite after float32 conversion"):
+        build_reference_bank([record], config)
+
+
+@pytest.mark.parametrize("field", ["boxes", "logits", "persistence"])
+def test_bank_rejects_non_strided_query_tensors(field):
+    config = ExperimentConfig.for_tests(
+        bank_capacity=6, k=2, query_count=10, persistence_dim=7
+    )
+    record = _record("a", 0)
+    record[field] = record[field].to_sparse()
+    with pytest.raises(ValueError, match="strided layout"):
+        build_reference_bank([record], config)
+
+
+def test_bank_stages_each_one_shot_record_before_advancing_the_input():
+    config = ExperimentConfig.for_tests(
+        bank_capacity=6, k=2, query_count=10, persistence_dim=7
+    )
+
+    def records():
+        first = _record("b", 100)
+        yield first
+        for field in ("boxes", "logits", "persistence"):
+            first[field].fill_(float("nan"))
+        yield _record("a", 0)
+
+    bank = build_reference_bank(records(), config)
+    assert bank[:, 0].tolist() == [49.0, 128.0, 149.0, 21.0, 121.0, 35.0]
+
+
+@pytest.mark.parametrize("image_ids", [("a", "a"), (1, "1")])
+def test_bank_rejects_duplicate_or_string_colliding_image_ids(image_ids):
+    config = ExperimentConfig.for_tests(
+        bank_capacity=6, k=2, query_count=10, persistence_dim=7
+    )
+    records = [
+        _record(image_ids[0], 0),
+        _record(image_ids[1], 100),
+    ]
+    with pytest.raises(ValueError, match="duplicate or string-colliding"):
+        build_reference_bank(records, config)
+
+
+def test_bank_closes_its_single_temporary_spool_when_input_validation_fails(
+    monkeypatch,
+):
+    config = ExperimentConfig.for_tests(
+        bank_capacity=6, k=2, query_count=10, persistence_dim=7
+    )
+    opened = []
+    real_temporary_file = tempfile.TemporaryFile
+
+    def tracked_temporary_file(*args, **kwargs):
+        handle = real_temporary_file(*args, **kwargs)
+        opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(
+        bank_module.tempfile,
+        "TemporaryFile",
+        tracked_temporary_file,
+    )
+    bad = _record("b", 100)
+    bad["severity"] = 1
+    with pytest.raises(ValueError, match="clean severity 0"):
+        build_reference_bank(iter((_record("a", 0), bad)), config)
+    assert len(opened) == 1
+    assert opened[0].closed
+
+
 def test_reservoir_sample_is_fixed_by_the_approved_seed_and_stream_order():
     config = ExperimentConfig.for_tests(
         bank_capacity=6, k=2, query_count=10, persistence_dim=7
@@ -145,6 +227,9 @@ def test_saved_bank_round_trip_has_the_exact_plan_schema(tmp_path):
         (torch.zeros(4), "two-dimensional"),
         (torch.zeros(4, 7, dtype=torch.float64), "float32"),
         (torch.full((4, 7), float("nan")), "finite"),
+        (torch.zeros(0, 7), "at least one row"),
+        (torch.zeros(4, 0), "at least one feature"),
+        (torch.zeros(4, 7).to_sparse(), "strided layout"),
     ],
 )
 def test_save_bank_rejects_wrong_rank_dtype_or_nonfinite_vectors(
@@ -154,15 +239,12 @@ def test_save_bank_rejects_wrong_rank_dtype_or_nonfinite_vectors(
         save_reference_bank(bad_bank, tmp_path / "bank.pt", _bank_metadata())
 
 
-def test_save_bank_requires_safe_plain_dict_metadata(tmp_path):
+def test_save_bank_requires_plain_dict_metadata(tmp_path):
     with pytest.raises(TypeError, match="plain dictionary"):
         save_reference_bank(_saved_bank(), tmp_path / "list.pt", [])
-    with pytest.raises(TypeError, match="safe Torch artifact value"):
-        save_reference_bank(
-            _saved_bank(), tmp_path / "unsafe.pt", {"bad": {1.5: "value"}}
-        )
 
 
+@pytest.mark.filterwarnings("ignore:Sparse invariant checks are implicitly disabled")
 @pytest.mark.parametrize(
     ("artifact", "message"),
     [
@@ -184,8 +266,19 @@ def test_save_bank_requires_safe_plain_dict_metadata(tmp_path):
         ),
         ({"vectors": _saved_bank(), "metadata": []}, "plain dictionary"),
         (
-            {"vectors": _saved_bank(), "metadata": {"bad": {1.5: "value"}}},
-            "safe Torch artifact value",
+            {"vectors": torch.zeros(0, 7), "metadata": _bank_metadata()},
+            "at least one row",
+        ),
+        (
+            {"vectors": torch.zeros(4, 0), "metadata": _bank_metadata()},
+            "at least one feature",
+        ),
+        (
+            {
+                "vectors": torch.zeros(4, 7).to_sparse(),
+                "metadata": _bank_metadata(),
+            },
+            "strided layout",
         ),
     ],
 )
@@ -194,6 +287,74 @@ def test_load_bank_rejects_malformed_schema_vectors_or_metadata(
 ):
     path = tmp_path / "bank.pt"
     atomic_torch(artifact, path)
+    with pytest.raises((TypeError, ValueError), match=message):
+        load_reference_bank(path)
+
+
+def _invalid_metadata_cases():
+    return [
+        (
+            {
+                key: value
+                for key, value in _bank_metadata().items()
+                if key != "seed"
+            },
+            "exact metadata keys",
+        ),
+        ({**_bank_metadata(), "extra": 1}, "exact metadata keys"),
+        (
+            {**_bank_metadata(), "reference_manifest_sha256": "A" * 64},
+            "lowercase 64-character hexadecimal",
+        ),
+        (
+            {**_bank_metadata(), "reference_manifest_sha256": "a" * 63},
+            "lowercase 64-character hexadecimal",
+        ),
+        (
+            {**_bank_metadata(), "capacity": True},
+            "capacity must be a positive integer",
+        ),
+        (
+            {**_bank_metadata(), "capacity": 0},
+            "capacity must be a positive integer",
+        ),
+        (
+            {**_bank_metadata(), "capacity": 3},
+            "capacity must equal",
+        ),
+        (
+            {**_bank_metadata(), "seed": True},
+            "seed must be an integer",
+        ),
+        (
+            {**_bank_metadata(), "seed": 1.5},
+            "seed must be an integer",
+        ),
+        (
+            {**_bank_metadata(), "padding_removed": False},
+            "padding_removed must be true",
+        ),
+        (
+            {**_bank_metadata(), "padding_removed": 1},
+            "padding_removed must be true",
+        ),
+    ]
+
+
+@pytest.mark.parametrize(("metadata", "message"), _invalid_metadata_cases())
+def test_save_bank_rejects_malformed_scientific_metadata(
+    tmp_path, metadata, message
+):
+    with pytest.raises((TypeError, ValueError), match=message):
+        save_reference_bank(_saved_bank(), tmp_path / "bank.pt", metadata)
+
+
+@pytest.mark.parametrize(("metadata", "message"), _invalid_metadata_cases())
+def test_load_bank_rejects_malformed_scientific_metadata(
+    tmp_path, metadata, message
+):
+    path = tmp_path / "bank.pt"
+    atomic_torch({"vectors": _saved_bank(), "metadata": metadata}, path)
     with pytest.raises((TypeError, ValueError), match=message):
         load_reference_bank(path)
 
