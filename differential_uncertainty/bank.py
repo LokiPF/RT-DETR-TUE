@@ -129,7 +129,7 @@ def build_reference_bank(
     return torch.stack(reservoir)
 
 
-def _validate_bank_vectors(bank: Tensor) -> None:
+def _validate_bank_vectors(bank: Tensor, config: ExperimentConfig) -> None:
     if not isinstance(bank, Tensor) or bank.ndim != 2:
         raise ValueError("reference bank vectors must be a two-dimensional tensor")
     if bank.layout != torch.strided:
@@ -140,11 +140,16 @@ def _validate_bank_vectors(bank: Tensor) -> None:
         raise ValueError("reference bank vectors need at least one row")
     if bank.shape[1] == 0:
         raise ValueError("reference bank vectors need at least one feature")
+    expected_shape = (config.bank_capacity, config.persistence_dim)
+    if tuple(bank.shape) != expected_shape:
+        raise ValueError(
+            f"reference bank vectors must have shape {expected_shape}"
+        )
     if not bool(torch.isfinite(bank).all()):
         raise ValueError("reference bank vectors must be finite")
 
 
-def _validated_metadata(metadata, bank: Tensor) -> dict:
+def _validated_metadata(metadata, config: ExperimentConfig) -> dict:
     if type(metadata) is not dict:
         raise TypeError("reference bank metadata must be a plain dictionary")
     expected_keys = {
@@ -171,11 +176,19 @@ def _validated_metadata(metadata, bank: Tensor) -> dict:
         or capacity <= 0
     ):
         raise ValueError("reference bank capacity must be a positive integer")
-    if int(capacity) != bank.shape[0]:
-        raise ValueError("reference bank capacity must equal the number of bank rows")
+    if int(capacity) != config.bank_capacity:
+        raise ValueError(
+            "reference bank capacity must equal the active configuration"
+        )
     seed = metadata["seed"]
     if isinstance(seed, bool) or not isinstance(seed, Integral):
         raise ValueError("reference bank seed must be an integer")
+    if int(seed) < 0:
+        raise ValueError("reference bank seed must be a non-negative integer")
+    if int(seed) != config.bank_seed:
+        raise ValueError(
+            "reference bank seed must equal the active configuration"
+        )
     if metadata["padding_removed"] is not True:
         raise ValueError("reference bank padding_removed must be true")
     return {
@@ -186,9 +199,14 @@ def _validated_metadata(metadata, bank: Tensor) -> dict:
     }
 
 
-def save_reference_bank(bank: Tensor, path, metadata: dict) -> None:
-    _validate_bank_vectors(bank)
-    validated_metadata = _validated_metadata(metadata, bank)
+def save_reference_bank(
+    bank: Tensor,
+    path,
+    metadata: dict,
+    config: ExperimentConfig = FIXED_CONFIG,
+) -> None:
+    _validate_bank_vectors(bank, config)
+    validated_metadata = _validated_metadata(metadata, config)
     atomic_torch(
         {
             "vectors": bank.detach().cpu().clone(),
@@ -198,18 +216,23 @@ def save_reference_bank(bank: Tensor, path, metadata: dict) -> None:
     )
 
 
-def load_reference_bank(path) -> tuple[Tensor, dict]:
+def load_reference_bank(
+    path, config: ExperimentConfig = FIXED_CONFIG
+) -> tuple[Tensor, dict]:
     with _open_regular_file(
         path,
         error_message="reference bank must be a regular file",
     ) as handle:
-        artifact = torch.load(handle, map_location="cpu", weights_only=True)
+        try:
+            artifact = torch.load(handle, map_location="cpu", weights_only=True)
+        except Exception as error:
+            raise ValueError("could not load reference bank artifact") from error
     if type(artifact) is not dict or set(artifact) != {"vectors", "metadata"}:
         raise ValueError(
             "reference bank artifact must contain exactly vectors and metadata"
         )
     vectors = artifact["vectors"]
     metadata = artifact["metadata"]
-    _validate_bank_vectors(vectors)
-    validated_metadata = _validated_metadata(metadata, vectors)
+    _validate_bank_vectors(vectors, config)
+    validated_metadata = _validated_metadata(metadata, config)
     return vectors.clone(), validated_metadata

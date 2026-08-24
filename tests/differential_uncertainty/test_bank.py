@@ -203,11 +203,17 @@ def _bank_metadata():
     }
 
 
+def _bank_config():
+    return ExperimentConfig.for_tests(
+        bank_capacity=4, k=2, query_count=10, persistence_dim=7
+    )
+
+
 def test_saved_bank_round_trip_has_the_exact_plan_schema(tmp_path):
     path = tmp_path / "reference-bank.pt"
     expected_bank = _saved_bank()
     expected_metadata = _bank_metadata()
-    save_reference_bank(expected_bank, path, expected_metadata)
+    save_reference_bank(expected_bank, path, expected_metadata, config=_bank_config())
 
     raw = torch.load(path, map_location="cpu", weights_only=True)
     assert type(raw) is dict
@@ -216,9 +222,45 @@ def test_saved_bank_round_trip_has_the_exact_plan_schema(tmp_path):
     assert raw["vectors"].dtype == torch.float32
     assert raw["metadata"] == expected_metadata
 
-    actual_bank, actual_metadata = load_reference_bank(path)
+    actual_bank, actual_metadata = load_reference_bank(path, config=_bank_config())
     torch.testing.assert_close(actual_bank, expected_bank, rtol=0, atol=0)
     assert actual_metadata == expected_metadata
+
+
+@pytest.mark.parametrize(
+    ("vectors", "metadata", "message"),
+    [
+        (
+            torch.zeros(5, 7),
+            {**_bank_metadata(), "capacity": 5},
+            r"shape \(4, 7\)",
+        ),
+        (
+            torch.zeros(4, 8),
+            _bank_metadata(),
+            r"shape \(4, 7\)",
+        ),
+        (
+            _saved_bank(),
+            {**_bank_metadata(), "seed": 999},
+            "seed must equal the active configuration",
+        ),
+    ],
+)
+def test_load_bank_rejects_artifacts_from_a_different_active_config(
+    tmp_path, vectors, metadata, message
+):
+    path = tmp_path / "bank.pt"
+    atomic_torch({"vectors": vectors, "metadata": metadata}, path)
+    with pytest.raises(ValueError, match=message):
+        load_reference_bank(path, config=_bank_config())
+
+
+def test_load_bank_normalizes_a_corrupt_torch_payload(tmp_path):
+    path = tmp_path / "bank.pt"
+    path.write_bytes(b"not a Torch artifact")
+    with pytest.raises(ValueError, match="could not load reference bank artifact"):
+        load_reference_bank(path, config=_bank_config())
 
 
 @pytest.mark.parametrize(
@@ -230,18 +272,23 @@ def test_saved_bank_round_trip_has_the_exact_plan_schema(tmp_path):
         (torch.zeros(0, 7), "at least one row"),
         (torch.zeros(4, 0), "at least one feature"),
         (torch.zeros(4, 7).to_sparse(), "strided layout"),
+        (torch.zeros(4, 6), r"shape \(4, 7\)"),
     ],
 )
 def test_save_bank_rejects_wrong_rank_dtype_or_nonfinite_vectors(
     tmp_path, bad_bank, message
 ):
     with pytest.raises(ValueError, match=message):
-        save_reference_bank(bad_bank, tmp_path / "bank.pt", _bank_metadata())
+        save_reference_bank(
+            bad_bank, tmp_path / "bank.pt", _bank_metadata(), config=_bank_config()
+        )
 
 
 def test_save_bank_requires_plain_dict_metadata(tmp_path):
     with pytest.raises(TypeError, match="plain dictionary"):
-        save_reference_bank(_saved_bank(), tmp_path / "list.pt", [])
+        save_reference_bank(
+            _saved_bank(), tmp_path / "list.pt", [], config=_bank_config()
+        )
 
 
 @pytest.mark.filterwarnings("ignore:Sparse invariant checks are implicitly disabled")
@@ -288,7 +335,7 @@ def test_load_bank_rejects_malformed_schema_vectors_or_metadata(
     path = tmp_path / "bank.pt"
     atomic_torch(artifact, path)
     with pytest.raises((TypeError, ValueError), match=message):
-        load_reference_bank(path)
+        load_reference_bank(path, config=_bank_config())
 
 
 def _invalid_metadata_cases():
@@ -331,6 +378,10 @@ def _invalid_metadata_cases():
             "seed must be an integer",
         ),
         (
+            {**_bank_metadata(), "seed": -1},
+            "seed must be a non-negative integer",
+        ),
+        (
             {**_bank_metadata(), "padding_removed": False},
             "padding_removed must be true",
         ),
@@ -346,7 +397,9 @@ def test_save_bank_rejects_malformed_scientific_metadata(
     tmp_path, metadata, message
 ):
     with pytest.raises((TypeError, ValueError), match=message):
-        save_reference_bank(_saved_bank(), tmp_path / "bank.pt", metadata)
+        save_reference_bank(
+            _saved_bank(), tmp_path / "bank.pt", metadata, config=_bank_config()
+        )
 
 
 @pytest.mark.parametrize(("metadata", "message"), _invalid_metadata_cases())
@@ -356,13 +409,15 @@ def test_load_bank_rejects_malformed_scientific_metadata(
     path = tmp_path / "bank.pt"
     atomic_torch({"vectors": _saved_bank(), "metadata": metadata}, path)
     with pytest.raises((TypeError, ValueError), match=message):
-        load_reference_bank(path)
+        load_reference_bank(path, config=_bank_config())
 
 
 def test_load_bank_rejects_a_symbolic_link(tmp_path):
     target = tmp_path / "target.pt"
     link = tmp_path / "bank.pt"
-    save_reference_bank(_saved_bank(), target, _bank_metadata())
+    save_reference_bank(
+        _saved_bank(), target, _bank_metadata(), config=_bank_config()
+    )
     link.symlink_to(target)
     with pytest.raises(ValueError, match="regular file"):
-        load_reference_bank(link)
+        load_reference_bank(link, config=_bank_config())
