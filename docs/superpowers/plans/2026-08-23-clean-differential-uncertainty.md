@@ -266,6 +266,12 @@ class ExperimentConfig:
 FIXED_CONFIG = ExperimentConfig()
 ```
 
+> **Manifest contract amendment (2026-08-24):** After surrounding whitespace is
+> stripped, an `image_id` must not begin with `=`, `+`, `-`, or `@`.
+> Task 10 rejects these IDs during manifest loading, before creating run output,
+> because exact CSV identity round-tripping would otherwise expose spreadsheet
+> formula interpretation.
+
 - [ ] **Step 4: Write failing manifest and corruption tests**
 
 ```python

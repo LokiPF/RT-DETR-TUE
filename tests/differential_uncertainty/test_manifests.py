@@ -84,6 +84,33 @@ def test_manifest_rejects_a_row_with_a_missing_image_path(tmp_path):
         load_manifest(path)
 
 
+@pytest.mark.parametrize(
+    "image_id",
+    (
+        "=formula",
+        "+formula",
+        "-formula",
+        "@formula",
+        "  =formula",
+        "\t+formula",
+        " -formula",
+        "  @formula",
+    ),
+)
+def test_manifest_rejects_formula_like_image_ids_after_whitespace_normalization(
+    tmp_path, image_id
+):
+    _image(tmp_path / "x.png")
+    manifest = tmp_path / "unsafe.csv"
+    manifest.write_text(
+        f"image_id,image_path\n{image_id},x.png\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="spreadsheet formula character"):
+        load_manifest(manifest)
+
+
 def test_reference_and_evaluation_cannot_repeat_an_image_id(tmp_path):
     _image(tmp_path / "reference.png")
     _image(tmp_path / "evaluation.png")

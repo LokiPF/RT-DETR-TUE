@@ -9,6 +9,7 @@ import pytest
 import torch
 from PIL import Image
 
+from differential_uncertainty.artifacts import iter_records
 from differential_uncertainty.cli import run_pipeline
 from differential_uncertainty.config import ExperimentConfig
 
@@ -251,6 +252,122 @@ def test_missing_report_is_rebuilt_without_extraction(tmp_path, small_config):
     _run(inputs, small_config, extractor_factory=RejectingExtractor)
 
     assert (inputs[-1] / "report" / "report.md").is_file()
+
+
+@pytest.mark.parametrize("unsafe_id", ("=reference", "  @reference"))
+def test_unsafe_reference_id_fails_before_output_or_detector_construction(
+    tmp_path, small_config, unsafe_id
+):
+    reference = _manifest(
+        tmp_path, "reference.csv", ((unsafe_id, 10), ("r2", 30))
+    )
+    evaluation = _manifest(tmp_path, "evaluation.csv", (("e1", 60),))
+    checkpoint = tmp_path / "checkpoint.pth"
+    checkpoint.write_bytes(b"fake checkpoint content")
+    output = tmp_path / "run"
+
+    with pytest.raises(ValueError, match="spreadsheet formula character"):
+        run_pipeline(
+            reference,
+            evaluation,
+            checkpoint,
+            output,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+        )
+
+    assert not output.exists()
+    assert FakeExtractor.instances == 0
+
+
+@pytest.mark.parametrize("unsafe_id", ("+evaluation", " -evaluation"))
+def test_unsafe_evaluation_id_fails_before_output_or_detector_construction(
+    tmp_path, small_config, unsafe_id
+):
+    reference = _manifest(
+        tmp_path, "reference.csv", (("r1", 10), ("r2", 30))
+    )
+    evaluation = _manifest(tmp_path, "evaluation.csv", ((unsafe_id, 60),))
+    checkpoint = tmp_path / "checkpoint.pth"
+    checkpoint.write_bytes(b"fake checkpoint content")
+    output = tmp_path / "run"
+
+    with pytest.raises(ValueError, match="spreadsheet formula character"):
+        run_pipeline(
+            reference,
+            evaluation,
+            checkpoint,
+            output,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+        )
+
+    assert not output.exists()
+    assert FakeExtractor.instances == 0
+
+
+def test_safe_image_ids_round_trip_exactly_through_artifacts_scores_and_report(
+    tmp_path, small_config
+):
+    reference_ids = ("ref=alpha", "ref+beta")
+    evaluation_ids = ("scene-01@safe", "scene_02+safe")
+    reference = _manifest(
+        tmp_path,
+        "reference.csv",
+        tuple(zip(reference_ids, (10, 30))),
+    )
+    evaluation = _manifest(
+        tmp_path,
+        "evaluation.csv",
+        tuple(zip(evaluation_ids, (60, 90))),
+    )
+    checkpoint = tmp_path / "checkpoint.pth"
+    checkpoint.write_bytes(b"fake checkpoint content")
+    output = tmp_path / "run"
+
+    run_pipeline(
+        reference,
+        evaluation,
+        checkpoint,
+        output,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=FakeExtractor,
+    )
+
+    reference_records = iter_records(
+        output / "artifacts" / "reference-extractions"
+    )
+    assert {record["image_id"] for record in reference_records} == set(
+        reference_ids
+    )
+    evaluation_records = list(
+        iter_records(output / "artifacts" / "evaluation-extractions")
+    )
+    assert {record["image_id"] for record in evaluation_records} == set(
+        evaluation_ids
+    )
+    artifact_scores = pd.read_csv(
+        output / "artifacts" / "scores.csv", dtype={"image_id": str}
+    )
+    report_scores = pd.read_csv(
+        output / "report" / "per-image-scores.csv",
+        dtype={"image_id": str},
+    )
+    assert set(artifact_scores["image_id"]) == set(evaluation_ids)
+    assert set(report_scores["image_id"]) == set(evaluation_ids)
+    report_text = (output / "report" / "report.md").read_text(
+        encoding="utf-8"
+    )
+    assert min(evaluation_ids) in report_text
 
 
 @pytest.mark.parametrize(

@@ -38,6 +38,11 @@ def load_manifest(value: str | Path) -> tuple[ManifestEntry, ...]:
         image_id = row["image_id"].strip()
         if not image_id:
             raise ValueError(f"manifest row {number} has an empty image_id")
+        if image_id.startswith(("=", "+", "-", "@")):
+            raise ValueError(
+                f"manifest row {number} image_id starts with a "
+                "spreadsheet formula character (=, +, -, or @)"
+            )
         if image_id in seen_ids:
             raise ValueError(f"duplicate image_id {image_id!r}")
         path = (manifest.parent / row["image_path"]).resolve()
