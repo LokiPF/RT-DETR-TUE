@@ -34,7 +34,7 @@ The complete retained suite was run with:
 Its exact summary was:
 
 ```text
-764 passed in 134.40s (0:02:14)
+764 passed in 133.57s (0:02:13)
 ```
 
 The two parity files were also run together with skip reasons enabled:
@@ -144,4 +144,48 @@ contrast_scores_by_severity.png
 easy-report.md
 per_scene_contrasts.csv
 summary.json
+```
+
+## README repair evidence
+
+The documentation repair was checked from parent commit
+`ae86ced498c684374d4c1368bc093794a6f25c60`. It changed no Python source, so
+the tested code commit and retained Python counts recorded above remain the same.
+
+A fresh environment query returned:
+
+```text
+Python 3.11.15
+PyTorch 2.11.0+cu128
+torchvision 0.26.0+cu128
+CUDA runtime 12.8
+cuDNN 91900 (version 9.19.0)
+CUDA available True
+GPU NVIDIA GeForce RTX 5090
+compute capability (12, 0)
+```
+
+A direct parser check returned the documented runtime defaults:
+
+```text
+device cuda:0
+batch_size 1
+shard_size 50
+```
+
+On the tested host, `findmnt` reported `proc /proc`, `/proc/self/fd` was a
+directory, and the C library exposed the `renameat2` symbol. The report tests
+exercise the no-replace publication path.
+
+A HEAD-only request returned HTTP 200 for the
+[official repository](https://github.com/lyuwenyu/RT-DETR) and for the final
+asset behind the [official checkpoint link](https://github.com/lyuwenyu/storage/releases/download/v0.2/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth).
+This checked the links without downloading the 81,198,974-byte body. The
+official repository's [`hubconf.py`](https://github.com/lyuwenyu/RT-DETR/blob/main/hubconf.py)
+mapped `rtdetrv2_r18vd` to that exact release URL.
+
+The existing local official checkpoint was checked independently:
+
+```text
+2ace52184b620204004509b72752ac7bfe64aadaf7fc1d076b18df8ab5a5c77e  rtdetrv2_r18vd_120e_coco_rerun_48.1.pth
 ```

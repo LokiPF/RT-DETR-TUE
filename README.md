@@ -5,13 +5,43 @@ question: when an image is damaged more strongly, does the detector's uncertaint
 score usually rise? The workflow performs inference only. It does not train a model
 and it does not require COCO annotation files.
 
-## Install
+## Requirements and install
 
-Create a Python environment with a suitable PyTorch build, then run:
+Use Python 3.10 or newer. The workflow currently requires Linux with `/proc`
+mounted and `renameat2` support; those operating-system features let it pin output
+directories safely and publish a complete report without replacing an existing one.
+
+The workflow was verified here with Python 3.11.15, PyTorch 2.11.0+cu128,
+torchvision 0.26.0+cu128, CUDA 12.8, cuDNN 9.19.0, and an NVIDIA GeForce RTX
+5090. These are tested versions, not the only suitable versions. Install a PyTorch
+build suitable for your computer, then run:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
+
+## Checkpoint
+
+The model comes from the [official RT-DETR repository](https://github.com/lyuwenyu/RT-DETR).
+Use its [official RT-DETRv2-R18 COCO checkpoint](https://github.com/lyuwenyu/storage/releases/download/v0.2/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth).
+The upstream [`hubconf.py`](https://github.com/lyuwenyu/RT-DETR/blob/main/hubconf.py)
+maps `rtdetrv2_r18vd` to that release file.
+
+The expected filename is `rtdetrv2_r18vd_120e_coco_rerun_48.1.pth`. Its expected
+SHA-256 is `2ace52184b620204004509b72752ac7bfe64aadaf7fc1d076b18df8ab5a5c77e`.
+From the directory containing the downloaded file, verify both the bytes and the
+filename before running:
+
+```bash
+printf '%s  %s\n' \
+  '2ace52184b620204004509b72752ac7bfe64aadaf7fc1d076b18df8ab5a5c77e' \
+  'rtdetrv2_r18vd_120e_coco_rerun_48.1.pth' | sha256sum --check --strict
+```
+
+A successful check prints `rtdetrv2_r18vd_120e_coco_rerun_48.1.pth: OK`.
+The run command records the SHA-256 of whichever checkpoint file you supply, but
+it does not enforce this official identity for a new run. The command uses the
+recorded digest to stop a resumed run from mixing different checkpoint bytes.
 
 ## Inputs
 
@@ -23,9 +53,21 @@ street_001,/data/images/street_001.jpg
 street_002,/data/images/street_002.jpg
 ```
 
-Image IDs must be unique inside each manifest. Paths may be absolute or relative to
-the manifest. The checkpoint must be the fixed RT-DETRv2-R18 COCO checkpoint used by
-this repository.
+Each CSV must follow these rules:
+
+- The header must be exactly `image_id,image_path`, in that order, with no extra
+  columns.
+- The manifest must contain at least one image.
+- After surrounding spaces are removed, every image ID must be nonempty and
+  unique within that manifest. An ID may contain at most 256 characters, may
+  not contain any Unicode category-C character (such as a control or format
+  character), and may not begin with `=`, `+`, `-`, or `@`.
+- Every image path must resolve to an existing file. Relative paths are resolved
+  from the directory containing the manifest, not from the current terminal
+  directory.
+- Two rows in one manifest may not resolve to the same image file.
+- The reference and evaluation manifests must be separate sets: they may not
+  share an image ID or a resolved image path.
 
 ## Run or resume everything
 
@@ -37,7 +79,20 @@ python -m differential_uncertainty run \
   --output-dir runs/blur-study
 ```
 
-Only runtime controls are exposed: `--device`, `--batch-size`, and `--shard-size`.
+The runtime defaults are `--device cuda:0`, `--batch-size 1`, and
+`--shard-size 50`. These are the only optional runtime controls. To run without
+CUDA, use the same command with the CPU control:
+
+```bash
+python -m differential_uncertainty run \
+  --reference-manifest reference.csv \
+  --evaluation-manifest evaluation.csv \
+  --checkpoint rtdetrv2_r18vd_120e_coco_rerun_48.1.pth \
+  --output-dir runs/blur-study-cpu \
+  --device cpu
+```
+
+CPU inference is supported but will normally be much slower than GPU inference.
 Scientific choices are fixed in code: layer 2, 335 persistence features, a seeded
 25,000-vector clean reference bank, 5-nearest-neighbour distance, responsive deciles
 50--60, reference deciles 90--100, relative gap, and Gaussian blur radii 0, 1, 2, 4,
