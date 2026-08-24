@@ -3,17 +3,69 @@ import torch
 from torch import nn
 
 from differential_uncertainty.persistence import Layer2Capture, batched_persistence
-# Transitional oracle: the later legacy-prune task must freeze this behavior in
-# a self-contained fixture before src.misc is removed.
-from src.misc.tue_utils import get_persistence_diagrams_batched
 
 
-def test_batched_persistence_matches_the_legacy_implementation_exactly():
+def _reference_persistence(weight_matrix, layer_inputs):
+    """Scalar Kruskal oracle, independent of the batched Prim implementation."""
+    weight = weight_matrix.detach().cpu().to(torch.float32)
+    inputs = layer_inputs.detach().cpu().to(torch.float32)
+    output_count, input_count = weight.shape
+    diagrams = []
+
+    for layer_input in inputs:
+        edges = [
+            (
+                abs(
+                    float(
+                        weight[output_index, input_index]
+                        * layer_input[input_index]
+                    )
+                ),
+                input_index,
+                input_count + output_index,
+            )
+            for output_index in range(output_count)
+            for input_index in range(input_count)
+        ]
+        edges.sort(key=lambda edge: edge[0], reverse=True)
+
+        parent = list(range(input_count + output_count))
+        rank = [0] * len(parent)
+
+        def find(vertex):
+            while parent[vertex] != vertex:
+                parent[vertex] = parent[parent[vertex]]
+                vertex = parent[vertex]
+            return vertex
+
+        selected = []
+        for edge_weight, left, right in edges:
+            left_root = find(left)
+            right_root = find(right)
+            if left_root == right_root:
+                continue
+            if rank[left_root] < rank[right_root]:
+                parent[left_root] = right_root
+            elif rank[left_root] > rank[right_root]:
+                parent[right_root] = left_root
+            else:
+                parent[right_root] = left_root
+                rank[left_root] += 1
+            selected.append(edge_weight)
+            if len(selected) == input_count + output_count - 1:
+                break
+
+        diagrams.append(selected)
+
+    return torch.tensor(diagrams, dtype=torch.float32)
+
+
+def test_batched_persistence_matches_independent_kruskal_reference_exactly():
     generator = torch.Generator().manual_seed(7)
     weight = torch.randn(5, 8, generator=generator)
     inputs = torch.randn(13, 8, generator=generator)
 
-    expected = get_persistence_diagrams_batched(weight, inputs, chunk_size=4)
+    expected = _reference_persistence(weight, inputs)
     actual = batched_persistence(weight, inputs, chunk_size=4)
 
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)

@@ -905,70 +905,17 @@ def test_pipeline_rejects_invalid_runtime_controls(
 
 _DETECTOR_SOURCE_PATHS = (
     "src/__init__.py",
-    "src/core/__init__.py",
-    "src/core/_config.py",
-    "src/core/workspace.py",
-    "src/core/yaml_config.py",
-    "src/core/yaml_utils.py",
-    "src/data/__init__.py",
-    "src/data/_misc.py",
-    "src/data/dataloader.py",
-    "src/data/dataset/__init__.py",
-    "src/data/dataset/_dataset.py",
-    "src/data/dataset/cifar_dataset.py",
-    "src/data/dataset/coco_dataset.py",
-    "src/data/dataset/coco_eval.py",
-    "src/data/dataset/coco_utils.py",
-    "src/data/dataset/voc_detection.py",
-    "src/data/dataset/voc_eval.py",
-    "src/data/transforms/__init__.py",
-    "src/data/transforms/_transforms.py",
-    "src/data/transforms/container.py",
-    "src/data/transforms/mosaic.py",
-    "src/misc/__init__.py",
-    "src/misc/box_ops.py",
-    "src/misc/dist_utils.py",
-    "src/misc/logger.py",
-    "src/misc/profiler_utils.py",
-    "src/misc/tue_utils.py",
-    "src/misc/visualizer.py",
     "src/nn/__init__.py",
-    "src/nn/arch/__init__.py",
-    "src/nn/arch/classification.py",
-    "src/nn/arch/yolo.py",
     "src/nn/backbone/__init__.py",
     "src/nn/backbone/common.py",
-    "src/nn/backbone/csp_darknet.py",
-    "src/nn/backbone/csp_resnet.py",
-    "src/nn/backbone/hgnetv2.py",
     "src/nn/backbone/presnet.py",
-    "src/nn/backbone/test_resnet.py",
-    "src/nn/backbone/timm_model.py",
-    "src/nn/backbone/torchvision_model.py",
-    "src/nn/backbone/utils.py",
-    "src/nn/criterion/__init__.py",
-    "src/nn/criterion/det_criterion.py",
-    "src/nn/postprocessor/__init__.py",
-    "src/nn/postprocessor/nms_postprocessor.py",
-    "src/optim/__init__.py",
-    "src/optim/amp.py",
-    "src/optim/ema.py",
-    "src/optim/optim.py",
-    "src/optim/warmup.py",
     "src/zoo/__init__.py",
     "src/zoo/rtdetr/__init__.py",
     "src/zoo/rtdetr/box_ops.py",
     "src/zoo/rtdetr/denoising.py",
     "src/zoo/rtdetr/hybrid_encoder.py",
-    "src/zoo/rtdetr/matcher.py",
     "src/zoo/rtdetr/rtdetr.py",
-    "src/zoo/rtdetr/rtdetr_criterion.py",
-    "src/zoo/rtdetr/rtdetr_decoder.py",
-    "src/zoo/rtdetr/rtdetr_postprocessor.py",
-    "src/zoo/rtdetr/rtdetrv2_criterion.py",
     "src/zoo/rtdetr/rtdetrv2_decoder.py",
-    "src/zoo/rtdetr/tue_rtdetr.py",
-    "src/zoo/rtdetr/tue_rtdetrv2_decoder.py",
     "src/zoo/rtdetr/utils.py",
 )
 
@@ -1096,8 +1043,8 @@ def test_detector_source_closure_matches_every_currently_executed_project_file()
     }
 
     assert actual == set(_DETECTOR_SOURCE_PATHS)
-    assert "src/scene_uncertainty/pipeline.py" not in actual
-    assert "src/solver/det_engine.py" not in actual
+    assert len(actual) == 13
+    assert all((root / relative).is_file() for relative in actual)
 
 
 def test_each_detector_source_affects_digest_but_unrelated_source_does_not(
@@ -1112,8 +1059,8 @@ def test_each_detector_source_affects_digest_but_unrelated_source_does_not(
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"{relative}\n", encoding="utf-8")
-    unrelated = root / "src/scene_uncertainty/unrelated.py"
-    unrelated.parent.mkdir(parents=True)
+    unrelated = root / "src/unrelated.py"
+    unrelated.parent.mkdir(parents=True, exist_ok=True)
     unrelated.write_text("first\n", encoding="utf-8")
 
     files = cli._source_files(root=root)

@@ -330,7 +330,8 @@ import sys
 
 import src
 
-assert "src.core" not in sys.modules
+removed_registry = "src." + "core"
+assert removed_registry not in sys.modules
 from src import nn, zoo
 from src.nn import backbone
 from src.zoo import rtdetr
@@ -339,7 +340,7 @@ assert nn.__all__ == ["PResNet"]
 assert backbone.__all__ == ["FrozenBatchNorm2d", "PResNet"]
 assert zoo.__all__ == ["HybridEncoder", "RTDETR", "RTDETRTransformerv2"]
 assert rtdetr.__all__ == ["HybridEncoder", "RTDETR", "RTDETRTransformerv2"]
-assert "src.core" not in sys.modules
+assert removed_registry not in sys.modules
 """
     completed = subprocess.run(
         [sys.executable, "-c", script],

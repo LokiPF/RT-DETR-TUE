@@ -1,29 +1,7 @@
-# torchvision>=0.18 is a hard floor, not a preference. `src/scene_uncertainty/dataset.py`
-# hands `SanitizeBoundingBoxes` a `labels_getter` that returns a *tuple* of per-annotation
-# tensors, and that transform only learned to accept a tuple/list in 0.18.0: up to and
-# including 0.17.2 its `forward` is
-#     if labels is not None and not isinstance(labels, torch.Tensor):
-#         raise ValueError("The labels in the input to forward() must be a tensor or None")
-# so the blur loader raises on every batch there. 0.15.2/0.16/0.17 -- the three versions
-# `src/data/_misc.py` still branches for -- are therefore all below the floor.
-# The torchvision 0.18.0 wheel requires `torch==2.3.0`, so that is the matching torch floor.
 torch>=2.3.0
 torchvision>=0.18.0
-
-# Imported at module scope by `src/scene_uncertainty`, so every subcommand needs them:
-# `reporting.py` imports pandas and matplotlib and `pipeline.py` imports `reporting`.
-# None of these may be left to arrive as somebody else's transitive dependency -- the
-# pipeline is required to import in an environment with no `supervisely`.
-matplotlib>=3.5  # `Axes.set_xticks(ticks, labels)` (class-switch plot) landed in 3.5.0
+matplotlib>=3.5
 numpy
 pandas
 pillow
-pycocotools
 scipy
-
-# Config loading (`src/core`) and training-side logging.
-PyYAML
-tensorboard
-
-# Training only. The scene-uncertainty pipeline must import without it.
-supervisely
