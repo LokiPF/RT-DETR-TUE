@@ -99,6 +99,94 @@ def test_report_writes_through_an_active_pinned_parent_lease(tmp_path):
     assert (tmp_path / "report" / "report.md").is_file()
 
 
+def test_directory_lease_direct_acquisition_survives_fd_reuse(
+    tmp_path, monkeypatch
+):
+    held_path = tmp_path / "held"
+    raced_path = tmp_path / "raced"
+    held_path.mkdir()
+    raced_path.mkdir()
+    held = reporting._DirectoryLease(held_path, message="held changed")
+    held.__enter__()
+    held_released = False
+    try:
+        reused_fd = held.fd
+        direct_open = getattr(reporting, "_open_owned_directory", None)
+        assert callable(direct_open)
+        triggered = False
+
+        def close_then_open(path, *, directory_fd=None):
+            nonlocal held_released, triggered
+            triggered = True
+            held.__exit__(None, None, None)
+            held_released = True
+            owner = direct_open(path, directory_fd=directory_fd)
+            assert owner.fd == reused_fd
+            return owner
+
+        monkeypatch.setattr(
+            reporting, "_open_owned_directory", close_then_open
+        )
+        with reporting._DirectoryLease(
+            raced_path, message="raced acquisition failed"
+        ) as raced:
+            assert raced.fd == reused_fd
+        assert triggered
+    finally:
+        if not held_released:
+            held.__exit__(None, None, None)
+
+
+def test_directory_direct_open_call_store_interrupt_closes_fd(tmp_path):
+    target_code = reporting._DirectoryLease.__enter__.__code__
+    owner_stores = [
+        instruction.offset
+        for instruction in dis.get_instructions(target_code)
+        if instruction.opname == "STORE_FAST"
+        and instruction.argval == "owner"
+    ]
+    assert len(owner_stores) == 2
+    direct_owner_store = owner_stores[1]
+    before = {
+        int(name)
+        for name in os.listdir("/proc/self/fd")
+        if name.isdigit() and Path(f"/proc/self/fd/{name}").exists()
+    }
+    interrupted = False
+
+    def trace(frame, event, _argument):
+        nonlocal interrupted
+        if frame.f_code is target_code:
+            frame.f_trace_opcodes = True
+            if (
+                not interrupted
+                and event == "opcode"
+                and frame.f_lasti == direct_owner_store
+            ):
+                interrupted = True
+                raise KeyboardInterrupt("after direct directory open")
+        return trace
+
+    previous = sys.gettrace()
+    sys.settrace(trace)
+    try:
+        with pytest.raises(KeyboardInterrupt, match="direct directory open"):
+            with reporting._DirectoryLease(
+                tmp_path, message="directory changed"
+            ):
+                pass
+    finally:
+        sys.settrace(previous)
+    after = {
+        int(name)
+        for name in os.listdir("/proc/self/fd")
+        if name.isdigit() and Path(f"/proc/self/fd/{name}").exists()
+    }
+
+    assert interrupted
+    assert after == before
+
+
 def test_csv_and_json_numbers_reconcile_with_the_supplied_results(tmp_path):
     rows, evaluation, provenance = _inputs()
     output = tmp_path / "report"

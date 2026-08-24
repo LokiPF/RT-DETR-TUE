@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 
@@ -96,3 +97,25 @@ def test_repository_python_surface_is_exact():
 
     assert len(RETAINED_PYTHON) == 43
     assert actual == RETAINED_PYTHON
+
+
+def test_repository_tree_contains_no_symlinks():
+    symlinks = set()
+    pending = [ROOT]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                relative = path.relative_to(ROOT)
+                if (
+                    relative.parent == Path(".")
+                    and relative.name in {".git", ".worktrees"}
+                ):
+                    continue
+                if entry.is_symlink():
+                    symlinks.add(relative.as_posix())
+                elif entry.is_dir(follow_symlinks=False):
+                    pending.append(path)
+
+    assert symlinks == set()

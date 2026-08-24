@@ -93,7 +93,6 @@ _SERIES_ORIENTATION_KEYS = {
     "persistence_responsive": "raw_responsive",
     "persistence_reference": "raw_reference",
 }
-_DIRECTORY_ACQUISITION_LOCK = threading.RLock()
 _PYPLOT_LOCK = threading.RLock()
 
 
@@ -903,63 +902,117 @@ reproducibility details are stored beside this report. Checkpoint SHA-256:
 """
 
 
-def _live_file_descriptors() -> set[int]:
-    descriptors = set()
-    for name in os.listdir("/proc/self/fd"):
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | os.O_DIRECTORY
+    | os.O_NOFOLLOW
+    | getattr(os, "O_CLOEXEC", 0)
+)
+_AT_FDCWD = -100
+
+
+class _OwnedDirectoryDescriptor(ctypes.c_int):
+    """Own a libc-opened directory fd from the C return boundary."""
+
+    @property
+    def fd(self) -> int:
+        descriptor = int(self.value)
+        if descriptor < 0:
+            raise RuntimeError("directory descriptor is closed")
+        return descriptor
+
+    def close(self) -> None:
+        descriptor = int(self.value)
+        if descriptor < 0:
+            return
+        self.value = -1
+        os.close(descriptor)
+
+    def __del__(self) -> None:
         try:
-            descriptor = int(name)
-            os.fstat(descriptor)
-        except (OSError, ValueError):
-            continue
-        descriptors.add(descriptor)
-    return descriptors
+            self.close()
+        except OSError:
+            pass
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_LIBC_OPENAT = _LIBC.openat
+_LIBC_OPENAT.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int)
+_LIBC_OPENAT.restype = _OwnedDirectoryDescriptor
+
+
+def _open_owned_directory(path, *, directory_fd=None):
+    base = _AT_FDCWD if directory_fd is None else int(directory_fd)
+    owner = _LIBC_OPENAT(
+        base, os.fsencode(os.fspath(path)), _DIRECTORY_OPEN_FLAGS
+    )
+    if owner.value < 0:
+        error_number = ctypes.get_errno()
+        raise OSError(
+            error_number, os.strerror(error_number), os.fspath(path)
+        )
+    return owner
 
 
 class _DirectoryLease:
-    """Keep a C-owned scanner, and therefore its directory fd, alive."""
+    """Own and verify one directly opened, no-follow directory fd."""
 
-    def __init__(self, path: Path, *, message: str) -> None:
+    def __init__(
+        self, path: Path, *, message: str, directory_fd: int | None = None
+    ) -> None:
         self.path = Path(path)
         self.message = message
+        self.directory_fd = directory_fd
         self.owner = None
         self.fd = None
         self.identity = None
 
+    def _entry_state(self):
+        if self.directory_fd is None:
+            return os.stat(self.path, follow_symlinks=False)
+        name = os.fspath(self.path)
+        if not name or Path(name).name != name:
+            raise ValueError(self.message)
+        return os.stat(
+            name, dir_fd=self.directory_fd, follow_symlinks=False
+        )
+
     def __enter__(self):
-        with _DIRECTORY_ACQUISITION_LOCK:
-            try:
-                before_state = os.stat(self.path, follow_symlinks=False)
-            except OSError as error:
-                raise ValueError(self.message) from error
-            if not stat.S_ISDIR(before_state.st_mode):
+        owner = None
+        try:
+            before = self._entry_state()
+            if not stat.S_ISDIR(before.st_mode):
                 raise ValueError(self.message)
-            identity = (before_state.st_dev, before_state.st_ino)
-            before_fds = _live_file_descriptors()
-            owner = os.scandir(self.path)
+            identity = (before.st_dev, before.st_ino)
+            owner = _open_owned_directory(
+                self.path, directory_fd=self.directory_fd
+            )
             self.owner = owner
-            try:
-                candidates = []
-                for descriptor in _live_file_descriptors() - before_fds:
-                    state = os.fstat(descriptor)
-                    if (
-                        stat.S_ISDIR(state.st_mode)
-                        and (state.st_dev, state.st_ino) == identity
-                    ):
-                        candidates.append(descriptor)
-                current = os.stat(self.path, follow_symlinks=False)
-                if (
-                    len(candidates) != 1
-                    or not stat.S_ISDIR(current.st_mode)
-                    or (current.st_dev, current.st_ino) != identity
-                ):
-                    raise ValueError(self.message)
-            except BaseException:
-                owner.close()
-                self.owner = None
-                raise
-            self.fd = candidates[0]
+            descriptor = owner.fd
+            opened = os.fstat(descriptor)
+            current = self._entry_state()
+            if (
+                not stat.S_ISDIR(opened.st_mode)
+                or not stat.S_ISDIR(current.st_mode)
+                or (opened.st_dev, opened.st_ino) != identity
+                or (current.st_dev, current.st_ino) != identity
+            ):
+                raise ValueError(self.message)
+            self.fd = descriptor
             self.identity = identity
             return self
+        except OSError as error:
+            if owner is not None:
+                owner.close()
+            self.owner = None
+            self.fd = None
+            raise ValueError(self.message) from error
+        except BaseException:
+            if owner is not None:
+                owner.close()
+            self.owner = None
+            self.fd = None
+            raise
 
     def __exit__(self, _type, _value, _traceback):
         owner = self.owner
@@ -970,7 +1023,7 @@ class _DirectoryLease:
 
     def verify_path(self) -> None:
         try:
-            state = os.stat(self.path, follow_symlinks=False)
+            state = self._entry_state()
         except OSError as error:
             raise ValueError(self.message) from error
         if (
@@ -1017,8 +1070,9 @@ def _bundle_bytes(root: Path, *, message: str) -> dict[str, bytes]:
         }
         if _directory_entries(root_lease) != (root_files, {"figures"}):
             raise ValueError(message)
-        figures_path = Path(f"/proc/self/fd/{root_lease.fd}") / "figures"
-        with _DirectoryLease(figures_path, message=message) as figures_lease:
+        with _DirectoryLease(
+            "figures", message=message, directory_fd=root_lease.fd
+        ) as figures_lease:
             figure_files = {
                 relative.split("/", 1)[1]
                 for relative in REPORT_FILES
@@ -1067,11 +1121,8 @@ def _bundle_is_exact(root: Path) -> bool:
             }
             if _directory_entries(root_lease) != (root_files, {"figures"}):
                 return False
-            figures_path = (
-                Path(f"/proc/self/fd/{root_lease.fd}") / "figures"
-            )
             with _DirectoryLease(
-                figures_path, message=message
+                "figures", message=message, directory_fd=root_lease.fd
             ) as figures_lease:
                 figure_files = {
                     relative.split("/", 1)[1]
@@ -1107,10 +1158,10 @@ def _remove_directory_contents(directory_fd: int) -> None:
         except FileNotFoundError:
             continue
         if stat.S_ISDIR(state.st_mode):
-            child_path = visible / name
             with _DirectoryLease(
-                child_path,
+                name,
                 message="report staging directory changed",
+                directory_fd=directory_fd,
             ) as child:
                 _remove_directory_contents(child.fd)
                 child.verify_entry(directory_fd, name)
@@ -1159,8 +1210,9 @@ class _StagingOwner:
             self.name = Path(self._temporary.name).name
             self.path = Path(parent_path) / self.name
             self.lease = _DirectoryLease(
-                self.path,
+                self.name,
                 message="report staging directory changed",
+                directory_fd=self.parent.fd,
             )
             self.lease.__enter__()
             return self

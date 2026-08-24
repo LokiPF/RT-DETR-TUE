@@ -1002,6 +1002,32 @@ def test_identical_fresh_thread_runs_coordinate_and_publish_exactly_once(
     _assert_no_lock_artifact(inputs[-1])
 
 
+def test_identical_completed_thread_runs_are_stable_under_high_repetition(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    expected_output = _run(inputs, small_config)
+    expected_tree = _tree_hashes(inputs[-1])
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        for _repeat in range(32):
+            futures = [
+                executor.submit(
+                    _run,
+                    inputs,
+                    small_config,
+                    extractor_factory=RejectingExtractor,
+                )
+                for _ in range(2)
+            ]
+            assert [
+                future.result(timeout=30) for future in futures
+            ] == [expected_output, expected_output]
+
+    assert _tree_hashes(inputs[-1]) == expected_tree
+    _assert_no_lock_artifact(inputs[-1])
+
+
 def test_identical_fresh_process_runs_coordinate_and_publish_exactly_once(
     tmp_path, small_config
 ):
