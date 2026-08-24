@@ -112,7 +112,122 @@ def _normalized_source(value) -> str:
     return normalized.replace("\r", "\n").strip() + "\n"
 
 
-def _corruption_implementation(corruption, apply) -> dict[str, str]:
+def _strict_sha256(value, *, label):
+    if (
+        not isinstance(value, str)
+        or re.fullmatch(r"[0-9a-f]{64}", value) is None
+    ):
+        raise ValueError(f"corruption {label} must be lowercase 64-hex")
+    return value
+
+
+def _canonical_plugin_state(value):
+    if not isinstance(value, dict):
+        raise ValueError("corruption behavior_state must be a mapping")
+
+    def validate(item, path):
+        if item is None or isinstance(item, (str, bool, int)):
+            return item
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise ValueError(
+                    f"corruption behavior_state {path} is not finite"
+                )
+            return item
+        if isinstance(item, list):
+            return [validate(child, f"{path}[]") for child in item]
+        if isinstance(item, dict):
+            normalized = {}
+            for key, child in item.items():
+                if not isinstance(key, str) or not key or len(key) > 512:
+                    raise ValueError("corruption behavior_state keys are invalid")
+                if any(
+                    unicodedata.category(char).startswith("C")
+                    for char in key
+                ):
+                    raise ValueError("corruption behavior_state keys are invalid")
+                normalized[key] = validate(child, f"{path}.{key}")
+            return normalized
+        raise ValueError(
+            f"corruption behavior_state {path} is not canonical JSON"
+        )
+
+    normalized = validate(value, "value")
+    return json.loads(
+        json.dumps(
+            normalized,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    )
+
+
+def _module_file_snapshot(module_name):
+    module = sys.modules.get(module_name)
+    path_value = getattr(module, "__file__", None) if module is not None else None
+    if not isinstance(path_value, str) or not path_value:
+        raise ValueError(f"corruption defining module {module_name!r} has no file")
+    path = Path(path_value).resolve()
+    if path.suffix in {".pyc", ".pyo"} and path.with_suffix(".py").is_file():
+        path = path.with_suffix(".py")
+    snapshot = _regular_file_snapshot(
+        path, label=f"corruption module {module_name}"
+    )
+    return {"path": str(path), "sha256": snapshot[-1]}, snapshot
+
+
+def _declared_dependencies(corruption):
+    try:
+        declared = corruption.dependency_sha256
+    except Exception as error:
+        raise ValueError("corruption needs dependency_sha256 mapping") from error
+    if not isinstance(declared, dict):
+        raise ValueError("corruption dependency_sha256 must be a mapping")
+    normalized = {}
+    for module_name, digest in declared.items():
+        if (
+            not isinstance(module_name, str)
+            or not module_name
+            or len(module_name) > 512
+            or any(
+                unicodedata.category(char).startswith("C")
+                for char in module_name
+            )
+        ):
+            raise ValueError("corruption dependency module name is invalid")
+        digest = _strict_sha256(digest, label=f"dependency {module_name}")
+        identity, _snapshot = _module_file_snapshot(module_name)
+        if identity["sha256"] != digest:
+            raise ValueError(f"corruption dependency {module_name} SHA-256 is stale")
+        normalized[module_name] = digest
+    return dict(sorted(normalized.items()))
+
+
+def _referenced_dependency_modules(apply, defining_modules):
+    function = getattr(apply, "__func__", apply)
+    try:
+        closure = inspect.getclosurevars(function)
+    except TypeError:
+        return set()
+    modules = set()
+    for value in (*closure.globals.values(), *closure.nonlocals.values()):
+        if inspect.ismodule(value):
+            module_name = value.__name__
+        elif inspect.isfunction(value) or inspect.isclass(value):
+            module_name = getattr(value, "__module__", None)
+        else:
+            continue
+        if (
+            isinstance(module_name, str)
+            and module_name not in defining_modules
+            and module_name != "builtins"
+        ):
+            modules.add(module_name)
+    return modules
+
+
+def _corruption_implementation(corruption, apply):
     plugin_class = type(corruption)
     module = getattr(plugin_class, "__module__", None)
     qualname = getattr(plugin_class, "__qualname__", None)
@@ -126,49 +241,103 @@ def _corruption_implementation(corruption, apply) -> dict[str, str]:
                 for character in value
             )
         ):
-            raise ValueError(
-                f"corruption implementation {label} is invalid"
-            )
+            raise ValueError(f"corruption implementation {label} is invalid")
+
+    apply_function = getattr(apply, "__func__", apply)
+    apply_module = getattr(apply_function, "__module__", None)
+    module_files = {}
+    module_snapshots = {}
+    for module_name in sorted({module, apply_module} - {None}):
+        identity, snapshot = _module_file_snapshot(module_name)
+        module_files[module_name] = identity
+        module_snapshots[module_name] = snapshot
+
     try:
         source_payload = {
             "class": _normalized_source(plugin_class),
             "apply": _normalized_source(apply),
         }
     except (OSError, TypeError):
-        try:
-            source_sha256 = corruption.implementation_sha256
-        except Exception as error:
-            raise ValueError(
-                "source-unavailable corruption needs implementation_sha256"
-            ) from error
-        if (
-            not isinstance(source_sha256, str)
-            or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
-        ):
-            raise ValueError(
-                "corruption implementation_sha256 must be lowercase 64-hex"
-            )
+        source_sha256 = None
     else:
         encoded = json.dumps(
             source_payload, sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
         source_sha256 = hashlib.sha256(encoded).hexdigest()
-    return {
+
+    if type(corruption) is GaussianBlur:
+        implementation_sha256 = source_sha256
+        behavior_state = {}
+        dependencies = {}
+        kind = "internal"
+    else:
+        try:
+            implementation_sha256 = corruption.implementation_sha256
+        except Exception as error:
+            raise ValueError("corruption needs implementation_sha256") from error
+        implementation_sha256 = _strict_sha256(
+            implementation_sha256, label="implementation_sha256"
+        )
+        try:
+            behavior_state = _canonical_plugin_state(corruption.behavior_state)
+        except AttributeError as error:
+            raise ValueError("corruption needs behavior_state mapping") from error
+        dependencies = _declared_dependencies(corruption)
+        required_dependencies = _referenced_dependency_modules(
+            apply, set(module_files)
+        )
+        missing_dependencies = required_dependencies - set(dependencies)
+        if missing_dependencies:
+            missing = ", ".join(sorted(missing_dependencies))
+            raise ValueError(f"corruption dependencies are incomplete: {missing}")
+        kind = "external"
+
+    identity = {
+        "behavior_state": behavior_state,
+        "dependency_sha256": dependencies,
+        "implementation_sha256": implementation_sha256,
+        "kind": kind,
         "module": module,
+        "module_files": module_files,
         "qualname": qualname,
         "source_sha256": source_sha256,
     }
+    return identity, module_snapshots
 
 
 @dataclass(frozen=True)
 class _CorruptionSnapshot:
     name: str
     severities: tuple[Severity, ...]
-    implementation: dict[str, str]
+    implementation: dict
     _apply: Callable
+    _original: object
+    _module_snapshots: dict
 
     def apply(self, image, level):
         return self._apply(image, level)
+
+    def revalidate(self):
+        try:
+            current_name = self._original.name
+            current_severities = self._original.severities
+            current_apply = self._original.apply
+        except Exception as error:
+            raise ValueError("corruption changed during the run") from error
+        if (
+            current_name != self.name
+            or current_severities != self.severities
+            or current_apply != self._apply
+        ):
+            raise ValueError("corruption changed during the run")
+        implementation, module_snapshots = _corruption_implementation(
+            self._original, current_apply
+        )
+        if (
+            implementation != self.implementation
+            or module_snapshots != self._module_snapshots
+        ):
+            raise ValueError("corruption implementation changed during the run")
 
 
 def _snapshot_corruption(
@@ -259,9 +428,14 @@ def _snapshot_corruption(
         raise ValueError(
             "corruption must provide a callable apply method"
         )
-    implementation = _corruption_implementation(corruption, apply)
+    implementation, module_snapshots = _corruption_implementation(corruption, apply)
     return _CorruptionSnapshot(
-        name, tuple(frozen_severities), implementation, apply
+        name,
+        tuple(frozen_severities),
+        implementation,
+        apply,
+        corruption,
+        module_snapshots,
     )
 
 
@@ -445,6 +619,7 @@ def _terminal_sweep(
     report_path: Path,
     report_snapshot: tuple,
     input_groups: tuple,
+    corruption: _CorruptionSnapshot,
 ) -> None:
     checks = [
         (provenance_path, "run provenance", provenance_snapshot),
@@ -482,6 +657,7 @@ def _terminal_sweep(
     for entries in input_groups:
         for entry in entries:
             validate_image_signature(entry)
+    corruption.revalidate()
 
 
 def _absolute_output_path(value: str | Path) -> Path:
@@ -1030,6 +1206,7 @@ def _final_audit(
     if report_content != expected["report"]:
         raise ValueError("published report bundle changed")
 
+    corruption.revalidate()
     _validate_input_images(reference, evaluation)
 
     _terminal_sweep(
@@ -1048,6 +1225,7 @@ def _final_audit(
         report_path=report_path,
         report_snapshot=report_snapshot,
         input_groups=(reference, evaluation),
+        corruption=corruption,
     )
 
 

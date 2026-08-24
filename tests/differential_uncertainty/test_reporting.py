@@ -70,6 +70,16 @@ def _inputs():
         "corruption": {
             "implementation": {
                 "module": "differential_uncertainty.corruptions.gaussian_blur",
+                "behavior_state": {},
+                "dependency_sha256": {},
+                "implementation_sha256": "1" * 64,
+                "kind": "internal",
+                "module_files": {
+                    "differential_uncertainty.corruptions.gaussian_blur": {
+                        "path": "/tmp/plugin.py",
+                        "sha256": "1" * 64,
+                    }
+                },
                 "qualname": "GaussianBlur",
                 "source_sha256": "1" * 64,
             },
