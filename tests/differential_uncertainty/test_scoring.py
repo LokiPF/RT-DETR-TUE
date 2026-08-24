@@ -143,3 +143,56 @@ def test_padding_rejects_nonfinite_query_fields():
     record["boxes"][3, 0] = float("nan")
     with pytest.raises(ValueError, match="finite"):
         detect_padded_tail(record)
+
+
+@pytest.mark.parametrize(
+    ("queries", "bank"),
+    [
+        (
+            torch.ones(1, 335, dtype=torch.float16),
+            torch.cat(
+                (
+                    torch.tensor([[1.0009765625]], dtype=torch.float16),
+                    torch.ones(1, 334, dtype=torch.float16),
+                ),
+                dim=1,
+            ),
+        ),
+        (
+            torch.tensor([[10_000.0, 10_000.0]]),
+            torch.tensor([[10_001.0, 10_000.0]]),
+        ),
+    ],
+)
+def test_mean_knn_matches_a_direct_difference_oracle_without_cancellation(queries, bank):
+    expected = (queries.float()[:, None, :] - bank.float()[None, :, :]).norm(dim=-1).mean(dim=1)
+    assert bool((expected > 0).all())
+    actual = mean_knn_distance(queries, bank, k=1, bank_chunk_size=1)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_scoring_requires_the_complete_configured_bank():
+    config = ExperimentConfig.for_tests(bank_capacity=30, k=2, query_count=20, persistence_dim=7)
+    records = [_record(severity=severity) for severity in range(6)]
+    with pytest.raises(ValueError, match=r"bank must have shape \(30, 7\)"):
+        score_image_records(records, torch.randn(29, 7), config)
+
+
+@pytest.mark.parametrize(("k", "chunk_size"), [(True, 2), (1.5, 2), (1, True), (1, 2.5)])
+def test_mean_knn_rejects_bool_or_nonintegral_sizes(k, chunk_size):
+    with pytest.raises(ValueError, match="must be an integer"):
+        mean_knn_distance(torch.zeros(2, 1), torch.zeros(3, 1), k=k, bank_chunk_size=chunk_size)
+
+
+def test_confidence_requires_at_least_one_class():
+    with pytest.raises(ValueError, match="at least one class"):
+        confidence_from_logits(torch.empty(2, 0))
+
+
+@pytest.mark.parametrize("bad_severity", [True, 1.0, 1.5])
+def test_scoring_requires_integral_non_bool_severities(bad_severity):
+    config = ExperimentConfig.for_tests(bank_capacity=30, k=2, query_count=20, persistence_dim=7)
+    records = [_record(severity=severity) for severity in range(6)]
+    records[1]["severity"] = bad_severity
+    with pytest.raises(ValueError, match="severity values must be integers"):
+        score_image_records(records, torch.randn(30, 7), config)

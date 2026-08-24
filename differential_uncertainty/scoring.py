@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from numbers import Integral
 
 import torch
 from torch import Tensor
@@ -61,6 +62,8 @@ def union_padded_query_ids(records) -> Tensor:
 def confidence_from_logits(logits: Tensor) -> Tensor:
     if logits.ndim != 2:
         raise ValueError("logits must have shape query,class")
+    if logits.shape[1] == 0:
+        raise ValueError("logits must contain at least one class")
     _require_floating_finite(logits, "logits")
     return logits.float().sigmoid().amax(dim=-1).cpu()
 
@@ -90,12 +93,13 @@ def confidence_deciles(confidence: Tensor, valid_ids: Tensor) -> tuple[Tensor, .
     return tuple(torch.tensor_split(valid.index_select(0, order), 10))
 
 
-def _squared_distances(queries: Tensor, bank: Tensor) -> Tensor:
-    return (
-        queries.square().sum(1, keepdim=True)
-        + bank.square().sum(1).unsqueeze(0)
-        - 2.0 * queries @ bank.T
-    ).clamp_min_(0.0)
+def _euclidean_distances(queries: Tensor, bank: Tensor) -> Tensor:
+    return torch.cdist(
+        queries,
+        bank,
+        p=2.0,
+        compute_mode="donot_use_mm_for_euclid_dist",
+    )
 
 
 def mean_knn_distance(
@@ -109,6 +113,12 @@ def mean_knn_distance(
     _require_floating_finite(bank, "bank")
     if queries.shape[1] != bank.shape[1]:
         raise ValueError("queries and bank must have matching feature dimensions")
+    if isinstance(k, bool) or not isinstance(k, Integral):
+        raise ValueError("k must be an integer")
+    if isinstance(bank_chunk_size, bool) or not isinstance(bank_chunk_size, Integral):
+        raise ValueError("bank chunk size must be an integer")
+    k = int(k)
+    bank_chunk_size = int(bank_chunk_size)
     if bank_chunk_size <= 0:
         raise ValueError("bank chunk size must be positive")
     queries = queries.float()
@@ -117,10 +127,10 @@ def mean_knn_distance(
         raise ValueError(f"k must lie in [1, {bank.shape[0]}]")
     best = torch.full((queries.shape[0], k), float("inf"), device=queries.device)
     for chunk in bank.split(bank_chunk_size):
-        local = _squared_distances(queries, chunk)
+        local = _euclidean_distances(queries, chunk)
         local = local.topk(min(k, chunk.shape[0]), dim=1, largest=False).values
         best = torch.cat((best, local), dim=1).topk(k, dim=1, largest=False).values
-    return best.sqrt().mean(dim=1)
+    return best.mean(dim=1)
 
 
 def relative_gap(reference: float, responsive: float) -> float:
@@ -136,7 +146,17 @@ def relative_gap(reference: float, responsive: float) -> float:
 def score_image_records(
     records, bank: Tensor, config: ExperimentConfig = FIXED_CONFIG
 ) -> list[dict]:
-    records = sorted(records, key=lambda item: int(item["severity"]))
+    expected_bank_shape = (config.bank_capacity, config.persistence_dim)
+    if not isinstance(bank, Tensor) or tuple(bank.shape) != expected_bank_shape:
+        raise ValueError(f"bank must have shape {expected_bank_shape}")
+    records = list(records)
+    severities = [item["severity"] for item in records]
+    if any(
+        isinstance(severity, bool) or not isinstance(severity, Integral)
+        for severity in severities
+    ):
+        raise ValueError("severity values must be integers and not booleans")
+    records = sorted(records, key=lambda item: item["severity"])
     if [int(item["severity"]) for item in records] != list(range(6)):
         raise ValueError("each image must have exactly severities 0 through 5")
     image_ids = {str(item["image_id"]) for item in records}
