@@ -916,23 +916,73 @@ class _OwnedDirectoryDescriptor(ctypes.c_int):
 
     @property
     def fd(self) -> int:
+        self._reconcile_pending()
         descriptor = int(self.value)
         if descriptor < 0:
             raise RuntimeError("directory descriptor is closed")
         return descriptor
 
+    @property
+    def closed(self) -> bool:
+        self._reconcile_pending()
+        return int(self.value) < 0
+
+    def remember_identity(self, state) -> None:
+        position = id(self)
+        os.lseek(int(self.value), position, os.SEEK_SET)
+        self.identity = (
+            state.st_dev,
+            state.st_ino,
+            stat.S_IFMT(state.st_mode),
+            position,
+        )
+        self._pending_descriptor = -1
+
+    def _still_owns(self, descriptor: int) -> bool:
+        try:
+            state = os.fstat(descriptor)
+            position = os.lseek(descriptor, 0, os.SEEK_CUR)
+        except OSError:
+            return False
+        identity = getattr(self, "identity", None)
+        if identity is None:
+            return True
+        return (
+            state.st_dev,
+            state.st_ino,
+            stat.S_IFMT(state.st_mode),
+            position,
+        ) == identity
+
+    def _reconcile_pending(self) -> None:
+        pending = int(getattr(self, "_pending_descriptor", -1))
+        if pending < 0:
+            return
+        if self._still_owns(pending):
+            self.value = pending
+            self._pending_descriptor = -1
+        else:
+            self._pending_descriptor = -1
+            self.value = -1
+
     def close(self) -> None:
+        self._reconcile_pending()
         descriptor = int(self.value)
         if descriptor < 0:
             return
+        self._pending_descriptor = descriptor
         self.value = -1
         os.close(descriptor)
+        self._pending_descriptor = -1
 
     def __del__(self) -> None:
-        try:
-            self.close()
-        except OSError:
-            pass
+        for _attempt in range(2):
+            try:
+                self.close()
+            except BaseException:
+                continue
+            if self.closed:
+                return
 
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -951,7 +1001,12 @@ def _open_owned_directory(path, *, directory_fd=None):
         raise OSError(
             error_number, os.strerror(error_number), os.fspath(path)
         )
-    return owner
+    try:
+        owner.remember_identity(os.fstat(owner.fd))
+        return owner
+    except BaseException:
+        owner.close()
+        raise
 
 
 class _DirectoryLease:
@@ -1016,10 +1071,14 @@ class _DirectoryLease:
 
     def __exit__(self, _type, _value, _traceback):
         owner = self.owner
-        self.owner = None
-        self.fd = None
-        if owner is not None:
+        if owner is None:
+            return
+        try:
             owner.close()
+        finally:
+            if owner.closed:
+                self.owner = None
+                self.fd = None
 
     def verify_path(self) -> None:
         try:

@@ -187,6 +187,354 @@ def test_directory_direct_open_call_store_interrupt_closes_fd(tmp_path):
     assert after == before
 
 
+class _DirectoryCloseInterrupted(BaseException):
+    pass
+
+
+def _live_file_descriptors():
+    descriptors = set()
+    for name in os.listdir("/proc/self/fd"):
+        if not name.isdigit():
+            continue
+        descriptor = int(name)
+        try:
+            os.fstat(descriptor)
+        except OSError:
+            continue
+        descriptors.add(descriptor)
+    return descriptors
+
+
+def _fd_identity(descriptor):
+    try:
+        state = os.fstat(descriptor)
+    except OSError:
+        return None
+    return state.st_dev, state.st_ino, state.st_mode
+
+
+def _executed_opcode_offsets(code, action, expected=()):
+    offsets = []
+
+    def trace(frame, event, _argument):
+        if frame.f_code is code:
+            frame.f_trace_opcodes = True
+            if event == "opcode":
+                offsets.append(frame.f_lasti)
+        return trace
+
+    previous = sys.gettrace()
+    sys.settrace(trace)
+    try:
+        action()
+    except expected:
+        pass
+    finally:
+        sys.settrace(previous)
+    return tuple(dict.fromkeys(offsets))
+
+
+def _interrupt_at_opcode(code, target, action):
+    interrupted = False
+
+    def trace(frame, event, _argument):
+        nonlocal interrupted
+        if frame.f_code is code:
+            frame.f_trace_opcodes = True
+            if (
+                not interrupted
+                and event == "opcode"
+                and frame.f_lasti == target
+            ):
+                interrupted = True
+                raise _DirectoryCloseInterrupted(
+                    f"directory close interrupted at opcode {target}"
+                )
+        return trace
+
+    previous = sys.gettrace()
+    sys.settrace(trace)
+    try:
+        with pytest.raises(
+            _DirectoryCloseInterrupted,
+            match=f"opcode {target}",
+        ):
+            action()
+    finally:
+        sys.settrace(previous)
+    assert interrupted
+
+
+def _open_test_lease(path):
+    lease = reporting._DirectoryLease(path, message="directory changed")
+    lease.__enter__()
+    return lease
+
+
+def _assert_lease_can_open_in_another_thread(path):
+    result = []
+
+    def open_lease():
+        try:
+            with reporting._DirectoryLease(
+                path, message="directory changed"
+            ) as lease:
+                os.fstat(lease.fd)
+            result.append(None)
+        except BaseException as error:
+            result.append(error)
+
+    thread = threading.Thread(target=open_lease, daemon=True)
+    thread.start()
+    thread.join(2)
+    assert not thread.is_alive()
+    assert result == [None]
+
+
+def test_owned_directory_close_is_safe_at_every_executed_opcode(tmp_path):
+    probe = _open_test_lease(tmp_path)
+    code = type(probe.owner).close.__code__
+    offsets = _executed_opcode_offsets(code, probe.owner.close)
+    probe.__exit__(None, None, None)
+    assert offsets
+
+    baseline = _live_file_descriptors()
+    for target in offsets:
+        lease = _open_test_lease(tmp_path)
+        owner = lease.owner
+        descriptor = lease.fd
+        identity = _fd_identity(descriptor)
+        try:
+            _interrupt_at_opcode(code, target, owner.close)
+            if _fd_identity(descriptor) == identity:
+                assert owner.fd == descriptor, target
+            else:
+                with pytest.raises(RuntimeError, match="closed"):
+                    owner.fd
+        finally:
+            lease.__exit__(None, None, None)
+            if _fd_identity(descriptor) == identity:
+                os.close(descriptor)
+        assert _live_file_descriptors() == baseline, target
+
+    with reporting._DirectoryLease(
+        tmp_path, message="directory changed"
+    ) as subsequent:
+        os.fstat(subsequent.fd)
+    _assert_lease_can_open_in_another_thread(tmp_path)
+    assert _live_file_descriptors() == baseline
+
+
+def test_directory_lease_exit_is_safe_at_every_executed_opcode(tmp_path):
+    probe = _open_test_lease(tmp_path)
+    code = reporting._DirectoryLease.__exit__.__code__
+    offsets = _executed_opcode_offsets(
+        code, lambda: probe.__exit__(None, None, None)
+    )
+    assert offsets
+
+    baseline = _live_file_descriptors()
+    for target in offsets:
+        lease = _open_test_lease(tmp_path)
+        owner = lease.owner
+        descriptor = lease.fd
+        identity = _fd_identity(descriptor)
+        try:
+            _interrupt_at_opcode(
+                code,
+                target,
+                lambda: lease.__exit__(None, None, None),
+            )
+            if _fd_identity(descriptor) == identity:
+                assert lease.owner is owner, target
+                assert lease.fd == descriptor, target
+                assert owner.fd == descriptor, target
+            else:
+                with pytest.raises(RuntimeError, match="closed"):
+                    owner.fd
+        finally:
+            lease.__exit__(None, None, None)
+            if _fd_identity(descriptor) == identity:
+                os.close(descriptor)
+        assert _live_file_descriptors() == baseline, target
+
+    with reporting._DirectoryLease(
+        tmp_path, message="directory changed"
+    ) as subsequent:
+        os.fstat(subsequent.fd)
+    _assert_lease_can_open_in_another_thread(tmp_path)
+    assert _live_file_descriptors() == baseline
+
+
+class _DirectoryCloseCallFailed(BaseException):
+    pass
+
+
+def test_owner_close_exception_paths_are_safe_at_every_executed_opcode(
+    tmp_path, monkeypatch
+):
+    owned = tmp_path / "owned-exhaustive"
+    unrelated = tmp_path / "unrelated-exhaustive"
+    owned.mkdir()
+    unrelated.mkdir()
+    code = reporting._OwnedDirectoryDescriptor.close.__code__
+    real_close = os.close
+
+    def observe_before_close():
+        lease = _open_test_lease(owned)
+
+        def fail_before_close(_descriptor):
+            raise _DirectoryCloseCallFailed("before close")
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(reporting.os, "close", fail_before_close)
+                offsets = _executed_opcode_offsets(
+                    code, lease.owner.close, _DirectoryCloseCallFailed
+                )
+            return offsets
+        finally:
+            lease.__exit__(None, None, None)
+
+    def observe_after_reuse():
+        lease = _open_test_lease(owned)
+        reused = None
+
+        def close_reuse_then_fail(descriptor):
+            nonlocal reused
+            real_close(descriptor)
+            reused = os.open(
+                unrelated, os.O_RDONLY | os.O_DIRECTORY
+            )
+            assert reused == descriptor
+            raise _DirectoryCloseCallFailed("after reuse")
+
+        try:
+            with monkeypatch.context() as patch:
+                patch.setattr(
+                    reporting.os, "close", close_reuse_then_fail
+                )
+                offsets = _executed_opcode_offsets(
+                    code, lease.owner.close, _DirectoryCloseCallFailed
+                )
+            return offsets
+        finally:
+            if reused is not None and _fd_identity(reused) is not None:
+                real_close(reused)
+            try:
+                lease.__exit__(None, None, None)
+            except OSError:
+                pass
+
+    scenario_offsets = {
+        "before_close": observe_before_close(),
+        "after_reuse": observe_after_reuse(),
+    }
+    assert all(scenario_offsets.values())
+
+    baseline = _live_file_descriptors()
+    for scenario, offsets in scenario_offsets.items():
+        for target in offsets:
+            lease = _open_test_lease(owned)
+            owner = lease.owner
+            descriptor = lease.fd
+            identity = _fd_identity(descriptor)
+            reused = None
+
+            def fail_before_close(_descriptor):
+                raise _DirectoryCloseCallFailed("before close")
+
+            def close_reuse_then_fail(closing):
+                nonlocal reused
+                real_close(closing)
+                reused = os.open(
+                    unrelated, os.O_RDONLY | os.O_DIRECTORY
+                )
+                assert reused == closing
+                raise _DirectoryCloseCallFailed("after reuse")
+
+            failing_close = (
+                fail_before_close
+                if scenario == "before_close"
+                else close_reuse_then_fail
+            )
+
+            def action():
+                with monkeypatch.context() as patch:
+                    patch.setattr(reporting.os, "close", failing_close)
+                    owner.close()
+
+            try:
+                _interrupt_at_opcode(code, target, action)
+                if _fd_identity(descriptor) == identity:
+                    assert owner.fd == descriptor, (scenario, target)
+                else:
+                    with pytest.raises(RuntimeError, match="closed"):
+                        owner.fd
+            finally:
+                if reused is not None and _fd_identity(reused) is not None:
+                    real_close(reused)
+                try:
+                    lease.__exit__(None, None, None)
+                except OSError:
+                    pass
+                if _fd_identity(descriptor) == identity:
+                    real_close(descriptor)
+            assert _live_file_descriptors() == baseline, (
+                scenario,
+                target,
+            )
+    _assert_lease_can_open_in_another_thread(owned)
+
+
+@pytest.mark.parametrize("same_directory", [False, True])
+def test_close_that_reuses_the_fd_then_raises_never_closes_the_reuser(
+    tmp_path, monkeypatch, same_directory
+):
+    owned = tmp_path / "owned"
+    unrelated = tmp_path / "unrelated"
+    owned.mkdir()
+    unrelated.mkdir()
+    reuse_directory = owned if same_directory else unrelated
+    lease = _open_test_lease(owned)
+    owner = lease.owner
+    descriptor = lease.fd
+    probe = os.open(reuse_directory, os.O_RDONLY | os.O_DIRECTORY)
+    reuse_identity = _fd_identity(probe)
+    os.close(probe)
+    real_close = os.close
+    reused = None
+
+    def close_reuse_then_interrupt(closing):
+        nonlocal reused
+        real_close(closing)
+        reused = os.open(
+            reuse_directory, os.O_RDONLY | os.O_DIRECTORY
+        )
+        assert reused == closing
+        raise _DirectoryCloseInterrupted("closed and reused")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(reporting.os, "close", close_reuse_then_interrupt)
+            with pytest.raises(
+                _DirectoryCloseInterrupted, match="closed and reused"
+            ):
+                lease.__exit__(None, None, None)
+
+        assert reused == descriptor
+        assert _fd_identity(reused) == reuse_identity
+        with pytest.raises(RuntimeError, match="closed"):
+            owner.fd
+        lease.__exit__(None, None, None)
+        assert _fd_identity(reused) == reuse_identity
+    finally:
+        if reused is not None and _fd_identity(reused) is not None:
+            real_close(reused)
+        elif _fd_identity(descriptor) is not None:
+            real_close(descriptor)
+
+
 def test_csv_and_json_numbers_reconcile_with_the_supplied_results(tmp_path):
     rows, evaluation, provenance = _inputs()
     output = tmp_path / "report"
