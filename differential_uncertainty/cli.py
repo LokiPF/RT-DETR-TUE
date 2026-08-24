@@ -42,7 +42,7 @@ from .extraction import (
     validate_extraction_cache,
 )
 from .manifests import load_manifest, manifest_digest, validate_disjoint
-from .reporting import _bundle_bytes, _DirectoryLease, write_report
+from .reporting import REPORT_FILES, _bundle_bytes, _DirectoryLease, write_report
 from .scoring import score_image_records
 
 
@@ -289,6 +289,68 @@ def _load_stable_scores(path: Path, expected_image_ids):
     if after != before:
         raise ValueError("score artifact changed while it was loaded")
     return rows, after
+
+
+def _named_file_snapshots(root: Path, names, *, label: str) -> tuple:
+    return tuple(
+        (
+            name,
+            _regular_file_snapshot(root / name, label=f"{label} {name}"),
+        )
+        for name in names
+    )
+
+
+def _terminal_sweep(
+    *,
+    provenance_path: Path,
+    provenance_snapshot: tuple,
+    checkpoint: Path,
+    checkpoint_snapshot: tuple,
+    reference_cache: Path,
+    reference_snapshot: tuple,
+    evaluation_cache: Path,
+    evaluation_snapshot: tuple,
+    bank_path: Path,
+    bank_snapshot: tuple,
+    score_path: Path,
+    score_snapshot: tuple,
+    report_path: Path,
+    report_snapshot: tuple,
+) -> None:
+    checks = [
+        (provenance_path, "run provenance", provenance_snapshot),
+        (checkpoint, "checkpoint", checkpoint_snapshot),
+    ]
+    checks.extend(
+        (
+            reference_cache / name,
+            f"reference cache {name}",
+            snapshot,
+        )
+        for name, snapshot in reference_snapshot
+    )
+    checks.extend(
+        (
+            evaluation_cache / name,
+            f"evaluation cache {name}",
+            snapshot,
+        )
+        for name, snapshot in evaluation_snapshot
+    )
+    checks.extend(
+        (
+            (bank_path, "reference bank", bank_snapshot),
+            (score_path, "score artifact", score_snapshot),
+        )
+    )
+    checks.extend(
+        (report_path / name, f"report file {name}", snapshot)
+        for name, snapshot in report_snapshot
+    )
+    for path, label, expected in checks:
+        if _regular_file_snapshot(path, label=label) != expected:
+            raise ValueError(f"{label} changed during the terminal audit")
 
 
 def _absolute_output_path(value: str | Path) -> Path:
@@ -709,9 +771,18 @@ def _final_audit(
     evaluation_cache: Path,
     expected: dict,
 ) -> None:
+    provenance_path = artifacts / "provenance.json"
+    provenance_before = _regular_file_snapshot(
+        provenance_path, label="run provenance"
+    )
     validate_provenance(
         output, provenance, artifacts_directory=artifacts
     )
+    provenance_snapshot = _regular_file_snapshot(
+        provenance_path, label="run provenance"
+    )
+    if provenance_snapshot != provenance_before:
+        raise ValueError("run provenance changed while it was validated")
     reference_metadata = _extraction_metadata(provenance, stage="reference")
     evaluation_metadata = _extraction_metadata(provenance, stage="evaluation")
     reference_snapshot = _validated_cache_snapshot(
@@ -733,7 +804,10 @@ def _final_audit(
     if evaluation_snapshot != expected["evaluation_cache"]:
         raise ValueError("evaluation cache changed after it was consumed")
 
-    if _checkpoint_digest(checkpoint) != provenance["checkpoint_sha256"]:
+    checkpoint_snapshot = _regular_file_snapshot(
+        checkpoint, label="checkpoint"
+    )
+    if checkpoint_snapshot[-1] != provenance["checkpoint_sha256"]:
         raise ValueError("checkpoint_sha256 changed while the run was executing")
 
     bank_path = artifacts / "reference-bank.pt"
@@ -749,8 +823,9 @@ def _final_audit(
         raise ValueError("reference bank provenance does not match this run")
 
     expected_ids = [entry.image_id for entry in evaluation]
+    score_path = artifacts / "scores.csv"
     rows, score_snapshot = _load_stable_scores(
-        artifacts / "scores.csv", expected_ids
+        score_path, expected_ids
     )
     if score_snapshot != expected["scores"]:
         raise ValueError("score artifact changed after it was consumed")
@@ -760,11 +835,37 @@ def _final_audit(
     if evaluation_summary != expected["evaluation"]:
         raise ValueError("evaluation changed during the final audit")
 
-    report_content = _bundle_bytes(
-        output / "report", message="published report bundle changed"
+    report_path = output / "report"
+    report_before = _named_file_snapshots(
+        report_path, REPORT_FILES, label="report file"
     )
+    report_content = _bundle_bytes(
+        report_path, message="published report bundle changed"
+    )
+    report_snapshot = _named_file_snapshots(
+        report_path, REPORT_FILES, label="report file"
+    )
+    if report_snapshot != report_before:
+        raise ValueError("published report bundle changed while it was validated")
     if report_content != expected["report"]:
         raise ValueError("published report bundle changed")
+
+    _terminal_sweep(
+        provenance_path=provenance_path,
+        provenance_snapshot=provenance_snapshot,
+        checkpoint=checkpoint,
+        checkpoint_snapshot=checkpoint_snapshot,
+        reference_cache=reference_cache,
+        reference_snapshot=reference_snapshot,
+        evaluation_cache=evaluation_cache,
+        evaluation_snapshot=evaluation_snapshot,
+        bank_path=bank_path,
+        bank_snapshot=bank_snapshot,
+        score_path=score_path,
+        score_snapshot=score_snapshot,
+        report_path=report_path,
+        report_snapshot=report_snapshot,
+    )
 
 
 def run_pipeline(

@@ -22,6 +22,7 @@ import differential_uncertainty.cli as cli
 from differential_uncertainty.artifacts import iter_records, source_digest
 from differential_uncertainty.cli import run_pipeline
 from differential_uncertainty.config import ExperimentConfig
+from differential_uncertainty.reporting import REPORT_FILES
 
 
 class FakeExtractor:
@@ -1470,3 +1471,60 @@ def test_existing_provenance_validation_interrupt_preserves_artifacts(
 
     assert _tree_state(artifacts) == before_tree
     assert _directory_metadata(artifacts) == before_metadata
+
+
+_LATE_FINAL_AUDIT_MUTATIONS = (
+    ("artifacts/provenance.json", "scores"),
+    ("checkpoint", "scores"),
+    ("artifacts/reference-extractions/manifest.json", "scores"),
+    ("artifacts/reference-extractions/shard_00000.pt", "scores"),
+    ("artifacts/evaluation-extractions/manifest.json", "scores"),
+    *(
+        (
+            f"artifacts/evaluation-extractions/shard_{index:05d}.pt",
+            "scores",
+        )
+        for index in range(9)
+    ),
+    ("artifacts/reference-bank.pt", "scores"),
+    ("artifacts/scores.csv", "scores"),
+    *((f"report/{relative}", "report") for relative in REPORT_FILES),
+)
+
+
+@pytest.mark.parametrize(
+    "case",
+    _LATE_FINAL_AUDIT_MUTATIONS,
+    ids=[relative for relative, _hook in _LATE_FINAL_AUDIT_MUTATIONS],
+)
+def test_terminal_sweep_rejects_leaf_mutated_from_a_later_audit_hook(
+    tmp_path, small_config, monkeypatch, case
+):
+    relative, hook = case
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    output = inputs[-1]
+    target = inputs[2] if relative == "checkpoint" else output / relative
+    score_loads = 0
+    original_scores = cli._load_stable_scores
+    original_bundle = cli._bundle_bytes
+
+    def mutate_after_scores(*args, **kwargs):
+        nonlocal score_loads
+        result = original_scores(*args, **kwargs)
+        score_loads += 1
+        if score_loads == 2 and hook == "scores":
+            target.write_bytes(b"mutation after earlier semantic validation")
+        return result
+
+    def mutate_after_bundle(*args, **kwargs):
+        result = original_bundle(*args, **kwargs)
+        if hook == "report":
+            target.write_bytes(b"mutation after report semantic validation")
+        return result
+
+    monkeypatch.setattr(cli, "_load_stable_scores", mutate_after_scores)
+    monkeypatch.setattr(cli, "_bundle_bytes", mutate_after_bundle)
+
+    with pytest.raises((ValueError, RuntimeError)):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
