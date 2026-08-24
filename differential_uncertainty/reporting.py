@@ -93,6 +93,7 @@ _SERIES_ORIENTATION_KEYS = {
     "persistence_reference": "raw_reference",
 }
 _DIRECTORY_ACQUISITION_LOCK = threading.RLock()
+_PYPLOT_LOCK = threading.RLock()
 
 
 def _validated_text(value, *, name: str, maximum_length: int) -> str:
@@ -107,12 +108,6 @@ def _validated_text(value, *, name: str, maximum_length: int) -> str:
         for character in value
     ):
         raise ValueError(f"{name} text must not contain control characters")
-    return value
-
-
-def _formula_safe_csv_text(value: str) -> str:
-    if value.lstrip().startswith(("=", "+", "-", "@")):
-        return f"'{value}"
     return value
 
 
@@ -281,6 +276,15 @@ def _validate_provenance(provenance) -> dict:
         levels.append(level)
     if levels != list(SEVERITIES):
         raise ValueError("provenance corruption needs levels 0 through 5")
+    if (
+        normalized["corruption"]["name"] == "gaussian_blur"
+        and [float(item["parameter"]) for item in severities]
+        != [float(radius) for radius in config["default_blur_radii"]]
+    ):
+        raise ValueError(
+            "Gaussian corruption parameters must match config "
+            "default_blur_radii"
+        )
     return normalized
 
 
@@ -314,6 +318,11 @@ def _validated_frame(rows, *, config: Mapping) -> pd.DataFrame:
             name="score row image_id",
             maximum_length=256,
         )
+        if image_id.lstrip().startswith(("=", "+", "-", "@")):
+            raise ValueError(
+                "score row image_id violates CSV safety: leading formula "
+                "characters are not allowed"
+            )
         severity = row["severity"]
         if isinstance(severity, bool) or not isinstance(severity, Integral):
             raise ValueError("score row severity must be an integer")
@@ -544,28 +553,43 @@ def _save_close(fig, path: Path) -> None:
 
 
 def _write_figures_impl(
-    frame: pd.DataFrame, evaluation: Mapping, directory: Path
+    frame: pd.DataFrame,
+    evaluation: Mapping,
+    directory: Path,
+    config: Mapping,
 ) -> None:
     severity = np.asarray(SEVERITIES)
+    reference_label = (
+        f"{10 * config['reference_decile']}-"
+        f"{10 * (config['reference_decile'] + 1)}% reference"
+    )
+    responsive_label = (
+        f"{10 * config['responsive_decile']}-"
+        f"{10 * (config['responsive_decile'] + 1)}% responsive"
+    )
 
     fig, axes = plt.subplots(
         1, 2, figsize=(11, 4.5), constrained_layout=True
     )
     for axis, prefix, title in (
-        (axes[0], "persistence", "Layer-2 distance"),
+        (
+            axes[0],
+            "persistence",
+            f"Layer-{config['persistence_layer']} distance",
+        ),
         (axes[1], "confidence", "1 - maximum sigmoid confidence"),
     ):
         axis.plot(
             severity,
             _median_curve(frame, f"{prefix}_reference"),
             marker="o",
-            label="90-100% reference",
+            label=reference_label,
         )
         axis.plot(
             severity,
             _median_curve(frame, f"{prefix}_responsive"),
             marker="o",
-            label="50-60% responsive",
+            label=responsive_label,
         )
         axis.set(
             title=title,
@@ -674,14 +698,18 @@ def _write_figures_impl(
 
 
 def _write_figures(
-    frame: pd.DataFrame, evaluation: Mapping, directory: Path
+    frame: pd.DataFrame,
+    evaluation: Mapping,
+    directory: Path,
+    config: Mapping,
 ) -> None:
-    caller_figures = set(plt.get_fignums())
-    try:
-        _write_figures_impl(frame, evaluation, directory)
-    finally:
-        for number in set(plt.get_fignums()) - caller_figures:
-            plt.close(number)
+    with _PYPLOT_LOCK:
+        caller_figures = set(plt.get_fignums())
+        try:
+            _write_figures_impl(frame, evaluation, directory, config)
+        finally:
+            for number in set(plt.get_fignums()) - caller_figures:
+                plt.close(number)
 
 
 def render_report(
@@ -704,6 +732,18 @@ def render_report(
     )
     example_id = _markdown_code(str(example["image_id"]))
     checkpoint = _markdown_code(provenance["checkpoint_sha256"])
+    reference_range = (
+        f"{10 * config['reference_decile']}-"
+        f"{10 * (config['reference_decile'] + 1)}%"
+    )
+    responsive_range = (
+        f"{10 * config['responsive_decile']}-"
+        f"{10 * (config['responsive_decile'] + 1)}%"
+    )
+    severity_parameters = ", ".join(
+        f"level {item['level']} = {item['parameter']:g}"
+        for item in provenance["corruption"]["severities"]
+    )
     auroc_lines = "\n".join(
         f"| {level} | {primary['auroc_by_severity'][level]:.3f} | "
         f"{confidence['auroc_by_severity'][level]:.3f} |"
@@ -721,22 +761,24 @@ def render_report(
 ## What was tested
 
 We tested **{corruption_name}** at six ordered levels. Level 0 is the clean image,
-and levels 1 through 5 add more corruption. The detector made
+and levels 1 through 5 are the configured corrupted versions. The detector made
 {config['query_count']} query guesses for every version of each image. Sometimes
 a detector fills unused spaces by repeating its last guess. We removed those
 exact repeated, padded guesses before doing any calculation.
 
+The configured corruption parameters were: {severity_parameters}.
+
 For each image, we ranked the remaining guesses by their maximum **sigmoid**
-class confidence. We compared two fixed groups: the middle 50-60% group, called
-the responsive group, and the highest 90-100% group, called the reference
-group. Both groups use the detector fingerprint from decoder layer
+class confidence. We compared two fixed groups: the {reference_range} group,
+called the reference group, and the {responsive_range} group, called the
+responsive group. Both groups use the detector fingerprint from decoder layer
 {config['persistence_layer']}.
 
 For every selected query, we found its **{config['k']} nearest clean** bank
 fingerprints and averaged their distances. Then we averaged those query
-distances inside each group. Here is a small nearest-neighbor example. If a
-query's five nearest distances are 0.10, 0.14, 0.17, 0.21, and 0.28, its score
-is:
+distances inside each group. Here is a toy five-neighbor example, separate from
+this run: its actual k is {config['k']}. If a query's five nearest distances are
+0.10, 0.14, 0.17, 0.21, and 0.28, its toy score is:
 
     (0.10 + 0.14 + 0.17 + 0.21 + 0.28) / 5 = 0.18
 
@@ -850,7 +892,7 @@ It does not turn AUROC into a probability and does not prove a universal effect.
 This workflow has no object labels, so it **does not measure mAP**, detection accuracy,
 or calibration. It cannot tell us whether the detector found the
 right objects. The bins, layer, relative-gap formula, and score directions came
-from earlier blur tuning. Fresh numbers may differ from the historical run
+from earlier tuning. Fresh numbers may differ from the historical run
 because this clean workflow also removes padded queries from the reference
 bank.
 
@@ -1102,6 +1144,7 @@ class _StagingOwner:
         self.name = None
         self.path = None
         self.published = False
+        self.final_name = None
 
     def __enter__(self):
         parent_path = f"/proc/self/fd/{self.parent.fd}"
@@ -1130,6 +1173,11 @@ class _StagingOwner:
     def verify(self) -> None:
         self.lease.verify_entry(self.parent.fd, self.name)
 
+    def prepare_publish(self, output_name: str) -> None:
+        if not output_name or Path(output_name).name != output_name:
+            raise ValueError("invalid final report directory name")
+        self.final_name = output_name
+
     def mark_published(self, output_name: str) -> None:
         self.lease.verify_entry(self.parent.fd, output_name)
         self.published = True
@@ -1155,11 +1203,16 @@ class _StagingOwner:
 
 def _cleanup_staging(staging: _StagingOwner) -> None:
     lease = staging.lease
+    owned_name = _find_owned_directory_name(
+        staging.parent.fd, lease.identity
+    )
+    if owned_name is None or owned_name == staging.final_name:
+        return
     _remove_directory_contents(lease.fd)
     owned_name = _find_owned_directory_name(
         staging.parent.fd, lease.identity
     )
-    if owned_name is not None:
+    if owned_name is not None and owned_name != staging.final_name:
         os.rmdir(owned_name, dir_fd=staging.parent.fd)
 
 
@@ -1201,9 +1254,7 @@ def _write_bundle(
     figures = staging / "figures"
     figures.mkdir()
 
-    csv_frame = frame.copy()
-    csv_frame["image_id"] = csv_frame["image_id"].map(_formula_safe_csv_text)
-    csv_frame.to_csv(
+    frame.to_csv(
         staging / "per-image-scores.csv",
         index=False,
         lineterminator="\n",
@@ -1227,7 +1278,7 @@ def _write_bundle(
         json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n",
         encoding="utf-8",
     )
-    _write_figures(frame, evaluation, figures)
+    _write_figures(frame, evaluation, figures, provenance["config"])
     (staging / "report.md").write_text(
         render_report(frame, evaluation, provenance),
         encoding="utf-8",
@@ -1237,6 +1288,11 @@ def _write_bundle(
 
 
 def write_report(output, rows, evaluation, provenance) -> None:
+    """Atomically publish a report on Linux with procfs and renameat2.
+
+    Directory identity pinning requires ``/proc/self/fd`` and publication
+    requires the Linux ``renameat2(RENAME_NOREPLACE)`` contract.
+    """
     normalized_provenance = _validate_provenance(provenance)
     frame = _validated_frame(
         rows,
@@ -1285,6 +1341,7 @@ def write_report(output, rows, evaluation, provenance) -> None:
                     "existing report bundle differs; choose a new output "
                     "directory"
                 )
+            staging.prepare_publish(output.name)
             try:
                 _publish_no_replace(staging.name, output.name, parent.fd)
             except FileExistsError:

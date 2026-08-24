@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sys
+import threading
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -260,9 +261,10 @@ def test_staging_is_same_parent_and_is_cleaned_after_baseexception(
     rows, evaluation, provenance = _inputs()
     output = tmp_path / "report"
 
-    def stop(frame, evaluated, directory):
+    def stop(frame, evaluated, directory, config):
         assert directory.parent.resolve().parent == output.parent
         assert directory.parent.name.startswith(".report.staging-")
+        assert config == provenance["config"]
         raise _StopNow("interrupt")
 
     monkeypatch.setattr(reporting, "_write_figures", stop)
@@ -452,7 +454,9 @@ def test_provenance_requires_the_full_valid_scientific_config(
     "unsafe_id",
     ["=2+3", "+cmd", "-2", "@SUM(A1:A2)", "  =2+3"],
 )
-def test_csv_image_ids_are_formula_safe(tmp_path, unsafe_id):
+def test_csv_unsafe_image_ids_are_rejected_without_publication(
+    tmp_path, unsafe_id
+):
     rows, _, provenance = _inputs()
     for row in rows:
         if row["image_id"] == "a":
@@ -462,14 +466,30 @@ def test_csv_image_ids_are_formula_safe(tmp_path, unsafe_id):
         bootstrap_samples=100,
     )
     evaluation = evaluate_rows(rows, config)
-    output = tmp_path / "report"
+    with pytest.raises(ValueError, match="image_id.*CSV safety"):
+        write_report(tmp_path / "report", rows, evaluation, provenance)
+    assert not (tmp_path / "report").exists()
 
-    write_report(output, rows, evaluation, provenance)
+
+def test_accepted_image_ids_round_trip_exactly_through_csv(tmp_path):
+    rows, _, provenance = _inputs()
+    accepted = "  safe,é_[sample]  "
+    for row in rows:
+        if row["image_id"] == "a":
+            row["image_id"] = accepted
+    config = ExperimentConfig.for_tests(
+        bank_capacity=20, k=5, query_count=20, persistence_dim=7,
+        bootstrap_samples=100,
+    )
+    evaluation = evaluate_rows(rows, config)
+
+    write_report(tmp_path / "report", rows, evaluation, provenance)
 
     observed = pd.read_csv(
-        output / "per-image-scores.csv", dtype={"image_id": str}
+        tmp_path / "report" / "per-image-scores.csv",
+        dtype={"image_id": str},
     )
-    assert f"'{unsafe_id}" in set(observed["image_id"])
+    assert accepted in set(observed["image_id"])
 
 
 def test_markdown_escapes_dynamic_image_and_provenance_text(tmp_path):
@@ -788,7 +808,313 @@ def test_plot_failure_closes_only_figures_created_by_this_call(
     monkeypatch.setattr("matplotlib.axes.Axes.scatter", fail_scatter)
     try:
         with pytest.raises(RuntimeError, match="plot failed"):
-            reporting._write_figures(frame, evaluation, tmp_path)
+            reporting._write_figures(
+                frame, evaluation, tmp_path, provenance["config"]
+            )
         assert set(plt.get_fignums()) == before
     finally:
         plt.close(caller)
+
+
+def test_report_and_figure_labels_follow_the_validated_test_config(
+    tmp_path, monkeypatch
+):
+    config = ExperimentConfig.for_tests(
+        bank_capacity=20,
+        k=3,
+        query_count=20,
+        persistence_layer=4,
+        persistence_dim=7,
+        reference_decile=1,
+        responsive_decile=7,
+        bootstrap_samples=100,
+        blur_radii=(0.0, 0.5, 1.5, 3.0, 6.0, 9.0),
+    )
+    rows = _rows()
+    evaluation = evaluate_rows(rows, config)
+    provenance = {
+        "checkpoint_sha256": "abc",
+        "config": config.scientific_dict(),
+        "corruption": {
+            "name": "gaussian_blur",
+            "severities": [
+                {"level": level, "parameter": radius}
+                for level, radius in enumerate(config.blur_radii)
+            ],
+        },
+    }
+    captured = {}
+    original_save = reporting._save_close
+
+    def capture_labels(fig, path):
+        captured[path.name] = {
+            "titles": [axis.get_title() for axis in fig.axes],
+            "labels": [
+                line.get_label()
+                for axis in fig.axes
+                for line in axis.get_lines()
+            ],
+        }
+        original_save(fig, path)
+
+    monkeypatch.setattr(reporting, "_save_close", capture_labels)
+    output = tmp_path / "report"
+    write_report(output, rows, evaluation, provenance)
+
+    text = (output / "report.md").read_text(encoding="utf-8")
+    normalized_text = " ".join(text.split())
+    assert "10-20% group, called the reference group" in normalized_text
+    assert "70-80% group, called the responsive group" in normalized_text
+    assert "decoder layer 4" in normalized_text
+    assert "**3 nearest clean**" in normalized_text
+    assert "toy five-neighbor example" in normalized_text
+    assert "actual k is 3" in normalized_text
+    assert "level 1 = 0.5" in normalized_text
+    assert "add more corruption" not in normalized_text
+    assert "earlier blur tuning" not in normalized_text
+    labels = captured["reference-and-responsive-distance.png"]
+    assert "Layer-4 distance" in labels["titles"]
+    assert "10-20% reference" in labels["labels"]
+    assert "70-80% responsive" in labels["labels"]
+
+
+def test_gaussian_parameters_must_match_scientific_config(tmp_path):
+    rows, evaluation, provenance = _inputs()
+    provenance["corruption"]["severities"][3]["parameter"] = 999.0
+
+    with pytest.raises(ValueError, match="Gaussian.*default_blur_radii"):
+        write_report(tmp_path / "report", rows, evaluation, provenance)
+
+
+def _write_minimal_complete_bundle(staging, *_args, **_kwargs):
+    (staging / "figures").mkdir()
+    for relative in REPORT_FILES:
+        path = staging / relative
+        path.write_bytes(relative.encode("ascii"))
+
+
+def _publication_transfer_opcode_targets():
+    targets = []
+    publish_code = reporting._publish_no_replace.__code__
+    publish_instructions = list(dis.get_instructions(publish_code))
+    store_result = next(
+        index
+        for index, instruction in enumerate(publish_instructions)
+        if instruction.opname == "STORE_FAST" and instruction.argval == "result"
+    )
+    publish_end = next(
+        index
+        for index, instruction in enumerate(
+            publish_instructions[store_result:], store_result
+        )
+        if instruction.opname == "RETURN_VALUE"
+    )
+    for instruction in publish_instructions[store_result:publish_end + 1]:
+        targets.append((
+            publish_code,
+            instruction.offset,
+            f"publish-{instruction.offset}",
+            True,
+        ))
+
+    write_code = reporting.write_report.__code__
+    write_instructions = list(dis.get_instructions(write_code))
+    start = next(
+        index
+        for index, instruction in enumerate(write_instructions)
+        if instruction.opname == "LOAD_GLOBAL"
+        and instruction.argval == "_publish_no_replace"
+    )
+    mark = next(
+        index
+        for index, instruction in enumerate(write_instructions[start:], start)
+        if instruction.opname == "LOAD_METHOD"
+        and instruction.argval == "mark_published"
+    )
+    end = next(
+        index
+        for index, instruction in enumerate(write_instructions[mark:], mark)
+        if instruction.opname == "POP_TOP"
+    )
+    success_jump = next(
+        index
+        for index, instruction in enumerate(write_instructions[start:], start)
+        if instruction.opname == "JUMP_FORWARD"
+    )
+    publish_call = next(
+        instruction.offset
+        for instruction in write_instructions[start:success_jump + 1]
+        if instruction.opname == "CALL"
+    )
+    for instruction in (
+        write_instructions[start:success_jump + 1]
+        + write_instructions[mark:end + 1]
+    ):
+        targets.append((
+            write_code,
+            instruction.offset,
+            f"write-{instruction.offset}",
+            instruction.offset > publish_call,
+        ))
+    return targets
+
+
+@pytest.mark.parametrize(
+    ("target_code", "target_offset", "boundary", "must_survive"),
+    _publication_transfer_opcode_targets(),
+    ids=lambda value: value if isinstance(value, str) else None,
+)
+def test_every_publication_transfer_interrupt_preserves_or_recovers_report(
+    tmp_path, monkeypatch, target_code, target_offset, boundary, must_survive
+):
+    rows, evaluation, provenance = _inputs()
+    output = tmp_path / boundary
+    monkeypatch.setattr(
+        reporting, "_write_bundle", _write_minimal_complete_bundle
+    )
+    raised = False
+
+    def trace(frame, event, _arg):
+        nonlocal raised
+        if frame.f_code is target_code:
+            frame.f_trace_opcodes = True
+            if (
+                not raised
+                and event == "opcode"
+                and frame.f_lasti == target_offset
+            ):
+                raised = True
+                raise KeyboardInterrupt(boundary)
+        return trace
+
+    previous = sys.gettrace()
+    sys.settrace(trace)
+    try:
+        with pytest.raises(KeyboardInterrupt, match=boundary):
+            write_report(output, rows, evaluation, provenance)
+    finally:
+        sys.settrace(previous)
+    assert raised
+    assert not list(tmp_path.glob(f".{boundary}.staging-*"))
+    if must_survive:
+        assert output.is_dir()
+    write_report(output, rows, evaluation, provenance)
+    assert sorted(
+        str(path.relative_to(output))
+        for path in output.rglob("*")
+        if path.is_file()
+    ) == sorted(REPORT_FILES)
+
+
+def test_second_writer_success_survives_first_writer_post_rename_interrupt(
+    tmp_path, monkeypatch
+):
+    rows, evaluation, provenance = _inputs()
+    output = tmp_path / "report"
+    published = threading.Event()
+    second_done = threading.Event()
+    failures = []
+    original_publish = reporting._publish_no_replace
+    monkeypatch.setattr(
+        reporting, "_write_bundle", _write_minimal_complete_bundle
+    )
+
+    def interrupt_first_after_rename(*args):
+        original_publish(*args)
+        if threading.current_thread().name == "writer-a":
+            published.set()
+            assert second_done.wait(10)
+            raise KeyboardInterrupt("after rename")
+
+    def first_writer():
+        try:
+            write_report(output, rows, evaluation, provenance)
+        except KeyboardInterrupt as error:
+            if str(error) != "after rename":
+                failures.append(error)
+        except BaseException as error:
+            failures.append(error)
+
+    def second_writer():
+        try:
+            assert published.wait(10)
+            write_report(output, rows, evaluation, provenance)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            second_done.set()
+
+    monkeypatch.setattr(
+        reporting, "_publish_no_replace", interrupt_first_after_rename
+    )
+    first = threading.Thread(target=first_writer, name="writer-a")
+    second = threading.Thread(target=second_writer, name="writer-b")
+    first.start()
+    second.start()
+    first.join(15)
+    second.join(15)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert not failures
+    assert output.is_dir()
+    write_report(output, rows, evaluation, provenance)
+    assert output.is_dir()
+
+
+def test_overlapping_plot_calls_never_close_each_others_figures(
+    tmp_path, monkeypatch
+):
+    rows, evaluation, provenance = _inputs()
+    frame = reporting._validated_frame(rows, config=provenance["config"])
+    first_inside = threading.Event()
+    second_attempted = threading.Event()
+    second_inside = threading.Event()
+    first_done = threading.Event()
+    second_figure_alive = []
+    failures = []
+
+    def overlapping_impl(*_args, **_kwargs):
+        figure = plt.figure()
+        if threading.current_thread().name == "plot-a":
+            first_inside.set()
+            assert second_attempted.wait(5)
+            second_inside.wait(0.3)
+            raise RuntimeError("first plot fails")
+        second_inside.set()
+        assert first_done.wait(5)
+        second_figure_alive.append(figure.number in plt.get_fignums())
+
+    def run_first():
+        try:
+            reporting._write_figures(
+                frame, evaluation, tmp_path / "a", provenance["config"]
+            )
+        except RuntimeError as error:
+            if str(error) != "first plot fails":
+                failures.append(error)
+        except BaseException as error:
+            failures.append(error)
+        finally:
+            first_done.set()
+
+    def run_second():
+        second_attempted.set()
+        try:
+            reporting._write_figures(
+                frame, evaluation, tmp_path / "b", provenance["config"]
+            )
+        except BaseException as error:
+            failures.append(error)
+
+    monkeypatch.setattr(reporting, "_write_figures_impl", overlapping_impl)
+    first = threading.Thread(target=run_first, name="plot-a")
+    second = threading.Thread(target=run_second, name="plot-b")
+    first.start()
+    assert first_inside.wait(5)
+    second.start()
+    first.join(10)
+    second.join(10)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert not failures
+    assert second_figure_alive == [True]
