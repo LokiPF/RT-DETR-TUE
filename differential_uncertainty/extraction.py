@@ -460,6 +460,71 @@ def _published_record_state(
     return identities, contract
 
 
+def _entry_present(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _validate_completed_extraction(
+    entries: tuple[ManifestEntry, ...],
+    root: Path,
+    metadata: dict,
+    severities: tuple[Severity, ...],
+) -> None:
+    expected_keys = _expected_keys(entries, severities)
+    actual = load_artifact_manifest(root)
+    actual_metadata = {
+        key: value
+        for key, value in actual.items()
+        if key not in _ARTIFACT_MANIFEST_KEYS
+    }
+    if actual_metadata != metadata:
+        raise ValueError(
+            "completed extraction metadata mismatch: "
+            f"actual={actual_metadata!r}, expected={metadata!r}"
+        )
+    actual_count = actual.get("record_count")
+    if type(actual_count) is not int or actual_count != len(expected_keys):
+        raise RuntimeError(
+            "completed extraction has "
+            f"{actual_count!r} records; expected {len(expected_keys)}"
+        )
+    actual_keys: list[tuple[str, int]] = []
+    contract: _RecordContract | None = None
+    for index, record in enumerate(iter_records(root)):
+        identity, _, contract = _validated_record(
+            record,
+            index=index,
+            contract=contract,
+            require_cache_dtypes=True,
+        )
+        actual_keys.append(identity)
+    if actual_keys != expected_keys:
+        raise RuntimeError(
+            "completed extraction record roster does not match the input"
+        )
+
+
+def validate_extraction_cache(
+    entries: tuple[ManifestEntry, ...],
+    directory: str | Path,
+    metadata: dict,
+    corruption: Corruption | None,
+) -> bool:
+    """Validate a complete cache, returning false only when no manifest exists."""
+    entries = _validated_entries(entries)
+    metadata = _validated_metadata(metadata)
+    severities = _validated_severities(corruption)
+    root = Path(directory)
+    if not _entry_present(root / "manifest.json"):
+        return False
+    _validate_completed_extraction(entries, root, metadata, severities)
+    return True
+
+
 def _pending_samples(
     entries: tuple[ManifestEntry, ...],
     corruption: Corruption | None,
@@ -538,38 +603,8 @@ def extract_manifest(
     expected_count = len(expected_keys)
     root = Path(directory)
     final = root / "manifest.json"
-    if final.exists():
-        actual = load_artifact_manifest(root)
-        actual_metadata = {
-            key: value
-            for key, value in actual.items()
-            if key not in _ARTIFACT_MANIFEST_KEYS
-        }
-        if actual_metadata != metadata:
-            raise ValueError(
-                "completed extraction metadata mismatch: "
-                f"actual={actual_metadata!r}, expected={metadata!r}"
-            )
-        actual_count = actual.get("record_count")
-        if type(actual_count) is not int or actual_count != expected_count:
-            raise RuntimeError(
-                "completed extraction has "
-                f"{actual_count!r} records; expected {expected_count}"
-            )
-        actual_keys: list[tuple[str, int]] = []
-        contract: _RecordContract | None = None
-        for index, record in enumerate(iter_records(root)):
-            identity, _, contract = _validated_record(
-                record,
-                index=index,
-                contract=contract,
-                require_cache_dtypes=True,
-            )
-            actual_keys.append(identity)
-        if actual_keys != expected_keys:
-            raise RuntimeError(
-                "completed extraction record roster does not match the input"
-            )
+    if _entry_present(final):
+        _validate_completed_extraction(entries, root, metadata, severities)
         return
 
     with ShardWriter(root, metadata, shard_size=shard_size) as writer:
