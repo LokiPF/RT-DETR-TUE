@@ -7,6 +7,7 @@ import json
 import multiprocessing
 import os
 import shutil
+import stat
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -532,6 +533,32 @@ def _tree_hashes(root: Path) -> dict[str, str]:
         for path in sorted(root.rglob("*"))
         if path.is_file()
     }
+
+
+def _tree_state(root: Path) -> dict[str, tuple]:
+    """Describe names, entry types, and file bytes without following links."""
+    result = {}
+
+    def visit(path: Path, relative: str) -> None:
+        state = path.lstat()
+        entry_type = stat.S_IFMT(state.st_mode)
+        if stat.S_ISREG(state.st_mode):
+            detail = hashlib.sha256(path.read_bytes()).hexdigest()
+        elif stat.S_ISLNK(state.st_mode):
+            detail = os.readlink(path)
+        else:
+            detail = None
+        result[relative] = (entry_type, detail)
+        if stat.S_ISDIR(state.st_mode):
+            with os.scandir(path) as entries:
+                children = sorted(entry.name for entry in entries)
+            for name in children:
+                child = path / name
+                child_relative = f"{relative}/{name}" if relative else name
+                visit(child, child_relative)
+
+    visit(root, "")
+    return result
 
 
 def _process_run(inputs, config, gate, results):
@@ -1153,3 +1180,204 @@ def test_runtime_nested_directory_replacement_stays_anchored_and_fails_closed(
     assert observed_identity[0][0] == observed_identity[0][1]
     assert not any(visible.iterdir())
     assert any(displaced.rglob("*"))
+
+
+def test_mismatched_provenance_refusal_does_not_change_the_existing_tree(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    output = inputs[-1]
+    artifacts = output / "artifacts"
+    shutil.rmtree(output / "report")
+    shutil.rmtree(artifacts / "reference-extractions")
+    shutil.rmtree(artifacts / "evaluation-extractions")
+    (artifacts / "reference-bank.pt").unlink()
+    (artifacts / "scores.csv").unlink()
+    provenance = artifacts / "provenance.json"
+    value = json.loads(provenance.read_text(encoding="utf-8"))
+    value["checkpoint_sha256"] = "0" * 64
+    provenance.write_text(json.dumps(value), encoding="utf-8")
+    before = _tree_state(output)
+
+    with pytest.raises(ValueError, match="checkpoint_sha256"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    assert _tree_state(output) == before
+
+
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "fifo"))
+def test_unsafe_provenance_refusal_does_not_change_the_existing_tree(
+    tmp_path, small_config, unsafe_kind
+):
+    inputs = _inputs(tmp_path)
+    output = inputs[-1]
+    artifacts = output / "artifacts"
+    artifacts.mkdir(parents=True)
+    provenance = artifacts / "provenance.json"
+    if unsafe_kind == "symlink":
+        outside = tmp_path / "outside-provenance.json"
+        outside.write_text("{}", encoding="utf-8")
+        provenance.symlink_to(outside)
+    else:
+        os.mkfifo(provenance)
+    before = _tree_state(output)
+
+    with pytest.raises(ValueError, match="provenance.*regular file"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    assert _tree_state(output) == before
+
+
+@pytest.mark.parametrize("location", ("early", "middle", "final"))
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "fifo", "file"))
+def test_every_output_ancestor_is_traversed_without_following_unsafe_entries(
+    tmp_path, small_config, location, unsafe_kind
+):
+    inputs = _inputs(tmp_path)
+    base = tmp_path / "output-base"
+    base.mkdir()
+    names = ("early", "middle", "final")
+    unsafe_index = names.index(location)
+    parent = base
+    for name in names[:unsafe_index]:
+        parent = parent / name
+        parent.mkdir()
+    unsafe = parent / names[unsafe_index]
+    outside = tmp_path / f"outside-{location}-{unsafe_kind}"
+    if unsafe_kind == "symlink":
+        outside.mkdir()
+        unsafe.symlink_to(outside, target_is_directory=True)
+    elif unsafe_kind == "fifo":
+        os.mkfifo(unsafe)
+    else:
+        unsafe.write_bytes(b"not a directory")
+    output = base.joinpath(*names, "run")
+    inputs = (*inputs[:-1], output)
+    constructed = 0
+
+    def reject_detector(*_args, **_kwargs):
+        nonlocal constructed
+        constructed += 1
+        raise AssertionError("unsafe output ancestor reached detector")
+
+    with pytest.raises(ValueError, match="output.*directory"):
+        _run(inputs, small_config, extractor_factory=reject_detector)
+
+    assert constructed == 0
+    if unsafe_kind == "symlink":
+        assert not any(outside.iterdir())
+
+
+def test_nested_output_components_are_created_normally(tmp_path, small_config):
+    inputs = _inputs(tmp_path)
+    output = tmp_path / "new" / "nested" / "parent" / "run"
+    inputs = (*inputs[:-1], output)
+
+    assert _run(inputs, small_config) == output.absolute()
+    assert (output / "report/report.md").is_file()
+
+
+def test_nested_output_creation_accepts_a_safe_concurrent_creator(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    output = tmp_path / "new" / "raced" / "parent" / "run"
+    inputs = (*inputs[:-1], output)
+    original = cli.os.mkdir
+    raced = False
+
+    def concurrent_mkdir(path, mode=0o777, *, dir_fd=None):
+        nonlocal raced
+        if path == "raced" and not raced:
+            raced = True
+            original(path, mode, dir_fd=dir_fd)
+            raise FileExistsError(path)
+        return original(path, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(cli.os, "mkdir", concurrent_mkdir)
+
+    assert _run(inputs, small_config) == output.absolute()
+    assert raced
+    assert (output / "report/report.md").is_file()
+
+
+def test_output_ancestor_traversal_releases_descriptors_on_keyboard_interrupt(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    output = tmp_path / "new" / "interrupt-here" / "parent" / "run"
+    inputs = (*inputs[:-1], output)
+    original = cli._pinned_child_directory
+    before = {
+        int(name)
+        for name in os.listdir("/proc/self/fd")
+        if name.isdigit() and Path(f"/proc/self/fd/{name}").exists()
+    }
+
+    def interrupt(parent, name, *, label):
+        if (
+            label == "output parent directory path component"
+            and name == "interrupt-here"
+        ):
+            raise KeyboardInterrupt("ancestor traversal interrupted")
+        return original(parent, name, label=label)
+
+    monkeypatch.setattr(cli, "_pinned_child_directory", interrupt)
+    with pytest.raises(KeyboardInterrupt, match="ancestor traversal interrupted"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+    after = {
+        int(name)
+        for name in os.listdir("/proc/self/fd")
+        if name.isdigit() and Path(f"/proc/self/fd/{name}").exists()
+    }
+
+    assert after == before
+
+
+@pytest.mark.parametrize(
+    "leaf",
+    (
+        "reference-manifest",
+        "reference-shard",
+        "evaluation-manifest",
+        "evaluation-shard",
+        "bank",
+        "scores",
+        "provenance",
+        "report",
+    ),
+)
+def test_leaf_mutation_after_last_normal_use_fails_the_final_audit(
+    tmp_path, small_config, monkeypatch, leaf
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    output = inputs[-1]
+    original = cli._run_pipeline_stages
+
+    def mutate_after_stages(*args, **kwargs):
+        result = original(*args, **kwargs)
+        paths = {
+            "reference-manifest": output
+            / "artifacts/reference-extractions/manifest.json",
+            "reference-shard": sorted(
+                (output / "artifacts/reference-extractions").glob("shard_*.pt")
+            )[0],
+            "evaluation-manifest": output
+            / "artifacts/evaluation-extractions/manifest.json",
+            "evaluation-shard": sorted(
+                (output / "artifacts/evaluation-extractions").glob("shard_*.pt")
+            )[0],
+            "bank": output / "artifacts/reference-bank.pt",
+            "scores": output / "artifacts/scores.csv",
+            "provenance": output / "artifacts/provenance.json",
+            "report": output / "report/report.md",
+        }
+        paths[leaf].write_bytes(b"late mutation")
+        return result
+
+    monkeypatch.setattr(cli, "_run_pipeline_stages", mutate_after_stages)
+
+    with pytest.raises((ValueError, RuntimeError)):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)

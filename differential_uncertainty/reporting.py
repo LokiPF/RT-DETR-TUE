@@ -1300,7 +1300,15 @@ def _validated_report_inputs(rows, evaluation, provenance):
     return normalized_provenance, frame, canonical_evaluation
 
 
-def write_report(output, rows, evaluation, provenance, *, parent=None) -> None:
+def write_report(
+    output,
+    rows,
+    evaluation,
+    provenance,
+    *,
+    parent=None,
+    _expected_content=None,
+) -> None:
     """Atomically publish a report on Linux with procfs and renameat2.
 
     Directory identity pinning requires ``/proc/self/fd`` and publication
@@ -1309,6 +1317,10 @@ def write_report(output, rows, evaluation, provenance, *, parent=None) -> None:
     normalized_provenance, frame, canonical_evaluation = (
         _validated_report_inputs(rows, evaluation, provenance)
     )
+    if _expected_content is not None and (
+        type(_expected_content) is not dict or _expected_content
+    ):
+        raise ValueError("expected report content capture must be an empty dict")
     if parent is None:
         output = Path(output)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1338,6 +1350,12 @@ def write_report(output, rows, evaluation, provenance, *, parent=None) -> None:
                 canonical_evaluation,
                 normalized_provenance,
             )
+            if _expected_content is not None:
+                _expected_content.update(
+                    _bundle_bytes(
+                        staging.path, message="intended report bundle changed"
+                    )
+                )
             parent.verify_path()
             staging.verify()
             anchored_output = (

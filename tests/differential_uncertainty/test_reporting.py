@@ -1137,3 +1137,24 @@ def test_overlapping_plot_calls_never_close_each_others_figures(
     assert not first.is_alive() and not second.is_alive()
     assert not failures
     assert second_figure_alive == [True]
+
+
+def test_report_can_capture_the_exact_intended_bundle_without_changing_default_api(
+    tmp_path,
+):
+    rows, evaluation, provenance = _inputs()
+    output = tmp_path / "report"
+    intended = {}
+
+    result = write_report(
+        output,
+        rows,
+        evaluation,
+        provenance,
+        _expected_content=intended,
+    )
+
+    assert result is None
+    assert intended == {
+        relative: (output / relative).read_bytes() for relative in REPORT_FILES
+    }

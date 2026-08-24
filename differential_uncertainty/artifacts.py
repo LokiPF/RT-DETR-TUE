@@ -555,6 +555,32 @@ def ensure_provenance(
     return path
 
 
+def validate_provenance(
+    run_directory: str | Path,
+    expected: Mapping,
+    *,
+    artifacts_directory: str | Path | None = None,
+) -> Path:
+    """Read and validate run provenance without creating any artifact."""
+    if not isinstance(expected, Mapping):
+        raise TypeError("expected provenance must be a mapping")
+    expected_dict = _json_snapshot(dict(expected))
+    artifact_root = (
+        Path(run_directory) / "artifacts"
+        if artifacts_directory is None
+        else Path(artifacts_directory)
+    )
+    path = artifact_root / "provenance.json"
+    with _open_regular_file(
+        path, error_message="run provenance must be a regular file"
+    ) as handle:
+        actual = json.load(handle)
+    if not isinstance(actual, dict):
+        raise ValueError("run provenance must contain a JSON object")
+    _ensure_exact_mapping(actual, expected_dict, label="run provenance")
+    return path
+
+
 def _validate_safe_artifact_value(
     value,
     *,

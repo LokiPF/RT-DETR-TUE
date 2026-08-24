@@ -10,7 +10,7 @@ import re
 import stat
 import sys
 import unicodedata
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from numbers import Integral
 from pathlib import Path
 
@@ -24,7 +24,9 @@ from .artifacts import (
     _staged_file,
     ensure_provenance,
     iter_records,
+    load_manifest as load_artifact_manifest,
     source_digest,
+    validate_provenance,
 )
 from .bank import (
     build_reference_bank,
@@ -40,7 +42,7 @@ from .extraction import (
     validate_extraction_cache,
 )
 from .manifests import load_manifest, manifest_digest, validate_disjoint
-from .reporting import _DirectoryLease, write_report
+from .reporting import _bundle_bytes, _DirectoryLease, write_report
 from .scoring import score_image_records
 
 
@@ -193,14 +195,106 @@ def _entry_present(path: Path) -> bool:
     return True
 
 
+def _stat_signature(value) -> tuple[int, ...]:
+    return (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def _regular_file_snapshot(path: str | Path, *, label: str) -> tuple:
+    path = Path(path)
+    with _open_regular_file(
+        path, error_message=f"{label} must be a regular file"
+    ) as handle:
+        before = os.fstat(handle.fileno())
+        digest = _sha256_stream(handle, 1024 * 1024)
+        after = os.fstat(handle.fileno())
+        try:
+            visible = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            raise ValueError(f"{label} changed while it was read") from error
+    if (
+        _stat_signature(before) != _stat_signature(after)
+        or _stat_signature(after) != _stat_signature(visible)
+        or not stat.S_ISREG(visible.st_mode)
+    ):
+        raise ValueError(f"{label} changed while it was read")
+    return (*_stat_signature(after), digest)
+
+
+def _cache_snapshot(directory: Path, *, label: str) -> tuple:
+    manifest_path = directory / "manifest.json"
+    manifest_before = _regular_file_snapshot(
+        manifest_path, label=f"{label} manifest"
+    )
+    manifest = load_artifact_manifest(directory)
+    manifest_after = _regular_file_snapshot(
+        manifest_path, label=f"{label} manifest"
+    )
+    if manifest_before != manifest_after:
+        raise ValueError(f"{label} manifest changed while it was read")
+    names = manifest.get("shards")
+    if type(names) is not list or names != [
+        f"shard_{index:05d}.pt" for index in range(len(names))
+    ]:
+        raise ValueError(f"{label} has a non-canonical shard sequence")
+    leaves = [("manifest.json", manifest_after)]
+    leaves.extend(
+        (
+            name,
+            _regular_file_snapshot(
+                directory / name, label=f"{label} shard {name}"
+            ),
+        )
+        for name in names
+    )
+    return tuple(leaves)
+
+
+def _validated_cache_snapshot(
+    entries,
+    directory: Path,
+    metadata: dict,
+    corruption,
+    *,
+    label: str,
+) -> tuple:
+    before = _cache_snapshot(directory, label=label)
+    if not validate_extraction_cache(entries, directory, metadata, corruption):
+        raise RuntimeError(f"{label} is incomplete")
+    after = _cache_snapshot(directory, label=label)
+    if after != before:
+        raise ValueError(f"{label} changed while it was validated")
+    return after
+
+
+def _load_stable_bank(path: Path, config: ExperimentConfig):
+    before = _regular_file_snapshot(path, label="reference bank")
+    bank, metadata = load_reference_bank(path, config=config)
+    after = _regular_file_snapshot(path, label="reference bank")
+    if after != before:
+        raise ValueError("reference bank changed while it was loaded")
+    return bank, metadata, after
+
+
+def _load_stable_scores(path: Path, expected_image_ids):
+    before = _regular_file_snapshot(path, label="score artifact")
+    rows = _load_score_csv(path, expected_image_ids)
+    after = _regular_file_snapshot(path, label="score artifact")
+    if after != before:
+        raise ValueError("score artifact changed while it was loaded")
+    return rows, after
+
+
 def _absolute_output_path(value: str | Path) -> Path:
     output = Path(os.path.abspath(os.fspath(value)))
     if output == output.parent:
         raise ValueError("output directory must not be the filesystem root")
-    try:
-        output.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as error:
-        raise ValueError("output parent directory must be a directory") from error
     return output
 
 
@@ -215,7 +309,13 @@ def _ensure_directory_entry(
     except FileNotFoundError:
         try:
             os.mkdir(name, dir_fd=parent_fd)
+        except FileExistsError:
+            pass
+        except OSError as error:
+            raise ValueError(error_message) from error
+        else:
             os.fsync(parent_fd)
+        try:
             state = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
         except OSError as error:
             raise ValueError(error_message) from error
@@ -249,10 +349,39 @@ def _pinned_child_directory(
 
 
 @contextmanager
+def _pinned_directory_path(path: Path):
+    message = "output parent directory path component must be stable"
+    if not path.is_absolute():
+        raise ValueError(message)
+    with ExitStack() as stack:
+        root = stack.enter_context(
+            _DirectoryLease(Path("/"), message=message)
+        )
+        current = root
+        anchored = Path(f"/proc/self/fd/{root.fd}")
+        for name in path.parts[1:]:
+            anchored, current = stack.enter_context(
+                _pinned_child_directory(
+                    current,
+                    name,
+                    label="output parent directory path component",
+                )
+            )
+        try:
+            yield anchored, current
+        except BaseException:
+            raise
+        else:
+            root.verify_path()
+
+
+@contextmanager
 def _coordinated_output(output: Path):
-    parent_message = "output parent directory must be a stable directory"
     output_message = "output directory must be a stable directory"
-    with _DirectoryLease(output.parent, message=parent_message) as parent:
+    with _pinned_directory_path(output.parent) as (
+        _anchored_parent,
+        parent,
+    ):
         fcntl.flock(parent.fd, fcntl.LOCK_EX)
         parent.verify_path()
         _ensure_directory_entry(
@@ -494,11 +623,19 @@ def _run_pipeline_stages(
                     anchored_directory=True,
                 )
         del extractor
-    validate_extraction_cache(
-        reference, reference_cache, reference_metadata, None
+    reference_snapshot = _validated_cache_snapshot(
+        reference,
+        reference_cache,
+        reference_metadata,
+        None,
+        label="reference cache",
     )
-    validate_extraction_cache(
-        evaluation, evaluation_cache, evaluation_metadata, corruption
+    evaluation_snapshot = _validated_cache_snapshot(
+        evaluation,
+        evaluation_cache,
+        evaluation_metadata,
+        corruption,
+        label="evaluation cache",
     )
 
     if _checkpoint_digest(checkpoint) != provenance["checkpoint_sha256"]:
@@ -506,7 +643,7 @@ def _run_pipeline_stages(
 
     bank_path = artifacts / "reference-bank.pt"
     if _entry_present(bank_path):
-        bank, bank_metadata = load_reference_bank(bank_path, config=config)
+        bank, bank_metadata, bank_snapshot = _load_stable_bank(bank_path, config)
     else:
         bank = build_reference_bank(iter_records(reference_cache), config)
         bank_metadata = {
@@ -518,7 +655,7 @@ def _run_pipeline_stages(
             "padding_removed": True,
         }
         save_reference_bank(bank, bank_path, bank_metadata, config=config)
-        bank, bank_metadata = load_reference_bank(bank_path, config=config)
+        bank, bank_metadata, bank_snapshot = _load_stable_bank(bank_path, config)
     if (
         bank_metadata["reference_manifest_sha256"]
         != provenance["reference_manifest_sha256"]
@@ -535,16 +672,99 @@ def _run_pipeline_stages(
         for _image_id, image_records in groups:
             score_rows.extend(score_image_records(image_records, bank, config))
         _atomic_score_csv(score_rows, score_path)
-    rows = _load_score_csv(score_path, expected_ids)
+    rows, score_snapshot = _load_stable_scores(score_path, expected_ids)
     evaluation_summary = evaluate_rows(rows, config)
+    intended_report = {}
     write_report(
         "report",
         rows,
         evaluation_summary,
         provenance,
         parent=report_parent,
+        _expected_content=intended_report,
     )
-    return output
+    return {
+        "reference_cache": reference_snapshot,
+        "evaluation_cache": evaluation_snapshot,
+        "bank": bank_snapshot,
+        "bank_metadata": bank_metadata,
+        "scores": score_snapshot,
+        "rows": rows,
+        "evaluation": evaluation_summary,
+        "report": intended_report,
+    }
+
+
+def _final_audit(
+    reference,
+    evaluation,
+    checkpoint: Path,
+    output: Path,
+    *,
+    config: ExperimentConfig,
+    corruption: GaussianBlur,
+    provenance: dict,
+    artifacts: Path,
+    reference_cache: Path,
+    evaluation_cache: Path,
+    expected: dict,
+) -> None:
+    validate_provenance(
+        output, provenance, artifacts_directory=artifacts
+    )
+    reference_metadata = _extraction_metadata(provenance, stage="reference")
+    evaluation_metadata = _extraction_metadata(provenance, stage="evaluation")
+    reference_snapshot = _validated_cache_snapshot(
+        reference,
+        reference_cache,
+        reference_metadata,
+        None,
+        label="reference cache",
+    )
+    if reference_snapshot != expected["reference_cache"]:
+        raise ValueError("reference cache changed after it was consumed")
+    evaluation_snapshot = _validated_cache_snapshot(
+        evaluation,
+        evaluation_cache,
+        evaluation_metadata,
+        corruption,
+        label="evaluation cache",
+    )
+    if evaluation_snapshot != expected["evaluation_cache"]:
+        raise ValueError("evaluation cache changed after it was consumed")
+
+    if _checkpoint_digest(checkpoint) != provenance["checkpoint_sha256"]:
+        raise ValueError("checkpoint_sha256 changed while the run was executing")
+
+    bank_path = artifacts / "reference-bank.pt"
+    bank, bank_metadata, bank_snapshot = _load_stable_bank(bank_path, config)
+    del bank
+    if bank_snapshot != expected["bank"]:
+        raise ValueError("reference bank changed after it was consumed")
+    if (
+        bank_metadata != expected["bank_metadata"]
+        or bank_metadata["reference_manifest_sha256"]
+        != provenance["reference_manifest_sha256"]
+    ):
+        raise ValueError("reference bank provenance does not match this run")
+
+    expected_ids = [entry.image_id for entry in evaluation]
+    rows, score_snapshot = _load_stable_scores(
+        artifacts / "scores.csv", expected_ids
+    )
+    if score_snapshot != expected["scores"]:
+        raise ValueError("score artifact changed after it was consumed")
+    if rows != expected["rows"]:
+        raise ValueError("score artifact values changed after they were consumed")
+    evaluation_summary = evaluate_rows(rows, config)
+    if evaluation_summary != expected["evaluation"]:
+        raise ValueError("evaluation changed during the final audit")
+
+    report_content = _bundle_bytes(
+        output / "report", message="published report bundle changed"
+    )
+    if report_content != expected["report"]:
+        raise ValueError("published report bundle changed")
 
 
 def run_pipeline(
@@ -580,6 +800,11 @@ def run_pipeline(
             "artifacts",
             label="artifacts",
         ) as (artifacts, artifacts_parent):
+            ensure_provenance(
+                anchored_output,
+                provenance,
+                artifacts_directory=artifacts,
+            )
             with _pinned_child_directory(
                 artifacts_parent,
                 "reference-extractions",
@@ -590,12 +815,7 @@ def run_pipeline(
                     "evaluation-extractions",
                     label="evaluation cache",
                 ) as (evaluation_cache, _evaluation_parent):
-                    ensure_provenance(
-                        anchored_output,
-                        provenance,
-                        artifacts_directory=artifacts,
-                    )
-                    _run_pipeline_stages(
+                    audit = _run_pipeline_stages(
                         reference,
                         evaluation,
                         checkpoint,
@@ -612,10 +832,18 @@ def run_pipeline(
                         reference_cache=reference_cache,
                         evaluation_cache=evaluation_cache,
                     )
-                    ensure_provenance(
+                    _final_audit(
+                        reference,
+                        evaluation,
+                        checkpoint,
                         anchored_output,
-                        provenance,
-                        artifacts_directory=artifacts,
+                        config=config,
+                        corruption=corruption,
+                        provenance=provenance,
+                        artifacts=artifacts,
+                        reference_cache=reference_cache,
+                        evaluation_cache=evaluation_cache,
+                        expected=audit,
                     )
     return output
 
