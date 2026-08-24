@@ -9,13 +9,11 @@ import random
 import numpy as np 
 from typing import List 
 
-from ...core import register
 
 
 __all__ = ['RTDETR', ]
 
 
-@register()
 class RTDETR(nn.Module):
     __inject__ = ['backbone', 'encoder', 'decoder', ]
 

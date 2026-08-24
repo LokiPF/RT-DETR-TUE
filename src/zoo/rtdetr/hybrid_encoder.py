@@ -10,7 +10,6 @@ import torch.nn.functional as F
 
 from .utils import get_activation
 
-from ...core import register
 
 
 __all__ = ['HybridEncoder']
@@ -179,7 +178,6 @@ class TransformerEncoder(nn.Module):
         return output
 
 
-@register()
 class HybridEncoder(nn.Module):
     __share__ = ['eval_spatial_size', ]
 

@@ -16,7 +16,6 @@ from .denoising import get_contrastive_denoising_training_group
 from .utils import deformable_attention_core_func_v2, get_activation, inverse_sigmoid
 from .utils import bias_init_with_prob
 
-from ...core import register
 
 __all__ = ['RTDETRTransformerv2']
 
@@ -284,7 +283,6 @@ class TransformerDecoder(nn.Module):
         return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits)
 
 
-@register()
 class RTDETRTransformerv2(nn.Module):
     __share__ = ['num_classes', 'eval_spatial_size']
 

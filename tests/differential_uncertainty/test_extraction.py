@@ -24,23 +24,6 @@ from differential_uncertainty.extraction import (
     record_from_outputs,
 )
 from differential_uncertainty.manifests import ManifestEntry
-from src.core import YAMLConfig
-
-
-def test_explicit_builder_has_the_same_state_contract_as_the_yaml_model():
-    legacy = YAMLConfig(
-        "configs/scene_uncertainty/rtdetrv2_r18vd_coco.yml"
-    ).model
-    explicit = build_fixed_detector()
-
-    legacy_shapes = {
-        name: tuple(value.shape) for name, value in legacy.state_dict().items()
-    }
-    explicit_shapes = {
-        name: tuple(value.shape) for name, value in explicit.state_dict().items()
-    }
-
-    assert explicit_shapes == legacy_shapes
 
 
 def test_checkpoint_state_accepts_the_three_historical_shapes():
