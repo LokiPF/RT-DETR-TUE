@@ -879,6 +879,7 @@ def run_pipeline(
     shard_size: int,
     config: ExperimentConfig = FIXED_CONFIG,
     extractor_factory=RTDETRExtractor,
+    corruption=None,
 ) -> Path:
     batch_size = _positive_integer(batch_size, name="batch_size")
     shard_size = _positive_integer(shard_size, name="shard_size")
@@ -891,7 +892,7 @@ def run_pipeline(
     validate_disjoint(reference, evaluation)
     checkpoint = Path(checkpoint).resolve()
     output = _absolute_output_path(output_dir)
-    corruption = GaussianBlur()
+    corruption = corruption or GaussianBlur()
     provenance = _provenance(
         reference, evaluation, checkpoint, config, corruption
     )

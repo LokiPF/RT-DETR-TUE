@@ -16,12 +16,13 @@ from pathlib import Path
 import pandas as pd
 import pytest
 import torch
-from PIL import Image
+from PIL import Image, ImageOps
 
 import differential_uncertainty.cli as cli
 from differential_uncertainty.artifacts import iter_records, source_digest
 from differential_uncertainty.cli import run_pipeline
 from differential_uncertainty.config import ExperimentConfig
+from differential_uncertainty.corruptions import Corruption, Severity
 from differential_uncertainty.reporting import REPORT_FILES
 
 
@@ -111,6 +112,20 @@ class LifetimeExtractor(FakeExtractor):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         type(self).instance_ref = weakref.ref(self)
+
+
+class InvertCorruption(Corruption):
+    name = "invert"
+    severities = tuple(Severity(level, float(level)) for level in range(6))
+
+    def apply(self, image, level):
+        if level not in range(6):
+            raise ValueError(f"unknown invert severity {level}")
+        return (
+            image.copy()
+            if level == 0
+            else ImageOps.invert(image.convert("RGB"))
+        )
 
 
 @pytest.fixture
@@ -205,6 +220,46 @@ def test_pipeline_builds_every_stage_and_second_run_constructs_no_extractor(
     _run(inputs, small_config, extractor_factory=RejectingExtractor)
 
     assert FakeExtractor.calls == first_calls
+
+
+def test_pipeline_accepts_a_corruption_plugin_without_changing_scoring(
+    tmp_path, small_config
+):
+    reference = _manifest(
+        tmp_path, "reference.csv", (("r1", 10), ("r2", 30))
+    )
+    evaluation = _manifest(
+        tmp_path, "evaluation.csv", (("e1", 60), ("e2", 90))
+    )
+    checkpoint = tmp_path / "checkpoint.pth"
+    checkpoint.write_bytes(b"fake checkpoint content")
+    output = tmp_path / "invert-run"
+
+    run_pipeline(
+        reference,
+        evaluation,
+        checkpoint,
+        output,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=FakeExtractor,
+        corruption=InvertCorruption(),
+    )
+
+    provenance = json.loads(
+        (output / "artifacts" / "provenance.json").read_text()
+    )
+    assert provenance["corruption"]["name"] == "invert"
+    assert [
+        item["level"] for item in provenance["corruption"]["severities"]
+    ] == list(range(6))
+    with (output / "artifacts" / "scores.csv").open(
+        newline="", encoding="utf-8"
+    ) as handle:
+        rows = list(csv.DictReader(handle))
+    assert {int(row["severity"]) for row in rows} == set(range(6))
 
 
 def test_changed_checkpoint_is_refused_before_any_stage_is_reused(
