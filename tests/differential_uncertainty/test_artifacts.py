@@ -5231,7 +5231,6 @@ exception_type = {exception_name}
 decoy_fd = os.open(target, os.O_RDONLY)
 before = artifacts._live_fd_snapshot()
 deliveries = 0
-caught = 0
 unexpected = None
 
 def interrupt(_signum, _frame):
@@ -5241,18 +5240,24 @@ def interrupt(_signum, _frame):
 
 signal.signal(signal.SIGALRM, interrupt)
 for _ in range(4000):
+    deliveries_before = deliveries
+    propagated = False
     handle = None
     try:
         try:
-            signal.setitimer(signal.ITIMER_REAL, 0.000005)
-            handle = artifacts._open_regular_file(
-                target, error_message="invalid test file"
-            )
-            handle.close()
-            handle = None
-            gc.collect()
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0.000005)
+                handle = artifacts._open_regular_file(
+                    target, error_message="invalid test file"
+                )
+                handle.close()
+                handle = None
+                gc.collect()
+            finally:
+                signal.setitimer(signal.ITIMER_REAL, 0)
         finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
+            if handle is not None:
+                handle.close()
     except (KeyboardInterrupt, SystemExit) as error:
         if (
             type(error) is not exception_type
@@ -5260,16 +5265,17 @@ for _ in range(4000):
         ):
             unexpected = error
             break
-        caught += 1
+        propagated = True
     except BaseException as error:
         unexpected = error
         break
-    finally:
-        if handle is not None:
-            handle.close()
+    if deliveries > deliveries_before and not propagated:
+        unexpected = AssertionError(
+            "a delivered reader signal was not propagated"
+        )
+        break
 
 assert deliveries
-assert caught == deliveries
 assert unexpected is None, repr(unexpected)
 assert artifacts._live_fd_snapshot() == before
 os.fstat(decoy_fd)
