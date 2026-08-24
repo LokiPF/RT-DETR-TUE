@@ -836,9 +836,9 @@ def _cache_record(image_id, severity, *, queries=20, classes=80, width=7):
     return {
         "image_id": image_id,
         "severity": severity,
-        "boxes": torch.full((queries, 4), value),
-        "logits": torch.full((queries, classes), value),
-        "persistence": torch.full((queries, width), value),
+        "boxes": torch.full((queries, 4), value, dtype=torch.float32),
+        "logits": torch.full((queries, classes), value, dtype=torch.float16),
+        "persistence": torch.full((queries, width), value, dtype=torch.float16),
     }
 
 
@@ -1522,7 +1522,6 @@ class RetainedMutationExtractor(FakeExtractor):
         if self.retained is not None:
             self.retained.fill_(999)
         records = super().extract_batch(identities, samples)
-        records[0]["debug"] = torch.tensor([123.0])
         if self.retained is None:
             self.retained = records[0]["logits"]
             self.original = self.retained.clone()
@@ -1552,7 +1551,9 @@ def test_buffered_records_own_only_normalized_independent_tensor_data(tmp_path: 
     )
 
     records = list(iter_records(cache))
-    torch.testing.assert_close(records[0]["logits"], extractor.original)
+    torch.testing.assert_close(
+        records[0]["logits"], extractor.original.to(torch.float16)
+    )
     assert set(records[0]) == {
         "image_id",
         "severity",
@@ -1560,3 +1561,171 @@ def test_buffered_records_own_only_normalized_independent_tensor_data(tmp_path: 
         "logits",
         "persistence",
     }
+
+
+class MixedFloatingDtypeExtractor(FakeExtractor):
+    def extract_batch(self, identities, samples):
+        records = super().extract_batch(identities, samples)
+        if self.calls == 1:
+            records[0]["boxes"] = records[0]["boxes"].to(torch.float64)
+            records[0]["logits"] = records[0]["logits"].to(torch.float64)
+            records[0]["persistence"] = records[0]["persistence"].to(
+                torch.float64
+            )
+        else:
+            records[0]["boxes"] = records[0]["boxes"].to(torch.float16)
+        return records
+
+
+def test_fresh_mixed_floating_dtypes_are_normalized_before_caching(
+    tmp_path: Path,
+):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    Image.new("RGB", (4, 4), 20).save(first)
+    Image.new("RGB", (4, 4), 40).save(second)
+    cache = tmp_path / "normalized-dtypes"
+
+    extract_manifest(
+        (
+            ManifestEntry("first", first.resolve()),
+            ManifestEntry("second", second.resolve()),
+        ),
+        cache,
+        {"stage": "reference"},
+        MixedFloatingDtypeExtractor(),
+        None,
+        image_size=(8, 8),
+        batch_size=1,
+        shard_size=10,
+    )
+
+    records = list(iter_records(cache))
+    assert [
+        (
+            record["boxes"].dtype,
+            record["logits"].dtype,
+            record["persistence"].dtype,
+        )
+        for record in records
+    ] == [
+        (torch.float32, torch.float16, torch.float16),
+        (torch.float32, torch.float16, torch.float16),
+    ]
+
+
+def _write_review_cache(cache, metadata, records, state):
+    if state == "completed":
+        with ShardWriter(cache, metadata, shard_size=6) as writer:
+            for record in records:
+                writer.add(record)
+        return
+    with pytest.raises(RuntimeError, match="leave partial"):
+        with ShardWriter(cache, metadata, shard_size=1) as writer:
+            writer.add(records[0])
+            raise RuntimeError("leave partial")
+
+
+@pytest.mark.parametrize("state", ["completed", "partial"])
+@pytest.mark.parametrize(
+    ("field", "bad_dtype", "canonical_dtype"),
+    [
+        ("boxes", torch.float16, torch.float32),
+        ("logits", torch.float32, torch.float16),
+        ("persistence", torch.float64, torch.float16),
+    ],
+)
+def test_existing_cache_requires_each_canonical_tensor_dtype(
+    tmp_path: Path,
+    state,
+    field,
+    bad_dtype,
+    canonical_dtype,
+):
+    cache = tmp_path / f"{state}-{field}-dtype"
+    metadata = {"stage": "evaluation" if state == "completed" else "reference"}
+    record_count = 6 if state == "completed" else 1
+    records = [_cache_record("scene", level) for level in range(record_count)]
+    records[-1][field] = records[-1][field].to(bad_dtype)
+    _write_review_cache(cache, metadata, records, state)
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    extractor = FakeExtractor()
+
+    with pytest.raises(
+        RuntimeError,
+        match=f"{field} must have dtype {canonical_dtype}",
+    ):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            metadata,
+            extractor,
+            GaussianBlur() if state == "completed" else None,
+            image_size=(8, 8),
+            batch_size=2,
+            shard_size=6 if state == "completed" else 1,
+        )
+
+    assert extractor.calls == 0
+    if state == "partial":
+        assert not (cache / "manifest.json").exists()
+
+
+@pytest.mark.parametrize("state", ["completed", "partial"])
+def test_existing_cache_records_must_have_exactly_five_keys(
+    tmp_path: Path,
+    state,
+):
+    cache = tmp_path / f"{state}-extra-record-key"
+    metadata = {"stage": "evaluation" if state == "completed" else "reference"}
+    record_count = 6 if state == "completed" else 1
+    records = [_cache_record("scene", level) for level in range(record_count)]
+    records[-1]["debug"] = torch.tensor([1.0])
+    _write_review_cache(cache, metadata, records, state)
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    extractor = FakeExtractor()
+
+    with pytest.raises(RuntimeError, match="exactly the cache record keys"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            metadata,
+            extractor,
+            GaussianBlur() if state == "completed" else None,
+            image_size=(8, 8),
+            batch_size=2,
+            shard_size=6 if state == "completed" else 1,
+        )
+
+    assert extractor.calls == 0
+    if state == "partial":
+        assert not (cache / "manifest.json").exists()
+
+
+class ExtraKeyExtractor(FakeExtractor):
+    def extract_batch(self, identities, samples):
+        records = super().extract_batch(identities, samples)
+        records[0]["debug"] = torch.tensor([1.0])
+        return records
+
+
+def test_fresh_extractor_records_must_have_exactly_five_keys(tmp_path: Path):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    cache = tmp_path / "fresh-extra-record-key"
+
+    with pytest.raises(RuntimeError, match="exactly the cache record keys"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            {"stage": "reference"},
+            ExtraKeyExtractor(),
+            None,
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert not (cache / "manifest.json").exists()

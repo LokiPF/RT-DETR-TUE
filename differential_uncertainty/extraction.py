@@ -31,14 +31,6 @@ from .persistence import Layer2Capture, batched_persistence
 
 
 CLEAN_ONLY = (Severity(0, 0.0),)
-
-
-@dataclass(frozen=True)
-class _RecordContract:
-    query_count: int
-    class_count: int
-    persistence_dim: int
-
 _ARTIFACT_MANIFEST_KEYS = frozenset(
     {
         "schema_version",
@@ -48,6 +40,21 @@ _ARTIFACT_MANIFEST_KEYS = frozenset(
         "shard_sha256",
     }
 )
+_CACHE_TENSOR_DTYPES = {
+    "boxes": torch.float32,
+    "logits": torch.float16,
+    "persistence": torch.float16,
+}
+_CACHE_RECORD_KEYS = frozenset(
+    {"image_id", "severity", *_CACHE_TENSOR_DTYPES}
+)
+
+
+@dataclass(frozen=True)
+class _RecordContract:
+    query_count: int
+    class_count: int
+    persistence_dim: int
 
 
 def build_fixed_detector() -> RTDETR:
@@ -305,11 +312,12 @@ def _validated_record(
     *,
     index: int,
     contract: _RecordContract | None,
+    require_cache_dtypes: bool,
 ) -> tuple[tuple[str, int], dict[str, Tensor], _RecordContract]:
     identity = _record_identity(record, index=index)
     assert type(record) is dict
     tensors: dict[str, Tensor] = {}
-    for name in ("logits", "boxes", "persistence"):
+    for name, cache_dtype in _CACHE_TENSOR_DTYPES.items():
         tensor = record.get(name)
         if not isinstance(tensor, Tensor):
             raise RuntimeError(
@@ -318,6 +326,11 @@ def _validated_record(
         if tensor.layout != torch.strided:
             raise RuntimeError(
                 f"extractor record {index} {name} must have strided layout"
+            )
+        if require_cache_dtypes and tensor.dtype != cache_dtype:
+            raise RuntimeError(
+                f"extractor record {index} {name} must have dtype "
+                f"{cache_dtype}"
             )
         if not tensor.is_floating_point():
             raise RuntimeError(
@@ -328,6 +341,11 @@ def _validated_record(
                 f"extractor record {index} {name} must contain only finite values"
             )
         tensors[name] = tensor
+
+    if frozenset(record) != _CACHE_RECORD_KEYS:
+        raise RuntimeError(
+            f"extractor record {index} must contain exactly the cache record keys"
+        )
 
     for name in ("logits", "persistence"):
         if tensors[name].ndim != 2:
@@ -384,6 +402,7 @@ def _validated_records(
             record,
             index=index,
             contract=contract,
+            require_cache_dtypes=False,
         )
         actual_keys.append(identity)
         normalized.append(
@@ -391,7 +410,11 @@ def _validated_records(
                 "image_id": identity[0],
                 "severity": identity[1],
                 **{
-                    name: tensor.detach().to(device="cpu", copy=True)
+                    name: tensor.detach().to(
+                        device="cpu",
+                        dtype=_CACHE_TENSOR_DTYPES[name],
+                        copy=True,
+                    )
                     for name, tensor in tensors.items()
                 },
             }
@@ -425,6 +448,7 @@ def _published_record_state(
                 record,
                 index=len(identities),
                 contract=contract,
+                require_cache_dtypes=True,
             )
             identities.append(identity)
     return identities, contract
@@ -530,7 +554,10 @@ def extract_manifest(
         contract: _RecordContract | None = None
         for index, record in enumerate(iter_records(root)):
             identity, _, contract = _validated_record(
-                record, index=index, contract=contract
+                record,
+                index=index,
+                contract=contract,
+                require_cache_dtypes=True,
             )
             actual_keys.append(identity)
         if actual_keys != expected_keys:
