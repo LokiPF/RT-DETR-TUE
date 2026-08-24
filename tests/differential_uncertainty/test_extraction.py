@@ -831,10 +831,21 @@ def test_partial_cache_resumes_only_the_missing_severities(tmp_path: Path):
     assert load_artifact_manifest(cache)["record_count"] == 6
 
 
+def _cache_record(image_id, severity, *, queries=20, classes=80, width=7):
+    value = float(severity + 1)
+    return {
+        "image_id": image_id,
+        "severity": severity,
+        "boxes": torch.full((queries, 4), value),
+        "logits": torch.full((queries, classes), value),
+        "persistence": torch.full((queries, width), value),
+    }
+
+
 def _write_complete_cache(cache: Path, metadata: dict, identities):
     with ShardWriter(cache, metadata, shard_size=6) as writer:
         for image_id, severity in identities:
-            writer.add({"image_id": image_id, "severity": severity})
+            writer.add(_cache_record(image_id, severity))
 
 
 def test_completed_cache_requires_exact_metadata_without_extra_keys(tmp_path: Path):
@@ -924,7 +935,7 @@ def test_partial_cache_rejects_an_unexpected_record_before_extraction(tmp_path: 
     metadata = {"stage": "reference"}
     with pytest.raises(RuntimeError, match="leave partial"):
         with ShardWriter(cache, metadata, shard_size=1) as writer:
-            writer.add({"image_id": "other", "severity": 0})
+            writer.add(_cache_record("other", 0))
             raise RuntimeError("leave partial")
     path = tmp_path / "image.png"
     Image.new("RGB", (4, 4)).save(path)
@@ -951,7 +962,7 @@ def test_partial_cache_must_be_a_canonical_prefix_before_resume(tmp_path: Path):
     metadata = {"stage": "evaluation"}
     with pytest.raises(RuntimeError, match="leave partial"):
         with ShardWriter(cache, metadata, shard_size=1) as writer:
-            writer.add({"image_id": "scene", "severity": 5})
+            writer.add(_cache_record("scene", 5))
             raise RuntimeError("leave partial")
     path = tmp_path / "image.png"
     Image.new("RGB", (4, 4)).save(path)
@@ -1239,3 +1250,313 @@ def test_failed_extraction_releases_writer_for_a_later_resume(tmp_path: Path):
     )
 
     assert load_artifact_manifest(cache)["record_count"] == 1
+
+
+def test_completed_cache_rejects_a_record_missing_a_required_tensor(tmp_path: Path):
+    cache = tmp_path / "completed-missing-tensor"
+    metadata = {"stage": "evaluation"}
+    records = [_cache_record("scene", level) for level in range(6)]
+    del records[2]["persistence"]
+    with ShardWriter(cache, metadata, shard_size=6) as writer:
+        for record in records:
+            writer.add(record)
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    extractor = FakeExtractor()
+
+    with pytest.raises(RuntimeError, match="must contain tensor persistence"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            metadata,
+            extractor,
+            GaussianBlur(),
+            image_size=(8, 8),
+            batch_size=2,
+            shard_size=6,
+        )
+
+    assert extractor.calls == 0
+
+
+def test_partial_cache_rejects_a_record_missing_a_required_tensor(tmp_path: Path):
+    cache = tmp_path / "partial-missing-tensor"
+    metadata = {"stage": "reference"}
+    record = _cache_record("scene", 0)
+    del record["logits"]
+    with pytest.raises(RuntimeError, match="leave partial"):
+        with ShardWriter(cache, metadata, shard_size=1) as writer:
+            writer.add(record)
+            raise RuntimeError("leave partial")
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    extractor = FakeExtractor()
+
+    with pytest.raises(RuntimeError, match="must contain tensor logits"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            metadata,
+            extractor,
+            None,
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert extractor.calls == 0
+    assert not (cache / "manifest.json").exists()
+
+
+class CrossBatchShapeExtractor(FakeExtractor):
+    def __init__(self, field):
+        super().__init__()
+        self.field = field
+
+    def extract_batch(self, identities, samples):
+        records = super().extract_batch(identities, samples)
+        if self.calls != 2:
+            return records
+        if self.field == "queries":
+            records[0]["boxes"] = records[0]["boxes"][:-1]
+            records[0]["logits"] = records[0]["logits"][:-1]
+            records[0]["persistence"] = records[0]["persistence"][:-1]
+        elif self.field == "classes":
+            records[0]["logits"] = records[0]["logits"][:, :-1]
+        else:
+            records[0]["persistence"] = records[0]["persistence"][:, :-1]
+        return records
+
+
+@pytest.mark.parametrize("field", ["queries", "classes", "persistence"])
+def test_record_contract_cannot_change_between_batches(tmp_path: Path, field):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    Image.new("RGB", (4, 4), 20).save(first)
+    Image.new("RGB", (4, 4), 40).save(second)
+    cache = tmp_path / f"cross-batch-{field}"
+
+    with pytest.raises(RuntimeError, match="cache record contract"):
+        extract_manifest(
+            (
+                ManifestEntry("first", first.resolve()),
+                ManifestEntry("second", second.resolve()),
+            ),
+            cache,
+            {"stage": "reference"},
+            CrossBatchShapeExtractor(field),
+            None,
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert not (cache / "manifest.json").exists()
+    assert (cache / "partial_manifest.json").exists()
+
+
+class InvalidTensorExtractor(FakeExtractor):
+    def __init__(self, kind):
+        super().__init__()
+        self.kind = kind
+
+    def extract_batch(self, identities, samples):
+        records = super().extract_batch(identities, samples)
+        if self.kind == "integer":
+            records[0]["logits"] = records[0]["logits"].to(torch.int64)
+        elif self.kind == "nonfinite":
+            records[0]["persistence"][0, 0] = float("nan")
+        else:
+            records[0]["logits"] = records[0]["logits"].to_sparse()
+        return records
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [
+        ("integer", "floating-point"),
+        ("nonfinite", "finite"),
+        ("layout", "strided"),
+    ],
+)
+def test_cache_tensors_must_be_floating_finite_and_strided(
+    tmp_path: Path,
+    kind,
+    message,
+):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (4, 4)).save(path)
+    cache = tmp_path / f"invalid-tensor-{kind}"
+
+    with pytest.raises(RuntimeError, match=message):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            cache,
+            {"stage": "reference"},
+            InvalidTensorExtractor(kind),
+            None,
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=1,
+        )
+
+    assert not (cache / "manifest.json").exists()
+
+
+class InPlaceCorruption:
+    name = "in_place"
+    severities = tuple(Severity(level, float(level)) for level in range(6))
+
+    def apply(self, image, level):
+        value = image.getpixel((0, 0))[0] + level
+        image.putpixel((0, 0), (value, value, value))
+        return image
+
+
+class PixelExtractor(FakeExtractor):
+    def __init__(self):
+        super().__init__()
+        self.values = []
+
+    def extract_batch(self, identities, samples):
+        self.values.extend(float(sample[0, 0, 0]) for sample in samples)
+        return super().extract_batch(identities, samples)
+
+
+def test_each_in_place_corruption_level_starts_from_an_independent_image(
+    tmp_path: Path,
+):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (1, 1), (10, 10, 10)).save(path)
+    extractor = PixelExtractor()
+
+    extract_manifest(
+        (ManifestEntry("scene", path.resolve()),),
+        tmp_path / "independent-corruption",
+        {"stage": "evaluation"},
+        extractor,
+        InPlaceCorruption(),
+        image_size=(1, 1),
+        batch_size=1,
+        shard_size=1,
+    )
+
+    assert extractor.values == pytest.approx(
+        [(10 + level) / 255 for level in range(6)]
+    )
+
+
+class CloseTrackingCorruption:
+    name = "close_tracking"
+    severities = tuple(Severity(level, float(level)) for level in range(6))
+
+    def __init__(self):
+        self.inputs = []
+        self.outputs = []
+
+    def apply(self, image, level):
+        self.inputs.append(image)
+        output = image if level == 0 else image.copy()
+        self.outputs.append(output)
+        return output
+
+
+class CancelOnSecondBatchExtractor(FakeExtractor):
+    def __init__(self):
+        super().__init__()
+        self.attempts = 0
+
+    def extract_batch(self, identities, samples):
+        self.attempts += 1
+        if self.attempts == 2:
+            raise KeyboardInterrupt("cancel extraction")
+        return super().extract_batch(identities, samples)
+
+
+def test_pil_images_close_once_when_extraction_is_cancelled(
+    tmp_path: Path,
+    monkeypatch,
+):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (8, 8)).save(path)
+    base = Image.new("RGB", (8, 8), 30)
+    corruption = CloseTrackingCorruption()
+    close_counts = {}
+    original_close = Image.Image.close
+
+    def observed_close(image):
+        close_counts[id(image)] = close_counts.get(id(image), 0) + 1
+        original_close(image)
+
+    monkeypatch.setattr(Image.Image, "close", observed_close)
+    monkeypatch.setattr(extraction, "resize_image", lambda *_args: base)
+
+    with pytest.raises(KeyboardInterrupt, match="cancel extraction"):
+        extract_manifest(
+            (ManifestEntry("scene", path.resolve()),),
+            tmp_path / "cancelled",
+            {"stage": "evaluation"},
+            CancelOnSecondBatchExtractor(),
+            corruption,
+            image_size=(8, 8),
+            batch_size=1,
+            shard_size=10,
+        )
+
+    tracked = {id(base)}
+    tracked.update(id(image) for image in corruption.inputs)
+    tracked.update(id(image) for image in corruption.outputs)
+    assert len(tracked) == 4
+    assert {identity: close_counts.get(identity, 0) for identity in tracked} == {
+        identity: 1 for identity in tracked
+    }
+
+
+class RetainedMutationExtractor(FakeExtractor):
+    def __init__(self):
+        super().__init__()
+        self.retained = None
+        self.original = None
+
+    def extract_batch(self, identities, samples):
+        if self.retained is not None:
+            self.retained.fill_(999)
+        records = super().extract_batch(identities, samples)
+        records[0]["debug"] = torch.tensor([123.0])
+        if self.retained is None:
+            self.retained = records[0]["logits"]
+            self.original = self.retained.clone()
+        return records
+
+
+def test_buffered_records_own_only_normalized_independent_tensor_data(tmp_path: Path):
+    first = tmp_path / "first.png"
+    second = tmp_path / "second.png"
+    Image.new("RGB", (4, 4), 20).save(first)
+    Image.new("RGB", (4, 4), 40).save(second)
+    extractor = RetainedMutationExtractor()
+    cache = tmp_path / "owned-records"
+
+    extract_manifest(
+        (
+            ManifestEntry("first", first.resolve()),
+            ManifestEntry("second", second.resolve()),
+        ),
+        cache,
+        {"stage": "reference"},
+        extractor,
+        None,
+        image_size=(8, 8),
+        batch_size=1,
+        shard_size=10,
+    )
+
+    records = list(iter_records(cache))
+    torch.testing.assert_close(records[0]["logits"], extractor.original)
+    assert set(records[0]) == {
+        "image_id",
+        "severity",
+        "boxes",
+        "logits",
+        "persistence",
+    }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from contextlib import closing
+from dataclasses import dataclass
 from math import isfinite
 from pathlib import Path
 from typing import Any
@@ -30,6 +31,14 @@ from .persistence import Layer2Capture, batched_persistence
 
 
 CLEAN_ONLY = (Severity(0, 0.0),)
+
+
+@dataclass(frozen=True)
+class _RecordContract:
+    query_count: int
+    class_count: int
+    persistence_dim: int
+
 _ARTIFACT_MANIFEST_KEYS = frozenset(
     {
         "schema_version",
@@ -159,7 +168,14 @@ def resize_image(
     image: Image.Image,
     image_size: tuple[int, int],
 ) -> Image.Image:
-    return vision.resize(image.convert("RGB"), list(image_size), antialias=True)
+    rgb = image.convert("RGB")
+    resized: Image.Image | None = None
+    try:
+        resized = vision.resize(rgb, list(image_size), antialias=True)
+        return resized
+    finally:
+        if rgb is not image and rgb is not resized:
+            rgb.close()
 
 
 def image_tensor(resized: Image.Image) -> Tensor:
@@ -170,7 +186,11 @@ def prepare_image(
     image: Image.Image,
     image_size: tuple[int, int],
 ) -> Tensor:
-    return image_tensor(resize_image(image, image_size))
+    resized = resize_image(image, image_size)
+    try:
+        return image_tensor(resized)
+    finally:
+        resized.close()
 
 
 def _positive_integer(value: object, *, name: str) -> int:
@@ -280,10 +300,75 @@ def _record_identity(record: object, *, index: int) -> tuple[str, int]:
     return image_id, severity
 
 
+def _validated_record(
+    record: object,
+    *,
+    index: int,
+    contract: _RecordContract | None,
+) -> tuple[tuple[str, int], dict[str, Tensor], _RecordContract]:
+    identity = _record_identity(record, index=index)
+    assert type(record) is dict
+    tensors: dict[str, Tensor] = {}
+    for name in ("logits", "boxes", "persistence"):
+        tensor = record.get(name)
+        if not isinstance(tensor, Tensor):
+            raise RuntimeError(
+                f"extractor record {index} must contain tensor {name}"
+            )
+        if tensor.layout != torch.strided:
+            raise RuntimeError(
+                f"extractor record {index} {name} must have strided layout"
+            )
+        if not tensor.is_floating_point():
+            raise RuntimeError(
+                f"extractor record {index} {name} must be floating-point"
+            )
+        if not bool(torch.isfinite(tensor).all().item()):
+            raise RuntimeError(
+                f"extractor record {index} {name} must contain only finite values"
+            )
+        tensors[name] = tensor
+
+    for name in ("logits", "persistence"):
+        if tensors[name].ndim != 2:
+            raise RuntimeError(
+                f"extractor record {index} {name} must have rank 2"
+            )
+    boxes = tensors["boxes"]
+    if boxes.ndim != 2 or boxes.shape[1] != 4:
+        raise RuntimeError(
+            f"extractor record {index} boxes must have shape (queries, 4)"
+        )
+    query_counts = {
+        tensors["logits"].shape[0],
+        boxes.shape[0],
+        tensors["persistence"].shape[0],
+    }
+    if len(query_counts) != 1:
+        raise RuntimeError("extractor record query counts must match")
+    query_count = query_counts.pop()
+    if query_count <= 0:
+        raise RuntimeError("extractor record query count must be positive")
+    class_count = tensors["logits"].shape[1]
+    persistence_dim = tensors["persistence"].shape[1]
+    if class_count <= 0:
+        raise RuntimeError("extractor record class count must be positive")
+    if persistence_dim <= 0:
+        raise RuntimeError("extractor record persistence width must be positive")
+    current = _RecordContract(query_count, class_count, persistence_dim)
+    if contract is not None and current != contract:
+        raise RuntimeError(
+            f"extractor cache record contract changed from {contract!r} "
+            f"to {current!r}"
+        )
+    return identity, tensors, current
+
+
 def _validated_records(
     records: object,
     identities: list[tuple[str, int]],
-) -> list[dict]:
+    contract: _RecordContract | None,
+) -> tuple[list[dict[str, object]], _RecordContract]:
     if type(records) is not list:
         raise RuntimeError("extractor must return a list of records")
     if len(records) != len(identities):
@@ -292,57 +377,42 @@ def _validated_records(
             f"expected {len(identities)}"
         )
 
+    normalized: list[dict[str, object]] = []
     actual_keys: list[tuple[str, int]] = []
-    batch_query_count: int | None = None
     for index, record in enumerate(records):
-        actual_keys.append(_record_identity(record, index=index))
-        assert type(record) is dict
-        tensors: dict[str, Tensor] = {}
-        for name in ("logits", "boxes", "persistence"):
-            tensor = record.get(name)
-            if not isinstance(tensor, Tensor):
-                raise RuntimeError(
-                    f"extractor record {index} must contain tensor {name}"
-                )
-            tensors[name] = tensor
-        for name in ("logits", "persistence"):
-            if tensors[name].ndim != 2:
-                raise RuntimeError(
-                    f"extractor record {index} {name} must have rank 2"
-                )
-        boxes = tensors["boxes"]
-        if boxes.ndim != 2 or boxes.shape[1] != 4:
-            raise RuntimeError(
-                f"extractor record {index} boxes must have shape (queries, 4)"
-            )
-        query_counts = {
-            tensors["logits"].shape[0],
-            boxes.shape[0],
-            tensors["persistence"].shape[0],
-        }
-        if len(query_counts) != 1:
-            raise RuntimeError("extractor record query counts must match")
-        query_count = query_counts.pop()
-        if query_count <= 0:
-            raise RuntimeError("extractor record query count must be positive")
-        if batch_query_count is None:
-            batch_query_count = query_count
-        elif query_count != batch_query_count:
-            raise RuntimeError(
-                "extractor record query counts must match within a batch"
-            )
+        identity, tensors, contract = _validated_record(
+            record,
+            index=index,
+            contract=contract,
+        )
+        actual_keys.append(identity)
+        normalized.append(
+            {
+                "image_id": identity[0],
+                "severity": identity[1],
+                **{
+                    name: tensor.detach().to(device="cpu", copy=True)
+                    for name, tensor in tensors.items()
+                },
+            }
+        )
     if actual_keys != identities:
         raise RuntimeError(
             f"extractor returned keys {actual_keys!r}; expected {identities!r}"
         )
-    return records
+    if contract is None:
+        raise RuntimeError("extractor returned no cache record contract")
+    return normalized, contract
 
 
-def _published_record_keys(writer: ShardWriter) -> list[tuple[str, int]]:
+def _published_record_state(
+    writer: ShardWriter,
+) -> tuple[list[tuple[str, int]], _RecordContract | None]:
     directory_fd = writer._lock_fd
     if directory_fd is None:
         raise RuntimeError("artifact writer has no active directory descriptor")
     identities: list[tuple[str, int]] = []
+    contract: _RecordContract | None = None
     for name in writer.shards:
         records = _safe_load_shard(
             writer.directory,
@@ -350,11 +420,14 @@ def _published_record_keys(writer: ShardWriter) -> list[tuple[str, int]]:
             writer.shard_sha256[name],
             directory_fd=directory_fd,
         )
-        identities.extend(
-            _record_identity(record, index=len(identities) + index)
-            for index, record in enumerate(records)
-        )
-    return identities
+        for record in records:
+            identity, _, contract = _validated_record(
+                record,
+                index=len(identities),
+                contract=contract,
+            )
+            identities.append(identity)
+    return identities, contract
 
 
 def _pending_samples(
@@ -368,25 +441,47 @@ def _pending_samples(
     for entry in entries:
         with Image.open(entry.path) as opened:
             resized = resize_image(opened, image_size)
-            for severity in severities:
-                key = (entry.image_id, int(severity.level))
-                if key in existing:
-                    continue
-                changed = (
-                    resized
-                    if corruption is None
-                    else corruption.apply(resized, severity.level)
-                )
-                if not isinstance(changed, Image.Image):
-                    raise RuntimeError("corruption must return a PIL image")
-                if changed.size != expected_size:
-                    raise RuntimeError(
-                        "corruption changed image size: "
-                        f"got {changed.size}, expected {expected_size}"
-                    )
-                if changed.mode != "RGB":
-                    raise RuntimeError("corruption must return an RGB image")
-                yield key, image_tensor(changed)
+            try:
+                for severity in severities:
+                    key = (entry.image_id, int(severity.level))
+                    if key in existing:
+                        continue
+                    severity_input = resized.copy()
+                    changed: Image.Image | object | None = None
+                    try:
+                        changed = (
+                            severity_input
+                            if corruption is None
+                            else corruption.apply(
+                                severity_input,
+                                severity.level,
+                            )
+                        )
+                        if not isinstance(changed, Image.Image):
+                            raise RuntimeError(
+                                "corruption must return a PIL image"
+                            )
+                        if changed.size != expected_size:
+                            raise RuntimeError(
+                                "corruption changed image size: "
+                                f"got {changed.size}, expected {expected_size}"
+                            )
+                        if changed.mode != "RGB":
+                            raise RuntimeError(
+                                "corruption must return an RGB image"
+                            )
+                        tensor = image_tensor(changed)
+                    finally:
+                        if (
+                            isinstance(changed, Image.Image)
+                            and changed is not severity_input
+                        ):
+                            changed.close()
+                        severity_input.close()
+                    yield key, tensor
+            finally:
+                if resized is not opened:
+                    resized.close()
 
 
 def extract_manifest(
@@ -431,10 +526,13 @@ def extract_manifest(
                 "completed extraction has "
                 f"{actual_count!r} records; expected {expected_count}"
             )
-        actual_keys = [
-            _record_identity(record, index=index)
-            for index, record in enumerate(iter_records(root))
-        ]
+        actual_keys: list[tuple[str, int]] = []
+        contract: _RecordContract | None = None
+        for index, record in enumerate(iter_records(root)):
+            identity, _, contract = _validated_record(
+                record, index=index, contract=contract
+            )
+            actual_keys.append(identity)
         if actual_keys != expected_keys:
             raise RuntimeError(
                 "completed extraction record roster does not match the input"
@@ -443,7 +541,7 @@ def extract_manifest(
 
     with ShardWriter(root, metadata, shard_size=shard_size) as writer:
         existing = writer.existing_keys()
-        published_keys = _published_record_keys(writer)
+        published_keys, record_contract = _published_record_state(writer)
         if set(published_keys) != existing:
             raise RuntimeError(
                 "partial extraction record roster does not match its shards"
@@ -466,12 +564,17 @@ def extract_manifest(
         tensors: list[Tensor] = []
 
         def flush_batch() -> None:
+            nonlocal record_contract
             batch_identities = list(identities)
             records = extractor.extract_batch(
                 list(batch_identities),
                 torch.stack(tensors),
             )
-            records = _validated_records(records, batch_identities)
+            records, record_contract = _validated_records(
+                records,
+                batch_identities,
+                record_contract,
+            )
             for record in records:
                 writer.add(record)
 
