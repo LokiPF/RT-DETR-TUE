@@ -5143,3 +5143,221 @@ os.close(decoy_fd)
     )
 
     assert completed.returncode == 0, completed.stderr
+
+
+def _invoke_public_reader(target: Path) -> None:
+    with artifacts._open_regular_file(
+        target, error_message="invalid test file"
+    ) as handle:
+        assert handle.read() == b"value"
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit])
+def test_public_reader_cancellation_is_never_swallowed(
+    tmp_path, exception_type
+):
+    target = tmp_path / "value.bin"
+    target.write_bytes(b"value")
+    decoy_fd = os.open(target, os.O_RDONLY)
+    before = artifacts._live_fd_snapshot()
+    finalizer = artifacts._RegularFileLease.__dict__.get("__del__")
+    finalizer_code = None if finalizer is None else finalizer.__code__
+    public_code = artifacts._open_regular_file.__code__
+    interrupted = False
+    handle = None
+    observed = None
+
+    def interrupt(frame, event, _argument):
+        nonlocal interrupted
+        frame.f_trace_opcodes = True
+        in_finalizer = (
+            finalizer_code is not None
+            and frame.f_code is finalizer_code
+            and event in ("line", "opcode")
+        )
+        after_public_return = (
+            finalizer_code is None
+            and frame.f_code is public_code
+            and event == "return"
+        )
+        if not interrupted and (in_finalizer or after_public_return):
+            interrupted = True
+            raise exception_type("injected public reader cancellation")
+        return interrupt
+
+    try:
+        sys.settrace(interrupt)
+        handle = artifacts._open_regular_file(
+            target, error_message="invalid test file"
+        )
+    except BaseException as error:
+        observed = error
+    finally:
+        sys.settrace(None)
+        if handle is not None:
+            handle.close()
+
+    try:
+        assert interrupted
+        assert type(observed) is exception_type
+        assert str(observed) == "injected public reader cancellation"
+        observed.__traceback__ = None
+        gc.collect()
+        assert artifacts._live_fd_snapshot() == before
+        os.fstat(decoy_fd)
+        _invoke_public_reader(target)
+    finally:
+        os.close(decoy_fd)
+
+
+@pytest.mark.parametrize("exception_name", ["KeyboardInterrupt", "SystemExit"])
+def test_public_reader_signal_cancellation_is_never_swallowed(
+    tmp_path, exception_name
+):
+    target = tmp_path / "value.bin"
+    target.write_bytes(b"value")
+    script = f"""
+import os
+import signal
+import sys
+
+import differential_uncertainty.artifacts as artifacts
+
+target = sys.argv[1]
+exception_type = {exception_name}
+decoy_fd = os.open(target, os.O_RDONLY)
+before = artifacts._live_fd_snapshot()
+deliveries = 0
+caught = 0
+unexpected = None
+
+def interrupt(_signum, _frame):
+    global deliveries
+    deliveries += 1
+    raise exception_type("injected public reader signal")
+
+signal.signal(signal.SIGALRM, interrupt)
+for _ in range(4000):
+    handle = None
+    try:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0.000005)
+            handle = artifacts._open_regular_file(
+                target, error_message="invalid test file"
+            )
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    except (KeyboardInterrupt, SystemExit) as error:
+        if (
+            type(error) is not exception_type
+            or str(error) != "injected public reader signal"
+        ):
+            unexpected = error
+            break
+        caught += 1
+    except BaseException as error:
+        unexpected = error
+        break
+    finally:
+        if handle is not None:
+            handle.close()
+
+assert deliveries
+assert caught == deliveries
+assert unexpected is None, repr(unexpected)
+assert artifacts._live_fd_snapshot() == before
+os.fstat(decoy_fd)
+with artifacts._open_regular_file(
+    target, error_message="invalid test file"
+) as handle:
+    assert handle.read() == b"value"
+os.close(decoy_fd)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, os.fspath(target)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+
+
+def _executed_trace_boundaries(function, invoke) -> list[tuple[str, int]]:
+    opcode_offsets = set()
+    line_offsets = set()
+
+    def collect(frame, event, _argument):
+        if frame.f_code is function.__code__:
+            frame.f_trace_opcodes = True
+            if event == "opcode":
+                opcode_offsets.add(frame.f_lasti)
+            elif event == "line":
+                line_offsets.add(frame.f_lasti)
+        return collect
+
+    try:
+        sys.settrace(collect)
+        invoke()
+    finally:
+        sys.settrace(None)
+    offsets = opcode_offsets if opcode_offsets else line_offsets
+    event = "opcode" if opcode_offsets else "line"
+    return [(event, offset) for offset in sorted(offsets)]
+
+
+@pytest.mark.parametrize("method_name", ["acquire", "release"])
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit])
+def test_reader_ownership_survives_every_method_boundary_without_finalizer(
+    tmp_path, method_name, exception_type
+):
+    assert "__del__" not in artifacts._RegularFileLease.__dict__
+    target = tmp_path / f"{method_name}-{exception_type.__name__}.bin"
+    target.write_bytes(b"value")
+    method = getattr(artifacts._RegularFileLease, method_name)
+    boundaries = _executed_trace_boundaries(
+        method, lambda: _invoke_public_reader(target)
+    )
+    assert boundaries
+    decoy_fd = os.open(target, os.O_RDONLY)
+    baseline = artifacts._live_fd_snapshot()
+
+    try:
+        for target_event, target_offset in boundaries:
+            interrupted = False
+            observed = None
+
+            def interrupt(frame, event, _argument):
+                nonlocal interrupted
+                if frame.f_code is method.__code__:
+                    frame.f_trace_opcodes = True
+                    if (
+                        not interrupted
+                        and event == target_event
+                        and frame.f_lasti == target_offset
+                    ):
+                        interrupted = True
+                        raise exception_type(
+                            f"injected {method_name} cancellation"
+                        )
+                return interrupt
+
+            try:
+                sys.settrace(interrupt)
+                _invoke_public_reader(target)
+            except BaseException as error:
+                observed = error
+            finally:
+                sys.settrace(None)
+
+            assert interrupted, (target_event, target_offset)
+            assert type(observed) is exception_type
+            observed.__traceback__ = None
+            gc.collect()
+            assert artifacts._live_fd_snapshot() == baseline
+            os.fstat(decoy_fd)
+            _invoke_public_reader(target)
+    finally:
+        os.close(decoy_fd)

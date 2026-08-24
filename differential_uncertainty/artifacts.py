@@ -391,13 +391,6 @@ class _RegularFileLease:
         self.handle = None
         return handle
 
-    def __del__(self):
-        try:
-            self.close()
-        except BaseException:
-            pass
-
-
 def _open_regular_file(
     path: str | Path,
     *,
