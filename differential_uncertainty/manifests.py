@@ -38,6 +38,14 @@ def load_manifest(value: str | Path) -> tuple[ManifestEntry, ...]:
         image_id = row["image_id"].strip()
         if not image_id:
             raise ValueError(f"manifest row {number} has an empty image_id")
+        if len(image_id) > 256:
+            raise ValueError(
+                f"manifest row {number} image_id must contain at most 256 characters"
+            )
+        if not image_id.isprintable():
+            raise ValueError(
+                f"manifest row {number} image_id must not contain control characters"
+            )
         if image_id.startswith(("=", "+", "-", "@")):
             raise ValueError(
                 f"manifest row {number} image_id starts with a "

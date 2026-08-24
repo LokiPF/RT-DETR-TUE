@@ -267,10 +267,11 @@ FIXED_CONFIG = ExperimentConfig()
 ```
 
 > **Manifest contract amendment (2026-08-24):** After surrounding whitespace is
-> stripped, an `image_id` must not begin with `=`, `+`, `-`, or `@`.
-> Task 10 rejects these IDs during manifest loading, before creating run output,
-> because exact CSV identity round-tripping would otherwise expose spreadsheet
-> formula interpretation.
+> stripped, an `image_id` must be at most 256 characters, contain no Unicode
+> control characters, and not begin with `=`, `+`, `-`, or `@`. Task 10 rejects
+> these IDs during manifest loading, before creating run output, because exact CSV
+> identity round-tripping otherwise permits multiline/control-bearing cells or
+> spreadsheet formula interpretation.
 
 - [ ] **Step 4: Write failing manifest and corruption tests**
 

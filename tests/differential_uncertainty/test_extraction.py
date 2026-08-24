@@ -594,12 +594,19 @@ def test_extractor_context_closes_real_hooks_when_inference_fails(
 
 
 def test_extractor_close_is_safe_to_repeat(monkeypatch):
-    extractor, _model, capture = _extractor(monkeypatch)
+    extractor, model, capture = _extractor(monkeypatch)
 
     extractor.close()
     extractor.close()
 
-    assert capture.close_count == 2
+    assert capture.close_count == 1
+    assert extractor.model is None
+    assert extractor.capture is None
+    assert model is not None
+    with pytest.raises(RuntimeError, match="extractor is closed"):
+        extractor.extract_batch(
+            [("a", 0)], torch.zeros(1, 3, 8, 8)
+        )
 
 
 class FakeExtractor:

@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import csv
+import gc
+import hashlib
 import json
+import multiprocessing
 import shutil
+import threading
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pandas as pd
@@ -9,7 +16,8 @@ import pytest
 import torch
 from PIL import Image
 
-from differential_uncertainty.artifacts import iter_records
+import differential_uncertainty.cli as cli
+from differential_uncertainty.artifacts import iter_records, source_digest
 from differential_uncertainty.cli import run_pipeline
 from differential_uncertainty.config import ExperimentConfig
 
@@ -83,6 +91,25 @@ class InterruptingExtractor(FakeExtractor):
         return super().extract_batch(identities, samples)
 
 
+class CoordinatedExtractor(FakeExtractor):
+    gate = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        try:
+            type(self).gate.wait(timeout=1)
+        except threading.BrokenBarrierError:
+            pass
+
+
+class LifetimeExtractor(FakeExtractor):
+    instance_ref = None
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        type(self).instance_ref = weakref.ref(self)
+
+
 @pytest.fixture
 def small_config():
     return ExperimentConfig.for_tests(
@@ -103,16 +130,21 @@ def reset_fake_extractor():
     InterruptingExtractor.calls = 0
     InterruptingExtractor.identities = []
     InterruptingExtractor.interrupted = False
+    CoordinatedExtractor.gate = None
+    LifetimeExtractor.instance_ref = None
 
 
 def _manifest(root: Path, name: str, entries) -> Path:
-    lines = ["image_id,image_path"]
-    for image_id, color in entries:
-        path = root / f"{image_id}.png"
+    rows = []
+    for index, (image_id, color) in enumerate(entries):
+        path = root / f"{Path(name).stem}-{index}.png"
         Image.new("RGB", (17, 13), (color, color, color)).save(path)
-        lines.append(f"{image_id},{path.name}")
+        rows.append((image_id, path.name))
     manifest = root / name
-    manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("image_id", "image_path"))
+        writer.writerows(rows)
     return manifest
 
 
@@ -242,6 +274,29 @@ def test_incomplete_score_roster_is_refused_instead_of_reused(
 
     with pytest.raises(ValueError, match="score.*roster|severities 0 through 5"):
         _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+
+@pytest.mark.parametrize("unsafe_id", ("line\nbreak", "nul\x00byte", "x" * 257))
+def test_score_artifact_reader_rejects_control_or_overlong_ids(
+    tmp_path, unsafe_id
+):
+    path = tmp_path / "scores.csv"
+    rows = []
+    for severity in range(6):
+        row = {field: 0.0 for field in cli._SCORE_COLUMNS}
+        row.update(
+            image_id=unsafe_id,
+            severity=severity,
+            padded_count=0,
+            valid_count=0,
+            reference_count=0,
+            responsive_count=0,
+        )
+        rows.append(row)
+    cli._atomic_score_csv(rows, path)
+
+    with pytest.raises(ValueError, match="unsafe image_id"):
+        cli._load_score_csv(path, (unsafe_id,))
 
 
 def test_missing_report_is_rebuilt_without_extraction(tmp_path, small_config):
@@ -395,3 +450,351 @@ def test_pipeline_rejects_invalid_runtime_controls(
 
     with pytest.raises(ValueError, match=message):
         run_pipeline(*inputs, **arguments)
+
+
+_DETECTOR_SOURCE_PATHS = (
+    "src/__init__.py",
+    "src/core/__init__.py",
+    "src/core/_config.py",
+    "src/core/workspace.py",
+    "src/core/yaml_config.py",
+    "src/core/yaml_utils.py",
+    "src/data/__init__.py",
+    "src/data/_misc.py",
+    "src/data/dataloader.py",
+    "src/data/dataset/__init__.py",
+    "src/data/dataset/_dataset.py",
+    "src/data/dataset/cifar_dataset.py",
+    "src/data/dataset/coco_dataset.py",
+    "src/data/dataset/coco_eval.py",
+    "src/data/dataset/coco_utils.py",
+    "src/data/dataset/voc_detection.py",
+    "src/data/dataset/voc_eval.py",
+    "src/data/transforms/__init__.py",
+    "src/data/transforms/_transforms.py",
+    "src/data/transforms/container.py",
+    "src/data/transforms/mosaic.py",
+    "src/misc/__init__.py",
+    "src/misc/box_ops.py",
+    "src/misc/dist_utils.py",
+    "src/misc/logger.py",
+    "src/misc/profiler_utils.py",
+    "src/misc/tue_utils.py",
+    "src/misc/visualizer.py",
+    "src/nn/__init__.py",
+    "src/nn/arch/__init__.py",
+    "src/nn/arch/classification.py",
+    "src/nn/arch/yolo.py",
+    "src/nn/backbone/__init__.py",
+    "src/nn/backbone/common.py",
+    "src/nn/backbone/csp_darknet.py",
+    "src/nn/backbone/csp_resnet.py",
+    "src/nn/backbone/hgnetv2.py",
+    "src/nn/backbone/presnet.py",
+    "src/nn/backbone/test_resnet.py",
+    "src/nn/backbone/timm_model.py",
+    "src/nn/backbone/torchvision_model.py",
+    "src/nn/backbone/utils.py",
+    "src/nn/criterion/__init__.py",
+    "src/nn/criterion/det_criterion.py",
+    "src/nn/postprocessor/__init__.py",
+    "src/nn/postprocessor/nms_postprocessor.py",
+    "src/optim/__init__.py",
+    "src/optim/amp.py",
+    "src/optim/ema.py",
+    "src/optim/optim.py",
+    "src/optim/warmup.py",
+    "src/zoo/__init__.py",
+    "src/zoo/rtdetr/__init__.py",
+    "src/zoo/rtdetr/box_ops.py",
+    "src/zoo/rtdetr/denoising.py",
+    "src/zoo/rtdetr/hybrid_encoder.py",
+    "src/zoo/rtdetr/matcher.py",
+    "src/zoo/rtdetr/rtdetr.py",
+    "src/zoo/rtdetr/rtdetr_criterion.py",
+    "src/zoo/rtdetr/rtdetr_decoder.py",
+    "src/zoo/rtdetr/rtdetr_postprocessor.py",
+    "src/zoo/rtdetr/rtdetrv2_criterion.py",
+    "src/zoo/rtdetr/rtdetrv2_decoder.py",
+    "src/zoo/rtdetr/tue_rtdetr.py",
+    "src/zoo/rtdetr/tue_rtdetrv2_decoder.py",
+    "src/zoo/rtdetr/utils.py",
+)
+
+
+def _tree_hashes(root: Path) -> dict[str, str]:
+    return {
+        str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+def _process_run(inputs, config, gate, results):
+    CoordinatedExtractor.gate = gate
+    try:
+        value = _run(inputs, config, extractor_factory=CoordinatedExtractor)
+    except BaseException as error:
+        results.put(("error", type(error).__name__, str(error)))
+    else:
+        results.put(("ok", str(value)))
+
+
+def test_identical_fresh_thread_runs_coordinate_and_publish_exactly_once(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    CoordinatedExtractor.gate = threading.Barrier(2)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                _run,
+                inputs,
+                small_config,
+                extractor_factory=CoordinatedExtractor,
+            )
+            for _ in range(2)
+        ]
+        results = [future.result(timeout=30) for future in futures]
+
+    assert results == [inputs[-1].resolve(), inputs[-1].resolve()]
+    first = _tree_hashes(inputs[-1])
+    _run(inputs, small_config, extractor_factory=RejectingExtractor)
+    assert _tree_hashes(inputs[-1]) == first
+
+
+def test_identical_fresh_process_runs_coordinate_and_publish_exactly_once(
+    tmp_path, small_config
+):
+    context = multiprocessing.get_context("spawn")
+    inputs = _inputs(tmp_path)
+    gate = context.Barrier(2)
+    results = context.Queue()
+    processes = [
+        context.Process(
+            target=_process_run,
+            args=(inputs, small_config, gate, results),
+        )
+        for _ in range(2)
+    ]
+
+    for process in processes:
+        process.start()
+    received = [results.get(timeout=30) for _ in processes]
+    for process in processes:
+        process.join(timeout=30)
+
+    assert [process.exitcode for process in processes] == [0, 0]
+    assert received == [
+        ("ok", str(inputs[-1].resolve())),
+        ("ok", str(inputs[-1].resolve())),
+    ]
+    first = _tree_hashes(inputs[-1])
+    _run(inputs, small_config, extractor_factory=RejectingExtractor)
+    assert _tree_hashes(inputs[-1]) == first
+
+
+def test_detector_source_closure_matches_every_currently_executed_project_file():
+    root = Path(cli.__file__).resolve().parents[1]
+    actual = {
+        path.relative_to(root).as_posix()
+        for path in cli._source_files()
+        if path.is_relative_to(root / "src")
+    }
+
+    assert actual == set(_DETECTOR_SOURCE_PATHS)
+    assert "src/scene_uncertainty/pipeline.py" not in actual
+    assert "src/solver/det_engine.py" not in actual
+
+
+def test_each_detector_source_affects_digest_but_unrelated_source_does_not(
+    tmp_path
+):
+    root = tmp_path / "clone"
+    workflow = (
+        "differential_uncertainty/__init__.py",
+        "differential_uncertainty/cli.py",
+    )
+    for relative in (*workflow, *_DETECTOR_SOURCE_PATHS):
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{relative}\n", encoding="utf-8")
+    unrelated = root / "src/scene_uncertainty/unrelated.py"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_text("first\n", encoding="utf-8")
+
+    files = cli._source_files(root=root)
+    baseline = source_digest(files, root=root)
+    for relative in _DETECTOR_SOURCE_PATHS:
+        path = root / relative
+        original = path.read_text(encoding="utf-8")
+        path.write_text(original + "changed\n", encoding="utf-8")
+        assert source_digest(cli._source_files(root=root), root=root) != baseline
+        path.write_text(original, encoding="utf-8")
+
+    unrelated.write_text("second\n", encoding="utf-8")
+    assert source_digest(cli._source_files(root=root), root=root) == baseline
+
+
+def test_evaluation_groups_stream_only_one_six_record_image_at_a_time():
+    image_ids = tuple(f"image-{index:03d}" for index in range(250))
+    yielded = 0
+
+    def records():
+        nonlocal yielded
+        for image_id in image_ids:
+            for severity in range(6):
+                yielded += 1
+                yield {"image_id": image_id, "severity": severity}
+
+    groups = cli._iter_evaluation_groups(records(), image_ids)
+    first_id, first_records = next(groups)
+
+    assert first_id == image_ids[0]
+    assert [record["severity"] for record in first_records] == list(range(6))
+    assert yielded == 6
+    second_id, _second_records = next(groups)
+    assert second_id == image_ids[1]
+    assert yielded == 12
+    assert sum(1 for _ in groups) == 248
+    assert yielded == 1_500
+
+
+@pytest.mark.parametrize(
+    "records",
+    (
+        (
+            {"image_id": "a", "severity": 0},
+            {"image_id": "a", "severity": 2},
+        ),
+        (
+            *({"image_id": "a", "severity": severity} for severity in range(6)),
+            {"image_id": "extra", "severity": 0},
+        ),
+    ),
+)
+def test_evaluation_group_stream_rejects_noncanonical_or_extra_records(records):
+    with pytest.raises(RuntimeError, match="canonical evaluation record roster"):
+        list(cli._iter_evaluation_groups(records, ("a",)))
+
+
+def test_extractor_is_released_before_reference_bank_building(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    original = cli.build_reference_bank
+
+    def observed_build(records, config):
+        gc.collect()
+        assert LifetimeExtractor.instance_ref() is None
+        return original(records, config)
+
+    monkeypatch.setattr(cli, "build_reference_bank", observed_build)
+
+    _run(inputs, small_config, extractor_factory=LifetimeExtractor)
+
+
+@pytest.mark.parametrize(
+    ("location", "unsafe_id"),
+    (
+        ("reference", "line\nbreak"),
+        ("reference", "nul\x00byte"),
+        ("reference", "x" * 257),
+        ("evaluation", "line\nbreak"),
+        ("evaluation", "nul\x00byte"),
+        ("evaluation", "x" * 257),
+    ),
+)
+def test_control_and_overlong_ids_fail_before_output_or_detector(
+    tmp_path, small_config, location, unsafe_id
+):
+    reference_entries = (
+        ((unsafe_id, 10), ("r2", 30))
+        if location == "reference"
+        else (("r1", 10), ("r2", 30))
+    )
+    evaluation_entries = (
+        ((unsafe_id, 60),)
+        if location == "evaluation"
+        else (("e1", 60),)
+    )
+    reference = _manifest(tmp_path, "reference.csv", reference_entries)
+    evaluation = _manifest(tmp_path, "evaluation.csv", evaluation_entries)
+    checkpoint = tmp_path / "checkpoint.pth"
+    checkpoint.write_bytes(b"fake checkpoint content")
+    output = tmp_path / "run"
+
+    with pytest.raises(ValueError, match="control characters|at most 256"):
+        run_pipeline(
+            reference,
+            evaluation,
+            checkpoint,
+            output,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+        )
+
+    assert not output.exists()
+
+
+def test_max_length_printable_unicode_ids_round_trip_end_to_end(
+    tmp_path, small_config
+):
+    reference_ids = ("R" * 256, "ref-safe")
+    evaluation_id = "雪" * 256
+    reference = _manifest(
+        tmp_path,
+        "reference.csv",
+        tuple(zip(reference_ids, (10, 30))),
+    )
+    evaluation = _manifest(
+        tmp_path,
+        "evaluation.csv",
+        ((evaluation_id, 60),),
+    )
+    checkpoint = tmp_path / "checkpoint.pth"
+    checkpoint.write_bytes(b"fake checkpoint content")
+    output = tmp_path / "run"
+
+    run_pipeline(
+        reference,
+        evaluation,
+        checkpoint,
+        output,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=FakeExtractor,
+    )
+
+    reference_records = list(
+        iter_records(output / "artifacts" / "reference-extractions")
+    )
+    evaluation_records = list(
+        iter_records(output / "artifacts" / "evaluation-extractions")
+    )
+    assert {record["image_id"] for record in reference_records} == set(
+        reference_ids
+    )
+    assert {record["image_id"] for record in evaluation_records} == {
+        evaluation_id
+    }
+    assert set(
+        pd.read_csv(
+            output / "artifacts" / "scores.csv", dtype={"image_id": str}
+        )["image_id"]
+    ) == {evaluation_id}
+    assert set(
+        pd.read_csv(
+            output / "report" / "per-image-scores.csv",
+            dtype={"image_id": str},
+        )["image_id"]
+    ) == {evaluation_id}
+    assert evaluation_id in (
+        output / "report" / "report.md"
+    ).read_text(encoding="utf-8")

@@ -1,3 +1,4 @@
+import csv
 import hashlib
 import json
 from pathlib import Path
@@ -182,3 +183,39 @@ def test_manifest_digest_hashes_a_canonical_id_and_resolved_path_payload(tmp_pat
 
     assert manifest_digest(entries) == expected
     assert manifest_digest(tuple(reversed(entries))) == expected
+
+
+@pytest.mark.parametrize(
+    ("image_id", "message"),
+    (
+        ("line\nbreak", "control characters"),
+        ("nul\x00byte", "control characters"),
+        ("x" * 257, "at most 256"),
+    ),
+)
+def test_manifest_rejects_control_and_overlong_image_ids(
+    tmp_path, image_id, message
+):
+    _image(tmp_path / "x.png")
+    manifest = tmp_path / "unsafe.csv"
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("image_id", "image_path"))
+        writer.writerow((image_id, "x.png"))
+
+    with pytest.raises(ValueError, match=message):
+        load_manifest(manifest)
+
+
+def test_manifest_accepts_a_printable_256_character_unicode_image_id(tmp_path):
+    image_id = "雪" * 256
+    _image(tmp_path / "x.png")
+    manifest = tmp_path / "safe.csv"
+    with manifest.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("image_id", "image_path"))
+        writer.writerow((image_id, "x.png"))
+
+    entries = load_manifest(manifest)
+
+    assert entries[0].image_id == image_id

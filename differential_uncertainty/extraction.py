@@ -718,6 +718,10 @@ class RTDETRExtractor:
         identities: list[tuple[str, int]],
         samples: Tensor,
     ) -> list[dict[str, object]]:
+        model = self.model
+        capture = self.capture
+        if model is None or capture is None:
+            raise RuntimeError("extractor is closed")
         if not isinstance(samples, Tensor):
             raise TypeError("samples must be a Tensor")
         if samples.ndim != 4:
@@ -745,7 +749,7 @@ class RTDETRExtractor:
                 f"{sample_count}"
             )
 
-        outputs = self.model(samples.to(self.device))
+        outputs = model(samples.to(self.device))
         if not isinstance(outputs, Mapping):
             raise TypeError("detector output must be a mapping")
         try:
@@ -786,7 +790,7 @@ class RTDETRExtractor:
                 f"expected {expected_logits} and {expected_boxes}"
             )
 
-        features, weight = self.capture.take()
+        features, weight = capture.take()
         if features.ndim != 3:
             raise RuntimeError(
                 "captured decoder features must have shape "
@@ -822,7 +826,11 @@ class RTDETRExtractor:
         ]
 
     def close(self) -> None:
-        self.capture.close()
+        capture = self.capture
+        self.capture = None
+        self.model = None
+        if capture is not None:
+            capture.close()
 
     def __enter__(self) -> RTDETRExtractor:
         return self
