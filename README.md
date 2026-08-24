@@ -111,8 +111,10 @@ SHA-256, canonical behavior-affecting state, and validated hashes for declared e
 dependency modules. These values are checked before any completed cache is reused and
 again at the end of the run, so a plugin or module changed during inference is refused.
 
-The built-in Gaussian blur needs no extra configuration. A custom corruption plugin
-must declare `implementation_sha256` as lowercase 64-hex, `behavior_state` as canonical
+The built-in Gaussian blur needs no extra configuration; its referenced Pillow
+dependency files are discovered, hashed, and revalidated automatically. A custom
+corruption plugin must declare `implementation_sha256` as lowercase 64-hex,
+`behavior_state` as canonical
 JSON data, and `dependency_sha256` as a module-name-to-lowercase-64-hex mapping. Helpers
 in the plugin's own defining modules are covered by the automatic module-file hashes;
 referenced helpers from other modules must appear in the dependency mapping.

@@ -14,7 +14,7 @@ The full branch-point commit is:
 The code commit tested immediately before this documentation change is:
 
 ```text
-f663b49837f7301610d82df2983454fcb3d5cd8c
+6f9e55b0c608860472801d8be75318f581482501
 ```
 
 ## Historical baseline
@@ -34,7 +34,7 @@ The complete retained suite was run with:
 Its exact summary was:
 
 ```text
-787 passed in 143.79s (0:02:23)
+791 passed in 147.74s (0:02:27)
 ```
 
 This full run includes the image-fingerprint, runtime-regime, plugin-identity,
@@ -46,6 +46,11 @@ The plugin checks bind authoritative build SHA-256, canonical behavior state,
 defining-module file hashes, and validated external dependency module hashes.
 They also reject defining-module, build-declaration, or behavior-state mutation
 mid-run.
+
+Built-in Gaussian blur also automatically binds and revalidates its Pillow
+`ImageFilter` dependency without user declarations. The terminal closure orders
+plugin revalidation before the full input hash, then audits artifacts, and ends
+with lightweight input signatures with no later substantive plugin work.
 
 The two parity files were also run together with skip reasons enabled:
 
@@ -126,10 +131,10 @@ find differential_uncertainty src tests/differential_uncertainty \
 Observed result:
 
 ```text
-22933 total
+23073 total
 ```
 
-That is **43 Python files and 22,933 lines** in the retained surface.
+That is **43 Python files and 23,073 lines** in the retained surface.
 
 ## Historical report bundle
 
@@ -159,7 +164,7 @@ summary.json
 ## Environment and documentation evidence
 
 This documentation update follows tested code commit
-`f663b49837f7301610d82df2983454fcb3d5cd8c`. It changes no Python source, so
+`6f9e55b0c608860472801d8be75318f581482501`. It changes no Python source, so
 the tested code commit and retained Python counts recorded above remain the same.
 
 A fresh environment query returned:
