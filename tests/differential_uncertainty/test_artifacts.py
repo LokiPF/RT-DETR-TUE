@@ -1,3 +1,4 @@
+import builtins
 import dis
 import gc
 import hashlib
@@ -50,6 +51,960 @@ def _write_manual_artifact(root: Path, records: list[dict]) -> Path:
     return shard
 
 
+def _traceable(function):
+    return getattr(function, "__wrapped__", function)
+
+
+def _interrupt_at_opcode(
+    function,
+    opname,
+    argval,
+    invoke,
+    *,
+    occurrence=0,
+) -> None:
+    function = _traceable(function)
+    targets = [
+        instruction.offset
+        for instruction in dis.get_instructions(function)
+        if instruction.opname == opname
+        and (argval is None or instruction.argval == argval)
+    ]
+    target = targets[occurrence]
+    interrupted = False
+
+    def interrupt(frame, event, _argument):
+        nonlocal interrupted
+        if frame.f_code is function.__code__:
+            frame.f_trace_opcodes = True
+            if not interrupted and event == "opcode" and frame.f_lasti == target:
+                interrupted = True
+                raise KeyboardInterrupt("interrupted at file ownership boundary")
+        return interrupt
+
+    try:
+        sys.settrace(interrupt)
+        with pytest.raises(KeyboardInterrupt, match="file ownership boundary"):
+            invoke()
+    finally:
+        sys.settrace(None)
+    assert interrupted
+
+
+def _temporary_entries(root: Path) -> list[Path]:
+    return [path for path in root.iterdir() if path.name.endswith(".tmp")]
+
+
+def _publication_case(tmp_path: Path, kind: str):
+    root = tmp_path / kind
+    root.mkdir()
+    directory_fd = None
+    if kind == "public_json":
+        invoke = lambda: artifacts.atomic_json({"value": 1}, root / "value.json")
+    elif kind == "public_json_create":
+        invoke = lambda: artifacts._atomic_json_create(
+            {"value": 1}, root / "value.json"
+        )
+    elif kind == "public_torch":
+        invoke = lambda: artifacts.atomic_torch(
+            {"value": torch.tensor([1])}, root / "value.pt"
+        )
+    else:
+        directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        if kind == "at_json":
+            invoke = lambda: artifacts._atomic_json_at(
+                {"value": 1}, "value.json", directory_fd
+            )
+        else:
+            invoke = lambda: artifacts._atomic_torch_at(
+                {"value": torch.tensor([1])}, "value.pt", directory_fd
+            )
+    return root, directory_fd, invoke
+
+
+def _read_case(tmp_path: Path, kind: str):
+    root = tmp_path / kind
+    root.mkdir()
+    directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    if kind == "read_json":
+        (root / "value.json").write_text('{"value": 1}\n', encoding="utf-8")
+        invoke = lambda: artifacts._read_json_at(directory_fd, "value.json")
+    elif kind == "sha256_at":
+        (root / "value.bin").write_bytes(b"value")
+        invoke = lambda: artifacts._sha256_file_at(directory_fd, "value.bin")
+    else:
+        shard = root / "shard_00000.pt"
+        torch.save([_record("a")], shard)
+        digest = sha256_file(shard)
+        if kind == "shard_path":
+            invoke = lambda: artifacts._safe_load_shard(
+                root, shard.name, digest
+            )
+        else:
+            invoke = lambda: artifacts._safe_load_shard(
+                root,
+                shard.name,
+                digest,
+                directory_fd=directory_fd,
+            )
+    return root, directory_fd, invoke
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["public_json", "public_json_create", "public_torch", "at_json", "at_torch"],
+)
+def test_staging_open_return_interrupt_has_no_raw_descriptor_or_file(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    root, directory_fd, invoke = _publication_case(tmp_path, kind)
+    original_close = os.close
+    observed: list[tuple[int, Path]] = []
+
+    if hasattr(artifacts, "_staged_file"):
+        target = artifacts._staged_file
+        opname, argval = "STORE_FAST", "handle"
+        original_open = builtins.open
+
+        def observed_open(path, mode="r", *args, **kwargs):
+            handle = original_open(path, mode, *args, **kwargs)
+            if mode == "xb" and os.fspath(path).endswith(".tmp"):
+                observed.append((handle.fileno(), Path(path)))
+            return handle
+
+        monkeypatch.setattr(builtins, "open", observed_open)
+    elif kind.startswith("public"):
+        target = artifacts._secure_temporary_file
+        opname, argval = "UNPACK_SEQUENCE", None
+        original_mkstemp = artifacts.tempfile.mkstemp
+
+        def observed_mkstemp(*args, **kwargs):
+            descriptor, name = original_mkstemp(*args, **kwargs)
+            observed.append((descriptor, Path(name)))
+            return descriptor, name
+
+        monkeypatch.setattr(artifacts.tempfile, "mkstemp", observed_mkstemp)
+    else:
+        target = artifacts._secure_temporary_file_at
+        opname, argval = "STORE_FAST", "descriptor"
+        original_open = artifacts.os.open
+
+        def observed_open(path, flags, *args, **kwargs):
+            descriptor = original_open(path, flags, *args, **kwargs)
+            if kwargs.get("dir_fd") == directory_fd:
+                observed.append((descriptor, root / os.fspath(path)))
+            return descriptor
+
+        monkeypatch.setattr(artifacts.os, "open", observed_open)
+
+    try:
+        _interrupt_at_opcode(
+            target,
+            opname,
+            argval,
+            invoke,
+            occurrence=1 if hasattr(artifacts, "_staged_file") else 0,
+        )
+        leaked = []
+        for descriptor, _path in observed:
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                continue
+            leaked.append(descriptor)
+        leftovers = _temporary_entries(root)
+    finally:
+        monkeypatch.undo()
+        for descriptor, path in observed:
+            try:
+                original_close(descriptor)
+            except OSError:
+                pass
+            path.unlink(missing_ok=True)
+        if directory_fd is not None:
+            original_close(directory_fd)
+
+    assert observed
+    assert leaked == []
+    assert leftovers == []
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["public_json", "public_json_create", "public_torch", "at_json", "at_torch"],
+)
+def test_staging_file_adoption_interrupt_never_recloses_a_reused_fd(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    root, directory_fd, invoke = _publication_case(tmp_path, kind)
+    original_close = os.close
+    original_open = os.open
+    resource_fd = None
+    replacement_fd = None
+
+    if hasattr(artifacts, "_staged_file"):
+        target = artifacts._staged_file
+        original_builtin_open = builtins.open
+
+        def observed_builtin_open(path, mode="r", *args, **kwargs):
+            nonlocal resource_fd
+            handle = original_builtin_open(path, mode, *args, **kwargs)
+            if mode == "xb" and os.fspath(path).endswith(".tmp"):
+                resource_fd = handle.fileno()
+            return handle
+
+        monkeypatch.setattr(builtins, "open", observed_builtin_open)
+    else:
+        target = {
+            "public_json": artifacts.atomic_json,
+            "public_torch": artifacts.atomic_torch,
+            "at_json": artifacts._atomic_json_at,
+            "at_torch": artifacts._atomic_torch_at,
+        }[kind]
+        original_fdopen = artifacts.os.fdopen
+
+        def observed_fdopen(descriptor, *args, **kwargs):
+            nonlocal resource_fd
+            handle = original_fdopen(descriptor, *args, **kwargs)
+            resource_fd = handle.fileno()
+            return handle
+
+        monkeypatch.setattr(artifacts.os, "fdopen", observed_fdopen)
+
+    def detect_stale_close(descriptor):
+        nonlocal replacement_fd
+        if descriptor == resource_fd:
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                replacement_fd = original_open(os.devnull, os.O_RDONLY)
+        return original_close(descriptor)
+
+    monkeypatch.setattr(artifacts.os, "close", detect_stale_close)
+    try:
+        _interrupt_at_opcode(
+            target,
+            "STORE_FAST",
+            "handle",
+            invoke,
+            occurrence=1 if hasattr(artifacts, "_staged_file") else 0,
+        )
+        replacement_survived = True
+        if replacement_fd is not None:
+            try:
+                os.fstat(replacement_fd)
+            except OSError:
+                replacement_survived = False
+        leftovers = _temporary_entries(root)
+    finally:
+        monkeypatch.undo()
+        if replacement_fd is not None:
+            try:
+                original_close(replacement_fd)
+            except OSError:
+                pass
+        if directory_fd is not None:
+            original_close(directory_fd)
+        for path in _temporary_entries(root):
+            path.unlink()
+
+    assert resource_fd is not None
+    assert replacement_survived
+    assert leftovers == []
+
+
+def test_staged_file_yield_interrupt_cleans_the_unique_entry(tmp_path):
+    target = tmp_path / "value.json"
+    assert hasattr(artifacts, "_staged_file")
+
+    _interrupt_at_opcode(
+        artifacts._staged_file,
+        "YIELD_VALUE",
+        None,
+        lambda: artifacts.atomic_json({"value": 1}, target),
+    )
+
+    assert _temporary_entries(tmp_path) == []
+    assert not target.exists()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["public_json", "public_json_create", "public_torch", "at_json", "at_torch"],
+)
+def test_staged_context_enter_return_interrupt_cleans_owned_file(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    root, directory_fd, invoke = _publication_case(tmp_path, kind)
+    target = {
+        "public_json": artifacts.atomic_json,
+        "public_json_create": artifacts._atomic_json_create,
+        "public_torch": artifacts.atomic_torch,
+        "at_json": artifacts._atomic_json_at,
+        "at_torch": artifacts._atomic_torch_at,
+    }[kind]
+    original_open = builtins.open
+    observed = []
+
+    def observed_open(path, mode="r", *args, **kwargs):
+        handle = original_open(path, mode, *args, **kwargs)
+        if mode == "xb" and os.fspath(path).endswith(".tmp"):
+            observed.append(handle.fileno())
+        return handle
+
+    monkeypatch.setattr(builtins, "open", observed_open)
+    try:
+        _interrupt_at_opcode(target, "UNPACK_SEQUENCE", None, invoke)
+        leaked = []
+        for descriptor in observed:
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                continue
+            leaked.append(descriptor)
+        leftovers = _temporary_entries(root)
+    finally:
+        monkeypatch.undo()
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+    assert observed
+    assert leaked == []
+    assert leftovers == []
+
+
+@pytest.mark.parametrize("kind", ["public_json", "at_json"])
+def test_staged_file_close_completion_never_recloses_a_reused_fd(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    root, directory_fd, invoke = _publication_case(tmp_path, kind)
+    function = _traceable(artifacts._staged_file)
+    instructions = list(dis.get_instructions(function))
+    close_pops = [
+        instruction.offset
+        for index, instruction in enumerate(instructions)
+        if instruction.opname == "POP_TOP"
+        and index >= 3
+        and instructions[index - 1].opname == "CALL"
+        and instructions[index - 3].opname == "LOAD_METHOD"
+        and instructions[index - 3].argval == "close"
+    ]
+    close_pop = close_pops[1]
+    original_builtin_open = builtins.open
+    resource_fd = None
+    replacement_fd = None
+    interrupted = False
+
+    def observed_open(path, mode="r", *args, **kwargs):
+        nonlocal resource_fd
+        handle = original_builtin_open(path, mode, *args, **kwargs)
+        if mode == "xb" and os.fspath(path).endswith(".tmp"):
+            resource_fd = handle.fileno()
+        return handle
+
+    def interrupt_after_close(frame, event, _argument):
+        nonlocal interrupted, replacement_fd
+        if frame.f_code is function.__code__:
+            frame.f_trace_opcodes = True
+            if not interrupted and event == "opcode" and frame.f_lasti == close_pop:
+                interrupted = True
+                replacement_fd = os.open(os.devnull, os.O_RDONLY)
+                assert replacement_fd == resource_fd
+                raise KeyboardInterrupt("interrupted after close completion")
+        return interrupt_after_close
+
+    monkeypatch.setattr(builtins, "open", observed_open)
+    try:
+        sys.settrace(interrupt_after_close)
+        with pytest.raises(KeyboardInterrupt, match="close completion"):
+            invoke()
+    finally:
+        sys.settrace(None)
+        monkeypatch.undo()
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+    assert interrupted
+    assert replacement_fd is not None
+    os.fstat(replacement_fd)
+    os.close(replacement_fd)
+    assert _temporary_entries(root) == []
+
+
+@pytest.mark.parametrize(
+    "kind", ["read_json", "sha256_at", "shard_path", "shard_at"]
+)
+def test_read_open_return_interrupt_has_no_raw_descriptor(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    _root, directory_fd, invoke = _read_case(tmp_path, kind)
+    original_close = os.close
+    observed = []
+    if hasattr(artifacts, "_open_regular_file"):
+        target = artifacts._open_regular_file
+        opname, argval = "STORE_FAST", "handle"
+        original_open = builtins.open
+
+        def observed_open(path, mode="r", *args, **kwargs):
+            handle = original_open(path, mode, *args, **kwargs)
+            if mode == "rb":
+                observed.append(handle.fileno())
+            return handle
+
+        monkeypatch.setattr(builtins, "open", observed_open)
+    else:
+        target = {
+            "read_json": artifacts._read_json_at,
+            "sha256_at": artifacts._sha256_file_at,
+            "shard_path": artifacts._safe_load_shard,
+            "shard_at": artifacts._safe_load_shard,
+        }[kind]
+        opname, argval = "STORE_FAST", "descriptor"
+        original_open = artifacts.os.open
+
+        def observed_open(path, flags, *args, **kwargs):
+            descriptor = original_open(path, flags, *args, **kwargs)
+            observed.append(descriptor)
+            return descriptor
+
+        monkeypatch.setattr(artifacts.os, "open", observed_open)
+    try:
+        _interrupt_at_opcode(
+            target,
+            opname,
+            argval,
+            invoke,
+            occurrence=(
+                1
+                if kind == "shard_at"
+                and not hasattr(artifacts, "_open_regular_file")
+                else 0
+            ),
+        )
+        leaked = []
+        for descriptor in observed:
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                continue
+            leaked.append(descriptor)
+    finally:
+        monkeypatch.undo()
+        for descriptor in observed:
+            if descriptor == directory_fd:
+                continue
+            try:
+                original_close(descriptor)
+            except OSError:
+                pass
+        original_close(directory_fd)
+
+    assert observed
+    assert leaked == []
+
+
+@pytest.mark.parametrize(
+    "kind", ["read_json", "sha256_at", "shard_path", "shard_at"]
+)
+def test_read_helper_return_interrupt_closes_owned_file(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    _root, directory_fd, invoke = _read_case(tmp_path, kind)
+    target = {
+        "read_json": artifacts._read_json_at,
+        "sha256_at": artifacts._sha256_file_at,
+        "shard_path": artifacts._safe_load_shard,
+        "shard_at": artifacts._safe_load_shard,
+    }[kind]
+    original_open = builtins.open
+    observed = []
+
+    def observed_open(path, mode="r", *args, **kwargs):
+        handle = original_open(path, mode, *args, **kwargs)
+        if mode == "rb":
+            observed.append(handle.fileno())
+        return handle
+
+    monkeypatch.setattr(builtins, "open", observed_open)
+    try:
+        _interrupt_at_opcode(target, "BEFORE_WITH", None, invoke)
+        leaked = []
+        for descriptor in observed:
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                continue
+            leaked.append(descriptor)
+    finally:
+        monkeypatch.undo()
+        os.close(directory_fd)
+
+    assert observed
+    assert leaked == []
+
+
+@pytest.mark.parametrize(
+    "kind", ["read_json", "sha256_at", "shard_path", "shard_at"]
+)
+def test_read_file_adoption_interrupt_never_recloses_a_reused_fd(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    _root, directory_fd, invoke = _read_case(tmp_path, kind)
+    original_close = os.close
+    original_open = os.open
+    resource_fd = None
+    replacement_fd = None
+    if hasattr(artifacts, "_open_regular_file"):
+        target = artifacts._open_regular_file
+        original_builtin_open = builtins.open
+
+        def observed_builtin_open(path, mode="r", *args, **kwargs):
+            nonlocal resource_fd
+            handle = original_builtin_open(path, mode, *args, **kwargs)
+            if mode == "rb":
+                resource_fd = handle.fileno()
+            return handle
+
+        monkeypatch.setattr(builtins, "open", observed_builtin_open)
+    else:
+        target = {
+            "read_json": artifacts._read_json_at,
+            "sha256_at": artifacts._sha256_file_at,
+            "shard_path": artifacts._safe_load_shard,
+            "shard_at": artifacts._safe_load_shard,
+        }[kind]
+        original_fdopen = artifacts.os.fdopen
+
+        def observed_fdopen(descriptor, *args, **kwargs):
+            nonlocal resource_fd
+            handle = original_fdopen(descriptor, *args, **kwargs)
+            resource_fd = handle.fileno()
+            return handle
+
+        monkeypatch.setattr(artifacts.os, "fdopen", observed_fdopen)
+
+    def detect_stale_close(descriptor):
+        nonlocal replacement_fd
+        if descriptor == resource_fd:
+            try:
+                os.fstat(descriptor)
+            except OSError:
+                replacement_fd = original_open(os.devnull, os.O_RDONLY)
+        return original_close(descriptor)
+
+    monkeypatch.setattr(artifacts.os, "close", detect_stale_close)
+    try:
+        _interrupt_at_opcode(target, "STORE_FAST", "handle", invoke)
+        replacement_survived = True
+        if replacement_fd is not None:
+            try:
+                os.fstat(replacement_fd)
+            except OSError:
+                replacement_survived = False
+    finally:
+        monkeypatch.undo()
+        if replacement_fd is not None:
+            try:
+                original_close(replacement_fd)
+            except OSError:
+                pass
+        original_close(directory_fd)
+
+    assert resource_fd is not None
+    assert replacement_survived
+
+
+@pytest.mark.parametrize("use_directory_fd", [False, True])
+def test_validation_failure_close_completion_never_recloses_a_reused_fd(
+    tmp_path,
+    monkeypatch,
+    use_directory_fd,
+):
+    root = tmp_path / "cache"
+    root.mkdir()
+    target = root / "value.bin"
+    target.write_bytes(b"value")
+    directory_fd = (
+        os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        if use_directory_fd
+        else None
+    )
+    source = target if directory_fd is None else target.name
+    function = artifacts._open_regular_file
+    instructions = list(dis.get_instructions(function))
+    close_pop = next(
+        instruction.offset
+        for index, instruction in enumerate(instructions)
+        if instruction.opname == "POP_TOP"
+        and index >= 3
+        and instructions[index - 1].opname == "CALL"
+        and instructions[index - 3].opname == "LOAD_METHOD"
+        and instructions[index - 3].argval == "close"
+    )
+    original_builtin_open = builtins.open
+    original_fstat = artifacts.os.fstat
+    resource_fd = None
+    replacement_fd = None
+    interrupted = False
+
+    def observed_open(path, mode="r", *args, **kwargs):
+        nonlocal resource_fd
+        handle = original_builtin_open(path, mode, *args, **kwargs)
+        if mode == "rb":
+            resource_fd = handle.fileno()
+        return handle
+
+    def fail_validation(descriptor):
+        if descriptor == resource_fd:
+            raise RuntimeError("validation failed")
+        return original_fstat(descriptor)
+
+    def interrupt_after_close(frame, event, _argument):
+        nonlocal interrupted, replacement_fd
+        if frame.f_code is function.__code__:
+            frame.f_trace_opcodes = True
+            if not interrupted and event == "opcode" and frame.f_lasti == close_pop:
+                interrupted = True
+                replacement_fd = os.open(os.devnull, os.O_RDONLY)
+                assert replacement_fd == resource_fd
+                raise KeyboardInterrupt("interrupted after close completion")
+        return interrupt_after_close
+
+    monkeypatch.setattr(builtins, "open", observed_open)
+    monkeypatch.setattr(artifacts.os, "fstat", fail_validation)
+    try:
+        sys.settrace(interrupt_after_close)
+        with pytest.raises(KeyboardInterrupt, match="close completion"):
+            artifacts._open_regular_file(
+                source,
+                directory_fd=directory_fd,
+                error_message="invalid test file",
+            )
+    finally:
+        sys.settrace(None)
+        monkeypatch.undo()
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+    assert interrupted
+    assert replacement_fd is not None
+    os.fstat(replacement_fd)
+    os.close(replacement_fd)
+
+
+@pytest.mark.parametrize(
+    "kind", ["read_json", "sha256_at", "shard_path", "shard_at"]
+)
+def test_reads_reject_an_entry_replaced_during_handle_validation(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    root, directory_fd, invoke = _read_case(tmp_path, kind)
+    name = {
+        "read_json": "value.json",
+        "sha256_at": "value.bin",
+        "shard_path": "shard_00000.pt",
+        "shard_at": "shard_00000.pt",
+    }[kind]
+    replacement = tmp_path / f"{kind}.replacement"
+    if kind == "read_json":
+        replacement.write_text('{"value": 2}\n', encoding="utf-8")
+    elif kind == "sha256_at":
+        replacement.write_bytes(b"replacement")
+    else:
+        torch.save([_record("replacement")], replacement)
+    original_fstat = artifacts.os.fstat
+    swapped = False
+
+    def swap_before_validation(descriptor):
+        nonlocal swapped
+        state = original_fstat(descriptor)
+        if (
+            not swapped
+            and descriptor != directory_fd
+            and artifacts.stat.S_ISREG(state.st_mode)
+        ):
+            (root / name).replace(root / f"{name}.original")
+            replacement.replace(root / name)
+            swapped = True
+        return state
+
+    monkeypatch.setattr(artifacts.os, "fstat", swap_before_validation)
+    try:
+        with pytest.raises(ValueError, match="changed|regular file"):
+            invoke()
+    finally:
+        monkeypatch.undo()
+        os.close(directory_fd)
+
+    assert swapped
+
+
+@pytest.mark.parametrize("kind", ["read_json", "sha256_at"])
+def test_dirfd_reads_reject_symlink_entries(tmp_path, kind):
+    root = tmp_path / kind
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.write_text('{"value": 1}\n', encoding="utf-8")
+    name = "value.json" if kind == "read_json" else "value.bin"
+    (root / name).symlink_to(outside)
+    directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        with pytest.raises(ValueError, match="regular file"):
+            if kind == "read_json":
+                artifacts._read_json_at(directory_fd, name)
+            else:
+                artifacts._sha256_file_at(directory_fd, name)
+    finally:
+        os.close(directory_fd)
+
+
+@pytest.mark.parametrize("kind", ["read_json", "shard_path", "shard_at"])
+def test_reads_reject_symlink_before_opening_its_fifo_target(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    root = tmp_path / kind
+    root.mkdir()
+    fifo = tmp_path / "blocking-fifo"
+    os.mkfifo(fifo)
+    name = "value.json" if kind == "read_json" else "shard_00000.pt"
+    (root / name).symlink_to(fifo)
+    directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    if kind == "read_json":
+        invoke = lambda: artifacts._read_json_at(directory_fd, name)
+    else:
+        invoke = lambda: artifacts._safe_load_shard(
+            root,
+            name,
+            "0" * 64,
+            directory_fd=directory_fd if kind == "shard_at" else None,
+        )
+    original_open = builtins.open
+
+    def forbid_fifo_open(path, mode="r", *args, **kwargs):
+        if mode == "rb" and os.fspath(path).endswith(name):
+            raise AssertionError("reader followed the symlink before validation")
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "open", forbid_fifo_open)
+    try:
+        with pytest.raises(ValueError, match="regular file"):
+            invoke()
+    finally:
+        os.close(directory_fd)
+
+
+def test_dirfd_torch_save_failure_closes_and_removes_staging_file(
+    tmp_path,
+    monkeypatch,
+):
+    root = tmp_path / "cache"
+    root.mkdir()
+    directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+
+    def fail_save(_value, handle):
+        handle.write(b"partial")
+        raise RuntimeError("save failed")
+
+    monkeypatch.setattr(artifacts.torch, "save", fail_save)
+    before = artifacts._live_fd_snapshot()
+    try:
+        with pytest.raises(RuntimeError, match="save failed"):
+            artifacts._atomic_torch_at({"value": 1}, "value.pt", directory_fd)
+        after = artifacts._live_fd_snapshot()
+        leftovers = _temporary_entries(root)
+    finally:
+        os.close(directory_fd)
+
+    assert after == before
+    assert leftovers == []
+
+
+@pytest.mark.parametrize(
+    "kind", ["public_json", "public_json_create", "at_json"]
+)
+def test_json_write_failure_closes_and_removes_staging_file(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    root, directory_fd, invoke = _publication_case(tmp_path, kind)
+    target = root / "value.json"
+    target.write_bytes(b"previous")
+    original_open = builtins.open
+
+    class FailingWriteHandle:
+        def __init__(self, handle):
+            self._handle = handle
+
+        def __getattr__(self, name):
+            return getattr(self._handle, name)
+
+        def write(self, value):
+            self._handle.write(value[:1])
+            raise RuntimeError("write failed")
+
+    def failing_open(path, mode="r", *args, **kwargs):
+        handle = original_open(path, mode, *args, **kwargs)
+        if mode == "xb":
+            return FailingWriteHandle(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", failing_open)
+    before = artifacts._live_fd_snapshot()
+    try:
+        with pytest.raises(RuntimeError, match="write failed"):
+            invoke()
+        after = artifacts._live_fd_snapshot()
+        leftovers = _temporary_entries(root)
+    finally:
+        monkeypatch.undo()
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+    assert after == before
+    assert target.read_bytes() == b"previous"
+    assert leftovers == []
+
+
+@pytest.mark.parametrize("kind", ["public_json", "at_json"])
+def test_staged_file_setup_failure_closes_and_removes_entry(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    root, directory_fd, invoke = _publication_case(tmp_path, kind)
+    monkeypatch.setattr(
+        artifacts.os,
+        "fchmod",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("setup failed")),
+    )
+    before = artifacts._live_fd_snapshot()
+    try:
+        with pytest.raises(RuntimeError, match="setup failed"):
+            invoke()
+        after = artifacts._live_fd_snapshot()
+        leftovers = _temporary_entries(root)
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+    assert after == before
+    assert leftovers == []
+
+
+def test_directory_fsync_open_return_interrupt_has_no_raw_descriptor(tmp_path):
+    (tmp_path / "published-value").write_bytes(b"value")
+    before = artifacts._live_fd_snapshot()
+    _interrupt_at_opcode(
+        artifacts._fsync_directory,
+        "STORE_FAST",
+        "descriptor",
+        lambda: artifacts._fsync_directory(tmp_path),
+    )
+    after = artifacts._live_fd_snapshot()
+    leaked = after - before
+    for descriptor in leaked:
+        os.close(descriptor)
+
+    assert leaked == set()
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["public_json", "public_json_create", "public_torch", "at_json", "at_torch"],
+)
+def test_publication_rejects_replaced_staging_entry(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    root, directory_fd, invoke = _publication_case(tmp_path, kind)
+    target = root / ("value.pt" if "torch" in kind else "value.json")
+    retained = root / "retained-correct-staging"
+    original_fsync = artifacts.os.fsync
+    swapped = False
+
+    def swap_after_file_fsync(descriptor):
+        nonlocal swapped
+        result = original_fsync(descriptor)
+        state = os.fstat(descriptor)
+        if not swapped and artifacts.stat.S_ISREG(state.st_mode):
+            staging = _temporary_entries(root)
+            assert len(staging) == 1
+            staging[0].replace(retained)
+            if "torch" in kind:
+                torch.save({"attacker": True}, staging[0])
+            else:
+                staging[0].write_text(
+                    '{"attacker": true}\n', encoding="utf-8"
+                )
+            swapped = True
+        return result
+
+    monkeypatch.setattr(artifacts.os, "fsync", swap_after_file_fsync)
+    try:
+        with pytest.raises(ValueError, match="staging entry changed"):
+            invoke()
+    finally:
+        if directory_fd is not None:
+            os.close(directory_fd)
+
+    assert swapped
+    assert retained.exists()
+    assert not target.exists()
+    assert _temporary_entries(root) == []
+
+
+@pytest.mark.parametrize("kind", ["read_json", "shard_path", "shard_at"])
+def test_read_or_load_failure_closes_the_owned_file(
+    tmp_path,
+    monkeypatch,
+    kind,
+):
+    _root, directory_fd, invoke = _read_case(tmp_path, kind)
+    if kind == "read_json":
+        monkeypatch.setattr(
+            artifacts.json,
+            "load",
+            lambda _handle: (_ for _ in ()).throw(RuntimeError("load failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            artifacts.torch,
+            "load",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("load failed")
+            ),
+        )
+    before = artifacts._live_fd_snapshot()
+    try:
+        with pytest.raises(RuntimeError, match="load failed"):
+            invoke()
+        after = artifacts._live_fd_snapshot()
+    finally:
+        os.close(directory_fd)
+
+    assert after == before
+
+
 def test_atomic_json_and_torch_publish_complete_values_without_staging_files(tmp_path):
     json_path = tmp_path / "nested" / "value.json"
     tensor_path = tmp_path / "nested" / "value.pt"
@@ -64,6 +1019,7 @@ def test_atomic_json_and_torch_publish_complete_values_without_staging_files(tmp
     loaded = torch.load(tensor_path, map_location="cpu", weights_only=True)
     torch.testing.assert_close(loaded["value"], torch.tensor([4, 5]))
     assert list(tmp_path.rglob("*.tmp")) == []
+    assert not (json_path.parent / artifacts._DIRECTORY_ANCHOR).exists()
 
 
 def test_failed_atomic_torch_publication_preserves_the_target(tmp_path, monkeypatch):

@@ -7,10 +7,10 @@ import json
 import os
 import secrets
 import stat
-import tempfile
 import threading
 import weakref
 from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from numbers import Integral
 from pathlib import Path
 
@@ -56,192 +56,191 @@ def _positive_integer(value, *, name: str) -> int:
     return int(value)
 
 
-def _secure_temporary_file(target: Path) -> tuple[int, Path]:
-    descriptor, name = tempfile.mkstemp(
-        dir=target.parent,
-        prefix=f".{target.name}.",
-        suffix=".tmp",
-    )
-    return descriptor, Path(name)
-
-
-def _discard_temporary(descriptor: int | None, path: Path) -> None:
-    if descriptor is not None:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
+def _unlink_staging(temporary, *, directory_fd: int | None) -> None:
     try:
-        path.unlink()
+        if directory_fd is None:
+            Path(temporary).unlink()
+        else:
+            os.unlink(temporary, dir_fd=directory_fd)
     except FileNotFoundError:
         pass
 
 
-def _fsync_directory(directory: Path) -> None:
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-    descriptor = os.open(directory, flags)
+def _stat_entry(path, *, directory_fd: int | None):
+    if directory_fd is None:
+        return os.stat(path, follow_symlinks=False)
+    return os.stat(path, dir_fd=directory_fd, follow_symlinks=False)
+
+
+def _require_staging_entry(handle, temporary, *, directory_fd: int | None) -> None:
     try:
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
+        opened = os.fstat(handle.fileno())
+        entry = _stat_entry(temporary, directory_fd=directory_fd)
+    except OSError as error:
+        raise ValueError("artifact staging entry changed") from error
+    if (
+        not stat.S_ISREG(opened.st_mode)
+        or not stat.S_ISREG(entry.st_mode)
+        or (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino)
+    ):
+        raise ValueError("artifact staging entry changed")
+
+
+@contextmanager
+def _staged_file(
+    target: str | Path,
+    *,
+    directory_fd: int | None = None,
+):
+    """Yield an exclusively created C-owned binary staging file."""
+    if directory_fd is None:
+        requested = Path(target)
+        target_name = requested.name
+        parent = requested.parent
+    else:
+        target_name = os.fspath(target)
+        if not target_name or Path(target_name).name != target_name:
+            raise ValueError(f"invalid artifact entry name: {target_name!r}")
+        parent = Path(f"/proc/self/fd/{directory_fd}")
+
+    for _attempt in range(100):
+        temporary_name = f".{target_name}.{secrets.token_hex(16)}.tmp"
+        temporary_path = parent / temporary_name
+        handle = None
+        collision = False
+        try:
+            try:
+                handle = open(temporary_path, "xb")
+            except FileExistsError:
+                collision = True
+                continue
+            os.fchmod(handle.fileno(), 0o600)
+            yield handle, (
+                temporary_path if directory_fd is None else temporary_name
+            )
+            return
+        finally:
+            try:
+                if handle is not None:
+                    handle.close()
+            finally:
+                if not collision:
+                    _unlink_staging(
+                        temporary_path
+                        if directory_fd is None
+                        else temporary_name,
+                        directory_fd=directory_fd,
+                    )
+    raise FileExistsError("could not allocate a unique artifact staging file")
+
+
+def _fsync_directory(directory: Path) -> None:
+    with _WRITER_REGISTRY_LOCK:
+        owner = _DirectoryHandle(directory, ensure_anchor=False)
+        try:
+            descriptor = owner.open()
+            owner.ownership(descriptor)
+            os.fsync(descriptor)
+        finally:
+            owner.close()
 
 
 def atomic_json(value: Mapping, path: str | Path) -> None:
     """Atomically publish a JSON mapping at the requested path."""
     if not isinstance(value, Mapping):
         raise TypeError("atomic JSON values must be mappings")
-    text = json.dumps(
-        dict(value), indent=2, sort_keys=True, allow_nan=False
-    ) + "\n"
+    content = (
+        json.dumps(dict(value), indent=2, sort_keys=True, allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = _secure_temporary_file(target)
-    try:
-        handle = os.fdopen(descriptor, "w", encoding="utf-8")
-        descriptor = None
-        with handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
+    with _staged_file(target) as (handle, temporary):
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+        _require_staging_entry(handle, temporary, directory_fd=None)
         os.replace(temporary, target)
-        _fsync_directory(target.parent)
-    except BaseException:
-        _discard_temporary(descriptor, temporary)
-        raise
+    _fsync_directory(target.parent)
 
 
 def _atomic_json_create(value: Mapping, path: str | Path) -> bool:
     """Atomically publish JSON only if the target does not already exist."""
     if not isinstance(value, Mapping):
         raise TypeError("atomic JSON values must be mappings")
-    text = json.dumps(
-        dict(value), indent=2, sort_keys=True, allow_nan=False
-    ) + "\n"
+    content = (
+        json.dumps(dict(value), indent=2, sort_keys=True, allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = _secure_temporary_file(target)
-    try:
-        handle = os.fdopen(descriptor, "w", encoding="utf-8")
-        descriptor = None
-        with handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
+    with _staged_file(target) as (handle, temporary):
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+        _require_staging_entry(handle, temporary, directory_fd=None)
         try:
             os.link(temporary, target, follow_symlinks=False)
         except FileExistsError:
             return False
-        temporary.unlink()
-        _fsync_directory(target.parent)
-        return True
-    finally:
-        _discard_temporary(descriptor, temporary)
+        Path(temporary).unlink()
+    _fsync_directory(target.parent)
+    return True
 
 
 def atomic_torch(value, path: str | Path) -> None:
     """Atomically publish a Torch value at the requested path."""
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = _secure_temporary_file(target)
-    try:
-        handle = os.fdopen(descriptor, "wb")
-        descriptor = None
-        with handle:
-            torch.save(value, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
+    with _staged_file(target) as (handle, temporary):
+        torch.save(value, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+        _require_staging_entry(handle, temporary, directory_fd=None)
         os.replace(temporary, target)
-        _fsync_directory(target.parent)
-    except BaseException:
-        _discard_temporary(descriptor, temporary)
-        raise
-
-
-def _secure_temporary_file_at(
-    directory_fd: int,
-    target_name: str,
-) -> tuple[int, str]:
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_NOFOLLOW", 0)
-        | getattr(os, "O_CLOEXEC", 0)
-    )
-    for _attempt in range(100):
-        name = f".{target_name}.{secrets.token_hex(16)}.tmp"
-        try:
-            descriptor = os.open(
-                name,
-                flags,
-                0o600,
-                dir_fd=directory_fd,
-            )
-        except FileExistsError:
-            continue
-        return descriptor, name
-    raise FileExistsError("could not allocate a unique artifact staging file")
-
-
-def _discard_temporary_at(
-    descriptor: int | None,
-    name: str,
-    directory_fd: int,
-) -> None:
-    if descriptor is not None:
-        try:
-            os.close(descriptor)
-        except OSError:
-            pass
-    try:
-        os.unlink(name, dir_fd=directory_fd)
-    except FileNotFoundError:
-        pass
+    _fsync_directory(target.parent)
 
 
 def _atomic_json_at(value: Mapping, name: str, directory_fd: int) -> None:
-    text = json.dumps(
-        dict(value), indent=2, sort_keys=True, allow_nan=False
-    ) + "\n"
-    descriptor, temporary = _secure_temporary_file_at(directory_fd, name)
-    try:
-        handle = os.fdopen(descriptor, "w", encoding="utf-8")
-        descriptor = None
-        with handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
+    content = (
+        json.dumps(dict(value), indent=2, sort_keys=True, allow_nan=False)
+        + "\n"
+    ).encode("utf-8")
+    with _staged_file(name, directory_fd=directory_fd) as (handle, temporary):
+        handle.write(content)
+        handle.flush()
+        os.fsync(handle.fileno())
+        _require_staging_entry(
+            handle,
+            temporary,
+            directory_fd=directory_fd,
+        )
         os.replace(
             temporary,
             name,
             src_dir_fd=directory_fd,
             dst_dir_fd=directory_fd,
         )
-        os.fsync(directory_fd)
-    except BaseException:
-        _discard_temporary_at(descriptor, temporary, directory_fd)
-        raise
+    os.fsync(directory_fd)
 
 
 def _atomic_torch_at(value, name: str, directory_fd: int) -> None:
-    descriptor, temporary = _secure_temporary_file_at(directory_fd, name)
-    try:
-        handle = os.fdopen(descriptor, "wb")
-        descriptor = None
-        with handle:
-            torch.save(value, handle)
-            handle.flush()
-            os.fsync(handle.fileno())
+    with _staged_file(name, directory_fd=directory_fd) as (handle, temporary):
+        torch.save(value, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+        _require_staging_entry(
+            handle,
+            temporary,
+            directory_fd=directory_fd,
+        )
         os.replace(
             temporary,
             name,
             src_dir_fd=directory_fd,
             dst_dir_fd=directory_fd,
         )
-        os.fsync(directory_fd)
-    except BaseException:
-        _discard_temporary_at(descriptor, temporary, directory_fd)
-        raise
+    os.fsync(directory_fd)
 
 
 def _path_exists_at(directory_fd: int, name: str) -> bool:
@@ -252,19 +251,64 @@ def _path_exists_at(directory_fd: int, name: str) -> bool:
     return True
 
 
-def _read_json_at(directory_fd: int, name: str):
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(name, flags, dir_fd=directory_fd)
+def _open_regular_file(
+    path: str | Path,
+    *,
+    directory_fd: int | None = None,
+    error_message: str,
+):
+    if directory_fd is None:
+        visible = Path(path)
+        entry_name = None
+    else:
+        entry_name = os.fspath(path)
+        if not entry_name or Path(entry_name).name != entry_name:
+            raise ValueError(error_message)
+        visible = Path(f"/proc/self/fd/{directory_fd}") / entry_name
     try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError(f"artifact file {name!r} must be a regular file")
-        handle = os.fdopen(descriptor, "r", encoding="utf-8")
-        descriptor = None
-        with handle:
-            return json.load(handle)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+        before = _stat_entry(
+            visible if directory_fd is None else entry_name,
+            directory_fd=directory_fd,
+        )
+    except OSError as error:
+        raise ValueError(error_message) from error
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError(error_message)
+    try:
+        handle = open(visible, "rb")
+    except OSError as error:
+        raise ValueError(error_message) from error
+    try:
+        opened = os.fstat(handle.fileno())
+        try:
+            entry = _stat_entry(
+                visible if directory_fd is None else entry_name,
+                directory_fd=directory_fd,
+            )
+        except OSError as error:
+            raise ValueError(f"{error_message}; entry changed") from error
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(entry.st_mode)
+            or (before.st_dev, before.st_ino)
+            != (opened.st_dev, opened.st_ino)
+            or (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino)
+        ):
+            raise ValueError(f"{error_message}; entry changed")
+    except BaseException:
+        handle.close()
+        raise
+    return handle
+
+
+def _read_json_at(directory_fd: int, name: str):
+    message = f"artifact file {name!r} must be a regular file"
+    with _open_regular_file(
+        name,
+        directory_fd=directory_fd,
+        error_message=message,
+    ) as handle:
+        return json.load(handle)
 
 
 def _unlink_at(directory_fd: int, name: str) -> None:
@@ -282,18 +326,13 @@ def _sha256_stream(handle, chunk_size: int) -> str:
 
 
 def _sha256_file_at(directory_fd: int, name: str) -> str:
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor = os.open(name, flags, dir_fd=directory_fd)
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError(f"artifact file {name!r} must be a regular file")
-        handle = os.fdopen(descriptor, "rb")
-        descriptor = None
-        with handle:
-            return _sha256_stream(handle, 1024 * 1024)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+    message = f"artifact file {name!r} must be a regular file"
+    with _open_regular_file(
+        name,
+        directory_fd=directory_fd,
+        error_message=message,
+    ) as handle:
+        return _sha256_stream(handle, 1024 * 1024)
 
 
 def sha256_file(
@@ -490,41 +529,21 @@ def _safe_load_shard(
     directory_fd: int | None = None,
 ) -> list[dict]:
     path = _shard_path(root, name)
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    descriptor: int | None
-    try:
-        if directory_fd is None:
-            descriptor = os.open(path, flags)
-        else:
-            descriptor = os.open(
-                name,
-                flags,
-                dir_fd=directory_fd,
-            )
-    except OSError as error:
-        if error.errno in (errno.ELOOP, errno.ENOENT, errno.ENOTDIR):
+    message = f"artifact shard {name!r} must be a regular file"
+    source = path if directory_fd is None else name
+    with _open_regular_file(
+        source,
+        directory_fd=directory_fd,
+        error_message=message,
+    ) as handle:
+        actual_sha256 = _sha256_stream(handle, 1024 * 1024)
+        if actual_sha256 != expected_sha256:
             raise ValueError(
-                f"artifact shard {name!r} must be a regular file"
-            ) from error
-        raise
-
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise ValueError(f"artifact shard {name!r} must be a regular file")
-        handle = os.fdopen(descriptor, "rb")
-        descriptor = None
-        with handle:
-            actual_sha256 = _sha256_stream(handle, 1024 * 1024)
-            if actual_sha256 != expected_sha256:
-                raise ValueError(
-                    f"artifact shard {name!r} SHA-256 mismatch: "
-                    f"actual={actual_sha256}, expected={expected_sha256}"
-                )
-            handle.seek(0)
-            records = torch.load(handle, map_location="cpu", weights_only=True)
-    finally:
-        if descriptor is not None:
-            os.close(descriptor)
+                f"artifact shard {name!r} SHA-256 mismatch: "
+                f"actual={actual_sha256}, expected={expected_sha256}"
+            )
+        handle.seek(0)
+        records = torch.load(handle, map_location="cpu", weights_only=True)
     if type(records) is not list or not all(type(record) is dict for record in records):
         raise ValueError(f"artifact shard {name!r} must contain a list of records")
     return records
@@ -580,7 +599,7 @@ def _ensure_directory_anchor(directory: Path) -> None:
 class _DirectoryHandle:
     """Retain C-level ownership of a directory fd across Python opcodes."""
 
-    def __init__(self, directory: Path) -> None:
+    def __init__(self, directory: Path, *, ensure_anchor: bool = True) -> None:
         state = os.stat(directory)
         self._directory = directory
         self._identity = (state.st_dev, state.st_ino)
@@ -591,13 +610,15 @@ class _DirectoryHandle:
         self._owner_pid = os.getpid()
         self._fork_generation = _FORK_GENERATION
         self._invalidated_by_fork = False
+        self._ensure_anchor = ensure_anchor
 
     def open(self) -> int:
         for _attempt in range(_DIRECTORY_OPEN_ATTEMPTS):
             self._require_valid()
             state = os.stat(self._directory)
             identity = (state.st_dev, state.st_ino)
-            _ensure_directory_anchor(self._directory)
+            if self._ensure_anchor:
+                _ensure_directory_anchor(self._directory)
             # ScandirIterator is a C-level RAII owner.  If an async exception
             # lands after this call but before STORE_FAST, decref closes its
             # directory fd.
