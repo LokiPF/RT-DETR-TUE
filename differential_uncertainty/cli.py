@@ -11,8 +11,10 @@ import stat
 import sys
 import unicodedata
 from contextlib import ExitStack, contextmanager
-from numbers import Integral
+from dataclasses import dataclass
+from numbers import Integral, Real
 from pathlib import Path
+from typing import Callable
 
 import torch
 
@@ -34,7 +36,7 @@ from .bank import (
     save_reference_bank,
 )
 from .config import FIXED_CONFIG, ExperimentConfig
-from .corruptions.gaussian_blur import GaussianBlur
+from .corruptions import Corruption, GaussianBlur, Severity
 from .evaluation import evaluate_rows
 from .extraction import (
     RTDETRExtractor,
@@ -142,6 +144,98 @@ _DETECTOR_SOURCE_PATHS = (
 )
 
 
+@dataclass(frozen=True)
+class _CorruptionSnapshot:
+    name: str
+    severities: tuple[Severity, ...]
+    _apply: Callable
+
+    def apply(self, image, level):
+        return self._apply(image, level)
+
+
+def _snapshot_corruption(corruption: Corruption) -> _CorruptionSnapshot:
+    try:
+        name = corruption.name
+    except Exception as error:
+        raise ValueError(
+            "corruption name must be a nonempty string"
+        ) from error
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("corruption name must be a nonempty string")
+    if len(name) > 128:
+        raise ValueError("corruption name must be at most 128 characters")
+    if any(
+        unicodedata.category(character).startswith("C")
+        for character in name
+    ):
+        raise ValueError(
+            "corruption name must not contain control characters"
+        )
+
+    try:
+        severities = corruption.severities
+    except Exception as error:
+        raise ValueError(
+            "corruption severities must be a tuple"
+        ) from error
+    if not isinstance(severities, tuple):
+        raise ValueError("corruption severities must be a tuple")
+    if len(severities) != 6:
+        raise ValueError(
+            "corruption severities must contain exactly six entries"
+        )
+    if not all(isinstance(item, Severity) for item in severities):
+        raise ValueError(
+            "corruption severities must contain only Severity entries"
+        )
+
+    levels = []
+    frozen_severities = []
+    for severity in severities:
+        level = severity.level
+        if isinstance(level, bool) or not isinstance(level, Integral):
+            raise ValueError(
+                "corruption severity levels must be non-bool integers"
+            )
+        parameter = severity.parameter
+        if isinstance(parameter, bool) or not isinstance(parameter, Real):
+            raise ValueError(
+                "corruption severity parameters must be finite numbers"
+            )
+        try:
+            numeric_parameter = float(parameter)
+        except (OverflowError, TypeError, ValueError) as error:
+            raise ValueError(
+                "corruption severity parameters must be finite numbers"
+            ) from error
+        if not math.isfinite(numeric_parameter):
+            raise ValueError(
+                "corruption severity parameters must be finite numbers"
+            )
+        normalized_level = int(level)
+        levels.append(normalized_level)
+        frozen_severities.append(
+            Severity(normalized_level, numeric_parameter)
+        )
+    if levels != list(range(6)):
+        raise ValueError(
+            "corruption severity levels must be exactly 0 through 5"
+        )
+
+    try:
+        apply = corruption.apply
+    except Exception as error:
+        raise ValueError(
+            "corruption must provide a callable apply method"
+        ) from error
+    if not callable(apply):
+        raise ValueError(
+            "corruption must provide a callable apply method"
+        )
+    return _CorruptionSnapshot(name, tuple(frozen_severities), apply)
+
+
 def _source_files(root: str | Path | None = None) -> list[Path]:
     source_root = (
         Path(__file__).resolve().parents[1]
@@ -162,7 +256,9 @@ def _checkpoint_digest(path: Path) -> str:
         return _sha256_stream(handle, 1024 * 1024)
 
 
-def _provenance(reference, evaluation, checkpoint, config, corruption):
+def _provenance(
+    reference, evaluation, checkpoint, config, corruption: Corruption
+):
     levels = [severity.level for severity in corruption.severities]
     if levels != list(range(6)):
         raise ValueError("the fixed evaluator needs corruption levels 0 through 5")
@@ -643,7 +739,7 @@ def _run_pipeline_stages(
     shard_size: int,
     config: ExperimentConfig,
     extractor_factory,
-    corruption: GaussianBlur,
+    corruption: Corruption,
     provenance: dict,
     report_parent: _DirectoryLease,
     artifacts: Path,
@@ -764,7 +860,7 @@ def _final_audit(
     output: Path,
     *,
     config: ExperimentConfig,
-    corruption: GaussianBlur,
+    corruption: Corruption,
     provenance: dict,
     artifacts: Path,
     reference_cache: Path,
@@ -879,20 +975,22 @@ def run_pipeline(
     shard_size: int,
     config: ExperimentConfig = FIXED_CONFIG,
     extractor_factory=RTDETRExtractor,
-    corruption=None,
+    corruption: Corruption | None = None,
 ) -> Path:
     batch_size = _positive_integer(batch_size, name="batch_size")
     shard_size = _positive_integer(shard_size, name="shard_size")
     runtime_device = _runtime_device(device)
     if not isinstance(config, ExperimentConfig):
         raise ValueError("config must be an ExperimentConfig")
+    if corruption is None:
+        corruption = GaussianBlur()
+    corruption = _snapshot_corruption(corruption)
 
     reference = load_manifest(reference_manifest)
     evaluation = load_manifest(evaluation_manifest)
     validate_disjoint(reference, evaluation)
     checkpoint = Path(checkpoint).resolve()
     output = _absolute_output_path(output_dir)
-    corruption = corruption or GaussianBlur()
     provenance = _provenance(
         reference, evaluation, checkpoint, config, corruption
     )

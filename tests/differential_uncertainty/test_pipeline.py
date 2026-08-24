@@ -12,6 +12,7 @@ import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -22,7 +23,11 @@ import differential_uncertainty.cli as cli
 from differential_uncertainty.artifacts import iter_records, source_digest
 from differential_uncertainty.cli import run_pipeline
 from differential_uncertainty.config import ExperimentConfig
-from differential_uncertainty.corruptions import Corruption, Severity
+from differential_uncertainty.corruptions import (
+    Corruption,
+    GaussianBlur,
+    Severity,
+)
 from differential_uncertainty.reporting import REPORT_FILES
 
 
@@ -126,6 +131,68 @@ class InvertCorruption(Corruption):
             if level == 0
             else ImageOps.invert(image.convert("RGB"))
         )
+
+
+class FalseyInvertCorruption(InvertCorruption):
+    def __init__(self):
+        self.apply_calls = []
+
+    def __bool__(self):
+        return False
+
+    def apply(self, image, level):
+        self.apply_calls.append(level)
+        return super().apply(image, level)
+
+
+class MutatingInvertCorruption(InvertCorruption):
+    name = "mutable-invert"
+
+    def __init__(self):
+        self.apply_calls = []
+
+    def apply(self, image, level):
+        self.apply_calls.append(level)
+        if len(self.apply_calls) == 1:
+            self.name = "mutated-name"
+            self.severities = tuple(
+                Severity(5 - value, float(value)) for value in range(6)
+            )
+
+            def mutated_apply(*_args):
+                raise AssertionError("mutated apply attribute was used")
+
+            self.apply = mutated_apply
+
+        return super().apply(image, level)
+
+
+def _copy_corruption_image(image, _level):
+    return image.copy()
+
+
+def _corruption_stub(**overrides):
+    values = {
+        "name": "test-corruption",
+        "severities": tuple(
+            Severity(level, float(level)) for level in range(6)
+        ),
+        "apply": _copy_corruption_image,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def _corruption_without(attribute):
+    corruption = _corruption_stub()
+    delattr(corruption, attribute)
+    return corruption
+
+
+def _severities_with(index, value):
+    severities = list(_corruption_stub().severities)
+    severities[index] = value
+    return tuple(severities)
 
 
 @pytest.fixture
@@ -234,6 +301,7 @@ def test_pipeline_accepts_a_corruption_plugin_without_changing_scoring(
     checkpoint = tmp_path / "checkpoint.pth"
     checkpoint.write_bytes(b"fake checkpoint content")
     output = tmp_path / "invert-run"
+    corruption = FalseyInvertCorruption()
 
     run_pipeline(
         reference,
@@ -245,8 +313,9 @@ def test_pipeline_accepts_a_corruption_plugin_without_changing_scoring(
         shard_size=2,
         config=small_config,
         extractor_factory=FakeExtractor,
-        corruption=InvertCorruption(),
+        corruption=corruption,
     )
+    assert corruption.apply_calls == list(range(6)) * 2
 
     provenance = json.loads(
         (output / "artifacts" / "provenance.json").read_text()
@@ -260,6 +329,245 @@ def test_pipeline_accepts_a_corruption_plugin_without_changing_scoring(
     ) as handle:
         rows = list(csv.DictReader(handle))
     assert {int(row["severity"]) for row in rows} == set(range(6))
+
+
+@pytest.mark.parametrize(
+    ("corruption", "message"),
+    [
+        pytest.param(
+            _corruption_without("name"), "name", id="missing-name"
+        ),
+        pytest.param(
+            _corruption_stub(name=None), "name", id="name-type"
+        ),
+        pytest.param(
+            _corruption_stub(name="   "), "name", id="empty-name"
+        ),
+        pytest.param(
+            _corruption_stub(name="x" * 129),
+            "name",
+            id="overlong-name",
+        ),
+        pytest.param(
+            _corruption_stub(name="blur\u200b"),
+            "name",
+            id="category-c-name",
+        ),
+        pytest.param(
+            _corruption_without("severities"),
+            "severities",
+            id="missing-severities",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=list(_corruption_stub().severities)
+            ),
+            "severities",
+            id="non-tuple-severities",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=_corruption_stub().severities[:5]
+            ),
+            "severities",
+            id="five-severities",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=(
+                    *_corruption_stub().severities,
+                    Severity(6, 6.0),
+                )
+            ),
+            "severities",
+            id="seven-severities",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=_severities_with(
+                    2, SimpleNamespace(level=2, parameter=2.0)
+                )
+            ),
+            "Severity",
+            id="non-severity-entry",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=_severities_with(
+                    0, Severity(True, 0.0)
+                )
+            ),
+            "levels",
+            id="bool-level",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=_severities_with(
+                    1, Severity(1.0, 1.0)
+                )
+            ),
+            "levels",
+            id="non-integer-level",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=tuple(
+                    reversed(_corruption_stub().severities)
+                )
+            ),
+            "levels",
+            id="unordered-levels",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=_severities_with(
+                    2, Severity(2, True)
+                )
+            ),
+            "parameters",
+            id="bool-parameter",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=_severities_with(
+                    2, Severity(2, "2")
+                )
+            ),
+            "parameters",
+            id="nonnumeric-parameter",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=_severities_with(
+                    2, Severity(2, float("nan"))
+                )
+            ),
+            "parameters",
+            id="nan-parameter",
+        ),
+        pytest.param(
+            _corruption_stub(
+                severities=_severities_with(
+                    2, Severity(2, float("inf"))
+                )
+            ),
+            "parameters",
+            id="infinite-parameter",
+        ),
+        pytest.param(
+            _corruption_without("apply"),
+            "apply",
+            id="missing-apply",
+        ),
+        pytest.param(
+            _corruption_stub(apply=None),
+            "apply",
+            id="noncallable-apply",
+        ),
+    ],
+)
+def test_invalid_corruption_contract_fails_before_output_or_extractor(
+    tmp_path, small_config, corruption, message
+):
+    inputs = _inputs(tmp_path)
+
+    with pytest.raises(ValueError, match=message):
+        run_pipeline(
+            *inputs,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=FakeExtractor,
+            corruption=corruption,
+        )
+
+    assert not inputs[-1].exists()
+    assert FakeExtractor.instances == 0
+
+
+def test_invalid_corruption_does_not_touch_a_preexisting_run(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    _run(inputs, small_config)
+    output = inputs[-1]
+    before_tree = _tree_state(output)
+    before_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    gaussian = GaussianBlur()
+    invalid = SimpleNamespace(
+        name=gaussian.name,
+        severities=gaussian.severities,
+        apply=None,
+    )
+    extractor_instances = FakeExtractor.instances
+
+    with pytest.raises(ValueError, match="apply"):
+        run_pipeline(
+            *inputs,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+            corruption=invalid,
+        )
+
+    after_metadata = {
+        str(path.relative_to(output)): _directory_metadata(path)
+        for path in (output, *sorted(output.rglob("*")))
+        if path.is_dir()
+    }
+    assert _tree_state(output) == before_tree
+    assert after_metadata == before_metadata
+    assert FakeExtractor.instances == extractor_instances
+
+
+def test_pipeline_snapshots_mutable_plugin_identity_and_apply_callable(
+    tmp_path, small_config
+):
+    reference = _manifest(
+        tmp_path, "reference.csv", (("r1", 10), ("r2", 30))
+    )
+    evaluation = _manifest(
+        tmp_path, "evaluation.csv", (("e1", 60), ("e2", 90))
+    )
+    checkpoint = tmp_path / "checkpoint.pth"
+    checkpoint.write_bytes(b"fake checkpoint content")
+    output = tmp_path / "mutable-run"
+    corruption = MutatingInvertCorruption()
+
+    run_pipeline(
+        reference,
+        evaluation,
+        checkpoint,
+        output,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=FakeExtractor,
+        corruption=corruption,
+    )
+
+    provenance = json.loads(
+        (output / "artifacts" / "provenance.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert corruption.apply_calls == list(range(6)) * 2
+    assert corruption.name == "mutated-name"
+    assert provenance["corruption"] == {
+        "name": "mutable-invert",
+        "severities": [
+            {"level": level, "parameter": float(level)}
+            for level in range(6)
+        ],
+    }
 
 
 def test_changed_checkpoint_is_refused_before_any_stage_is_reused(
