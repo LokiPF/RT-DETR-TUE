@@ -1,5 +1,9 @@
+import json
+
+import numpy as np
 import pytest
 
+import differential_uncertainty.evaluation as evaluation
 from differential_uncertainty.config import ExperimentConfig
 from differential_uncertainty.evaluation import (
     binary_auroc,
@@ -71,6 +75,14 @@ def test_series_summary_reports_every_severity_and_curve_check():
     }
 
 
+def test_series_normalizes_numpy_integer_orientation_for_json():
+    rows = _rows("score", {"a": [0, 1, 2, 3, 4, 5]})
+    summary = summarize_series(rows, "score", orientation=np.int64(1))
+
+    assert type(summary["orientation"]) is int
+    json.dumps(summary)
+
+
 @pytest.mark.parametrize("severity", [True, 1.0, "1"])
 def test_series_rows_require_integral_non_boolean_severities(severity):
     rows = _rows("score", {"a": [0, 1, 2, 3, 4, 5]})
@@ -99,6 +111,56 @@ def test_series_rejects_nonfinite_scores():
     rows = _rows("score", {"a": [0, 1, 2, float("nan"), 4, 5]})
     with pytest.raises(ValueError, match="finite score"):
         summarize_series(rows, "score", orientation=1)
+
+
+@pytest.mark.parametrize("image_id", [1, None, True, "", "  \t"])
+def test_series_requires_a_nonempty_string_image_id(image_id):
+    rows = _rows("score", {"a": [0, 1, 2, 3, 4, 5]})
+    rows[0]["image_id"] = image_id
+    with pytest.raises(ValueError, match="image_id must be a nonempty string"):
+        summarize_series(rows, "score", orientation=1)
+
+
+def test_integer_and_string_image_ids_cannot_merge_into_one_curve():
+    rows = _rows("score", {1: [0, 1, 2, 3, 4, 5]})
+    rows.extend(_rows("score", {"1": [1, 2, 3, 4, 5, 6]}))
+    with pytest.raises(ValueError, match="image_id must be a nonempty string"):
+        summarize_series(rows, "score", orientation=1)
+
+
+@pytest.mark.parametrize("missing", ["image_id", "severity", "score"])
+def test_series_reports_missing_required_row_keys(missing):
+    rows = _rows("score", {"a": [0, 1, 2, 3, 4, 5]})
+    del rows[0][missing]
+    with pytest.raises(ValueError, match=rf"missing required row key.*{missing}"):
+        summarize_series(rows, "score", orientation=1)
+
+
+@pytest.mark.parametrize("score", [True, "1.0", 1 + 0j, None])
+def test_series_rejects_boolean_numeric_string_and_nonreal_scores(score):
+    rows = _rows("score", {"a": [0, 1, 2, 3, 4, 5]})
+    rows[0]["score"] = score
+    with pytest.raises(ValueError, match="score must be a real number"):
+        summarize_series(rows, "score", orientation=1)
+
+
+def test_series_accepts_python_and_numpy_real_scalar_scores():
+    rows = _rows(
+        "score",
+        {
+            "a": [
+                0,
+                1.0,
+                np.int64(2),
+                np.float32(3),
+                np.int32(4),
+                np.float64(5),
+            ]
+        },
+    )
+    result = summarize_series(rows, "score", orientation=1)
+    assert result["image_count"] == 1
+    assert result["macro_auroc"] == 1.0
 
 
 def test_empty_series_is_an_explicit_error():
@@ -268,3 +330,67 @@ def test_evaluate_rows_keeps_two_relative_gaps_and_two_persistence_controls():
         "persistence_responsive",
         "persistence_reference",
     ]
+
+
+def test_bootstrap_bounds_rank_batches_and_matches_the_unchunked_oracle(
+    monkeypatch,
+):
+    rows = [
+        {
+            "image_id": f"image-{image_index}",
+            "severity": severity,
+            "candidate": float((3 * image_index + 2 * severity) % 11),
+            "control": float((5 * image_index - severity) % 13),
+        }
+        for image_index in range(7)
+        for severity in range(6)
+    ]
+    samples = 513
+    seed = 101
+    candidate_ids, candidate = evaluation._arrays(rows, "candidate")
+    control_ids, control = evaluation._arrays(rows, "control")
+    assert candidate_ids == control_ids
+    count = len(candidate_ids)
+    draws = np.random.default_rng(seed).integers(
+        0, count, size=(samples, count)
+    )
+
+    original = evaluation._bootstrap_macro
+    oracle_differences = original(candidate, draws, 1) - original(
+        control, draws, -1
+    )
+    identity = np.arange(count, dtype=int)[None, :]
+    oracle_point = float(
+        original(candidate, identity, 1)[0]
+        - original(control, identity, -1)[0]
+    )
+    oracle_low, oracle_high = np.percentile(
+        oracle_differences, [2.5, 97.5]
+    )
+
+    seen_draws = []
+
+    def recording_bootstrap(columns, batch, orientation):
+        seen_draws.append(batch.copy())
+        return original(columns, batch, orientation)
+
+    monkeypatch.setattr(evaluation, "_bootstrap_macro", recording_bootstrap)
+    result = paired_macro_bootstrap(
+        rows,
+        "candidate",
+        "control",
+        candidate_orientation=1,
+        control_orientation=-1,
+        samples=samples,
+        seed=seed,
+    )
+
+    assert max(batch.shape[0] for batch in seen_draws) < samples
+    assert len(seen_draws) % 2 == 0
+    for candidate_draws, control_draws in zip(
+        seen_draws[0::2], seen_draws[1::2]
+    ):
+        assert np.array_equal(candidate_draws, control_draws)
+    assert result["point_difference"] == oracle_point
+    assert result["ci_low"] == float(oracle_low)
+    assert result["ci_high"] == float(oracle_high)

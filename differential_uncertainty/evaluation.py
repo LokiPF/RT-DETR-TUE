@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from numbers import Integral
+from numbers import Integral, Real
 
 import numpy as np
 from scipy.stats import rankdata, spearmanr
@@ -9,6 +9,7 @@ from scipy.stats import rankdata, spearmanr
 from .config import ExperimentConfig, FIXED_CONFIG
 
 
+_BOOTSTRAP_ROW_CHUNK_SIZE = 256
 SEVERITIES = tuple(range(6))
 
 
@@ -72,8 +73,16 @@ def binary_auroc(clean_scores, corrupted_scores, *, orientation: int) -> float:
 
 def _curves(rows, field: str) -> dict[str, dict[int, float]]:
     curves: dict[str, dict[int, float]] = defaultdict(dict)
-    for row in rows:
-        image_id = str(row["image_id"])
+    required = ("image_id", "severity", field)
+    for row_index, row in enumerate(rows):
+        for key in required:
+            if key not in row:
+                raise ValueError(
+                    f"score row {row_index} is missing required row key {key!r}"
+                )
+        image_id = row["image_id"]
+        if not isinstance(image_id, str) or not image_id.strip():
+            raise ValueError("score row image_id must be a nonempty string")
         raw_severity = row["severity"]
         if isinstance(raw_severity, bool) or not isinstance(raw_severity, Integral):
             raise ValueError(
@@ -82,7 +91,15 @@ def _curves(rows, field: str) -> dict[str, dict[int, float]]:
         severity = int(raw_severity)
         if severity in curves[image_id]:
             raise ValueError(f"duplicate score row for {image_id} severity {severity}")
-        value = float(row[field])
+        raw_value = row[field]
+        if (
+            isinstance(raw_value, (bool, np.bool_))
+            or not isinstance(raw_value, Real)
+        ):
+            raise ValueError(
+                f"score row for {image_id} severity {severity} score must be a real number"
+            )
+        value = float(raw_value)
         if not np.isfinite(value):
             raise ValueError(
                 f"score row for {image_id} severity {severity} needs a finite score"
@@ -98,6 +115,7 @@ def summarize_series(rows, field: str, orientation: int) -> dict:
     curves = _curves(rows, field)
     if not curves:
         raise ValueError("series summary needs at least one complete image")
+    orientation = _require_orientation(orientation)
     ordered = sorted(curves)
     trends = [trend_metrics([curves[i][s] for s in SEVERITIES]) for i in ordered]
     oriented = [
@@ -207,9 +225,13 @@ def paired_macro_bootstrap(
         raise ValueError("bootstrap needs images and a positive sample count")
     generator = np.random.default_rng(seed)
     draws = generator.integers(0, count, size=(samples, count))
-    differences = _bootstrap_macro(
-        candidate, draws, candidate_orientation
-    ) - _bootstrap_macro(control, draws, control_orientation)
+    differences = np.empty(samples, dtype=float)
+    for start in range(0, samples, _BOOTSTRAP_ROW_CHUNK_SIZE):
+        stop = min(start + _BOOTSTRAP_ROW_CHUNK_SIZE, samples)
+        batch = draws[start:stop]
+        differences[start:stop] = _bootstrap_macro(
+            candidate, batch, candidate_orientation
+        ) - _bootstrap_macro(control, batch, control_orientation)
     identity = np.arange(count, dtype=int)[None, :]
     point = float(
         _bootstrap_macro(candidate, identity, candidate_orientation)[0]
