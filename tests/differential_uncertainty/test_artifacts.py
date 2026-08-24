@@ -873,7 +873,9 @@ try:
         artifacts.ensure_provenance(root, {"schema_version": 1})
     else:
         artifacts.load_manifest(root)
-except ValueError:
+except ValueError as error:
+    if operation == "manifest_swap":
+        assert str(error) == "artifact manifest must be a regular file"
     raise SystemExit(0)
 raise SystemExit(3)
 """
@@ -5001,3 +5003,143 @@ def test_live_reader_weakref_callback_tolerates_module_teardown(
     monkeypatch.setattr(artifacts, "_WRITER_REGISTRY_LOCK", None)
     callback(reference)
     handle.close()
+
+
+@pytest.mark.parametrize("exception_type", [KeyboardInterrupt, SystemExit])
+def test_regular_reader_trace_interrupt_preserves_baseexception(
+    tmp_path, exception_type
+):
+    target = tmp_path / "value.bin"
+    target.write_bytes(b"value")
+    decoy_fd = os.open(target, os.O_RDONLY)
+    before = artifacts._live_fd_snapshot()
+    converter = artifacts._RegularFileOpenFlags.from_param
+    traceable_converter = getattr(converter, "__func__", converter)
+    converter_code = getattr(traceable_converter, "__code__", None)
+    helper = artifacts._open_regular_file_object
+    helper_instructions = {
+        instruction.offset: instruction
+        for instruction in dis.get_instructions(helper)
+    }
+    interrupted = False
+
+    def interrupt(frame, event, _argument):
+        nonlocal interrupted
+        frame.f_trace_opcodes = True
+        instruction = helper_instructions.get(frame.f_lasti)
+        in_python_converter = (
+            converter_code is not None and frame.f_code is converter_code
+        )
+        after_atomic_open = (
+            converter_code is None
+            and frame.f_code is helper.__code__
+            and instruction is not None
+            and instruction.opname == "RETURN_VALUE"
+        )
+        if (
+            not interrupted
+            and (
+                (in_python_converter and event in ("line", "opcode"))
+                or (after_atomic_open and event in ("opcode", "return"))
+            )
+        ):
+            interrupted = True
+            raise exception_type("injected reader cancellation")
+        return interrupt
+
+    observed = None
+    try:
+        sys.settrace(interrupt)
+        with artifacts._open_regular_file(
+            target, error_message="invalid test file"
+        ) as handle:
+            handle.read()
+    except BaseException as error:
+        observed = error
+    finally:
+        sys.settrace(None)
+
+    try:
+        assert interrupted
+        assert type(observed) is exception_type
+        assert str(observed) == "injected reader cancellation"
+        observed.__traceback__ = None
+        gc.collect()
+        assert artifacts._live_fd_snapshot() == before
+        os.fstat(decoy_fd)
+        with artifacts._open_regular_file(
+            target, error_message="invalid test file"
+        ) as handle:
+            assert handle.read() == b"value"
+    finally:
+        os.close(decoy_fd)
+
+
+@pytest.mark.parametrize("exception_name", ["KeyboardInterrupt", "SystemExit"])
+def test_regular_reader_signal_interrupt_preserves_baseexception(
+    tmp_path, exception_name
+):
+    target = tmp_path / "value.bin"
+    target.write_bytes(b"value")
+    script = f"""
+import os
+import signal
+import sys
+
+import differential_uncertainty.artifacts as artifacts
+
+target = sys.argv[1]
+exception_type = {exception_name}
+decoy_fd = os.open(target, os.O_RDONLY)
+before = artifacts._live_fd_snapshot()
+interruptions = 0
+unexpected = None
+
+def interrupt(_signum, _frame):
+    raise exception_type("injected reader signal")
+
+signal.signal(signal.SIGALRM, interrupt)
+for _ in range(4000):
+    handle = None
+    try:
+        try:
+            signal.setitimer(signal.ITIMER_REAL, 0.000005)
+            with artifacts._serialized_regular_file_acquisition():
+                handle = artifacts._open_regular_file_object(target)
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+    except (KeyboardInterrupt, SystemExit) as error:
+        if (
+            type(error) is not exception_type
+            or str(error) != "injected reader signal"
+        ):
+            unexpected = error
+            break
+        interruptions += 1
+    except BaseException as error:
+        unexpected = error
+        break
+    finally:
+        if handle is not None:
+            handle.close()
+
+assert interruptions
+assert unexpected is None, repr(unexpected)
+assert artifacts._live_fd_snapshot() == before
+os.fstat(decoy_fd)
+with artifacts._open_regular_file(
+    target, error_message="invalid test file"
+) as handle:
+    assert handle.read() == b"value"
+os.close(decoy_fd)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, os.fspath(target)],
+        cwd=Path.cwd(),
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr

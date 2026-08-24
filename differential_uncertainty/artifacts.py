@@ -3,9 +3,11 @@ from __future__ import annotations
 import ctypes
 import errno
 import fcntl
+import functools
 import hashlib
 import io
 import json
+import operator
 import os
 import secrets
 import stat
@@ -281,17 +283,17 @@ def _register_live_reader(handle, lease: "_RegularFileLease") -> None:
     _LIVE_READER_LEASES[reference] = weakref.ref(lease)
 
 
-class _RegularFileOpenFlags:
-    """Add the safety flags before the C opener creates any resource."""
+_REQUIRED_REGULAR_FILE_FLAGS = (
+    os.O_NONBLOCK | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+)
 
-    @classmethod
-    def from_param(cls, value: int):
-        return ctypes.c_int(
-            value
-            | os.O_NONBLOCK
-            | os.O_NOFOLLOW
-            | getattr(os, "O_CLOEXEC", 0)
-        )
+
+class _RegularFileOpenFlags:
+    """Add safety flags in C before the opener creates any resource."""
+
+    from_param = functools.partial(
+        operator.or_, _REQUIRED_REGULAR_FILE_FLAGS
+    )
 
 
 _LIBC = ctypes.CDLL(None, use_errno=True)
@@ -304,8 +306,9 @@ def _open_regular_file_object(path: Path):
     """Open without exposing the descriptor to a Python ownership boundary.
 
     FileIO audits the path before calling its opener, then adopts the C
-    opener's result inside the same C call.  The Python flag converter runs
-    before libc creates the descriptor, so interruption cannot strand it.
+    opener's result inside the same C call.  Its C-implemented flag converter
+    runs before libc creates the descriptor, so interruption cannot strand it
+    or translate a cancellation exception.
     """
     return io.FileIO(
         os.fsencode(path),
@@ -350,7 +353,10 @@ class _RegularFileLease:
     ) -> None:
         handle = None
         try:
-            handle = _open_regular_file_object(visible)
+            try:
+                handle = _open_regular_file_object(visible)
+            except ValueError as error:
+                raise ValueError(error_message) from error
             self.handle = handle
             if not self._valid_process():
                 raise RuntimeError("artifact file acquisition crossed a fork")
