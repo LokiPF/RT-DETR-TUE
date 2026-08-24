@@ -80,6 +80,25 @@ def test_report_writes_the_exact_dedicated_bundle(tmp_path):
         assert phrase in text
 
 
+def test_report_writes_through_an_active_pinned_parent_lease(tmp_path):
+    rows, evaluation, provenance = _inputs()
+
+    with reporting._DirectoryLease(
+        tmp_path,
+        message="pinned report parent changed",
+    ) as parent:
+        write_report(
+            "report",
+            rows,
+            evaluation,
+            provenance,
+            parent=parent,
+        )
+        os.fstat(parent.fd)
+
+    assert (tmp_path / "report" / "report.md").is_file()
+
+
 def test_csv_and_json_numbers_reconcile_with_the_supplied_results(tmp_path):
     rows, evaluation, provenance = _inputs()
     output = tmp_path / "report"

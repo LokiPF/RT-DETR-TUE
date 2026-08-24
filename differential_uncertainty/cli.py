@@ -7,7 +7,9 @@ import io
 import math
 import os
 import re
+import stat
 import sys
+import unicodedata
 from contextlib import contextmanager
 from numbers import Integral
 from pathlib import Path
@@ -38,7 +40,7 @@ from .extraction import (
     validate_extraction_cache,
 )
 from .manifests import load_manifest, manifest_digest, validate_disjoint
-from .reporting import write_report
+from .reporting import _DirectoryLease, write_report
 from .scoring import score_image_records
 
 
@@ -191,17 +193,56 @@ def _entry_present(path: Path) -> bool:
     return True
 
 
-@contextmanager
-def _coordinated_run(provenance_path: Path):
-    with _open_regular_file(
-        provenance_path,
-        error_message="run provenance must be a regular file",
-    ) as handle:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+def _absolute_output_path(value: str | Path) -> Path:
+    output = Path(os.path.abspath(os.fspath(value)))
+    if output == output.parent:
+        raise ValueError("output directory must not be the filesystem root")
+    try:
+        output.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ValueError("output parent directory must be a directory") from error
+    return output
+
+
+def _ensure_output_entry(parent_fd: int, name: str) -> None:
+    try:
+        state = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
         try:
-            yield
-        finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            os.mkdir(name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+            state = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as error:
+            raise ValueError("output directory must be a directory") from error
+    except OSError as error:
+        raise ValueError("output directory must be a directory") from error
+    if not stat.S_ISDIR(state.st_mode):
+        raise ValueError("output directory must be a directory")
+
+
+@contextmanager
+def _coordinated_output(output: Path):
+    parent_message = "output parent directory must be a stable directory"
+    output_message = "output directory must be a stable directory"
+    with _DirectoryLease(output.parent, message=parent_message) as parent:
+        fcntl.flock(parent.fd, fcntl.LOCK_EX)
+        parent.verify_path()
+        _ensure_output_entry(parent.fd, output.name)
+        anchored_output = Path(f"/proc/self/fd/{parent.fd}") / output.name
+        with _DirectoryLease(
+            anchored_output,
+            message=output_message,
+        ) as run:
+            fcntl.flock(run.fd, fcntl.LOCK_EX)
+            parent.verify_path()
+            run.verify_entry(parent.fd, output.name)
+            try:
+                yield Path(f"/proc/self/fd/{run.fd}"), run
+            except BaseException:
+                raise
+            else:
+                parent.verify_path()
+                run.verify_entry(parent.fd, output.name)
 
 
 def _iter_evaluation_groups(records, expected_image_ids):
@@ -307,7 +348,10 @@ def _load_score_csv(path: str | Path, expected_image_ids) -> list[dict]:
         if (
             not image_id
             or len(image_id) > 256
-            or not image_id.isprintable()
+            or any(
+                unicodedata.category(character).startswith("C")
+                for character in image_id
+            )
             or image_id.lstrip().startswith(("=", "+", "-", "@"))
         ):
             raise ValueError(f"score row {number} has an unsafe image_id")
@@ -378,6 +422,7 @@ def _run_pipeline_stages(
     extractor_factory,
     corruption: GaussianBlur,
     provenance: dict,
+    report_parent: _DirectoryLease,
 ) -> Path:
     artifacts = output / "artifacts"
     reference_cache = artifacts / "reference-extractions"
@@ -458,7 +503,13 @@ def _run_pipeline_stages(
         _atomic_score_csv(score_rows, score_path)
     rows = _load_score_csv(score_path, expected_ids)
     evaluation_summary = evaluate_rows(rows, config)
-    write_report(output / "report", rows, evaluation_summary, provenance)
+    write_report(
+        "report",
+        rows,
+        evaluation_summary,
+        provenance,
+        parent=report_parent,
+    )
     return output
 
 
@@ -484,19 +535,18 @@ def run_pipeline(
     evaluation = load_manifest(evaluation_manifest)
     validate_disjoint(reference, evaluation)
     checkpoint = Path(checkpoint).resolve()
-    output = Path(output_dir).resolve()
+    output = _absolute_output_path(output_dir)
     corruption = GaussianBlur()
     provenance = _provenance(
         reference, evaluation, checkpoint, config, corruption
     )
-    provenance_path = ensure_provenance(output, provenance)
-    with _coordinated_run(provenance_path):
-        ensure_provenance(output, provenance)
-        return _run_pipeline_stages(
+    with _coordinated_output(output) as (anchored_output, report_parent):
+        ensure_provenance(anchored_output, provenance)
+        _run_pipeline_stages(
             reference,
             evaluation,
             checkpoint,
-            output,
+            anchored_output,
             runtime_device=runtime_device,
             batch_size=batch_size,
             shard_size=shard_size,
@@ -504,7 +554,10 @@ def run_pipeline(
             extractor_factory=extractor_factory,
             corruption=corruption,
             provenance=provenance,
+            report_parent=report_parent,
         )
+        ensure_provenance(anchored_output, provenance)
+    return output
 
 
 def _positive(value: str) -> int:

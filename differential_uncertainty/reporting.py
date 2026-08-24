@@ -11,6 +11,7 @@ import tempfile
 import threading
 import unicodedata
 from collections.abc import Mapping
+from contextlib import nullcontext
 from numbers import Integral, Real
 from pathlib import Path
 
@@ -1287,12 +1288,7 @@ def _write_bundle(
         raise RuntimeError("report bundle is incomplete")
 
 
-def write_report(output, rows, evaluation, provenance) -> None:
-    """Atomically publish a report on Linux with procfs and renameat2.
-
-    Directory identity pinning requires ``/proc/self/fd`` and publication
-    requires the Linux ``renameat2(RENAME_NOREPLACE)`` contract.
-    """
+def _validated_report_inputs(rows, evaluation, provenance):
     normalized_provenance = _validate_provenance(provenance)
     frame = _validated_frame(
         rows,
@@ -1301,15 +1297,39 @@ def write_report(output, rows, evaluation, provenance) -> None:
     canonical_evaluation = _validate_evaluation(
         evaluation, frame, normalized_provenance
     )
+    return normalized_provenance, frame, canonical_evaluation
 
-    output = Path(output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with _DirectoryLease(
-        output.parent,
-        message="report parent directory changed",
-    ) as parent:
+
+def write_report(output, rows, evaluation, provenance, *, parent=None) -> None:
+    """Atomically publish a report on Linux with procfs and renameat2.
+
+    Directory identity pinning requires ``/proc/self/fd`` and publication
+    requires the Linux ``renameat2(RENAME_NOREPLACE)`` contract.
+    """
+    normalized_provenance, frame, canonical_evaluation = (
+        _validated_report_inputs(rows, evaluation, provenance)
+    )
+    if parent is None:
+        output = Path(output)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output_name = output.name
+        parent_context = _DirectoryLease(
+            output.parent,
+            message="report parent directory changed",
+        )
+    else:
+        output_name = os.fspath(output)
+        if (
+            not isinstance(parent, _DirectoryLease)
+            or parent.fd is None
+            or not output_name
+            or Path(output_name).name != output_name
+        ):
+            raise ValueError("report parent directory lease is not active")
+        parent_context = nullcontext(parent)
+    with parent_context as parent:
         with _StagingOwner(
-            parent, prefix=f".{output.name}.staging-"
+            parent, prefix=f".{output_name}.staging-"
         ) as staging:
             staging.detach_temporary_finalizer()
             _write_bundle(
@@ -1321,11 +1341,11 @@ def write_report(output, rows, evaluation, provenance) -> None:
             parent.verify_path()
             staging.verify()
             anchored_output = (
-                Path(f"/proc/self/fd/{parent.fd}") / output.name
+                Path(f"/proc/self/fd/{parent.fd}") / output_name
             )
             try:
                 os.stat(
-                    output.name,
+                    output_name,
                     dir_fd=parent.fd,
                     follow_symlinks=False,
                 )
@@ -1341,9 +1361,9 @@ def write_report(output, rows, evaluation, provenance) -> None:
                     "existing report bundle differs; choose a new output "
                     "directory"
                 )
-            staging.prepare_publish(output.name)
+            staging.prepare_publish(output_name)
             try:
-                _publish_no_replace(staging.name, output.name, parent.fd)
+                _publish_no_replace(staging.name, output_name, parent.fd)
             except FileExistsError:
                 if _same_bundle(anchored_output, staging.path):
                     parent.verify_path()
@@ -1352,5 +1372,5 @@ def write_report(output, rows, evaluation, provenance) -> None:
                     "existing report bundle differs; choose a new output "
                     "directory"
                 ) from None
-            staging.mark_published(output.name)
+            staging.mark_published(output_name)
             parent.verify_path()

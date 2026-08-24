@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -42,7 +43,10 @@ def load_manifest(value: str | Path) -> tuple[ManifestEntry, ...]:
             raise ValueError(
                 f"manifest row {number} image_id must contain at most 256 characters"
             )
-        if not image_id.isprintable():
+        if any(
+            unicodedata.category(character).startswith("C")
+            for character in image_id
+        ):
             raise ValueError(
                 f"manifest row {number} image_id must not contain control characters"
             )

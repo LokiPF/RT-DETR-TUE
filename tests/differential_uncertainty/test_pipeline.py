@@ -5,6 +5,7 @@ import gc
 import hashlib
 import json
 import multiprocessing
+import os
 import shutil
 import threading
 import weakref
@@ -276,7 +277,10 @@ def test_incomplete_score_roster_is_refused_instead_of_reused(
         _run(inputs, small_config, extractor_factory=RejectingExtractor)
 
 
-@pytest.mark.parametrize("unsafe_id", ("line\nbreak", "nul\x00byte", "x" * 257))
+@pytest.mark.parametrize(
+    "unsafe_id",
+    ("line\nbreak", "nul\x00byte", "zero\u200bwidth", "x" * 257),
+)
 def test_score_artifact_reader_rejects_control_or_overlong_ids(
     tmp_path, unsafe_id
 ):
@@ -562,6 +566,7 @@ def test_identical_fresh_thread_runs_coordinate_and_publish_exactly_once(
     first = _tree_hashes(inputs[-1])
     _run(inputs, small_config, extractor_factory=RejectingExtractor)
     assert _tree_hashes(inputs[-1]) == first
+    _assert_no_lock_artifact(inputs[-1])
 
 
 def test_identical_fresh_process_runs_coordinate_and_publish_exactly_once(
@@ -593,6 +598,7 @@ def test_identical_fresh_process_runs_coordinate_and_publish_exactly_once(
     first = _tree_hashes(inputs[-1])
     _run(inputs, small_config, extractor_factory=RejectingExtractor)
     assert _tree_hashes(inputs[-1]) == first
+    _assert_no_lock_artifact(inputs[-1])
 
 
 def test_detector_source_closure_matches_every_currently_executed_project_file():
@@ -741,11 +747,11 @@ def test_control_and_overlong_ids_fail_before_output_or_detector(
     assert not output.exists()
 
 
-def test_max_length_printable_unicode_ids_round_trip_end_to_end(
+def test_max_length_safe_unicode_ids_round_trip_end_to_end(
     tmp_path, small_config
 ):
     reference_ids = ("R" * 256, "ref-safe")
-    evaluation_id = "雪" * 256
+    evaluation_id = "雪" * 127 + "\N{NO-BREAK SPACE}" + "雪" * 128
     reference = _manifest(
         tmp_path,
         "reference.csv",
@@ -798,3 +804,233 @@ def test_max_length_printable_unicode_ids_round_trip_end_to_end(
     assert evaluation_id in (
         output / "report" / "report.md"
     ).read_text(encoding="utf-8")
+
+
+def _future_outcome(future):
+    try:
+        return future.result(timeout=30)
+    except BaseException as error:
+        return error
+
+
+def _assert_no_lock_artifact(output: Path) -> None:
+    assert all("lock" not in path.name.casefold() for path in output.rglob("*"))
+
+
+def test_replaced_identical_provenance_cannot_bypass_run_coordination(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    original = cli._run_pipeline_stages
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+    state_lock = threading.Lock()
+    state = {"calls": 0, "active": 0, "maximum": 0}
+
+    def observed(*args, **kwargs):
+        with state_lock:
+            state["calls"] += 1
+            call = state["calls"]
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        try:
+            if call == 1:
+                first_entered.set()
+                assert release_first.wait(timeout=10)
+            else:
+                second_entered.set()
+            return original(*args, **kwargs)
+        finally:
+            with state_lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr(cli, "_run_pipeline_stages", observed)
+    executor = ThreadPoolExecutor(max_workers=2)
+    try:
+        first = executor.submit(_run, inputs, small_config)
+        assert first_entered.wait(timeout=10)
+        provenance = inputs[-1] / "artifacts" / "provenance.json"
+        payload = provenance.read_bytes()
+        os.replace(provenance, tmp_path / "original-provenance.json")
+        provenance.write_bytes(payload)
+        second = executor.submit(_run, inputs, small_config)
+        entered_concurrently = second_entered.wait(timeout=0.5)
+        release_first.set()
+        outcomes = (_future_outcome(first), _future_outcome(second))
+    finally:
+        release_first.set()
+        executor.shutdown(wait=True)
+
+    assert not entered_concurrently
+    assert outcomes == (inputs[-1].absolute(), inputs[-1].absolute())
+    assert state == {"calls": 2, "active": 0, "maximum": 1}
+    _assert_no_lock_artifact(inputs[-1])
+
+
+def test_replaced_run_directory_never_redirects_or_overlaps_stage_writes(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    original = cli._run_pipeline_stages
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+    state_lock = threading.Lock()
+    state = {"calls": 0, "active": 0, "maximum": 0}
+    identities = {}
+
+    def observed(*args, **kwargs):
+        output = args[3]
+        with state_lock:
+            state["calls"] += 1
+            call = state["calls"]
+            state["active"] += 1
+            state["maximum"] = max(state["maximum"], state["active"])
+        before = os.stat(output, follow_symlinks=False)
+        try:
+            if call == 1:
+                first_entered.set()
+                assert release_first.wait(timeout=10)
+            else:
+                second_entered.set()
+            return original(*args, **kwargs)
+        finally:
+            after = os.stat(output, follow_symlinks=False)
+            identities[call] = (
+                (before.st_dev, before.st_ino),
+                (after.st_dev, after.st_ino),
+            )
+            with state_lock:
+                state["active"] -= 1
+
+    monkeypatch.setattr(cli, "_run_pipeline_stages", observed)
+    executor = ThreadPoolExecutor(max_workers=2)
+    displaced = tmp_path / "displaced-run"
+    try:
+        first = executor.submit(_run, inputs, small_config)
+        assert first_entered.wait(timeout=10)
+        provenance = inputs[-1] / "artifacts" / "provenance.json"
+        payload = provenance.read_bytes()
+        os.replace(inputs[-1], displaced)
+        (inputs[-1] / "artifacts").mkdir(parents=True)
+        (inputs[-1] / "artifacts" / "provenance.json").write_bytes(payload)
+        second = executor.submit(_run, inputs, small_config)
+        entered_concurrently = second_entered.wait(timeout=0.5)
+        release_first.set()
+        outcomes = (_future_outcome(first), _future_outcome(second))
+    finally:
+        release_first.set()
+        executor.shutdown(wait=True)
+
+    assert not entered_concurrently
+    assert state == {"calls": 2, "active": 0, "maximum": 1}
+    assert identities[1][0] == identities[1][1]
+    assert isinstance(outcomes[0], ValueError)
+    assert "output directory" in str(outcomes[0])
+    assert outcomes[1] == inputs[-1].absolute()
+    assert all(
+        "superseded" not in str(outcome)
+        and "active writer" not in str(outcome)
+        for outcome in outcomes
+    )
+    _assert_no_lock_artifact(inputs[-1])
+    _assert_no_lock_artifact(displaced)
+
+
+@pytest.mark.parametrize(
+    "raised",
+    (RuntimeError("stage failed"), KeyboardInterrupt("stage interrupted")),
+)
+def test_stage_failure_releases_run_locks_and_directory_descriptors(
+    tmp_path, small_config, monkeypatch, raised
+):
+    inputs = _inputs(tmp_path)
+    original = cli._run_pipeline_stages
+    before = {
+        int(name)
+        for name in os.listdir("/proc/self/fd")
+        if name.isdigit()
+        and Path(f"/proc/self/fd/{name}").exists()
+    }
+
+    def fail(*_args, **_kwargs):
+        raise raised
+
+    monkeypatch.setattr(cli, "_run_pipeline_stages", fail)
+    with pytest.raises(type(raised), match=str(raised)):
+        _run(inputs, small_config)
+    monkeypatch.setattr(cli, "_run_pipeline_stages", original)
+    after = {
+        int(name)
+        for name in os.listdir("/proc/self/fd")
+        if name.isdigit()
+        and Path(f"/proc/self/fd/{name}").exists()
+    }
+
+    assert after == before
+    assert _run(inputs, small_config) == inputs[-1].absolute()
+    _assert_no_lock_artifact(inputs[-1])
+
+
+def test_static_symlink_output_is_rejected_before_stage_work(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    target = tmp_path / "target"
+    target.mkdir()
+    inputs[-1].symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="output directory"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    assert not any(target.iterdir())
+
+
+def test_static_symlink_output_parent_is_rejected_before_stage_work(
+    tmp_path, small_config
+):
+    inputs = _inputs(tmp_path)
+    real_parent = tmp_path / "real-parent"
+    real_parent.mkdir()
+    linked_parent = tmp_path / "linked-parent"
+    linked_parent.symlink_to(real_parent, target_is_directory=True)
+    inputs = (*inputs[:-1], linked_parent / "run")
+
+    with pytest.raises(ValueError, match="output parent directory"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+    assert not any(real_parent.iterdir())
+
+
+@pytest.mark.parametrize("unsafe_kind", ("file", "fifo"))
+def test_static_nondirectory_output_is_rejected_before_stage_work(
+    tmp_path, small_config, unsafe_kind
+):
+    inputs = _inputs(tmp_path)
+    if unsafe_kind == "file":
+        inputs[-1].write_bytes(b"not a directory")
+    else:
+        os.mkfifo(inputs[-1])
+
+    with pytest.raises(ValueError, match="output directory"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)
+
+
+@pytest.mark.parametrize("unsafe_kind", ("symlink", "fifo"))
+def test_static_unsafe_provenance_is_rejected_before_stage_work(
+    tmp_path, small_config, unsafe_kind
+):
+    inputs = _inputs(tmp_path)
+    artifacts = inputs[-1] / "artifacts"
+    artifacts.mkdir(parents=True)
+    provenance = artifacts / "provenance.json"
+    if unsafe_kind == "symlink":
+        target = tmp_path / "outside-provenance.json"
+        target.write_text("{}", encoding="utf-8")
+        provenance.symlink_to(target)
+    else:
+        os.mkfifo(provenance)
+
+    with pytest.raises(ValueError, match="provenance.*regular file"):
+        _run(inputs, small_config, extractor_factory=RejectingExtractor)

@@ -190,6 +190,7 @@ def test_manifest_digest_hashes_a_canonical_id_and_resolved_path_payload(tmp_pat
     (
         ("line\nbreak", "control characters"),
         ("nul\x00byte", "control characters"),
+        ("zero\u200bwidth", "control characters"),
         ("x" * 257, "at most 256"),
     ),
 )
@@ -207,8 +208,8 @@ def test_manifest_rejects_control_and_overlong_image_ids(
         load_manifest(manifest)
 
 
-def test_manifest_accepts_a_printable_256_character_unicode_image_id(tmp_path):
-    image_id = "雪" * 256
+def test_manifest_accepts_a_safe_256_character_unicode_image_id(tmp_path):
+    image_id = "雪" * 127 + "\N{NO-BREAK SPACE}" + "雪" * 128
     _image(tmp_path / "x.png")
     manifest = tmp_path / "safe.csv"
     with manifest.open("w", newline="", encoding="utf-8") as handle:
