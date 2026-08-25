@@ -1,5 +1,66 @@
 # Differential corruption uncertainty
 
+## Repository map
+
+This tree shows the active workflow and what each part is responsible for. Historical result
+reports and planning documents are grouped so the runtime path stays easy to see.
+
+```text
+.
+|-- differential_uncertainty/          # End-to-end experiment package
+|   |-- __main__.py                     # `python -m differential_uncertainty` entry point
+|   |-- cli.py                          # Validates inputs and coordinates run/resume/audits
+|   |-- config.py                       # Fixed scientific settings and blur severity ladder
+|   |-- manifests.py                    # Reads, fingerprints, and separates image manifests
+|   |-- extraction.py                   # Runs pretrained RT-DETR and creates query records
+|   |-- persistence.py                  # Computes layer-2 topological persistence features
+|   |-- bank.py                         # Builds the clean natural-query comparison bank
+|   |-- scoring.py                      # Forms confidence groups and relative-gap scores
+|   |-- evaluation.py                   # Computes AUROC, Spearman, curve, and bootstrap metrics
+|   |-- artifacts.py                    # Validates and atomically stores resumable artifacts
+|   |-- reporting.py                    # Writes CSV, JSON, Markdown, and figure outputs
+|   |-- corruptions/
+|   |   |-- base.py                     # Small corruption interface and Severity record
+|   |   `-- gaussian_blur.py            # Current six-level Gaussian blur implementation
+|   `-- __init__.py                     # Package version marker
+|-- src/                                # Minimal upstream detector closure kept for inference
+|   |-- nn/backbone/
+|   |   |-- common.py                   # Frozen batch-normalization layer
+|   |   `-- presnet.py                  # RT-DETR ResNet backbone
+|   `-- zoo/rtdetr/
+|       |-- box_ops.py                  # Bounding-box conversion helpers
+|       |-- denoising.py                # Dormant decoder compatibility helper
+|       |-- hybrid_encoder.py           # Multi-scale feature encoder
+|       |-- rtdetr.py                   # RT-DETR model assembly
+|       |-- rtdetrv2_decoder.py         # RT-DETRv2 transformer decoder
+|       `-- utils.py                    # Detector tensor and initialization utilities
+|-- tests/differential_uncertainty/     # Tests for the retained workflow
+|   |-- fixtures/                       # Small frozen detector-parity reference
+|   |-- test_artifacts.py               # Atomic storage, cache, and filesystem safety
+|   |-- test_bank.py                    # Clean-bank construction
+|   |-- test_cli.py                     # Public command-line surface
+|   |-- test_config.py                  # Fixed scientific configuration
+|   |-- test_corruptions.py             # Corruption interface and Gaussian blur
+|   |-- test_detector_parity.py         # Retained detector versus frozen reference
+|   |-- test_evaluation.py              # AUROC, Spearman, curve, and bootstrap calculations
+|   |-- test_extraction.py              # Image loading, detector inference, and clean level 0
+|   |-- test_legacy_parity.py           # New evaluator versus archived blur results
+|   |-- test_manifests.py               # Manifest validation and image fingerprints
+|   |-- test_persistence.py             # Layer-2 persistence calculation
+|   |-- test_pipeline.py                # End-to-end execution, resume, and final audits
+|   |-- test_reporting.py               # Report values, figures, and safe publication
+|   |-- test_repository_surface.py      # Enforces the intentionally small repository
+|   `-- test_scoring.py                 # Deciles, nearest neighbours, and relative gaps
+|-- docs/
+|   |-- clean-branch-verification.md    # Reproducible verification record for this codebase
+|   |-- scene-uncertainty-*.md          # Historical plain-language experiment reports
+|   `-- superpowers/                    # Approved design notes and implementation plans
+|-- pretrained_weights/                 # Legacy statistics; not used by this clean workflow
+|-- requirements.txt                    # Python dependencies
+|-- RT-DETR_Topological_Uncertainty_TODO.md # Historical project notes
+`-- README.md                            # Setup, usage, outputs, and interpretation
+```
+
 This repository runs one pretrained RT-DETRv2-R18 experiment. It asks a simple
 question: when an image is damaged more strongly, does the detector's uncertainty
 score usually rise? The workflow performs inference only. It does not train a model
