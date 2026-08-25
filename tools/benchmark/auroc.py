@@ -20,10 +20,10 @@ import shutil
 
 import torch
 import torchvision.transforms as T
-import yaml
 from PIL import Image
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
+from ruamel.yaml import YAML
 from sklearn.metrics import roc_auc_score
 from torchvision.ops import box_convert
 from tqdm import tqdm
@@ -52,15 +52,23 @@ COCO_STATS = [
     "AR_l",
 ]
 
+yaml_ = YAML()
+
 with open(CONFIG_FILE, "r") as f:
-    config = yaml.safe_load(f)
+    config = yaml_.load(f)
 
 datasets = config["datasets"]
 model_config = config["config"]
 ckpt = config["checkpoint"]
 output_dir = pathlib.Path(CONFIG_FILE).parent.resolve()
 config_filename = pathlib.Path(model_config).name
-shutil.copy2(model_config, os.path.join(output_dir, config_filename))
+output_config_dir = os.path.join(output_dir, "configs")
+shutil.copytree("./configs", output_config_dir, dirs_exist_ok=True)
+
+config["config"] = os.path.join(output_dir, model_config)
+with open(CONFIG_FILE, "w") as f:
+    yaml_.preserve_quotes = True
+    yaml_.dump(config, f)
 
 
 def load_model():
