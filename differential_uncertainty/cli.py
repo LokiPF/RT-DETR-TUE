@@ -72,6 +72,8 @@ _SCORE_COLUMNS = (
     "confidence_reference",
     "confidence_responsive",
     "confidence_relative_gap",
+    "direct_confidence_mean",
+    "direct_confidence_max",
 )
 _COUNT_COLUMNS = (
     "severity",

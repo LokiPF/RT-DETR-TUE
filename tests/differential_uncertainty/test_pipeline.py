@@ -352,6 +352,13 @@ def test_pipeline_accepts_a_corruption_plugin_without_changing_scoring(
     ) as handle:
         rows = list(csv.DictReader(handle))
     assert {int(row["severity"]) for row in rows} == set(range(6))
+    assert list(rows[0])[-2:] == [
+        "direct_confidence_mean", "direct_confidence_max"
+    ]
+    assert all(
+        0.0 <= float(row["direct_confidence_mean"]) <= float(row["direct_confidence_max"]) <= 1.0
+        for row in rows
+    )
 
 
 @pytest.mark.parametrize(

@@ -55,6 +55,8 @@ _SCORE_COLUMNS = (
     "confidence_reference",
     "confidence_responsive",
     "confidence_relative_gap",
+    "direct_confidence_mean",
+    "direct_confidence_max",
 )
 _COUNT_COLUMNS = (
     "padded_count",
@@ -69,21 +71,29 @@ _SCORE_FIELDS = (
     "confidence_reference",
     "confidence_responsive",
     "confidence_relative_gap",
+    "direct_confidence_mean",
+    "direct_confidence_max",
 )
 _SERIES = (
     "persistence_relative_gap",
     "confidence_relative_gap",
     "persistence_responsive",
     "persistence_reference",
+    "direct_confidence_mean",
+    "direct_confidence_max",
 )
 _CONTROLS = (
     "confidence_relative_gap",
     "persistence_responsive",
     "persistence_reference",
+    "direct_confidence_mean",
+    "direct_confidence_max",
 )
 _FIXED_ORIENTATIONS = {
     "persistence_relative_gap": 1,
     "confidence_relative_gap": -1,
+    "direct_confidence_mean": -1,
+    "direct_confidence_max": -1,
     "raw_responsive": 1,
     "raw_reference": -1,
 }
@@ -92,6 +102,8 @@ _SERIES_ORIENTATION_KEYS = {
     "confidence_relative_gap": "confidence_relative_gap",
     "persistence_responsive": "raw_responsive",
     "persistence_reference": "raw_reference",
+    "direct_confidence_mean": "direct_confidence_mean",
+    "direct_confidence_max": "direct_confidence_max",
 }
 _PYPLOT_LOCK = threading.RLock()
 
@@ -482,6 +494,13 @@ def _validated_frame(rows, *, config: Mapping) -> pd.DataFrame:
             and 0.0 <= row["confidence_responsive"] <= 1.0
         ):
             raise ValueError("confidence means must lie in [0, 1]")
+        if not (
+            0.0 <= row["direct_confidence_mean"]
+            <= row["direct_confidence_max"] <= 1.0
+        ):
+            raise ValueError(
+                "direct confidence mean and maximum must lie in [0, 1] and be ordered"
+            )
         for prefix in ("persistence", "confidence"):
             expected = _expected_gap(
                 row[f"{prefix}_reference"], row[f"{prefix}_responsive"]
@@ -524,7 +543,7 @@ def _validate_evaluation(evaluation, frame: pd.DataFrame, provenance: dict) -> d
         raise ValueError("evaluation must keep the exact Task 8 structure")
     series = evaluation["series"]
     if not isinstance(series, Mapping) or set(series) != set(_SERIES):
-        raise ValueError("evaluation series must contain the four fixed scores")
+        raise ValueError("evaluation series must contain the six fixed scores")
 
     score_rows = frame.to_dict(orient="records")
     canonical_series = {}
@@ -561,7 +580,7 @@ def _validate_evaluation(evaluation, frame: pd.DataFrame, provenance: dict) -> d
 
     comparisons = evaluation["bootstrap_comparisons"]
     if not isinstance(comparisons, list) or len(comparisons) != len(_CONTROLS):
-        raise ValueError("evaluation needs the three fixed bootstrap comparisons")
+        raise ValueError("evaluation needs the five fixed bootstrap comparisons")
     config = provenance["config"]
     canonical_comparisons = []
     for index, (item, control) in enumerate(zip(comparisons, _CONTROLS)):
@@ -754,6 +773,8 @@ def _write_figures_impl(
         "confidence_relative_gap": "Matched confidence",
         "persistence_responsive": "Raw responsive control",
         "persistence_reference": "Raw reference control",
+        "direct_confidence_mean": "Direct global confidence mean",
+        "direct_confidence_max": "Direct global confidence maximum",
     }
     for name, label in labels.items():
         values = evaluation["series"][name]["auroc_by_severity"]
@@ -803,6 +824,8 @@ def render_report(
 ) -> str:
     primary = evaluation["series"]["persistence_relative_gap"]
     confidence = evaluation["series"]["confidence_relative_gap"]
+    direct_mean = evaluation["series"]["direct_confidence_mean"]
+    direct_max = evaluation["series"]["direct_confidence_max"]
     example = frame.sort_values(
         ["image_id", "severity"], kind="stable"
     ).iloc[0]
@@ -812,6 +835,8 @@ def render_report(
     confidence_reference = example["confidence_reference"]
     confidence_responsive = example["confidence_responsive"]
     confidence_gap = example["confidence_relative_gap"]
+    direct_confidence_mean = example["direct_confidence_mean"]
+    direct_confidence_max = example["direct_confidence_max"]
     config = provenance["config"]
     corruption_name = _markdown_text(
         provenance["corruption"]["name"].replace("_", " ")
@@ -841,7 +866,9 @@ def render_report(
     )
     auroc_lines = "\n".join(
         f"| {level} | {primary['auroc_by_severity'][level]:.3f} | "
-        f"{confidence['auroc_by_severity'][level]:.3f} |"
+        f"{confidence['auroc_by_severity'][level]:.3f} | "
+        f"{direct_mean['auroc_by_severity'][level]:.3f} | "
+        f"{direct_max['auroc_by_severity'][level]:.3f} |"
         for level in SEVERITIES[1:]
     )
     bootstrap_lines = "\n".join(
@@ -926,12 +953,26 @@ maximum sigmoid class confidence. The archived experiment fixed this score's
 direction at -1, which means a smaller raw confidence gap ranks as more
 corrupted.
 
+
+## Direct global confidence baselines
+
+Unlike the matched-confidence relative-gap control above, these two direct global
+confidence controls use **all valid queries** for each image and severity, not
+the decile-matched reference and responsive groups. For every retained query we
+take its maximum sigmoid confidence, then summarize the global mean and maximum.
+
+For image {example_id} at corruption level {int(example['severity'])}, the
+direct global confidence mean was {direct_confidence_mean:.6f} and the direct
+global confidence maximum was {direct_confidence_max:.6f}.
+
+They are raw confidence controls rather than relative gaps. Their fixed
+orientation is -1: lower confidence ranks as more corrupted.
 ## Results
 
-| Corruption level | Persistence AUROC | Matched confidence AUROC |
-|---|---:|---:|
+| Corruption level | Persistence AUROC | Matched confidence relative-gap AUROC | Direct global confidence mean AUROC | Direct global confidence maximum AUROC |
+|---|---:|---:|---:|---:|
 {auroc_lines}
-| Average | {primary['macro_auroc']:.3f} | {confidence['macro_auroc']:.3f} |
+| Average | {primary['macro_auroc']:.3f} | {confidence['macro_auroc']:.3f} | {direct_mean['macro_auroc']:.3f} | {direct_max['macro_auroc']:.3f} |
 
 ### How AUROC was calculated for each severity
 
