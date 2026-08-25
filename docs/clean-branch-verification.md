@@ -14,7 +14,7 @@ The full branch-point commit is:
 The code commit tested immediately before this documentation change is:
 
 ```text
-6f9e55b0c608860472801d8be75318f581482501
+cc6b0f6c88498dd1fccf81e2b41b1ce2b68a7bf5
 ```
 
 ## Historical baseline
@@ -34,23 +34,25 @@ The complete retained suite was run with:
 Its exact summary was:
 
 ```text
-791 passed in 147.74s (0:02:27)
+777 passed in 141.26s (0:02:21)
 ```
 
-This full run includes the image-fingerprint, runtime-regime, plugin-identity,
-terminal-audit, and real-checkpoint GPU batch-resume tests. The real GPU check
+This full run includes the image-fingerprint, runtime-regime, practical corruption
+interface, cache and artifact integrity, report reconciliation, final input and
+artifact checks, and real-checkpoint GPU batch-resume tests. The real GPU check
 performed detector inference at batch size 1 and verified that a batch size 2
 resume was refused; it does not assert batch invariance.
 
-The plugin checks bind authoritative build SHA-256, canonical behavior state,
-defining-module file hashes, and validated external dependency module hashes.
-They also reject defining-module, build-declaration, or behavior-state mutation
-mid-run.
+The corruption checks validate a name, six ordered severities, and
+`apply(image, level)`. They refuse cache reuse when the recorded name or severity
+table changes. Resume otherwise assumes the same corruption code and hidden
+settings. The workflow intentionally does not inspect arbitrary Python dependencies
+or in-memory state, so code or hidden-setting changes require a new output folder.
+Output folders created with the old strict corruption-implementation schema should
+not be reused after this code change; start a new output directory.
 
-Built-in Gaussian blur also automatically binds and revalidates its Pillow
-`ImageFilter` dependency without user declarations. The terminal closure orders
-plugin revalidation before the full input hash, then audits artifacts, and ends
-with lightweight input signatures with no later substantive plugin work.
+The final checks still perform full input-image validation, audit the published
+artifacts, and finish with lightweight input signatures.
 
 The two parity files were also run together with skip reasons enabled:
 
@@ -131,10 +133,10 @@ find differential_uncertainty src tests/differential_uncertainty \
 Observed result:
 
 ```text
-23073 total
+22230 total
 ```
 
-That is **43 Python files and 23,073 lines** in the retained surface.
+That is **43 Python files and 22,230 lines** in the retained surface.
 
 ## Historical report bundle
 
@@ -163,9 +165,10 @@ summary.json
 
 ## Environment and documentation evidence
 
-This documentation update follows tested code commit
-`6f9e55b0c608860472801d8be75318f581482501`. It changes no Python source, so
-the tested code commit and retained Python counts recorded above remain the same.
+The tests recorded here target code commit
+`cc6b0f6c88498dd1fccf81e2b41b1ce2b68a7bf5`, not the later documentation
+commit. This documentation update changes no Python source, so the tested code
+commit and retained Python counts recorded above remain the same.
 
 A fresh environment query returned:
 
