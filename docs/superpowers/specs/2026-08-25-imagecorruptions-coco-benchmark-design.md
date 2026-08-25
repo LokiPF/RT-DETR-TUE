@@ -37,12 +37,13 @@ pixels to a `uint8` NumPy array and call `imagecorruptions.corrupt` with that
 named corruption and severity. Reported parameters are ordinal levels `0..5`, not
 invented common physical units for family-specific settings.
 
-Package corruptions that use randomness derive a stable 32-bit seed from the
-benchmark seed, corruption name, source-image content digest, and severity. The
-adapter scopes and restores random state for each call, making outputs independent
-of extraction batch size, interruption, and processing order. Every supported
-adapter needs a determinism test. A routine that cannot meet this contract fails
-before inference rather than publishing an unreproducible result.
+Some package corruptions are stochastic. The benchmark uses the upstream routine
+at the named corruption and requested severity without requiring repeat calls to
+produce identical pixels. An interrupted run reuses its completed extracted
+artifacts, while an independently started run may receive a different random draw
+at the same corruption/severity. This is acceptable for the requested robustness
+comparison; the report identifies the corruption and ordinal severity but does
+not claim pixel-for-pixel replayability.
 
 ## COCO inputs and split
 
@@ -55,13 +56,13 @@ The command sorts COCO image identities, applies a fixed recorded split seed, an
 chooses the first 250 identities for reference and the next 250 for evaluation.
 It writes canonical CSV manifests plus `benchmark-manifest.json` under the output
 directory. The manifest records the annotation digest, image directory, split
-seed, requested counts, selected IDs, manifest digests, checkpoint digest,
-`imagecorruptions` version, and package seed. Existing manifest checks enforce
-that reference and evaluation images remain disjoint.
+seed, requested counts, selected IDs, manifest digests, and checkpoint digest.
+Existing manifest checks enforce that reference and evaluation images remain
+disjoint.
 
 The command exposes count controls for a later 2,500/2,500 run but defaults to
 250/250. Provenance rejects an attempt to reuse a pilot directory with changed
-counts, split, checkpoint, package version, or corruption seed.
+counts, split, or checkpoint.
 
 ## Execution and cache layout
 
@@ -117,10 +118,9 @@ both direct-confidence baseline differences.
 
 ## Reporting
 
-Each corruption report shows its exact name, level table, package/seed metadata
-when applicable, all score metrics, per-severity AUROCs, macro-AUROC, trends, and
-paired bootstrap comparisons. Its tables and figures include the two direct
-baselines alongside the existing scores.
+Each corruption report shows its exact name, level table, all score metrics,
+per-severity AUROCs, macro-AUROC, trends, and paired bootstrap comparisons. Its
+tables and figures include the two direct baselines alongside the existing scores.
 
 After all 19 reports have passed their audits, the root-level report produces a
 19-row leaderboard with every corruption's macro-AUROC for the primary score,
@@ -136,16 +136,17 @@ Add `imagecorruptions==1.1.2` and its required runtime dependencies. The
 batch/shard sizes, and reference/evaluation counts. Existing `run` retains its
 Gaussian-blur-only behavior and compatibility.
 
-The benchmark records the installed package version and seed. Existing practical
-provenance boundaries remain: changes to arbitrary corruption code or hidden
-settings require a new output directory.
+Existing practical provenance boundaries remain: changes to arbitrary corruption
+code or hidden settings require a new output directory. Stochastic corruptions
+are identified by name and severity rather than by an exact generated-image
+fingerprint.
 
 ## Tests and acceptance
 
 Test-first implementation covers:
 
 - all 18 adapters' six-level contract, exact level-0 pixels, invalid-level
-  rejection, RGB output shape, determinism, and no random-state leakage;
+  rejection, and RGB output shape;
 - direct mean/max confidence calculation over valid queries and their
   lower-confidence evaluation orientation;
 - report/artifact inclusion of both new score fields and comparisons;
