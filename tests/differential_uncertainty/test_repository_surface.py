@@ -32,6 +32,7 @@ RETAINED_PYTHON = {
     "differential_uncertainty/corruptions/__init__.py",
     "differential_uncertainty/corruptions/base.py",
     "differential_uncertainty/corruptions/gaussian_blur.py",
+    "differential_uncertainty/corruptions/imagecorruptions.py",
     "differential_uncertainty/evaluation.py",
     "differential_uncertainty/extraction.py",
     "differential_uncertainty/manifests.py",
@@ -184,7 +185,7 @@ def test_repository_python_surface_is_exact():
         )
     }
 
-    assert len(RETAINED_PYTHON) == 43
+    assert len(RETAINED_PYTHON) == 44
     assert actual == RETAINED_PYTHON
 
 
