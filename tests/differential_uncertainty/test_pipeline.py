@@ -3,14 +3,11 @@ from __future__ import annotations
 import csv
 import gc
 import hashlib
-import importlib
-import importlib.util
 import json
 import multiprocessing
 import os
 import shutil
 import stat
-import sys
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
@@ -20,7 +17,7 @@ from types import SimpleNamespace
 import pandas as pd
 import pytest
 import torch
-from PIL import Image, ImageOps
+from PIL import Image, ImageEnhance
 
 import differential_uncertainty.cli as cli
 from differential_uncertainty.artifacts import iter_records, source_digest
@@ -32,10 +29,6 @@ from differential_uncertainty.corruptions import (
     Severity,
 )
 from differential_uncertainty.reporting import REPORT_FILES
-
-gaussian_module = importlib.import_module(
-    "differential_uncertainty.corruptions.gaussian_blur"
-)
 
 
 class FakeExtractor:
@@ -126,125 +119,46 @@ class LifetimeExtractor(FakeExtractor):
         type(self).instance_ref = weakref.ref(self)
 
 
-def _module_digest(module_name):
-    path = Path(sys.modules[module_name].__file__).resolve()
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-class InvertCorruption(Corruption):
-    name = "invert"
+class ContrastCorruption(Corruption):
+    name = "contrast"
     severities = tuple(Severity(level, float(level)) for level in range(6))
-    implementation_sha256 = "1" * 64
-    behavior_state = {}
-    dependency_sha256 = {
-        "PIL.ImageOps": _module_digest("PIL.ImageOps"),
-        Severity.__module__: _module_digest(Severity.__module__),
-    }
 
     def apply(self, image, level):
-        if level not in range(6):
-            raise ValueError(f"unknown invert severity {level}")
-        return (
-            image.copy()
-            if level == 0
-            else ImageOps.invert(image.convert("RGB"))
+        return ImageEnhance.Contrast(image).enhance(1.0 + level * 0.1)
+
+
+class ReadOnceCorruption:
+    def __init__(self):
+        self.reads = {"name": 0, "severities": 0, "apply": 0}
+
+    def _read(self, field, value):
+        self.reads[field] += 1
+        if self.reads[field] > 1:
+            raise AssertionError(f"corruption {field} was read more than once")
+        return value
+
+    @property
+    def name(self):
+        return self._read("name", "read-once")
+
+    @property
+    def severities(self):
+        return self._read(
+            "severities",
+            tuple(Severity(level, float(level)) for level in range(6)),
         )
 
+    @property
+    def apply(self):
+        return self._read("apply", self._apply)
 
-class AlternateInvertCorruption(Corruption):
-    name = "invert"
-    severities = tuple(Severity(level, float(level)) for level in range(6))
-
-    def apply(self, image, level):
-        if level not in range(6):
-            raise ValueError(f"unknown invert severity {level}")
+    def _apply(self, image, _level):
         return image.copy()
-
-
-class FalseyInvertCorruption(InvertCorruption):
-    def __init__(self):
-        self.apply_calls = []
-
-    def __bool__(self):
-        return False
-
-    def apply(self, image, level):
-        self.apply_calls.append(level)
-        return super().apply(image, level)
-
-
-class MutatingInvertCorruption(InvertCorruption):
-    name = "mutable-invert"
-
-    def __init__(self):
-        self.apply_calls = []
-
-    def apply(self, image, level):
-        self.apply_calls.append(level)
-        if len(self.apply_calls) == 1:
-            self.name = "mutated-name"
-            self.severities = tuple(
-                Severity(5 - value, float(value)) for value in range(6)
-            )
-
-            def mutated_apply(*_args):
-                raise AssertionError("mutated apply attribute was used")
-
-            self.apply = mutated_apply
-
-        return super().apply(image, level)
 
 
 def _copy_corruption_image(image, _level):
     return image.copy()
 
-
-
-_DECLARED_HELPER_VALUE = 11
-
-
-def _declared_helper(image, level):
-    changed = image.copy()
-    if level:
-        changed.putpixel((0, 0), (_DECLARED_HELPER_VALUE,) * 3)
-    return changed
-
-
-class DeclaredPlugin(Corruption):
-    name = "declared-plugin"
-    severities = tuple(Severity(level, float(level)) for level in range(6))
-
-    def __init__(
-        self, *, implementation_sha256, factor=11, helper=False, mutate_state=False
-    ):
-        self.implementation_sha256 = implementation_sha256
-        self.behavior_state = {
-            "factor": factor, "helper": helper, "mutate_state": mutate_state
-        }
-        self.dependency_sha256 = {}
-        self.factor = factor
-        self.helper = helper
-        self.mutate_state = mutate_state
-        self.apply_calls = 0
-
-    def apply(self, image, level):
-        self.apply_calls += 1
-        if self.mutate_state and self.apply_calls == 1:
-            self.behavior_state["factor"] = 99
-        if self.helper:
-            return _declared_helper(image, level)
-        changed = image.copy()
-        if level:
-            changed.putpixel((0, 0), (self.factor,) * 3)
-        return changed
-
-
-class MutatingBuildPlugin(DeclaredPlugin):
-    def apply(self, image, level):
-        changed = super().apply(image, level)
-        if self.apply_calls == 1:
-            self.implementation_sha256 = "b" * 64
-        return changed
 
 
 def _corruption_stub(**overrides):
@@ -254,9 +168,6 @@ def _corruption_stub(**overrides):
             Severity(level, float(level)) for level in range(6)
         ),
         "apply": _copy_corruption_image,
-        "implementation_sha256": "1" * 64,
-        "behavior_state": {},
-        "dependency_sha256": {},
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -379,8 +290,7 @@ def test_pipeline_accepts_a_corruption_plugin_without_changing_scoring(
     )
     checkpoint = tmp_path / "checkpoint.pth"
     checkpoint.write_bytes(b"fake checkpoint content")
-    output = tmp_path / "invert-run"
-    corruption = FalseyInvertCorruption()
+    output = tmp_path / "contrast-run"
 
     run_pipeline(
         reference,
@@ -392,23 +302,36 @@ def test_pipeline_accepts_a_corruption_plugin_without_changing_scoring(
         shard_size=2,
         config=small_config,
         extractor_factory=FakeExtractor,
-        corruption=corruption,
+        corruption=ContrastCorruption(),
     )
-    assert corruption.apply_calls == list(range(6)) * 2
 
     provenance = json.loads(
         (output / "artifacts" / "provenance.json").read_text()
     )
-    assert provenance["corruption"]["name"] == "invert"
-    assert [
-        item["level"] for item in provenance["corruption"]["severities"]
-    ] == list(range(6))
+    corruption = provenance["corruption"]
+    assert set(corruption) == {"name", "severities"}
+    assert corruption["name"] == "contrast"
+    assert [item["level"] for item in corruption["severities"]] == list(
+        range(6)
+    )
+    extraction = json.loads(
+        (
+            output
+            / "artifacts"
+            / "evaluation-extractions"
+            / "manifest.json"
+        ).read_text()
+    )
+    assert extraction["corruption"] == corruption
+    summary = json.loads(
+        (output / "report" / "summary.json").read_text()
+    )
+    assert summary["provenance"]["corruption"] == corruption
     with (output / "artifacts" / "scores.csv").open(
         newline="", encoding="utf-8"
     ) as handle:
         rows = list(csv.DictReader(handle))
     assert {int(row["severity"]) for row in rows} == set(range(6))
-
 
 @pytest.mark.parametrize(
     ("corruption", "message"),
@@ -688,36 +611,23 @@ def test_mismatched_reserved_gaussian_does_not_touch_a_preexisting_run(
     assert FakeExtractor.instances == extractor_instances
 
 
-def test_pipeline_rejects_plugin_identity_mutation_during_terminal_audit(
+def test_corruption_contract_is_snapshotted_once_before_pipeline_work(
     tmp_path, small_config
 ):
-    reference = _manifest(
-        tmp_path, "reference.csv", (("r1", 10), ("r2", 30))
-    )
-    evaluation = _manifest(
-        tmp_path, "evaluation.csv", (("e1", 60), ("e2", 90))
-    )
-    checkpoint = tmp_path / "checkpoint.pth"
-    checkpoint.write_bytes(b"fake checkpoint content")
-    output = tmp_path / "mutable-run"
-    corruption = MutatingInvertCorruption()
+    inputs = _inputs(tmp_path)
+    corruption = ReadOnceCorruption()
 
-    with pytest.raises(ValueError, match="corruption changed during the run"):
-        run_pipeline(
-            reference,
-            evaluation,
-            checkpoint,
-            output,
-            device="cpu",
-            batch_size=2,
-            shard_size=2,
-            config=small_config,
-            extractor_factory=FakeExtractor,
-            corruption=corruption,
-        )
+    run_pipeline(
+        *inputs,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=FakeExtractor,
+        corruption=corruption,
+    )
 
-    assert corruption.apply_calls == list(range(6)) * 2
-    assert corruption.name == "mutated-name"
+    assert corruption.reads == {"name": 1, "severities": 1, "apply": 1}
 
 
 def test_changed_checkpoint_is_refused_before_any_stage_is_reused(
@@ -798,8 +708,20 @@ def test_same_path_image_overwrite_refuses_completed_stage_reuse(
     assert after_metadata == before_metadata
 
 
-def test_same_named_corruption_with_different_code_refuses_cache_reuse(
-    tmp_path, small_config
+@pytest.mark.parametrize(
+    "changed",
+    (
+        _corruption_stub(name="changed-corruption"),
+        _corruption_stub(
+            severities=tuple(
+                Severity(level, float(level + 1)) for level in range(6)
+            )
+        ),
+    ),
+    ids=("name", "severities"),
+)
+def test_changed_corruption_name_or_severities_refuses_cache_reuse(
+    tmp_path, small_config, monkeypatch, changed
 ):
     inputs = _inputs(tmp_path)
     run_pipeline(
@@ -809,7 +731,7 @@ def test_same_named_corruption_with_different_code_refuses_cache_reuse(
         shard_size=2,
         config=small_config,
         extractor_factory=FakeExtractor,
-        corruption=InvertCorruption(),
+        corruption=_corruption_stub(),
     )
     output = inputs[-1]
     before_tree = _tree_state(output)
@@ -819,7 +741,11 @@ def test_same_named_corruption_with_different_code_refuses_cache_reuse(
         if path.is_dir()
     }
 
-    with pytest.raises(ValueError, match="provenance|corruption|implementation"):
+    def forbid_cache(*_args, **_kwargs):
+        raise AssertionError("corruption mismatch reached cache validation")
+
+    monkeypatch.setattr(cli, "validate_extraction_cache", forbid_cache)
+    with pytest.raises(ValueError, match="provenance"):
         run_pipeline(
             *inputs,
             device="cpu",
@@ -827,7 +753,7 @@ def test_same_named_corruption_with_different_code_refuses_cache_reuse(
             shard_size=2,
             config=small_config,
             extractor_factory=RejectingExtractor,
-            corruption=AlternateInvertCorruption(),
+            corruption=changed,
         )
 
     after_metadata = {
@@ -2322,77 +2248,6 @@ def test_every_runtime_field_mismatch_refuses_before_cache_access_and_mutation(
         assert after_metadata == before_metadata
 
 
-@pytest.mark.parametrize("digest", (None, "A" * 64, "1" * 63))
-def test_source_unavailable_plugin_requires_lowercase_64_hex_identity(
-    tmp_path, small_config, digest
-):
-    inputs = _inputs(tmp_path)
-    corruption = _corruption_stub(implementation_sha256=digest)
-    if digest is None:
-        delattr(corruption, "implementation_sha256")
-
-    with pytest.raises(ValueError, match="implementation_sha256|lowercase 64-hex"):
-        run_pipeline(
-            *inputs,
-            device="cpu",
-            batch_size=2,
-            shard_size=2,
-            config=small_config,
-            extractor_factory=RejectingExtractor,
-            corruption=corruption,
-        )
-
-    assert not inputs[-1].exists()
-    assert FakeExtractor.instances == 0
-
-
-def test_explicit_plugin_implementation_change_refuses_before_cache_access(
-    tmp_path, small_config, monkeypatch
-):
-    inputs = _inputs(tmp_path)
-    first = _corruption_stub(implementation_sha256="1" * 64)
-    run_pipeline(
-        *inputs,
-        device="cpu",
-        batch_size=2,
-        shard_size=2,
-        config=small_config,
-        extractor_factory=FakeExtractor,
-        corruption=first,
-    )
-    output = inputs[-1]
-    before_tree = _tree_state(output)
-    before_metadata = {
-        str(path.relative_to(output)): _directory_metadata(path)
-        for path in (output, *sorted(output.rglob("*")))
-        if path.is_dir()
-    }
-
-    def forbid_cache(*_args, **_kwargs):
-        raise AssertionError("plugin mismatch reached extraction cache access")
-
-    monkeypatch.setattr(cli, "validate_extraction_cache", forbid_cache)
-    second = _corruption_stub(implementation_sha256="2" * 64)
-    with pytest.raises(ValueError, match="provenance"):
-        run_pipeline(
-            *inputs,
-            device="cpu",
-            batch_size=2,
-            shard_size=2,
-            config=small_config,
-            extractor_factory=RejectingExtractor,
-            corruption=second,
-        )
-
-    after_metadata = {
-        str(path.relative_to(output)): _directory_metadata(path)
-        for path in (output, *sorted(output.rglob("*")))
-        if path.is_dir()
-    }
-    assert _tree_state(output) == before_tree
-    assert after_metadata == before_metadata
-
-
 _REAL_CHECKPOINT = Path(
     os.environ.get(
         "UE_RTDETRV2_CHECKPOINT",
@@ -2459,378 +2314,3 @@ def test_real_gpu_run_binds_batch_regime_and_refuses_cross_regime_resume(
     }
     assert _tree_state(output) == before_tree
     assert after_metadata == before_metadata
-
-
-def test_plugin_implementation_text_is_validated_before_output_or_extractor(
-    tmp_path, small_config
-):
-    plugin_class = type(
-        "UnsafePlugin",
-        (),
-        {
-            "__module__": "unsafe\nmodule",
-            "name": "unsafe-plugin",
-            "severities": tuple(
-                Severity(level, float(level)) for level in range(6)
-            ),
-            "implementation_sha256": "1" * 64,
-            "apply": lambda self, image, _level: image.copy(),
-        },
-    )
-    inputs = _inputs(tmp_path)
-
-    with pytest.raises(ValueError, match="implementation module"):
-        run_pipeline(
-            *inputs,
-            device="cpu",
-            batch_size=2,
-            shard_size=2,
-            config=small_config,
-            extractor_factory=RejectingExtractor,
-            corruption=plugin_class(),
-        )
-
-    assert not inputs[-1].exists()
-    assert FakeExtractor.instances == 0
-
-
-def _run_then_require_plugin_mismatch(
-    tmp_path,
-    small_config,
-    monkeypatch,
-    first,
-    second_factory,
-):
-    inputs = _inputs(tmp_path)
-    run_pipeline(
-        *inputs,
-        device="cpu",
-        batch_size=2,
-        shard_size=2,
-        config=small_config,
-        extractor_factory=FakeExtractor,
-        corruption=first,
-    )
-    output = inputs[-1]
-    second = second_factory()
-    before_tree = _tree_state(output)
-    before_metadata = {
-        str(path.relative_to(output)): _directory_metadata(path)
-        for path in (output, *sorted(output.rglob("*")))
-        if path.is_dir()
-    }
-
-    def forbid_cache(*_args, **_kwargs):
-        raise AssertionError("plugin mismatch reached cache validation")
-
-    monkeypatch.setattr(cli, "validate_extraction_cache", forbid_cache)
-    with pytest.raises(ValueError, match="corruption|plugin|provenance"):
-        run_pipeline(
-            *inputs,
-            device="cpu",
-            batch_size=2,
-            shard_size=2,
-            config=small_config,
-            extractor_factory=RejectingExtractor,
-            corruption=second,
-        )
-
-    after_metadata = {
-        str(path.relative_to(output)): _directory_metadata(path)
-        for path in (output, *sorted(output.rglob("*")))
-        if path.is_dir()
-    }
-    assert second.apply_calls == 0
-    assert _tree_state(output) == before_tree
-    assert after_metadata == before_metadata
-
-
-
-def _load_file_plugin(path, module_name):
-    spec = importlib.util.spec_from_file_location(module_name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    source = path.read_text(encoding="utf-8")
-    exec(compile(source, str(path), "exec"), module.__dict__)
-    return module.FilePlugin()
-
-
-def _file_plugin_source(value):
-    return f'''from differential_uncertainty.corruptions import Severity
-
-HELPER_VALUE = {value}
-
-def helper(image, level):
-    changed = image.copy()
-    if level:
-        changed.putpixel((0, 0), (HELPER_VALUE,) * 3)
-    return changed
-
-class FilePlugin:
-    name = "file-plugin"
-    severities = tuple(Severity(level, float(level)) for level in range(6))
-    implementation_sha256 = "{'a' * 64}"
-    behavior_state = {{"mode": "helper"}}
-    dependency_sha256 = {{}}
-
-    def __init__(self):
-        self.apply_calls = 0
-
-    def apply(self, image, level):
-        self.apply_calls += 1
-        return helper(image, level)
-'''
-
-def test_plugin_helper_global_change_refuses_resume_before_cache_or_mutation(
-    tmp_path, small_config, monkeypatch
-):
-    module_path = tmp_path / "file_plugin.py"
-    module_name = "task15_file_plugin"
-    module_path.write_text(_file_plugin_source(11), encoding="utf-8")
-    first = _load_file_plugin(module_path, module_name)
-
-    def changed_plugin():
-        module_path.write_text(_file_plugin_source(12), encoding="utf-8")
-        second = _load_file_plugin(module_path, module_name)
-        changed = second.apply(Image.new("RGB", (2, 2)), 1)
-        assert changed.getpixel((0, 0)) == (12, 12, 12)
-        second.apply_calls = 0
-        return second
-
-    _run_then_require_plugin_mismatch(
-        tmp_path, small_config, monkeypatch, first, changed_plugin
-    )
-
-
-def test_plugin_behavior_state_change_refuses_resume_before_cache_or_mutation(
-    tmp_path, small_config, monkeypatch
-):
-    first = DeclaredPlugin(implementation_sha256="a" * 64, factor=11)
-    second = DeclaredPlugin(implementation_sha256="a" * 64, factor=12)
-
-    _run_then_require_plugin_mismatch(
-        tmp_path, small_config, monkeypatch, first, lambda: second
-    )
-
-
-def test_source_visible_plugin_build_sha_change_refuses_before_cache_or_mutation(
-    tmp_path, small_config, monkeypatch
-):
-    first = DeclaredPlugin(implementation_sha256="a" * 64, factor=11)
-    second = DeclaredPlugin(implementation_sha256="b" * 64, factor=11)
-
-    _run_then_require_plugin_mismatch(
-        tmp_path, small_config, monkeypatch, first, lambda: second
-    )
-
-
-def test_plugin_behavior_state_mutation_is_caught_by_terminal_revalidation(
-    tmp_path, small_config
-):
-    inputs = _inputs(tmp_path)
-    plugin = DeclaredPlugin(
-        implementation_sha256="a" * 64, mutate_state=True
-    )
-
-    with pytest.raises(
-        ValueError, match="corruption implementation changed during the run"
-    ):
-        run_pipeline(
-            *inputs,
-            device="cpu",
-            batch_size=2,
-            shard_size=2,
-            config=small_config,
-            extractor_factory=FakeExtractor,
-            corruption=plugin,
-        )
-
-    assert plugin.behavior_state["factor"] == 99
-    assert plugin.apply_calls > 0
-
-
-def test_plugin_module_file_mutation_is_caught_by_terminal_revalidation(
-    tmp_path, small_config
-):
-    inputs = _inputs(tmp_path)
-    module_path = tmp_path / "mutating_file_plugin.py"
-    module_name = "task15_mutating_file_plugin"
-    source = _file_plugin_source(11).replace(
-        "        self.apply_calls += 1\n        return helper(image, level)",
-        """        self.apply_calls += 1
-        if self.apply_calls == 1:
-            with open(__file__, "a", encoding="utf-8") as handle:
-                handle.write("\\n# mutated during apply\\n")
-        return helper(image, level)""",
-    )
-    module_path.write_text(source, encoding="utf-8")
-    plugin = _load_file_plugin(module_path, module_name)
-
-    with pytest.raises(
-        ValueError, match="corruption implementation changed during the run"
-    ):
-        run_pipeline(
-            *inputs,
-            device="cpu",
-            batch_size=2,
-            shard_size=2,
-            config=small_config,
-            extractor_factory=FakeExtractor,
-            corruption=plugin,
-        )
-
-    assert plugin.apply_calls > 0
-    assert module_path.read_text(encoding="utf-8").endswith(
-        "# mutated during apply\n"
-    )
-
-
-def test_plugin_build_declaration_mutation_is_caught_by_terminal_revalidation(
-    tmp_path, small_config
-):
-    inputs = _inputs(tmp_path)
-    plugin = MutatingBuildPlugin(implementation_sha256="a" * 64)
-
-    with pytest.raises(
-        ValueError, match="corruption implementation changed during the run"
-    ):
-        run_pipeline(
-            *inputs,
-            device="cpu",
-            batch_size=2,
-            shard_size=2,
-            config=small_config,
-            extractor_factory=FakeExtractor,
-            corruption=plugin,
-        )
-
-    assert plugin.implementation_sha256 == "b" * 64
-    assert plugin.apply_calls > 0
-
-
-def test_builtin_dependency_change_refuses_resume_before_cache_or_mutation(
-    tmp_path, small_config, monkeypatch
-):
-    inputs = _inputs(tmp_path)
-    dependency_path = tmp_path / "ImageFilter.py"
-    dependency_path.write_text("GAUSSIAN_BEHAVIOR = 1\n", encoding="utf-8")
-    monkeypatch.setattr(
-        gaussian_module.ImageFilter, "__file__", str(dependency_path)
-    )
-    _run(inputs, small_config)
-    extractor_instances = FakeExtractor.instances
-
-    output = inputs[-1]
-    before_tree = _tree_state(output)
-    before_metadata = {
-        str(path.relative_to(output)): _directory_metadata(path)
-        for path in (output, *sorted(output.rglob("*")))
-        if path.is_dir()
-    }
-    dependency_path.write_text("GAUSSIAN_BEHAVIOR = 2\n", encoding="utf-8")
-    dependency_calls = 0
-
-    def changed_gaussian_blur(_radius):
-        nonlocal dependency_calls
-        dependency_calls += 1
-        raise AssertionError("changed built-in dependency was called")
-
-    def forbid_cache(*_args, **_kwargs):
-        raise AssertionError("built-in dependency mismatch reached cache validation")
-
-    monkeypatch.setattr(
-        gaussian_module.ImageFilter, "GaussianBlur", changed_gaussian_blur
-    )
-    monkeypatch.setattr(cli, "validate_extraction_cache", forbid_cache)
-
-    with pytest.raises(ValueError, match="corruption|provenance|dependency"):
-        _run(inputs, small_config, extractor_factory=RejectingExtractor)
-
-    after_metadata = {
-        str(path.relative_to(output)): _directory_metadata(path)
-        for path in (output, *sorted(output.rglob("*")))
-        if path.is_dir()
-    }
-    assert dependency_calls == 0
-    assert FakeExtractor.instances == extractor_instances
-    assert _tree_state(output) == before_tree
-    assert after_metadata == before_metadata
-
-
-def test_builtin_dependency_mutation_during_apply_is_caught_terminally(
-    tmp_path, small_config, monkeypatch
-):
-    inputs = _inputs(tmp_path)
-    dependency_path = tmp_path / "ImageFilter.py"
-    dependency_path.write_text("GAUSSIAN_BEHAVIOR = 1\n", encoding="utf-8")
-    monkeypatch.setattr(
-        gaussian_module.ImageFilter, "__file__", str(dependency_path)
-    )
-    original_filter = gaussian_module.ImageFilter.GaussianBlur
-    mutated = False
-
-    def mutate_dependency(radius):
-        nonlocal mutated
-        if not mutated:
-            mutated = True
-            dependency_path.write_text(
-                "GAUSSIAN_BEHAVIOR = 2\n", encoding="utf-8"
-            )
-        return original_filter(radius)
-
-    monkeypatch.setattr(
-        gaussian_module.ImageFilter, "GaussianBlur", mutate_dependency
-    )
-    with pytest.raises(
-        ValueError, match="corruption implementation changed during the run"
-    ):
-        _run(inputs, small_config)
-
-    assert mutated
-
-
-def test_builtin_dependency_identity_is_automatic_and_needs_no_declarations(
-    tmp_path, small_config, monkeypatch
-):
-    dependency_path = tmp_path / "ImageFilter.py"
-    dependency_path.write_text("GAUSSIAN_BEHAVIOR = 1\n", encoding="utf-8")
-    monkeypatch.setattr(
-        gaussian_module.ImageFilter, "__file__", str(dependency_path)
-    )
-
-    snapshot = cli._snapshot_corruption(GaussianBlur(), small_config)
-
-    assert snapshot.implementation["kind"] == "internal"
-    assert snapshot.implementation["dependency_sha256"] == {
-        "PIL.ImageFilter": hashlib.sha256(dependency_path.read_bytes()).hexdigest()
-    }
-
-
-def test_no_plugin_revalidation_may_follow_final_input_signature(
-    tmp_path, small_config, monkeypatch
-):
-    inputs = _inputs(tmp_path)
-    _run(inputs, small_config)
-    target = tmp_path / "evaluation-0.png"
-    replacement = tmp_path / "post-signature-replacement.png"
-    Image.new("RGB", (17, 13), (230, 230, 230)).save(replacement)
-    original = cli._CorruptionSnapshot.revalidate
-    calls = 0
-
-    def replace_during_terminal_revalidation(self):
-        nonlocal calls
-        result = original(self)
-        calls += 1
-        if calls == 1:
-            os.replace(replacement, target)
-        return result
-
-    monkeypatch.setattr(
-        cli._CorruptionSnapshot, "revalidate", replace_during_terminal_revalidation
-    )
-    with pytest.raises(
-        ValueError, match="image changed after it was audited"
-    ):
-        _run(inputs, small_config, extractor_factory=RejectingExtractor)
-
-    assert calls == 1

@@ -68,21 +68,6 @@ def _inputs():
                      "compute_capability": None},
         },
         "corruption": {
-            "implementation": {
-                "module": "differential_uncertainty.corruptions.gaussian_blur",
-                "behavior_state": {},
-                "dependency_sha256": {},
-                "implementation_sha256": "1" * 64,
-                "kind": "internal",
-                "module_files": {
-                    "differential_uncertainty.corruptions.gaussian_blur": {
-                        "path": "/tmp/plugin.py",
-                        "sha256": "1" * 64,
-                    }
-                },
-                "qualname": "GaussianBlur",
-                "source_sha256": "1" * 64,
-            },
             "name": "gaussian_blur",
             "severities": [
                 {"level": level, "parameter": radius}
@@ -101,13 +86,19 @@ def test_report_writes_the_exact_dedicated_bundle(tmp_path):
     assert actual == sorted(REPORT_FILES)
     summary = json.loads((output / "summary.json").read_text())
     assert summary["evaluation"]["series"]["persistence_relative_gap"]["orientation"] == 1
+    corruption = summary["provenance"]["corruption"]
+    assert set(corruption) == {"name", "severities"}
+    assert corruption["name"] == "gaussian_blur"
     text = (output / "report.md").read_text(encoding="utf-8").lower()
     for phrase in (
         "what was tested", "relative gap", "nearest clean", "sigmoid", "spearman",
         "3.5 / 4 = 0.875", "not a probability", "adjacent consistency",
         "paired bootstrap", "does not measure map",
+        "corruption code or hidden settings change", "new output folder",
     ):
         assert phrase in text
+    assert "authoritative build sha-256" not in text
+    assert "corruption implementation was" not in text
 
 
 def test_report_writes_through_an_active_pinned_parent_lease(tmp_path):
@@ -1323,9 +1314,6 @@ def test_report_and_figure_labels_follow_the_validated_test_config(
         "config": config.scientific_dict(),
         "runtime": copy.deepcopy(default_provenance["runtime"]),
         "corruption": {
-            "implementation": copy.deepcopy(
-                default_provenance["corruption"]["implementation"]
-            ),
             "name": "gaussian_blur",
             "severities": [
                 {"level": level, "parameter": radius}

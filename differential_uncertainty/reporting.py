@@ -334,71 +334,10 @@ def _validate_provenance(provenance) -> dict:
     corruption = normalized.get("corruption")
     if not isinstance(corruption, dict):
         raise ValueError("provenance needs a corruption mapping")
-    if set(corruption) != {"name", "severities", "implementation"}:
+    if set(corruption) != {"name", "severities"}:
         raise ValueError(
             "provenance corruption must have the exact fixed fields"
         )
-    implementation = corruption["implementation"]
-    expected_implementation = {
-        "behavior_state",
-        "dependency_sha256",
-        "implementation_sha256",
-        "kind",
-        "module",
-        "module_files",
-        "qualname",
-        "source_sha256",
-    }
-    if (
-        not isinstance(implementation, dict)
-        or set(implementation) != expected_implementation
-    ):
-        raise ValueError("provenance corruption implementation is invalid")
-    for key in ("module", "qualname"):
-        _validated_text(
-            implementation[key],
-            name=f"provenance corruption implementation {key}",
-            maximum_length=512,
-        )
-    if implementation["kind"] not in {"internal", "external"}:
-        raise ValueError("provenance corruption implementation kind is invalid")
-    for key in ("implementation_sha256",):
-        value = implementation[key]
-        if not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None:
-            raise ValueError(f"provenance corruption implementation {key} is invalid")
-    source_sha256 = implementation["source_sha256"]
-    if source_sha256 is not None and (
-        not isinstance(source_sha256, str)
-        or re.fullmatch(r"[0-9a-f]{64}", source_sha256) is None
-    ):
-        raise ValueError(
-            "provenance corruption implementation source_sha256 is invalid"
-        )
-    if not isinstance(implementation["behavior_state"], dict):
-        raise ValueError("provenance corruption behavior_state is invalid")
-    dependencies = implementation["dependency_sha256"]
-    if not isinstance(dependencies, dict) or any(
-        not isinstance(key, str)
-        or not isinstance(value, str)
-        or re.fullmatch(r"[0-9a-f]{64}", value) is None
-        for key, value in dependencies.items()
-    ):
-        raise ValueError("provenance corruption dependencies are invalid")
-    module_files = implementation["module_files"]
-    if not isinstance(module_files, dict) or not module_files:
-        raise ValueError("provenance corruption module files are invalid")
-    for module_name, identity in module_files.items():
-        if not isinstance(module_name, str) or not isinstance(identity, dict):
-            raise ValueError("provenance corruption module files are invalid")
-        if set(identity) != {"path", "sha256"}:
-            raise ValueError("provenance corruption module files are invalid")
-        _validated_text(
-            identity["path"],
-            name="corruption module path",
-            maximum_length=4096,
-        )
-        if re.fullmatch(r"[0-9a-f]{64}", identity["sha256"]) is None:
-            raise ValueError("provenance corruption module SHA-256 is invalid")
     _validated_text(
         corruption.get("name"),
         name="provenance corruption name",
@@ -889,11 +828,6 @@ def render_report(
         f"{name} {runtime['libraries'][name]}"
         for name in sorted(runtime["libraries"])
     )
-    implementation = provenance["corruption"]["implementation"]
-    implementation_name = _markdown_code(
-        f"{implementation['module']}.{implementation['qualname']}"
-    )
-    implementation_sha = _markdown_code(implementation["implementation_sha256"])
     reference_range = (
         f"{10 * config['reference_decile']}-"
         f"{10 * (config['reference_decile'] + 1)}%"
@@ -1062,8 +996,9 @@ bank.
 
 This run used device {runtime_device}, batch size {runtime["batch_size"]}, and
 shard size {runtime["shard_size"]}. Library versions were:
-{runtime_libraries}. The corruption implementation was {implementation_name},
-with authoritative build SHA-256 {implementation_sha}. Checkpoint SHA-256: {checkpoint}.
+{runtime_libraries}. The corruption was **{corruption_name}**, with severities
+{severity_parameters}. If corruption code or hidden settings change, use a
+new output folder rather than resuming this run. Checkpoint SHA-256: {checkpoint}.
 
 The complete per-image rows, metric tables, bootstrap comparisons, figures, and
 reproducibility details are stored beside this report.
