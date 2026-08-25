@@ -98,7 +98,8 @@ def test_imagecorruptions_matrix_creates_fresh_corruptions():
 
 
 @pytest.mark.parametrize("name", ADDITIONAL_IMAGECORRUPTIONS)
-def test_imagecorruptions_adapter_has_clean_and_five_package_levels(name):
+@pytest.mark.parametrize("level", range(1, 6))
+def test_imagecorruptions_adapter_has_clean_and_five_package_levels(name, level):
     image = Image.effect_noise((64, 64), 90).convert("RGB")
     corruption = ImageCorruption(name)
 
@@ -107,7 +108,7 @@ def test_imagecorruptions_adapter_has_clean_and_five_package_levels(name):
     )
     assert corruption.apply(image, 0) is image
 
-    result = corruption.apply(image, 3)
+    result = corruption.apply(image, level)
 
     assert result.mode == "RGB"
     assert result.size == image.size
