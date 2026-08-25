@@ -258,6 +258,8 @@ def evaluate_rows(rows, config: ExperimentConfig = FIXED_CONFIG) -> dict:
         "confidence_relative_gap": config.confidence_orientation,
         "persistence_responsive": config.raw_responsive_orientation,
         "persistence_reference": config.raw_reference_orientation,
+        "direct_confidence_mean": config.direct_confidence_orientation,
+        "direct_confidence_max": config.direct_confidence_orientation,
     }
     series = {
         field: summarize_series(rows, field, orientation)
@@ -277,6 +279,8 @@ def evaluate_rows(rows, config: ExperimentConfig = FIXED_CONFIG) -> dict:
             "confidence_relative_gap",
             "persistence_responsive",
             "persistence_reference",
+            "direct_confidence_mean",
+            "direct_confidence_max",
         )
     ]
     return {"series": series, "bootstrap_comparisons": comparisons}

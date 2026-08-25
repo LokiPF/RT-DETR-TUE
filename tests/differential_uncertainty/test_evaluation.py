@@ -284,7 +284,7 @@ def test_paired_bootstrap_is_deterministic_and_reconciles_its_point_estimate():
     assert first["point_difference"] == pytest.approx(expected)
 
 
-def test_evaluate_rows_keeps_two_relative_gaps_and_two_persistence_controls():
+def test_evaluate_rows_includes_direct_confidence_baselines_after_existing_controls():
     curves = {
         "a": [0, 1, 2, 3, 4, 5],
         "b": [1, 2, 3, 4, 5, 6],
@@ -297,6 +297,8 @@ def test_evaluate_rows_keeps_two_relative_gaps_and_two_persistence_controls():
                 "confidence_relative_gap": float(5 - severity),
                 "persistence_responsive": float(severity + 2),
                 "persistence_reference": float(8 - severity),
+                "direct_confidence_mean": float(9 - severity),
+                "direct_confidence_max": float(11 - severity),
                 "confidence_responsive": 123.0,
                 "confidence_reference": 456.0,
             }
@@ -310,6 +312,8 @@ def test_evaluate_rows_keeps_two_relative_gaps_and_two_persistence_controls():
         "confidence_relative_gap",
         "persistence_responsive",
         "persistence_reference",
+        "direct_confidence_mean",
+        "direct_confidence_max",
     }
     assert set(result["series"]) == expected_fields
     assert "confidence_responsive" not in result["series"]
@@ -321,15 +325,19 @@ def test_evaluate_rows_keeps_two_relative_gaps_and_two_persistence_controls():
         "confidence_relative_gap": -1,
         "persistence_responsive": 1,
         "persistence_reference": -1,
+        "direct_confidence_mean": -1,
+        "direct_confidence_max": -1,
     }
     comparisons = result["bootstrap_comparisons"]
     assert [item["candidate"] for item in comparisons] == [
         "persistence_relative_gap"
-    ] * 3
+    ] * 5
     assert [item["control"] for item in comparisons] == [
         "confidence_relative_gap",
         "persistence_responsive",
         "persistence_reference",
+        "direct_confidence_mean",
+        "direct_confidence_max",
     ]
 
 

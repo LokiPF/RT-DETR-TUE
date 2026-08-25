@@ -84,6 +84,39 @@ def test_one_image_produces_six_complete_persistence_and_confidence_rows():
         assert -2.0 <= row["persistence_relative_gap"] <= 2.0
         assert -2.0 <= row["confidence_relative_gap"] <= 2.0
 
+def test_direct_confidence_baselines_exclude_the_union_padded_queries():
+    config = ExperimentConfig.for_tests(
+        bank_capacity=30, k=2, query_count=20, persistence_dim=7
+    )
+    records = [_record(severity=severity) for severity in range(6)]
+    for severity, record in enumerate(records):
+        logits = torch.full((20, 80), float(severity - 5))
+        logits[:18, 0] = torch.linspace(-4.0, 2.0, 18) + severity
+        logits[18:, 0] = 20.0
+        record["logits"] = logits
+    for field in ("boxes", "logits", "persistence"):
+        records[2][field][-2] = records[2][field][-1]
+
+    bank = torch.randn(30, 7, generator=torch.Generator().manual_seed(3))
+    rows = score_image_records(records, bank, config)
+
+    valid_ids = torch.arange(18)
+    for record, row in zip(records, rows):
+        valid_confidence = confidence_from_logits(record["logits"]).index_select(
+            0, valid_ids
+        )
+        assert row["padded_count"] == 2
+        assert row["direct_confidence_mean"] == pytest.approx(
+            float(valid_confidence.mean())
+        )
+        assert row["direct_confidence_max"] == pytest.approx(
+            float(valid_confidence.max())
+        )
+        assert isinstance(row["direct_confidence_mean"], float)
+        assert isinstance(row["direct_confidence_max"], float)
+        assert math.isfinite(row["direct_confidence_mean"])
+        assert math.isfinite(row["direct_confidence_max"])
+
 
 def test_padding_union_rejects_query_count_changes_across_severities():
     records = [_record(severity=0), _record(severity=1, query_count=19)]

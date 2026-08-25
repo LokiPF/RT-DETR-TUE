@@ -24,6 +24,7 @@ def test_public_configuration_contains_every_approved_fixed_value():
     assert FIXED_CONFIG.responsive_decile == 5
     assert FIXED_CONFIG.persistence_orientation == 1
     assert FIXED_CONFIG.confidence_orientation == -1
+    assert FIXED_CONFIG.direct_confidence_orientation == -1
     assert FIXED_CONFIG.raw_responsive_orientation == 1
     assert FIXED_CONFIG.raw_reference_orientation == -1
     assert FIXED_CONFIG.bootstrap_samples == 10_000
@@ -55,6 +56,7 @@ def test_public_configuration_is_frozen():
         ({"persistence_dim": 0}, "persistence_dim"),
         ({"persistence_orientation": 0}, "orientation"),
         ({"confidence_orientation": 2}, "orientation"),
+        ({"direct_confidence_orientation": 0}, "orientation"),
         ({"raw_responsive_orientation": -2}, "orientation"),
         ({"raw_reference_orientation": 3}, "orientation"),
     ],
@@ -95,6 +97,8 @@ def test_scientific_dict_serializes_the_complete_scientific_contract():
         "responsive_decile": 5,
         "orientations": {
             "persistence_relative_gap": 1,
+            "direct_confidence_mean": -1,
+            "direct_confidence_max": -1,
             "confidence_relative_gap": -1,
             "raw_responsive": 1,
             "raw_reference": -1,
