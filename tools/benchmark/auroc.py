@@ -59,8 +59,8 @@ datasets = config["datasets"]
 model_config = config["config"]
 ckpt = config["checkpoint"]
 output_dir = pathlib.Path(CONFIG_FILE).parent.resolve()
-config_filename = pathlib.Path(CONFIG_FILE).name
-shutil.copy2(CONFIG_FILE, os.path.join(output_dir, config_filename))
+config_filename = pathlib.Path(model_config).name
+shutil.copy2(model_config, os.path.join(output_dir, config_filename))
 
 
 def load_model():
