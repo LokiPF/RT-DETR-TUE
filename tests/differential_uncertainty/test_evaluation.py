@@ -60,7 +60,8 @@ def test_series_summary_reports_every_severity_and_curve_check():
     summary = summarize_series(rows, field, orientation=1)
     assert summary["median_signed_spearman"] == 1.0
     assert summary["oriented_adjacent_consistency"] == 1.0
-    assert summary["strongest_blur_above_clean_rate"] == 1.0
+    assert summary["strongest_corruption_above_clean_rate"] == 1.0
+    assert "strongest_blur_above_clean_rate" not in summary
     assert set(summary["auroc_by_severity"]) == {1, 2, 3, 4, 5}
     assert summary["auroc_by_severity"] == pytest.approx(
         {1: 0.875, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0}

@@ -157,7 +157,7 @@ def summarize_series(rows, field: str, orientation: int) -> dict:
         "oriented_adjacent_consistency": float(
             np.mean([item["adjacent_consistency"] for item in oriented])
         ),
-        "strongest_blur_above_clean_rate": float(
+        "strongest_corruption_above_clean_rate": float(
             np.mean([item["strongest_blur_above_clean"] for item in oriented])
         ),
         "auroc_by_severity": aurocs,

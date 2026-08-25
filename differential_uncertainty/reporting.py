@@ -6,7 +6,6 @@ import html
 import json
 import math
 import os
-import re
 import stat
 import tempfile
 import threading
@@ -967,7 +966,7 @@ persistence score moved the expected way on
 
 Finally, the **strongest corruption** check asks whether level 5 ranks above
 level 0 for each image. That happened for
-{primary['strongest_blur_above_clean_rate']:.1%} of images. These checks tell
+{primary['strongest_corruption_above_clean_rate']:.1%} of images. These checks tell
 us about smooth change within images, while AUROC tells us about ranking across
 the whole group.
 

@@ -541,6 +541,92 @@ def validate_extraction_cache(
     return True
 
 
+def _image_value(image: Image.Image, *, message: str):
+    try:
+        return image.mode, image.size, image.tobytes()
+    except Exception as error:
+        raise RuntimeError(message) from error
+
+
+def _validate_corruption_result(
+    severity_input: Image.Image,
+    changed: object,
+    *,
+    expected_size: tuple[int, int],
+    clean_value=None,
+) -> None:
+    if not isinstance(changed, Image.Image):
+        raise RuntimeError("corruption must return a PIL image")
+    if clean_value is not None:
+        input_value = _image_value(
+            severity_input,
+            message="corruption level 0 mutated its input",
+        )
+        if input_value != clean_value:
+            raise RuntimeError("corruption level 0 mutated its input")
+    if changed.size != expected_size:
+        raise RuntimeError(
+            "corruption changed image size: "
+            f"got {changed.size}, expected {expected_size}"
+        )
+    if changed.mode != "RGB":
+        raise RuntimeError("corruption must return an RGB image")
+    if clean_value is not None:
+        output_value = _image_value(
+            changed,
+            message=(
+                "corruption level 0 must return a pixel-equivalent clean image"
+            ),
+        )
+        if output_value != clean_value:
+            raise RuntimeError(
+                "corruption level 0 must return a pixel-equivalent clean image"
+            )
+
+
+def _validate_pending_clean_levels(
+    entries: tuple[ManifestEntry, ...],
+    corruption: Corruption | None,
+    existing: set[tuple[str, int]],
+    image_size: tuple[int, int],
+) -> None:
+    if corruption is None:
+        return
+    expected_size = (image_size[1], image_size[0])
+    for entry in entries:
+        if (entry.image_id, 0) in existing:
+            continue
+        with open_fingerprinted_image(entry) as image_file:
+            with Image.open(image_file) as opened:
+                opened.load()
+                resized = resize_image(opened, image_size)
+            try:
+                severity_input = resized.copy()
+                changed: Image.Image | object | None = None
+                clean_value = _image_value(
+                    severity_input,
+                    message="corruption level 0 mutated its input",
+                )
+                try:
+                    changed = corruption.apply(severity_input, 0)
+                    _validate_corruption_result(
+                        severity_input,
+                        changed,
+                        expected_size=expected_size,
+                        clean_value=clean_value,
+                    )
+                finally:
+                    if (
+                        isinstance(changed, Image.Image)
+                        and changed is not severity_input
+                    ):
+                        changed.close()
+                    severity_input.close()
+            finally:
+                if resized is not opened:
+                    resized.close()
+
+
 def _pending_samples(
     entries: tuple[ManifestEntry, ...],
     corruption: Corruption | None,
@@ -549,6 +635,12 @@ def _pending_samples(
     image_size: tuple[int, int],
 ):
     expected_size = (image_size[1], image_size[0])
+    _validate_pending_clean_levels(
+        entries,
+        corruption,
+        existing,
+        image_size,
+    )
     for entry in entries:
         with open_fingerprinted_image(entry) as image_file:
             with Image.open(image_file) as opened:
@@ -564,25 +656,17 @@ def _pending_samples(
                     try:
                         changed = (
                             severity_input
-                            if corruption is None
+                            if corruption is None or severity.level == 0
                             else corruption.apply(
                                 severity_input,
                                 severity.level,
                             )
                         )
-                        if not isinstance(changed, Image.Image):
-                            raise RuntimeError(
-                                "corruption must return a PIL image"
-                            )
-                        if changed.size != expected_size:
-                            raise RuntimeError(
-                                "corruption changed image size: "
-                                f"got {changed.size}, expected {expected_size}"
-                            )
-                        if changed.mode != "RGB":
-                            raise RuntimeError(
-                                "corruption must return an RGB image"
-                            )
+                        _validate_corruption_result(
+                            severity_input,
+                            changed,
+                            expected_size=expected_size,
+                        )
                         tensor = image_tensor(changed)
                     finally:
                         if (

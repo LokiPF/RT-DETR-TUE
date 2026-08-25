@@ -160,6 +160,26 @@ def _copy_corruption_image(image, _level):
     return image.copy()
 
 
+def _alter_clean_return(image, level):
+    output = image.copy()
+    if level == 0:
+        output.putpixel((0, 0), (1, 2, 3))
+    return output
+
+
+def _mutate_clean_input_and_return_pristine_copy(image, level):
+    output = image.copy()
+    if level == 0:
+        image.putpixel((0, 0), (1, 2, 3))
+    return output
+
+
+def _alter_later_clean_return(image, level):
+    output = image.copy()
+    if level == 0 and image.getpixel((0, 0)) == (90, 90, 90):
+        output.putpixel((0, 0), (1, 2, 3))
+    return output
+
 
 def _corruption_stub(**overrides):
     values = {
@@ -332,6 +352,60 @@ def test_pipeline_accepts_a_corruption_plugin_without_changing_scoring(
     ) as handle:
         rows = list(csv.DictReader(handle))
     assert {int(row["severity"]) for row in rows} == set(range(6))
+
+
+@pytest.mark.parametrize(
+    ("apply", "message"),
+    [
+        pytest.param(
+            _alter_clean_return,
+            "level 0.*pixel-equivalent",
+            id="altered-return",
+        ),
+        pytest.param(
+            _mutate_clean_input_and_return_pristine_copy,
+            "level 0.*mutated",
+            id="mutated-input",
+        ),
+        pytest.param(
+            _alter_later_clean_return,
+            "level 0.*pixel-equivalent",
+            id="later-altered-return",
+        ),
+    ],
+)
+def test_nonclean_level_zero_refuses_before_evaluation_inference_or_shards(
+    tmp_path,
+    small_config,
+    apply,
+    message,
+):
+    inputs = _inputs(tmp_path)
+
+    with pytest.raises(RuntimeError, match=message):
+        run_pipeline(
+            *inputs,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=FakeExtractor,
+            corruption=_corruption_stub(apply=apply),
+        )
+
+    output = inputs[-1]
+    reference_cache = output / "artifacts" / "reference-extractions"
+    evaluation_cache = output / "artifacts" / "evaluation-extractions"
+    assert (reference_cache / "manifest.json").is_file()
+    assert FakeExtractor.identities == [("r1", 0), ("r2", 0)]
+    assert not (evaluation_cache / "manifest.json").exists()
+    partial = json.loads(
+        (evaluation_cache / "partial_manifest.json").read_text()
+    )
+    assert partial["record_count"] == 0
+    assert partial["shards"] == []
+    assert not list(evaluation_cache.glob("shard_*.pt"))
+
 
 @pytest.mark.parametrize(
     ("corruption", "message"),

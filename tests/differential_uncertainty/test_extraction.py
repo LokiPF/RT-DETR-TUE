@@ -1403,6 +1403,48 @@ class InPlaceCorruption:
         return image
 
 
+class PixelEquivalentCleanCorruption:
+    name = "pixel_equivalent_clean"
+    severities = tuple(Severity(level, float(level)) for level in range(6))
+
+    def __init__(self, *, copy_clean: bool):
+        self.copy_clean = copy_clean
+
+    def apply(self, image, level):
+        if level == 0 and not self.copy_clean:
+            return image
+        return image.copy()
+
+
+@pytest.mark.parametrize(
+    "copy_clean",
+    [False, True],
+    ids=("same-object", "equivalent-copy"),
+)
+def test_clean_level_accepts_any_pixel_equivalent_pil_image(
+    tmp_path: Path,
+    copy_clean: bool,
+):
+    path = tmp_path / "image.png"
+    Image.new("RGB", (3, 2), (10, 20, 30)).save(path)
+    cache = tmp_path / f"clean-{copy_clean}"
+    extractor = FakeExtractor()
+
+    extract_manifest(
+        (ManifestEntry("scene", path.resolve()),),
+        cache,
+        {"stage": "evaluation"},
+        extractor,
+        PixelEquivalentCleanCorruption(copy_clean=copy_clean),
+        image_size=(2, 3),
+        batch_size=1,
+        shard_size=1,
+    )
+
+    assert extractor.calls == 6
+    assert load_artifact_manifest(cache)["record_count"] == 6
+
+
 class PixelExtractor(FakeExtractor):
     def __init__(self):
         super().__init__()
@@ -1469,17 +1511,24 @@ def test_pil_images_close_once_when_extraction_is_cancelled(
 ):
     path = tmp_path / "image.png"
     Image.new("RGB", (8, 8)).save(path)
-    base = Image.new("RGB", (8, 8), 30)
+    resized_images = []
     corruption = CloseTrackingCorruption()
     close_counts = {}
+    closed_images = {}
     original_close = Image.Image.close
 
     def observed_close(image):
+        closed_images[id(image)] = image
         close_counts[id(image)] = close_counts.get(id(image), 0) + 1
         original_close(image)
 
+    def observed_resize(*_args):
+        resized = Image.new("RGB", (8, 8), 30)
+        resized_images.append(resized)
+        return resized
+
     monkeypatch.setattr(Image.Image, "close", observed_close)
-    monkeypatch.setattr(extraction, "resize_image", lambda *_args: base)
+    monkeypatch.setattr(extraction, "resize_image", observed_resize)
 
     with pytest.raises(KeyboardInterrupt, match="cancel extraction"):
         extract_manifest(
@@ -1493,10 +1542,10 @@ def test_pil_images_close_once_when_extraction_is_cancelled(
             shard_size=10,
         )
 
-    tracked = {id(base)}
+    tracked = {id(image) for image in resized_images}
     tracked.update(id(image) for image in corruption.inputs)
     tracked.update(id(image) for image in corruption.outputs)
-    assert len(tracked) == 4
+    assert len(tracked) == 5
     assert {identity: close_counts.get(identity, 0) for identity in tracked} == {
         identity: 1 for identity in tracked
     }

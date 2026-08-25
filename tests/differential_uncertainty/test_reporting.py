@@ -571,6 +571,8 @@ def test_csv_and_json_numbers_reconcile_with_the_supplied_results(tmp_path):
 
     metric_frame = pd.read_csv(output / "metrics.csv").set_index("series")
     assert set(metric_frame.index) == set(evaluation["series"])
+    assert "strongest_corruption_above_clean_rate" in metric_frame.columns
+    assert "strongest_blur_above_clean_rate" not in metric_frame.columns
     for name, summary in evaluation["series"].items():
         for key, expected in summary.items():
             if key in {"auroc_by_severity", "severity_statistics", "field"}:
@@ -591,6 +593,9 @@ def test_csv_and_json_numbers_reconcile_with_the_supplied_results(tmp_path):
         "provenance": provenance,
         "evaluation": evaluation,
     }))
+    for series in summary["evaluation"]["series"].values():
+        assert "strongest_corruption_above_clean_rate" in series
+        assert "strongest_blur_above_clean_rate" not in series
 
 
 def test_report_explains_calculations_limits_and_uses_concrete_run_values(tmp_path):
