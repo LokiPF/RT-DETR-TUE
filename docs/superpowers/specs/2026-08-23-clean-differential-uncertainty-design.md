@@ -235,7 +235,7 @@ not replaced by their absolute values.
 After applying the score's fixed orientation, also report:
 
 - adjacent consistency: the fraction of five consecutive steps that do not move backwards;
-- strongest-blur-above-clean: whether oriented level 5 is strictly above oriented level 0.
+- strongest-corruption-above-clean: whether oriented level 5 is strictly above oriented level 0.
 
 ### Per-severity AUROC
 

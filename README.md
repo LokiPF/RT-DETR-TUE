@@ -107,14 +107,17 @@ The command safely resumes compatible partial extraction. It refuses to mix chan
 image bytes or file identities, manifests, checkpoint bytes, workflow or detector source
 code, or runtime regimes in one output directory. A corruption provides only a `name`,
 six ordered severities, and `apply(image, level)`. The recorded name and severity
-table must still match before a completed cache is reused.
+table must still match before a completed cache is reused. Severity 0 must return a
+pixel-equivalent clean image. Before any evaluation inference begins, the pipeline
+prevalidates that contract for every pending level-0 image.
 
 Resume assumes that the corruption code and its hidden settings are unchanged. The
 workflow intentionally does not inspect arbitrary Python dependencies or in-memory
 state, so it cannot detect every code-only or settings change. If either changes, use a
-new output folder rather than resuming the old one. Output folders created with the old
-strict corruption-implementation schema should not be reused after this code change;
-start a new output directory. The built-in Gaussian blur needs no extra configuration.
+new output folder rather than resuming the old one. This is a practical resume boundary,
+not a claim of strict corruption-implementation identity. Output folders created before
+this practical contract should not be reused after the code change; start a new output
+directory. The built-in Gaussian blur needs no extra configuration.
 
 The runtime regime includes the resolved device and index, batch and shard sizes,
 Python and library versions, and CUDA/cuDNN/GPU details when CUDA is used. Therefore a

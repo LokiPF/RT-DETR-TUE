@@ -1,6 +1,6 @@
 # Clean branch verification
 
-This record was made on 2026-08-24 from the `clean` worktree. It separates
+This record was refreshed on 2026-08-25 from the `clean` worktree. It separates
 historical evidence from commands run on the reduced repository.
 
 ## Commits checked
@@ -14,7 +14,7 @@ The full branch-point commit is:
 The code commit tested immediately before this documentation change is:
 
 ```text
-cc6b0f6c88498dd1fccf81e2b41b1ce2b68a7bf5
+8848a5eb30362172bb2c4d03d533f4d23a03713c
 ```
 
 ## Historical baseline
@@ -34,7 +34,7 @@ The complete retained suite was run with:
 Its exact summary was:
 
 ```text
-777 passed in 141.26s (0:02:21)
+782 passed in 142.91s (0:02:22)
 ```
 
 This full run includes the image-fingerprint, runtime-regime, practical corruption
@@ -45,11 +45,14 @@ resume was refused; it does not assert batch invariance.
 
 The corruption checks validate a name, six ordered severities, and
 `apply(image, level)`. They refuse cache reuse when the recorded name or severity
-table changes. Resume otherwise assumes the same corruption code and hidden
-settings. The workflow intentionally does not inspect arbitrary Python dependencies
-or in-memory state, so code or hidden-setting changes require a new output folder.
-Output folders created with the old strict corruption-implementation schema should
-not be reused after this code change; start a new output directory.
+table changes. Severity 0 must return a pixel-equivalent clean image, and the pipeline
+prevalidates every pending level-0 image before any evaluation inference begins.
+Resume otherwise assumes the same corruption code and hidden settings. The workflow
+intentionally does not inspect arbitrary Python dependencies or in-memory state, so
+code or hidden-setting changes require a new output folder. This is a practical resume
+boundary, not a claim of strict corruption-implementation identity. Output folders
+created before this practical contract should not be reused after the code change;
+start a new output directory.
 
 The final checks still perform full input-image validation, audit the published
 artifacts, and finish with lightweight input signatures.
@@ -133,10 +136,10 @@ find differential_uncertainty src tests/differential_uncertainty \
 Observed result:
 
 ```text
-22230 total
+22441 total
 ```
 
-That is **43 Python files and 22,230 lines** in the retained surface.
+That is **43 Python files and 22,441 lines** in the retained surface.
 
 ## Historical report bundle
 
@@ -166,7 +169,7 @@ summary.json
 ## Environment and documentation evidence
 
 The tests recorded here target code commit
-`cc6b0f6c88498dd1fccf81e2b41b1ce2b68a7bf5`, not the later documentation
+`8848a5eb30362172bb2c4d03d533f4d23a03713c`, not the later documentation
 commit. This documentation update changes no Python source, so the tested code
 commit and retained Python counts recorded above remain the same.
 
