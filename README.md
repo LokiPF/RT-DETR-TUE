@@ -17,10 +17,9 @@ A new [solver](src/solver/tue_solver.py) and [engine](src/solver/tue_engine.py) 
 
 ## Benchmarking
 
-### AUROC
-To perform the auroc experiments, create a ```.yaml``` config, similar to [exp1_config.yaml](output/auroc/exp1/exp1_config.yaml). The config contains a set of datasets, incl. their name and if they are ood or id. 
+For reproducibility, the [configs](configs/) the model is based on  are copied into the experiment folder in which the experiment config lies. Additionally, the reference in the experiment config is pointing to the copied version of the config. This is supposed to prevent any misalignment in case an experiment is rerun in a different script.
 
-Use the following YAML structure when defining datasets:
+Use the following YAML structure when defining experiments:
 
 ```yaml
 description: "Description"
@@ -39,6 +38,16 @@ datasets:
       ood: false
 ```
 
+### AUROC
+To perform the auroc experiments, create a ```.yaml``` config, similar to [exp1_config.yaml](output/auroc/exp1/exp1_config.yaml). The config contains a set of datasets, incl. their name and if they are ood or id.
+Then run ```python tools/benchmark/auroc.py```. To plot the results, run ```python tools/benchmark/plot_auroc_stats.py```.
+
+Don't forget to update the ```CONFIG_FILE``` argument in the top of the scripts.
+
+### Histogram
+To generate id vs ood histograms, create a ```.yaml``` config, similar to [exp1_config.yaml](output/auroc/exp1/exp1_config.yaml). Then run ```python tools/benchmark/histogram.py```.
+
+Don't forget to update the ```CONFIG_FILE``` argument in the top of the scripts.
 
 ## Software Tools Used During Development:
 | Software Tools | Use Case | Scope | Remarks |
