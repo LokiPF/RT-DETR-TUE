@@ -160,4 +160,4 @@ The score does **not** by itself provide:
 
 ## Source for the recorded evidence
 
-The group-reaction values and their planned-versus-exploratory interpretation are reproduced from the project’s [within-image contrast report](scene-uncertainty-within-image-contrast-results.md).
+The group-reaction values and their planned-versus-exploratory interpretation are reproduced from the project’s [within-image contrast report](../scene-uncertainty-within-image-contrast-results.md).
