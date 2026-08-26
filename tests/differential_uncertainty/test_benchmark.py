@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import csv
 import json
+import multiprocessing as mp
+import os
 
 import numpy as np
 import pytest
 from PIL import Image
+
+import differential_uncertainty.benchmark as benchmark
 
 from differential_uncertainty.benchmark import (
     create_coco_manifests,
@@ -214,6 +218,154 @@ def test_coco_split_rejects_incomplete_existing_manifest_set(tmp_path):
     )
 
     with pytest.raises(ValueError, match="incomplete existing COCO manifest set"):
+        create_coco_manifests(
+            annotations,
+            images,
+            output,
+            reference_count=1,
+            evaluation_count=1,
+        )
+
+
+def test_coco_split_recovers_exact_partial_manifests_after_interruption(
+    tmp_path, monkeypatch
+):
+    annotations, images = _coco_fixture(tmp_path, image_count=2)
+    output = tmp_path / "inputs"
+    original_atomic_bytes = benchmark._atomic_bytes
+
+    def interrupt_after_evaluation(value, path):
+        original_atomic_bytes(value, path)
+        if path.name == "evaluation-manifest.csv":
+            raise RuntimeError("interrupted after evaluation manifest")
+
+    monkeypatch.setattr(benchmark, "_atomic_bytes", interrupt_after_evaluation)
+    with pytest.raises(RuntimeError, match="interrupted after evaluation"):
+        create_coco_manifests(
+            annotations,
+            images,
+            output,
+            reference_count=1,
+            evaluation_count=1,
+        )
+
+    assert (output / "reference-manifest.csv").is_file()
+    assert (output / "evaluation-manifest.csv").is_file()
+    assert (output / "benchmark-manifest-journal.json").is_file()
+    assert not (output / "benchmark-manifest.json").exists()
+
+    monkeypatch.setattr(benchmark, "_atomic_bytes", original_atomic_bytes)
+    split = create_coco_manifests(
+        annotations,
+        images,
+        output,
+        reference_count=1,
+        evaluation_count=1,
+    )
+
+    assert split.benchmark_manifest.is_file()
+    assert not (output / "benchmark-manifest-journal.json").exists()
+
+
+def _concurrent_manifest_creator(
+    annotations, images, output, barrier, write_counts, write_lock, queue
+):
+    original_atomic_bytes = benchmark._atomic_bytes
+
+    def count_atomic_bytes(value, path):
+        with write_lock:
+            process_id = os.getpid()
+            write_counts[process_id] = write_counts.get(process_id, 0) + 1
+        return original_atomic_bytes(value, path)
+
+    benchmark._atomic_bytes = count_atomic_bytes
+    try:
+        barrier.wait(timeout=10)
+        split = create_coco_manifests(
+            annotations,
+            images,
+            output,
+            reference_count=1,
+            evaluation_count=1,
+        )
+    except BaseException as error:
+        queue.put(("error", type(error).__name__, str(error)))
+    else:
+        queue.put(
+            (
+                "ok",
+                split.reference_ids,
+                split.evaluation_ids,
+                str(split.benchmark_manifest),
+            )
+        )
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires POSIX fork")
+def test_concurrent_coco_manifest_creators_publish_one_coherent_set(tmp_path):
+    annotations, images = _coco_fixture(tmp_path, image_count=2)
+    output = tmp_path / "inputs"
+    context = mp.get_context("fork")
+    manager = context.Manager()
+    write_counts = manager.dict()
+    write_lock = context.Lock()
+    barrier = context.Barrier(2)
+    queue = context.Queue()
+    creators = [
+        context.Process(
+            target=_concurrent_manifest_creator,
+            args=(
+                annotations,
+                images,
+                output,
+                barrier,
+                write_counts,
+                write_lock,
+                queue,
+            ),
+        )
+        for _index in range(2)
+    ]
+    for creator in creators:
+        creator.start()
+    for creator in creators:
+        creator.join(timeout=20)
+        assert creator.exitcode == 0
+
+    results = [queue.get(timeout=2) for _index in creators]
+    assert [result[0] for result in results] == ["ok", "ok"]
+    assert results[0][1:3] == results[1][1:3]
+    assert sorted(write_counts.values()) == [4]
+    manager.shutdown()
+    split = create_coco_manifests(
+        annotations,
+        images,
+        output,
+        reference_count=1,
+        evaluation_count=1,
+    )
+    assert split.benchmark_manifest.is_file()
+
+
+@pytest.mark.parametrize("field", ("schema_version", "reference_count"))
+def test_coco_split_rejects_boolean_metadata_fields(tmp_path, field):
+    annotations, images = _coco_fixture(tmp_path, image_count=2)
+    output = tmp_path / "inputs"
+    split = create_coco_manifests(
+        annotations,
+        images,
+        output,
+        reference_count=1,
+        evaluation_count=1,
+    )
+    metadata = json.loads(split.benchmark_manifest.read_text(encoding="utf-8"))
+    metadata[field] = True
+    split.benchmark_manifest.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="incompatible existing benchmark manifest"):
         create_coco_manifests(
             annotations,
             images,

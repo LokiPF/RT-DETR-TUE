@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import csv
+import fcntl
 import hashlib
 import io
 import json
 import os
 import stat
 import unicodedata
+from contextlib import contextmanager
 from dataclasses import dataclass
 from numbers import Integral
 from pathlib import Path
@@ -20,7 +22,6 @@ from .artifacts import (
     _require_staging_entry,
     _sha256_stream,
     _staged_file,
-    atomic_json,
 )
 from .config import FIXED_CONFIG, ExperimentConfig
 from .extraction import RTDETRExtractor
@@ -31,6 +32,7 @@ from .manifests import (
     manifest_digest,
     validate_disjoint,
 )
+from .reporting import _DirectoryLease
 
 
 _BENCHMARK_MANIFEST = "benchmark-manifest.json"
@@ -38,6 +40,7 @@ _EVALUATION_MANIFEST = "evaluation-manifest.csv"
 _REFERENCE_MANIFEST = "reference-manifest.csv"
 _SCHEMA_VERSION = 1
 _DEFAULT_SPLIT_SEED = 20260825
+_JOURNAL = "benchmark-manifest-journal.json"
 
 
 @dataclass(frozen=True)
@@ -318,27 +321,20 @@ def _regular_bytes(path: Path, *, label: str) -> bytes:
     return value
 
 
-def _load_metadata(path: Path) -> dict:
-    try:
-        value = json.loads(_regular_bytes(path, label="benchmark manifest"))
-    except (json.JSONDecodeError, UnicodeDecodeError) as error:
-        raise ValueError("benchmark manifest must be valid JSON") from error
-    if type(value) is not dict:
-        raise ValueError("benchmark manifest must contain a JSON object")
-    reference_ids = value.get("reference_ids")
-    evaluation_ids = value.get("evaluation_ids")
-    if type(reference_ids) is not list or type(evaluation_ids) is not list:
-        raise ValueError("benchmark manifest must contain cohort id lists")
-    if (
-        any(type(item) is not int or item <= 0 for item in reference_ids)
-        or any(type(item) is not int or item <= 0 for item in evaluation_ids)
-        or len(set(reference_ids)) != len(reference_ids)
-        or len(set(evaluation_ids)) != len(evaluation_ids)
-    ):
-        raise ValueError("benchmark manifest has invalid cohort ids")
-    if set(reference_ids) & set(evaluation_ids):
-        raise ValueError("benchmark manifest reference and evaluation cohorts overlap")
-    return value
+def _canonical_json_bytes(value: dict) -> bytes:
+    return (
+        json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    ).encode("utf-8")
+
+
+def _journal_bytes(metadata: dict) -> bytes:
+    return _canonical_json_bytes(
+        {
+            "schema_version": _SCHEMA_VERSION,
+            "state": "pending",
+            "benchmark_manifest": metadata,
+        }
+    )
 
 
 def _entry_present(path: Path) -> bool:
@@ -346,6 +342,107 @@ def _entry_present(path: Path) -> bool:
         path.lstat()
     except FileNotFoundError:
         return False
+    return True
+
+
+@contextmanager
+def _coordinated_manifest_directory(output_directory: Path):
+    message = "COCO manifest directory must be a stable directory"
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ValueError(message) from error
+    with _DirectoryLease(output_directory, message=message) as lease:
+        fcntl.flock(lease.fd, fcntl.LOCK_EX)
+        lease.verify_path()
+        try:
+            yield Path(f"/proc/self/fd/{lease.fd}")
+        finally:
+            lease.verify_path()
+
+
+def _matches_or_absent(
+    path: Path,
+    expected: bytes,
+    *,
+    label: str,
+    error_message: str,
+) -> bool:
+    if not _entry_present(path):
+        return False
+    if _regular_bytes(path, label=label) != expected:
+        raise ValueError(error_message)
+    return True
+
+
+def _remove_journal(path: Path) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    _fsync_directory(path.parent)
+
+
+def _reject_overlapping_metadata_cohorts(value: bytes) -> None:
+    try:
+        metadata = json.loads(value)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return
+    if type(metadata) is not dict:
+        return
+    reference_ids = metadata.get("reference_ids")
+    evaluation_ids = metadata.get("evaluation_ids")
+    if (
+        type(reference_ids) is not list
+        or type(evaluation_ids) is not list
+        or any(type(item) is not int or item <= 0 for item in reference_ids)
+        or any(type(item) is not int or item <= 0 for item in evaluation_ids)
+    ):
+        return
+    if set(reference_ids) & set(evaluation_ids):
+        raise ValueError("benchmark manifest reference and evaluation cohorts overlap")
+
+
+def _validate_final_set(
+    split: CocoSplit,
+    *,
+    reference_bytes: bytes,
+    evaluation_bytes: bytes,
+    metadata: dict,
+    metadata_bytes: bytes,
+) -> bool:
+    if not _entry_present(split.benchmark_manifest):
+        return False
+    actual_metadata = _regular_bytes(
+        split.benchmark_manifest, label="benchmark manifest"
+    )
+    if actual_metadata != metadata_bytes:
+        _reject_overlapping_metadata_cohorts(actual_metadata)
+        raise ValueError("incompatible existing benchmark manifest")
+    reference_exists = _matches_or_absent(
+        split.reference_manifest,
+        reference_bytes,
+        label="reference manifest",
+        error_message="incompatible existing benchmark manifests",
+    )
+    evaluation_exists = _matches_or_absent(
+        split.evaluation_manifest,
+        evaluation_bytes,
+        label="evaluation manifest",
+        error_message="incompatible existing benchmark manifests",
+    )
+    if not reference_exists or not evaluation_exists:
+        raise ValueError("incomplete existing COCO manifest set")
+    loaded_reference = load_manifest(split.reference_manifest)
+    loaded_evaluation = load_manifest(split.evaluation_manifest)
+    validate_disjoint(loaded_reference, loaded_evaluation)
+    if (
+        manifest_digest(loaded_reference)
+        != metadata["reference_manifest_sha256"]
+        or manifest_digest(loaded_evaluation)
+        != metadata["evaluation_manifest_sha256"]
+    ):
+        raise ValueError("incompatible existing benchmark manifests")
     return True
 
 
@@ -416,6 +513,8 @@ def create_coco_manifests(
         reference_bytes=reference_bytes,
         evaluation_bytes=evaluation_bytes,
     )
+    metadata_bytes = _canonical_json_bytes(metadata)
+    journal_bytes = _journal_bytes(metadata)
     split = _split(
         output_directory,
         reference=reference,
@@ -423,37 +522,62 @@ def create_coco_manifests(
         split_seed=split_seed,
     )
 
-    if _entry_present(split.benchmark_manifest):
-        actual = _load_metadata(split.benchmark_manifest)
-        if actual != metadata:
-            raise ValueError("incompatible existing benchmark manifest")
-        if _regular_bytes(
-            split.reference_manifest, label="reference manifest"
-        ) != reference_bytes or _regular_bytes(
-            split.evaluation_manifest, label="evaluation manifest"
-        ) != evaluation_bytes:
-            raise ValueError("incompatible existing benchmark manifests")
-        loaded_reference = load_manifest(split.reference_manifest)
-        loaded_evaluation = load_manifest(split.evaluation_manifest)
-        validate_disjoint(loaded_reference, loaded_evaluation)
-        if (
-            manifest_digest(loaded_reference)
-            != metadata["reference_manifest_sha256"]
-            or manifest_digest(loaded_evaluation)
-            != metadata["evaluation_manifest_sha256"]
+    with _coordinated_manifest_directory(output_directory) as anchored_output:
+        anchored_split = _split(
+            anchored_output,
+            reference=reference,
+            evaluation=evaluation,
+            split_seed=split_seed,
+        )
+        journal_path = anchored_output / _JOURNAL
+        if _validate_final_set(
+            anchored_split,
+            reference_bytes=reference_bytes,
+            evaluation_bytes=evaluation_bytes,
+            metadata=metadata,
+            metadata_bytes=metadata_bytes,
         ):
-            raise ValueError("incompatible existing benchmark manifests")
-        return split
-    if (
-        _entry_present(split.reference_manifest)
-        or _entry_present(split.evaluation_manifest)
-    ):
-        raise ValueError("incomplete existing COCO manifest set")
+            if _entry_present(journal_path):
+                if _regular_bytes(
+                    journal_path, label="benchmark manifest journal"
+                ) != journal_bytes:
+                    raise ValueError("incompatible existing benchmark manifest journal")
+                _remove_journal(journal_path)
+            return split
 
-
-    _atomic_bytes(reference_bytes, split.reference_manifest)
-    _atomic_bytes(evaluation_bytes, split.evaluation_manifest)
-    atomic_json(metadata, split.benchmark_manifest)
+        reference_exists = _matches_or_absent(
+            anchored_split.reference_manifest,
+            reference_bytes,
+            label="reference manifest",
+            error_message="incomplete existing COCO manifest set",
+        )
+        evaluation_exists = _matches_or_absent(
+            anchored_split.evaluation_manifest,
+            evaluation_bytes,
+            label="evaluation manifest",
+            error_message="incomplete existing COCO manifest set",
+        )
+        if _entry_present(journal_path):
+            if _regular_bytes(
+                journal_path, label="benchmark manifest journal"
+            ) != journal_bytes:
+                raise ValueError("incompatible existing benchmark manifest journal")
+        else:
+            _atomic_bytes(journal_bytes, journal_path)
+        if not reference_exists:
+            _atomic_bytes(reference_bytes, anchored_split.reference_manifest)
+        if not evaluation_exists:
+            _atomic_bytes(evaluation_bytes, anchored_split.evaluation_manifest)
+        _atomic_bytes(metadata_bytes, anchored_split.benchmark_manifest)
+        if not _validate_final_set(
+            anchored_split,
+            reference_bytes=reference_bytes,
+            evaluation_bytes=evaluation_bytes,
+            metadata=metadata,
+            metadata_bytes=metadata_bytes,
+        ):
+            raise RuntimeError("COCO manifest publication did not complete")
+        _remove_journal(journal_path)
     return split
 
 
