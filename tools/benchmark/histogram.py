@@ -50,21 +50,29 @@ def load_model():
 
 @torch.no_grad()
 def scores(model, d):
+    """Per-detection (U, C) and per-image mean (IU, IC) over conf>=CONF_TH dets."""
     coco = COCO(d["anns"])
     paths = [
         os.path.join(d["imgs"], im["file_name"])
         for im in coco.loadImgs(coco.getImgIds())
     ]
-    U, C = [], []
+    s = {"U": [], "C": [], "IU": [], "IC": []}
     for b in tqdm(list(chunks(paths, BATCH)), desc=d["name"]):
         x = torch.stack([tf(Image.open(p).convert("RGB")) for p in b]).to(DEVICE)
         out = model(x)
         conf = out["pred_logits"].sigmoid().max(-1).values
         unc = out["tue_uncertainty"]
         m = (conf >= CONF_TH) & torch.isfinite(unc) & torch.isfinite(conf)
-        U += unc[m].cpu().tolist()
-        C += conf[m].cpu().tolist()
-    return U, C
+        for i in range(conf.shape[0]):
+            cu = unc[i][m[i]].cpu()
+            cc = conf[i][m[i]].cpu()
+            if cu.numel() == 0:
+                continue
+            s["U"] += cu.tolist()
+            s["C"] += cc.tolist()
+            s["IU"].append(cu.mean().item())
+            s["IC"].append(cc.mean().item())
+    return s
 
 
 def phist(ax, groups, key, bins):
@@ -87,7 +95,7 @@ def main():
     groups, oi = [], 0
     for ds in datasets:
         d = ds["dataset"]
-        U, C = scores(model, d)
+        s = scores(model, d)
         if d["ood"]:
             color = OOD_COLORS[oi % len(OOD_COLORS)]
             oi += 1
@@ -95,21 +103,28 @@ def main():
         else:
             color = ID_COLOR
             tag = "ID/Train"
-        groups.append((f"{d['name']} ({tag})", color, {"U": U, "C": C}))
+        groups.append((f"{d['name']} ({tag})", color, s))
 
-    plt.rcParams.update({"font.family": "serif", "font.size": 10})
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(7.5, 2.8))
-    allU = np.concatenate([np.asarray(g[2]["U"]) for g in groups if g[2]["U"]])
-    ub = np.linspace(allU.min(), allU.max(), 31)
+    def bins(key):
+        allv = np.concatenate([np.asarray(g[2][key]) for g in groups if g[2][key]])
+        return np.linspace(allv.min(), allv.max(), 31)
+
     cb = np.linspace(CONF_TH, 1.0, 31)
-    phist(a1, groups, "U", ub)
-    phist(a2, groups, "C", cb)
-    a1.set_xlabel("(a) Distrib. of Uncertainty")
-    a2.set_xlabel("(b) Distrib. of Confidences")
-    a2.set_xlim(CONF_TH, 1.0)
-    for ax in (a1, a2):
-        ax.grid(alpha=0.3)
-        ax.legend(fontsize=7)
+    plt.rcParams.update({"font.family": "serif", "font.size": 10})
+    fig, ax = plt.subplots(2, 2, figsize=(7.5, 5.2))
+    phist(ax[0, 0], groups, "U", bins("U"))
+    phist(ax[0, 1], groups, "C", cb)
+    phist(ax[1, 0], groups, "IU", bins("IU"))
+    phist(ax[1, 1], groups, "IC", cb)
+    ax[0, 0].set_xlabel("(a) Uncertainty (per detection)")
+    ax[0, 1].set_xlabel("(b) Confidence (per detection)")
+    ax[1, 0].set_xlabel("(c) Uncertainty (image avg)")
+    ax[1, 1].set_xlabel("(d) Confidence (image avg)")
+    ax[0, 1].set_xlim(CONF_TH, 1.0)
+    ax[1, 1].set_xlim(CONF_TH, 1.0)
+    for a in ax.ravel():
+        a.grid(alpha=0.3)
+    ax[0, 0].legend(fontsize=7)
     fig.tight_layout()
     out = Path(CONFIG_FILE).parent / "uncertainty_hist.png"
     fig.savefig(out, dpi=200, bbox_inches="tight")
