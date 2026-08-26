@@ -82,7 +82,9 @@ class TUERTDETR(nn.Module):
         )
 
         if not self.frechet_means:
-            raise ValueError("Frechet means are None. Make sure the correct frechet means checkpoint is loaded and it contains the correct keys.")
+            raise ValueError(
+                "Frechet means are None. Make sure the correct frechet means checkpoint is loaded and it contains the correct keys."
+            )
 
     def _get_reference(
         self,
@@ -107,11 +109,11 @@ class TUERTDETR(nn.Module):
 
     @torch.no_grad()
     def _expected_distance(
-            self,
-            diagram: Tensor,
-            layer_id: int,
-            class_ids: Tensor,  # [k] top-k class indices, cpu long
-            class_weights: Tensor,  # [k] top-k scores,       cpu float
+        self,
+        diagram: Tensor,
+        layer_id: int,
+        class_ids: Tensor,  # [k] top-k class indices, cpu long
+        class_weights: Tensor,  # [k] top-k scores,       cpu float
     ) -> float:
         """
         Expectation of the persistence distance over the top-k predicted
@@ -128,8 +130,8 @@ class TUERTDETR(nn.Module):
         weight_total = 0.0
 
         for class_id, weight in zip(
-                class_ids.tolist(),
-                class_weights.tolist(),
+            class_ids.tolist(),
+            class_weights.tolist(),
         ):
             reference = self._get_reference(
                 layer_id=layer_id,
@@ -177,9 +179,7 @@ class TUERTDETR(nn.Module):
         logits = outputs["pred_logits"]
         probabilities = logits.sigmoid()
         confidence, _ = probabilities.max(dim=-1)
-        confidence_mask = (
-            confidence > self.tue_confidence_threshold
-        )
+        confidence_mask = confidence > self.tue_confidence_threshold
 
         query_indices = [
             torch.where(confidence_mask[batch_id])[0]
@@ -219,11 +219,10 @@ class TUERTDETR(nn.Module):
         )
 
         layer_positions = {
-            layer_id: position
-            for position, layer_id in enumerate(selected_layers)
+            layer_id: position for position, layer_id in enumerate(selected_layers)
         }
 
-        for layer_id, batch_diagrams in diagrams.items(): # per layer
+        for layer_id, batch_diagrams in diagrams.items():  # per layer
             layer_position = layer_positions[layer_id]
             layer_logits = captures[layer_id]["logits"].detach().cpu()
             layer_classes = layer_logits.argmax(dim=-1)
@@ -232,35 +231,29 @@ class TUERTDETR(nn.Module):
             # same sigmoid scoring as the rest of the model; weights are
             # renormalized per query inside _expected_distance.
             top_count = min(self.tue_topk, layer_logits.shape[-1])
-            topk_weights, topk_classes = (
-                layer_logits.sigmoid().topk(top_count, dim=-1)
-            )
+            topk_weights, topk_classes = layer_logits.sigmoid().topk(top_count, dim=-1)
 
-            for batch_id, query_diagrams in enumerate(batch_diagrams): # per batch
-                for query_id, diagram in query_diagrams.items(): # per query/diagram
+            for batch_id, query_diagrams in enumerate(batch_diagrams):  # per batch
+                for query_id, diagram in query_diagrams.items():  # per query/diagram
                     class_id = int(layer_classes[batch_id, query_id])
 
-                    layer_classes_output[
-                        batch_id, query_id, layer_position
-                    ] = class_id
+                    layer_classes_output[batch_id, query_id, layer_position] = class_id
 
-                    distances[
-                        batch_id, query_id, layer_position
-                    ] = self._expected_distance(
-                        diagram=diagram,
-                        layer_id=layer_id,
-                        class_ids=topk_classes[batch_id, query_id],
-                        class_weights=topk_weights[batch_id, query_id],
+                    distances[batch_id, query_id, layer_position] = (
+                        self._expected_distance(
+                            diagram=diagram,
+                            layer_id=layer_id,
+                            class_ids=topk_classes[batch_id, query_id],
+                            class_weights=topk_weights[batch_id, query_id],
+                        )
                     )
 
         output_device = logits.device
 
         outputs["tue_distances"] = distances.to(output_device)
-        outputs["tue_classes"] = layer_classes_output.to(
-            output_device
-        )
+        outputs["tue_classes"] = layer_classes_output.to(output_device)
 
-        outputs["tue_uncertainty"] =  torch.nanmean(
+        outputs["tue_uncertainty"] = torch.nanmean(
             distances.to(output_device),
             dim=-1,
         )

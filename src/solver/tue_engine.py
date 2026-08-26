@@ -4,37 +4,25 @@ https://github.com/facebookresearch/detr/blob/main/engine.py
 
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
+
 from __future__ import annotations
 
-import sys
 import math
-import time
-from typing import Iterable
+from collections.abc import Iterable
 
 import numpy as np
 import torch
-import torch.amp 
-from torch.utils.tensorboard import SummaryWriter
-from torch.cuda.amp.grad_scaler import GradScaler
+import torch.amp
+from torch import nn
 
-from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
-from supervisely.nn.training import train_logger
-
-
-import torch.nn.functional as F
-
-from collections.abc import Iterable
-
-import torch
-import torch.nn.functional as F
-from torch import Tensor, nn
-
+from ..misc import MetricLogger, SmoothedValue
 from ..misc.tue_utils import (
     LayerClassBuckets,
-    get_captured_persistence_diagrams, hook_decoder_layers,
+    get_captured_persistence_diagrams,
+    hook_decoder_layers,
 )
-from ..misc import MetricLogger, SmoothedValue
+
 
 def _update_buckets(
     diagrams,
@@ -44,17 +32,11 @@ def _update_buckets(
     allowed_class_ids: frozenset[int] | None = None,
 ):
     for layer_id, batch_diagrams in diagrams.items():
-        layer_classes = captures[layer_id][
-            "logits"
-        ].argmax(dim=-1)
+        layer_classes = captures[layer_id]["logits"].argmax(dim=-1)
 
-        for batch_id, query_diagrams in enumerate(
-                batch_diagrams
-        ):
+        for batch_id, query_diagrams in enumerate(batch_diagrams):
             for query_id, diagram in query_diagrams.items():
-                gt_label = int(
-                    matched_labels[batch_id, query_id].item()
-                )
+                gt_label = int(matched_labels[batch_id, query_id].item())
                 if gt_label < 0:
                     continue
 
@@ -79,6 +61,7 @@ def _update_buckets(
                 # end_time = time.perf_counter()
                 # elapsed_times = np.append(elapsed_times, end_time-start_time)
 
+
 @torch.inference_mode()
 def collect_persistence_one_epoch(
     model: nn.Module,
@@ -93,15 +76,15 @@ def collect_persistence_one_epoch(
     data_fraction: float = 1.0,
 ) -> tuple[LayerClassBuckets, dict, dict]:
     if not 0.0 <= confidence_threshold <= 1.0:
-        raise ValueError(
-            "confidence_threshold must be between zero and one"
-        )
+        raise ValueError("confidence_threshold must be between zero and one")
 
     if not 0.0 < data_fraction <= 1.0:
         raise ValueError("data_fraction must be in the interval (0, 1]")
 
     allowed_class_ids = (
-        None if class_ids is None else frozenset(int(class_id) for class_id in class_ids)
+        None
+        if class_ids is None
+        else frozenset(int(class_id) for class_id in class_ids)
     )
     if allowed_class_ids is not None:
         invalid = sorted(
@@ -144,9 +127,7 @@ def collect_persistence_one_epoch(
         for bbox_layer_id in range(num_bbox_layers)
     }
     captures_score, handles_score, selected_layers_score = hook_decoder_layers(
-        transformer=transformer,
-        decoder_layers=decoder_layers,
-        head_task='score'
+        transformer=transformer, decoder_layers=decoder_layers, head_task="score"
     )
 
     captures_bbox = {}
@@ -171,9 +152,7 @@ def collect_persistence_one_epoch(
         "epoch": epoch,
         "step": -1,
         "global_step": epoch * len(data_loader),
-        "class_ids": (
-            None if allowed_class_ids is None else sorted(allowed_class_ids)
-        ),
+        "class_ids": (None if allowed_class_ids is None else sorted(allowed_class_ids)),
     }
 
     elapsed_times = np.array([])
@@ -193,11 +172,7 @@ def collect_persistence_one_epoch(
             for captures in captures_bbox.values():
                 captures.clear()
             samples = samples.to(device)
-            targets = [
-                {k: v.to(device) for k, v in t.items()}
-                for t in targets
-            ]
-
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             outputs = model(samples)
 
@@ -219,26 +194,20 @@ def collect_persistence_one_epoch(
 
             match_indices = matcher(outputs, targets)["indices"]
 
-            for batch_id, (query_idx, target_idx) in enumerate(
-                match_indices
-            ):
-                matched_labels[batch_id, query_idx] = targets[
-                    batch_id
-                ]["labels"][target_idx]
+            for batch_id, (query_idx, target_idx) in enumerate(match_indices):
+                matched_labels[batch_id, query_idx] = targets[batch_id]["labels"][
+                    target_idx
+                ]
 
             query_indices = [
                 torch.where(confidence_mask[batch_id])[0]
                 for batch_id in range(confidence_mask.shape[0])
             ]
 
-            selected_query_count = sum(
-                indices.numel()
-                for indices in query_indices
-            )
+            selected_query_count = sum(indices.numel() for indices in query_indices)
 
             metric_logger.update(
-                selected_queries=selected_query_count
-                / confidence.shape[0]
+                selected_queries=selected_query_count / confidence.shape[0]
             )
 
             missing_score = set(selected_layers_score) - set(captures_score)
@@ -312,15 +281,22 @@ def collect_persistence_one_epoch(
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, data_loader, coco_evaluator: CocoEvaluator, device):
+def evaluate(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    postprocessor,
+    data_loader,
+    coco_evaluator: CocoEvaluator,
+    device,
+):
     model.eval()
     criterion.eval()
     coco_evaluator.cleanup()
 
     metric_logger = MetricLogger(delimiter="  ")
     # metric_logger.add_meter('class_error', SmoothedValue(window_size=1, fmt='{value:.2f}'))
-    header = 'Test:'
-    
+    header = "Test:"
+
     # iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessor.keys())
     iou_types = coco_evaluator.iou_types
     # coco_evaluator = CocoEvaluator(base_ds, iou_types)
@@ -337,7 +313,7 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
         # TODO (lyuwenyu), fix dataset converted using `convert_to_coco_api`?
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         # orig_target_sizes = torch.tensor([[samples.shape[-1], samples.shape[-2]]], device=samples.device)
-        
+
         results = postprocessor(outputs, orig_target_sizes)
 
         # if 'segm' in postprocessor.keys():
@@ -347,17 +323,22 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
         # predictions carry 0-based label indices, while GT annotations use dataset
         # category ids (1-based for COCO-style json); remap unless the postprocessor
         # already did it (remap_mscoco_category=True)
-        label2category = getattr(data_loader.dataset, 'label2category', None)
-        if label2category is not None and not getattr(postprocessor, 'remap_mscoco_category', False):
+        label2category = getattr(data_loader.dataset, "label2category", None)
+        if label2category is not None and not getattr(
+            postprocessor, "remap_mscoco_category", False
+        ):
             for result in results:
-                labels = result['labels']
-                result['labels'] = torch.tensor(
+                labels = result["labels"]
+                result["labels"] = torch.tensor(
                     [label2category[int(x)] for x in labels.flatten()],
                     dtype=labels.dtype,
                     device=labels.device,
                 ).reshape(labels.shape)
 
-        res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+        res = {
+            target["image_id"].item(): output
+            for target, output in zip(targets, results)
+        }
         if coco_evaluator is not None:
             coco_evaluator.update(res)
 
@@ -375,11 +356,9 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
     stats = {}
     # stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     if coco_evaluator is not None:
-        if 'bbox' in iou_types:
-            stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
-        if 'segm' in iou_types:
-            stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
-            
+        if "bbox" in iou_types:
+            stats["coco_eval_bbox"] = coco_evaluator.coco_eval["bbox"].stats.tolist()
+        if "segm" in iou_types:
+            stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
+
     return stats, coco_evaluator
-
-

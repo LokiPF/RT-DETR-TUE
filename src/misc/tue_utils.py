@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from typing import Iterable
+from collections.abc import Iterable
 
 import torch
-from torch import Tensor, nn
 import torch.nn.functional as F
+from torch import Tensor, nn
 
 # The graph structure is identical for every query with the same dimensions.
 _EDGE_INDEX_CACHE: dict[tuple[int, int], Tensor] = {}
@@ -12,21 +12,30 @@ _EDGE_INDEX_CACHE: dict[tuple[int, int], Tensor] = {}
 
 def empirical_cdf(sorted_distances: torch.Tensor, measured) -> torch.Tensor:
     total = sorted_distances.numel()
-    measured = torch.as_tensor(measured, dtype=sorted_distances.dtype, device=sorted_distances.device)
+    measured = torch.as_tensor(
+        measured, dtype=sorted_distances.dtype, device=sorted_distances.device
+    )
     if total == 0:
         return torch.full_like(measured, float("nan"), dtype=torch.float32)
-    count_le = torch.searchsorted(sorted_distances, measured, right=True).to(torch.float32)
+    count_le = torch.searchsorted(sorted_distances, measured, right=True).to(
+        torch.float32
+    )
     return count_le / total
 
 
 def conformal_pvalue(sorted_distances: torch.Tensor, measured) -> torch.Tensor:
     total = sorted_distances.numel()
-    measured = torch.as_tensor(measured, dtype=sorted_distances.dtype, device=sorted_distances.device)
+    measured = torch.as_tensor(
+        measured, dtype=sorted_distances.dtype, device=sorted_distances.device
+    )
     if total == 0:
         return torch.full_like(measured, float("nan"), dtype=torch.float32)
-    count_lt = torch.searchsorted(sorted_distances, measured, right=False).to(torch.float32)
+    count_lt = torch.searchsorted(sorted_distances, measured, right=False).to(
+        torch.float32
+    )
     count_ge = total - count_lt
     return (1.0 + count_ge) / (total + 1.0)
+
 
 def hook_decoder_layers(
     transformer: nn.Module,
@@ -91,11 +100,7 @@ def hook_decoder_layers(
                 ) -> None:
                     features = output.detach()
                     weight = head.weight.detach()
-                    bias = (
-                        head.bias.detach()
-                        if head.bias is not None
-                        else None
-                    )
+                    bias = head.bias.detach() if head.bias is not None else None
                     head_output = F.linear(
                         features,
                         weight,
@@ -164,11 +169,7 @@ def hook_decoder_layers(
                     captures.setdefault(index, {})["logits"] = F.linear(
                         output.detach(),
                         head.weight.detach(),
-                        (
-                            head.bias.detach()
-                            if head.bias is not None
-                            else None
-                        ),
+                        (head.bias.detach() if head.bias is not None else None),
                     ).detach()
 
                 return hook
@@ -202,13 +203,12 @@ def hook_decoder_layers(
 
             # Unlike intermediate score heads, bbox heads really execute at
             # evaluation time, so capture the selected MLP layer directly.
-            handle = bbox_linear.register_forward_hook(
-                make_bbox_hook(layer_id)
-            )
+            handle = bbox_linear.register_forward_hook(make_bbox_hook(layer_id))
 
         handles.append(handle)
 
     return captures, handles, normalized_layers
+
 
 def diagram_distance(diagram: Tensor, reference: Tensor) -> Tensor:
     diagram = torch.sort(
@@ -225,6 +225,7 @@ def diagram_distance(diagram: Tensor, reference: Tensor) -> Tensor:
 
     return torch.sqrt(torch.mean((diagram - reference) ** 2))
 
+
 def _get_bipartite_edge_index(
     num_inputs: int,
     num_outputs: int,
@@ -234,9 +235,9 @@ def _get_bipartite_edge_index(
     if cache_key not in _EDGE_INDEX_CACHE:
         input_vertices = torch.arange(num_inputs).repeat(num_outputs)
 
-        output_vertices = (
-            num_inputs + torch.arange(num_outputs)
-        ).repeat_interleave(num_inputs)
+        output_vertices = (num_inputs + torch.arange(num_outputs)).repeat_interleave(
+            num_inputs
+        )
 
         _EDGE_INDEX_CACHE[cache_key] = torch.stack(
             [input_vertices, output_vertices],
@@ -264,13 +265,10 @@ def get_activation_weights(
 
     if layer_input.shape[0] != num_inputs:
         raise ValueError(
-            f"Expected input dimension {num_inputs}, "
-            f"got {layer_input.shape[0]}"
+            f"Expected input dimension {num_inputs}, got {layer_input.shape[0]}"
         )
 
-    activation_matrix = torch.abs(
-        weight_matrix * layer_input.unsqueeze(0)
-    )
+    activation_matrix = torch.abs(weight_matrix * layer_input.unsqueeze(0))
 
     edge_index = _get_bipartite_edge_index(
         num_inputs=num_inputs,
@@ -350,6 +348,7 @@ def get_maximum_spanning_tree(
         weights_cpu.index_select(0, selected_indices),
     )
 
+
 @torch.no_grad()
 def _batched_prim(
     weight_matrix: Tensor,
@@ -395,10 +394,7 @@ def _batched_prim(
         )
 
     # [K, C, H]
-    edge_weights = torch.abs(
-        layer_inputs[:, None, :]
-        * weight_matrix[None, :, :]
-    )
+    edge_weights = torch.abs(layer_inputs[:, None, :] * weight_matrix[None, :, :])
 
     selected_inputs = torch.zeros(
         (num_queries, num_inputs),
@@ -452,12 +448,8 @@ def _batched_prim(
 
         is_input = selected_vertex < num_inputs
 
-        input_index = selected_vertex.clamp(
-            max=num_inputs - 1
-        )
-        output_index = (
-            selected_vertex - num_inputs
-        ).clamp(
+        input_index = selected_vertex.clamp(max=num_inputs - 1)
+        output_index = (selected_vertex - num_inputs).clamp(
             min=0,
             max=num_outputs - 1,
         )
@@ -528,6 +520,7 @@ def _batched_prim(
         descending=True,
     ).values
 
+
 @torch.no_grad()
 def get_persistence_diagrams_batched(
     weight_matrix: Tensor,
@@ -543,11 +536,7 @@ def get_persistence_diagrams_batched(
         diagrams: [K, H + C - 1]
     """
     if layer_inputs.shape[0] == 0:
-        diagram_size = (
-            weight_matrix.shape[0]
-            + weight_matrix.shape[1]
-            - 1
-        )
+        diagram_size = weight_matrix.shape[0] + weight_matrix.shape[1] - 1
 
         return torch.empty(
             (0, diagram_size),
@@ -566,6 +555,7 @@ def get_persistence_diagrams_batched(
     ]
 
     return torch.cat(chunks, dim=0)
+
 
 @torch.no_grad()
 def get_persistence_diagram(
@@ -614,9 +604,7 @@ def get_captured_persistence_diagrams(
         layer_inputs = capture["input"]
         weight_matrix = capture["weight"]
 
-        batch_results = [
-            {} for _ in range(layer_inputs.shape[0])
-        ]
+        batch_results = [{} for _ in range(layer_inputs.shape[0])]
 
         selected_inputs = []
         locations: list[tuple[int, int]] = []
@@ -638,8 +626,7 @@ def get_captured_persistence_diagrams(
             )
 
             locations.extend(
-                (batch_id, query_id)
-                for query_id in query_ids.cpu().tolist()
+                (batch_id, query_id) for query_id in query_ids.cpu().tolist()
             )
 
         if selected_inputs:
@@ -679,13 +666,11 @@ class LayerClassBuckets:
         self.num_classes = num_classes
 
         self.sums: list[list[Tensor | None]] = [
-            [None for _ in range(num_classes)]
-            for _ in range(num_layers)
+            [None for _ in range(num_classes)] for _ in range(num_layers)
         ]
 
         self.counts: list[list[int]] = [
-            [0 for _ in range(num_classes)]
-            for _ in range(num_layers)
+            [0 for _ in range(num_classes)] for _ in range(num_layers)
         ]
 
     def update(
@@ -704,9 +689,7 @@ class LayerClassBuckets:
             self.sums[layer_id][class_id] = diagram.clone()
         else:
             if current_sum.shape != diagram.shape:
-                raise ValueError(
-                    "All diagrams in a bucket must have the same shape"
-                )
+                raise ValueError("All diagrams in a bucket must have the same shape")
 
             current_sum.add_(diagram)
 
@@ -723,9 +706,7 @@ class LayerClassBuckets:
         diagram_sum = self.sums[layer_id][class_id]
 
         if count == 0 or diagram_sum is None:
-            raise ValueError(
-                f"No diagrams for layer {layer_id}, class {class_id}"
-            )
+            raise ValueError(f"No diagrams for layer {layer_id}, class {class_id}")
 
         return diagram_sum / count
 
