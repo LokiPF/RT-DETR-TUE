@@ -89,6 +89,23 @@ the file remains standalone. Include:
 - a side-by-side ruler-group / changing-group illustration;
 - a compact worked-example comparison for construction and agriculture.
 
+## Evidence package and placement
+
+Place the final reader-facing reference and its evidence files directly in `docs/`:
+
+- `scene-reliability-reference.md` — the reference itself, including a compact reader-facing results table;
+- `scene-reliability-group-reaction.png` — a publication-ready line chart of the recorded confidence-group comparison results across the five non-clean Gaussian blur levels;
+- `scene-reliability-group-evidence.csv` — the exact plotted values and labels.
+
+The figure and table will reproduce the recorded tuning-study comparison between:
+
+- the planned 0–10% ruler versus 50–60% responsive relative-gap comparison; and
+- the later 90–100% versus 50–60% raw-gap comparison, which was suggested after inspecting the earlier tuning results.
+
+
+The chart will show AUROC by blur level (1–5), label the 250-image Gaussian-blur tuning set, and make clear that the later comparison is exploratory. It explains why group behaviour was investigated; it is not a performance claim for the current fixed 90–100% / 50–60% relative-gap workflow.
+
+
 ## Accuracy boundaries
 
 - The implementation is inference-only; it does not retrain the detector.
@@ -100,6 +117,9 @@ the file remains standalone. Include:
 - Current repository results use Gaussian blur as a controlled degradation. Rain,
   fog, and dust are motivating deployment examples that require representative
   validation before any conclusion about performance under those conditions.
+- The included group-reaction chart reproduces recorded tuning-study numbers
+  and retains the planned-versus-exploratory provenance of the two comparisons.
+
 - Avoid unnecessary implementation detail such as transformer-layer mechanics,
   exact tensor shapes, or full topological-persistence derivations.
 
