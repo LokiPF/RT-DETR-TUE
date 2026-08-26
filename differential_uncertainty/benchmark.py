@@ -20,6 +20,7 @@ from .artifacts import (
     _fsync_directory,
     _open_regular_file,
     _require_staging_entry,
+    source_digest,
     _sha256_stream,
     _staged_file,
 )
@@ -590,6 +591,116 @@ def create_coco_manifests(
 def _validate_regular_file(path: Path, *, label: str) -> None:
     with _open_regular_file(path, error_message=f"{label} must be a regular file"):
         pass
+
+
+_BENCHMARK_ROSTER_SCHEMA_VERSION = 2
+
+
+def _current_source_digest() -> str:
+    """Use the staged evaluator's complete source roster for provenance."""
+    # This local import avoids the CLI -> benchmark module import cycle.
+    from .cli import _source_files
+
+    root = Path(__file__).resolve().parents[1]
+    return source_digest(_source_files(root=root), root=root)
+
+
+def _current_runtime_provenance(
+    device: str, *, batch_size: int, shard_size: int
+) -> dict:
+    """Mirror the staged evaluator's complete runtime provenance."""
+    # This local import avoids the CLI -> benchmark module import cycle.
+    from .cli import _runtime_device, _runtime_provenance
+
+    return _runtime_provenance(
+        _runtime_device(device), batch_size=batch_size, shard_size=shard_size
+    )
+
+
+def _valid_sha256(value) -> bool:
+    return (
+        type(value) is str
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _bound_stage_provenance(provenance, roster: dict, corruption: dict) -> dict:
+    """Validate one final stage report against benchmark-level provenance."""
+    if type(provenance) is not dict:
+        raise ValueError("benchmark report provenance does not match roster")
+    expected = {
+        "schema_version": 1,
+        "reference_manifest_sha256": roster["reference_manifest_sha256"],
+        "evaluation_manifest_sha256": roster["evaluation_manifest_sha256"],
+        "checkpoint_sha256": roster["checkpoint_sha256"],
+        "source_sha256": roster["source_sha256"],
+        "config": roster["config"],
+        "runtime": roster["runtime"],
+        "corruption": corruption,
+    }
+    if any(provenance.get(name) != value for name, value in expected.items()):
+        raise ValueError("benchmark report provenance does not match roster")
+    shared_reference = provenance.get("shared_reference")
+    if type(shared_reference) is not dict:
+        raise ValueError("benchmark report provenance does not match roster")
+    reference_provenance = {
+        "schema_version": 1,
+        "stage": "reference",
+        "reference_manifest_sha256": roster["reference_manifest_sha256"],
+        "checkpoint_sha256": roster["checkpoint_sha256"],
+        "source_sha256": roster["source_sha256"],
+        "config": roster["config"],
+        "runtime": roster["runtime"],
+    }
+    binding = shared_reference.get("reference_bank_binding")
+    bank = shared_reference.get("reference_bank")
+    cache = shared_reference.get("reference_cache")
+    if (
+        shared_reference.get("reference_manifest_sha256")
+        != roster["reference_manifest_sha256"]
+        or type(binding) is not dict
+        or binding.get("schema_version") != 1
+        or binding.get("state") != "complete"
+        or binding.get("reference_provenance") != reference_provenance
+        or type(bank) is not dict
+        or type(cache) is not list
+        or binding.get("reference_cache") != cache
+        or binding.get("reference_bank") != bank
+        or type(bank.get("metadata")) is not dict
+        or bank["metadata"].get("reference_manifest_sha256")
+        != roster["reference_manifest_sha256"]
+    ):
+        raise ValueError("benchmark report provenance does not match roster")
+    return shared_reference
+
+
+def _validated_benchmark_roster(roster) -> dict:
+    if type(roster) is not dict or roster.get("schema_version") != (
+        _BENCHMARK_ROSTER_SCHEMA_VERSION
+    ):
+        raise ValueError("benchmark corruption roster is invalid")
+    for field in (
+        "reference_manifest_sha256",
+        "evaluation_manifest_sha256",
+        "checkpoint_sha256",
+        "source_sha256",
+    ):
+        if not _valid_sha256(roster.get(field)):
+            raise ValueError("benchmark corruption roster is invalid")
+    if (
+        type(roster.get("config")) is not dict
+        or type(roster.get("runtime")) is not dict
+    ):
+        raise ValueError("benchmark corruption roster is invalid")
+    corruptions = roster.get("corruptions")
+    if type(corruptions) is not list or not corruptions:
+        raise ValueError("benchmark corruption roster is invalid")
+    if any(type(item) is not dict for item in corruptions):
+        raise ValueError("benchmark corruption roster is invalid")
+    return roster
+
+
 _BENCHMARK_ROSTER = "corruption-roster.json"
 
 
@@ -646,7 +757,7 @@ def _corruption_roster(
     if not snapshots or len({item["name"] for item in snapshots}) != len(snapshots):
         raise ValueError("benchmark corruption roster must contain unique corruptions")
     return {
-        "schema_version": 1,
+        "schema_version": _BENCHMARK_ROSTER_SCHEMA_VERSION,
         "reference_manifest_sha256": manifest_digest(
             load_manifest(split.reference_manifest)
         ),
@@ -656,11 +767,12 @@ def _corruption_roster(
         "checkpoint_sha256": hashlib.sha256(
             _regular_bytes(checkpoint, label="checkpoint")
         ).hexdigest(),
-        "runtime": {
-            "device": device,
-            "batch_size": batch_size,
-            "shard_size": shard_size,
-        },
+        "source_sha256": _current_source_digest(),
+        "runtime": _current_runtime_provenance(
+            device,
+            batch_size=batch_size,
+            shard_size=shard_size,
+        ),
         "config": config.scientific_dict(),
         "corruptions": snapshots,
     }
@@ -693,13 +805,15 @@ def _ensure_corruption_roster(output_directory: Path, roster: dict) -> None:
                 raise ValueError("incompatible corruption roster")
         else:
             _atomic_bytes(expected, roster_path)
+
         if _regular_bytes(roster_path, label="corruption roster") != expected:
             raise ValueError("incompatible corruption roster")
-
 
 def _final_benchmark_entries(
     output_directory: Path, roster: dict
 ) -> tuple[dict, ...]:
+    roster = _validated_benchmark_roster(roster)
+    common_shared_reference = None
     entries = []
     for item in roster["corruptions"]:
         name = item["name"]
@@ -716,8 +830,15 @@ def _final_benchmark_entries(
         if type(summary) is not dict:
             raise ValueError(f"final report for corruption {name} is invalid")
         provenance = summary.get("provenance")
+        shared_reference = _bound_stage_provenance(
+            provenance, roster, item
+        )
+        if common_shared_reference is None:
+            common_shared_reference = shared_reference
+        elif shared_reference != common_shared_reference:
+            raise ValueError("benchmark report provenance does not match roster")
         evaluation = summary.get("evaluation")
-        if type(provenance) is not dict or type(evaluation) is not dict:
+        if type(evaluation) is not dict:
             raise ValueError(f"final report for corruption {name} is invalid")
         series = evaluation.get("series")
         if type(series) is not dict:

@@ -67,6 +67,11 @@ class FakeExtractor:
         return records
 
 
+class RejectingExtractor:
+    def __init__(self, *_args, **_kwargs):
+        raise AssertionError("completed benchmark stages must not extract")
+
+
 class ContrastCorruption:
     name = "contrast"
     severities = tuple(Severity(level, float(level)) for level in range(6))
@@ -542,3 +547,116 @@ def test_run_coco_benchmark_resumes_after_second_corruption_failure(
     assert FakeExtractor.instances == instances_after_failure + 1
     assert len(FakeExtractor.identities) == len(identities_after_failure) + 12
     assert (output / "corruptions" / "contrast" / "report").is_dir()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "checkpoint",
+        "source",
+        "shared_reference",
+        "different-common-binding",
+        "swapped-summary",
+    ),
+)
+def test_final_benchmark_entries_reject_unbound_stage_reports(
+    tmp_path, small_config, monkeypatch, mutation
+):
+    annotations, images = _coco_fixture(tmp_path, image_count=4)
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    output = tmp_path / "benchmark"
+    monkeypatch.setattr(
+        benchmark,
+        "benchmark_corruptions",
+        lambda: (GaussianBlur(), ContrastCorruption()),
+        raising=False,
+    )
+    run_coco_benchmark(
+        annotations, images, checkpoint, output,
+        device="cpu", batch_size=1, shard_size=1,
+        reference_count=2, evaluation_count=2,
+        config=small_config, extractor_factory=FakeExtractor,
+    )
+    target = output / "corruptions" / "contrast" / "report" / "summary.json"
+    summary = json.loads(target.read_text(encoding="utf-8"))
+    if mutation == "swapped-summary":
+        summary = json.loads(
+            (
+                output
+                / "corruptions"
+                / "gaussian_blur"
+                / "report"
+                / "summary.json"
+            ).read_text(encoding="utf-8")
+        )
+    elif mutation == "checkpoint":
+        summary["provenance"]["checkpoint_sha256"] = "tampered"
+    elif mutation == "source":
+        summary["provenance"]["source_sha256"] = "tampered"
+    elif mutation == "different-common-binding":
+        bank = summary["provenance"]["shared_reference"]["reference_bank"]
+        bank["metadata"]["benchmark_marker"] = "different"
+        summary["provenance"]["shared_reference"]["reference_bank_binding"][
+            "reference_bank"
+        ] = bank
+    else:
+        summary["provenance"]["shared_reference"]["reference_cache"] = []
+    target.write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    roster = json.loads(
+        (output / "corruption-roster.json").read_text(encoding="utf-8")
+    )
+    root_before = {
+        name: (output / "benchmark-report" / name).read_bytes()
+        for name in ("corruption-metrics.csv", "summary.json", "report.md")
+    }
+    with pytest.raises(ValueError, match="benchmark report provenance"):
+        benchmark._final_benchmark_entries(output, roster)
+
+    published = []
+    monkeypatch.setattr(
+        benchmark, "write_benchmark_report", lambda *_args: published.append(True)
+    )
+    with pytest.raises(ValueError):
+        run_coco_benchmark(
+            annotations, images, checkpoint, output,
+            device="cpu", batch_size=1, shard_size=1,
+            reference_count=2, evaluation_count=2,
+            config=small_config, extractor_factory=RejectingExtractor,
+        )
+    assert not published
+    assert root_before == {
+        name: (output / "benchmark-report" / name).read_bytes()
+        for name in root_before
+    }
+
+
+def test_normal_benchmark_resume_accepts_bound_stage_reports(
+    tmp_path, small_config, monkeypatch
+):
+    annotations, images = _coco_fixture(tmp_path, image_count=4)
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    output = tmp_path / "benchmark"
+    monkeypatch.setattr(
+        benchmark,
+        "benchmark_corruptions",
+        lambda: (GaussianBlur(), ContrastCorruption()),
+        raising=False,
+    )
+    run_coco_benchmark(
+        annotations, images, checkpoint, output,
+        device="cpu", batch_size=1, shard_size=1,
+        reference_count=2, evaluation_count=2,
+        config=small_config, extractor_factory=FakeExtractor,
+    )
+    before = (output / "benchmark-report" / "summary.json").read_bytes()
+    assert run_coco_benchmark(
+        annotations, images, checkpoint, output,
+        device="cpu", batch_size=1, shard_size=1,
+        reference_count=2, evaluation_count=2,
+        config=small_config, extractor_factory=RejectingExtractor,
+    ) == output.resolve()
+    assert (output / "benchmark-report" / "summary.json").read_bytes() == before
