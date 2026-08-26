@@ -1,0 +1,11 @@
+comparison_id,comparison_label,provenance,blur_level,auroc
+planned_low_middle,0–10% ruler vs 50–60% changing (relative gap),planned,1,0.478
+planned_low_middle,0–10% ruler vs 50–60% changing (relative gap),planned,2,0.515
+planned_low_middle,0–10% ruler vs 50–60% changing (relative gap),planned,3,0.600
+planned_low_middle,0–10% ruler vs 50–60% changing (relative gap),planned,4,0.802
+planned_low_middle,0–10% ruler vs 50–60% changing (relative gap),planned,5,0.845
+exploratory_high_middle,90–100% ruler vs 50–60% changing (raw gap),exploratory,1,0.512
+exploratory_high_middle,90–100% ruler vs 50–60% changing (raw gap),exploratory,2,0.569
+exploratory_high_middle,90–100% ruler vs 50–60% changing (raw gap),exploratory,3,0.669
+exploratory_high_middle,90–100% ruler vs 50–60% changing (raw gap),exploratory,4,0.893
+exploratory_high_middle,90–100% ruler vs 50–60% changing (raw gap),exploratory,5,0.961
