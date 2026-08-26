@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import csv
+import json
 import fcntl
 import io
 import math
@@ -33,6 +35,7 @@ from .artifacts import (
     iter_records,
     load_manifest as load_artifact_manifest,
     source_digest,
+    atomic_json,
     validate_provenance,
 )
 from .bank import (
@@ -113,9 +116,34 @@ class _CorruptionSnapshot:
     def apply(self, image, level):
         return self._apply(image, level)
 
+@dataclass(frozen=True)
+class ReferenceStage:
+    """Authenticated clean-reference artifacts reusable across corruptions."""
+
+    reference_manifest: tuple
+    checkpoint: Path
+    checkpoint_snapshot: tuple
+    artifacts: Path
+    runtime_device: torch.device
+    runtime: dict
+    batch_size: int
+    shard_size: int
+    config: ExperimentConfig
+    provenance: dict
+    reference_metadata: dict
+    reference_cache: Path
+    reference_cache_snapshot: tuple
+    bank_path: Path
+    bank_snapshot: tuple
+    bank_metadata: dict
+    bank_binding_path: Path
+    bank_binding_snapshot: tuple
+    bank_binding: dict
+    bank: torch.Tensor
 def _snapshot_corruption(
     corruption: Corruption, config: ExperimentConfig
 ) -> _CorruptionSnapshot:
+
     try:
         name = corruption.name
     except Exception as error:
@@ -997,6 +1025,711 @@ def _validate_input_images(*groups) -> None:
             validate_image_fingerprint(entry)
 
 
+
+def _reference_provenance(
+    reference, checkpoint: Path, config: ExperimentConfig, runtime: dict
+) -> dict:
+    root = Path(__file__).resolve().parents[1]
+    return {
+        "schema_version": 1,
+        "stage": "reference",
+        "reference_manifest_sha256": manifest_digest(reference),
+        "checkpoint_sha256": _checkpoint_digest(checkpoint),
+        "source_sha256": source_digest(_source_files(), root=root),
+        "config": config.scientific_dict(),
+        "runtime": runtime,
+    }
+
+
+
+_REFERENCE_BANK_BINDING_FILE = "reference-bank-binding.json"
+
+
+def _reference_bank_binding(
+    provenance: dict,
+    reference_snapshot: tuple,
+    bank_snapshot: tuple,
+    bank_metadata: dict,
+) -> dict:
+    return {
+        "schema_version": 1,
+        "state": "complete",
+        "reference_provenance": provenance,
+        "reference_cache": [
+            {"name": name, "snapshot": list(snapshot)}
+            for name, snapshot in reference_snapshot
+        ],
+        "reference_bank": {
+            "snapshot": list(bank_snapshot),
+            "metadata": bank_metadata,
+        },
+    }
+
+
+
+def _reference_cache_pending_binding(provenance: dict) -> dict:
+    return {
+        "schema_version": 1,
+        "state": "cache-pending",
+        "reference_provenance": provenance,
+    }
+
+
+def _reference_bank_pending_binding(
+    provenance: dict, reference_snapshot: tuple
+) -> dict:
+    return {
+        "schema_version": 1,
+        "state": "bank-pending",
+        "reference_provenance": provenance,
+        "reference_cache": [
+            {"name": name, "snapshot": list(snapshot)}
+            for name, snapshot in reference_snapshot
+        ],
+    }
+
+
+def _load_stable_reference_bank_binding(path: Path, expected=None):
+    before = _regular_file_snapshot(path, label="reference bank binding")
+    with _open_regular_file(
+        path, error_message="reference bank binding must be a regular file"
+    ) as handle:
+        try:
+            binding = json.load(handle)
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError("reference bank binding must be JSON") from error
+    after = _regular_file_snapshot(path, label="reference bank binding")
+    if after != before:
+        raise ValueError("reference bank binding changed while it was loaded")
+    if type(binding) is not dict:
+        raise ValueError("reference bank binding must contain a JSON object")
+    if expected is not None and binding != expected:
+        raise ValueError("reference bank binding does not match preparation")
+    return binding, after
+
+def _reference_binding(reference: ReferenceStage) -> dict:
+    return {
+        "reference_manifest_sha256": reference.provenance[
+            "reference_manifest_sha256"
+        ],
+        "reference_cache": [
+            {"name": name, "snapshot": list(snapshot)}
+            for name, snapshot in reference.reference_cache_snapshot
+        ],
+        "reference_bank": {
+            "snapshot": list(reference.bank_snapshot),
+            "metadata": reference.bank_metadata,
+        },
+        "reference_bank_binding": reference.bank_binding,
+    }
+
+
+def _reference_terminal_sweep(
+    reference: ReferenceStage,
+    *,
+    checkpoint_snapshot: tuple,
+    reference_snapshot: tuple,
+    bank_snapshot: tuple,
+    bank_binding_snapshot: tuple,
+) -> None:
+    checks = [
+        (reference.checkpoint, "checkpoint", checkpoint_snapshot),
+        (
+            reference.bank_binding_path,
+            "reference bank binding",
+            bank_binding_snapshot,
+        ),
+        (reference.bank_path, "reference bank", bank_snapshot),
+    ]
+    checks.extend(
+        (
+            reference.reference_cache / name,
+            f"reference cache {name}",
+            snapshot,
+        )
+        for name, snapshot in reference_snapshot
+    )
+    for path, label, expected in checks:
+        if _regular_file_snapshot(path, label=label) != expected:
+            raise ValueError(f"{label} changed during the terminal audit")
+    for entry in reference.reference_manifest:
+        validate_image_signature(entry)
+
+
+def _authenticate_reference_stage(reference: ReferenceStage) -> dict:
+    if not isinstance(reference, ReferenceStage):
+        raise ValueError("reference must be a ReferenceStage")
+    if not isinstance(reference.config, ExperimentConfig):
+        raise ValueError("reference stage config must be an ExperimentConfig")
+    if not isinstance(reference.reference_manifest, tuple):
+        raise ValueError("reference stage manifest must be immutable")
+    if not isinstance(reference.runtime_device, torch.device):
+        raise ValueError("reference stage device is invalid")
+
+    provenance = reference.provenance
+    if type(provenance) is not dict:
+        raise ValueError("reference stage provenance is invalid")
+    expected_metadata = _extraction_metadata(provenance, stage="reference")
+    if reference.reference_metadata != expected_metadata:
+        raise ValueError("reference stage metadata does not match provenance")
+    root = Path(__file__).resolve().parents[1]
+    if reference.runtime != provenance.get("runtime"):
+        raise ValueError("reference stage runtime does not match provenance")
+    if reference.config.scientific_dict() != provenance.get("config"):
+        raise ValueError("reference stage config does not match provenance")
+    if source_digest(_source_files(), root=root) != provenance["source_sha256"]:
+        raise ValueError("reference source changed after preparation")
+
+    checkpoint_snapshot = _regular_file_snapshot(
+        reference.checkpoint, label="checkpoint"
+    )
+    if (
+        checkpoint_snapshot != reference.checkpoint_snapshot
+        or checkpoint_snapshot[-1] != provenance["checkpoint_sha256"]
+    ):
+        raise ValueError("checkpoint changed after reference preparation")
+    reference_snapshot = _validated_cache_snapshot(
+        reference.reference_manifest,
+        reference.reference_cache,
+        expected_metadata,
+        None,
+        label="reference cache",
+    )
+    if reference_snapshot != reference.reference_cache_snapshot:
+        raise ValueError("reference cache changed after preparation")
+    bank, bank_metadata, bank_snapshot = _load_stable_bank(
+        reference.bank_path, reference.config
+    )
+    if bank_snapshot != reference.bank_snapshot:
+        raise ValueError("reference bank changed after preparation")
+    if (
+        bank_metadata != reference.bank_metadata
+        or bank_metadata["reference_manifest_sha256"]
+        != provenance["reference_manifest_sha256"]
+    ):
+        raise ValueError("reference bank provenance does not match preparation")
+    expected_binding = _reference_bank_binding(
+        provenance, reference_snapshot, bank_snapshot, bank_metadata
+    )
+    bank_binding, bank_binding_snapshot = _load_stable_reference_bank_binding(
+        reference.bank_binding_path, expected_binding
+    )
+    if (
+        bank_binding_snapshot != reference.bank_binding_snapshot
+        or bank_binding != reference.bank_binding
+    ):
+        raise ValueError("reference bank binding changed after preparation")
+    if not isinstance(reference.bank, torch.Tensor) or not torch.equal(
+        bank, reference.bank
+    ):
+        raise ValueError("reference bank values changed after preparation")
+    _validate_input_images(reference.reference_manifest)
+    return {
+        "checkpoint": checkpoint_snapshot,
+        "reference_cache": reference_snapshot,
+        "bank": bank,
+        "bank_snapshot": bank_snapshot,
+        "bank_metadata": bank_metadata,
+        "bank_binding_snapshot": bank_binding_snapshot,
+        "bank_binding": bank_binding,
+    }
+
+
+def prepare_reference_stage(
+    reference_manifest,
+    checkpoint,
+    artifacts,
+    *,
+    device: str,
+    batch_size: int,
+    shard_size: int,
+    config: ExperimentConfig = FIXED_CONFIG,
+    extractor_factory=RTDETRExtractor,
+) -> ReferenceStage:
+    """Create or resume the clean cache and reference bank for reuse."""
+    batch_size = _positive_integer(batch_size, name="batch_size")
+    shard_size = _positive_integer(shard_size, name="shard_size")
+    runtime_device = _runtime_device(device)
+    runtime = _runtime_provenance(
+        runtime_device, batch_size=batch_size, shard_size=shard_size
+    )
+    if not isinstance(config, ExperimentConfig):
+        raise ValueError("config must be an ExperimentConfig")
+
+    reference = load_manifest(reference_manifest)
+    _validate_input_images(reference)
+    checkpoint = Path(checkpoint).resolve()
+    artifacts = _absolute_output_path(artifacts)
+    provenance = _reference_provenance(reference, checkpoint, config, runtime)
+    reference_metadata = _extraction_metadata(provenance, stage="reference")
+
+    with _coordinated_output(artifacts) as (
+        anchored_artifacts,
+        artifacts_parent,
+    ):
+        _validate_input_images(reference)
+        checkpoint_snapshot = _regular_file_snapshot(
+            checkpoint, label="checkpoint"
+        )
+        if checkpoint_snapshot[-1] != provenance["checkpoint_sha256"]:
+            raise ValueError("checkpoint_sha256 changed while it was prepared")
+        with _pinned_child_directory(
+            artifacts_parent,
+            "reference-extractions",
+            label="reference cache",
+        ) as (reference_cache, _reference_parent):
+            bank_path = anchored_artifacts / "reference-bank.pt"
+            bank_binding_path = anchored_artifacts / _REFERENCE_BANK_BINDING_FILE
+            cache_pending_binding = _reference_cache_pending_binding(provenance)
+            reference_complete = validate_extraction_cache(
+                reference, reference_cache, reference_metadata, None
+            )
+            if not reference_complete:
+                if _entry_present(bank_binding_path):
+                    bank_binding, _bank_binding_snapshot = (
+                        _load_stable_reference_bank_binding(bank_binding_path)
+                    )
+                    if bank_binding != cache_pending_binding:
+                        atomic_json(cache_pending_binding, bank_binding_path)
+                else:
+                    atomic_json(cache_pending_binding, bank_binding_path)
+                with extractor_factory(
+                    checkpoint, runtime_device, config
+                ) as extractor:
+                    extract_manifest(
+                        reference,
+                        reference_cache,
+                        reference_metadata,
+                        extractor,
+                        None,
+                        image_size=config.image_size,
+                        batch_size=batch_size,
+                        shard_size=shard_size,
+                        anchored_directory=True,
+                    )
+                del extractor
+            reference_snapshot = _validated_cache_snapshot(
+                reference,
+                reference_cache,
+                reference_metadata,
+                None,
+                label="reference cache",
+            )
+            if _checkpoint_digest(checkpoint) != provenance["checkpoint_sha256"]:
+                raise ValueError(
+                    "checkpoint_sha256 changed while it was prepared"
+                )
+
+            bank_pending_binding = _reference_bank_pending_binding(
+                provenance, reference_snapshot
+            )
+            rebuild_bank = not (
+                reference_complete and _entry_present(bank_path)
+            )
+            if not rebuild_bank:
+                bank, bank_metadata, bank_snapshot = _load_stable_bank(
+                    bank_path, config
+                )
+                expected_binding = _reference_bank_binding(
+                    provenance,
+                    reference_snapshot,
+                    bank_snapshot,
+                    bank_metadata,
+                )
+                bank_binding, bank_binding_snapshot = (
+                    _load_stable_reference_bank_binding(bank_binding_path)
+                )
+                if bank_binding != expected_binding:
+                    if bank_binding not in (
+                        cache_pending_binding,
+                        bank_pending_binding,
+                    ):
+                        raise ValueError(
+                            "reference bank binding does not match preparation"
+                        )
+                    rebuild_bank = True
+
+            if rebuild_bank:
+                if _entry_present(bank_path):
+                    stale_bank, _stale_metadata, _stale_snapshot = (
+                        _load_stable_bank(bank_path, config)
+                    )
+                    del stale_bank
+                if _entry_present(bank_binding_path):
+                    _load_stable_reference_bank_binding(bank_binding_path)
+                atomic_json(bank_pending_binding, bank_binding_path)
+                bank = build_reference_bank(
+                    iter_records(reference_cache), config
+                )
+                bank_metadata = {
+                    "reference_manifest_sha256": provenance[
+                        "reference_manifest_sha256"
+                    ],
+                    "capacity": config.bank_capacity,
+                    "seed": config.bank_seed,
+                    "padding_removed": True,
+                }
+                save_reference_bank(bank, bank_path, bank_metadata, config=config)
+                bank, bank_metadata, bank_snapshot = _load_stable_bank(
+                    bank_path, config
+                )
+                expected_binding = _reference_bank_binding(
+                    provenance,
+                    reference_snapshot,
+                    bank_snapshot,
+                    bank_metadata,
+                )
+                atomic_json(expected_binding, bank_binding_path)
+                bank_binding, bank_binding_snapshot = (
+                    _load_stable_reference_bank_binding(
+                        bank_binding_path, expected_binding
+                    )
+                )
+            if (
+                bank_metadata["reference_manifest_sha256"]
+                != provenance["reference_manifest_sha256"]
+            ):
+                raise ValueError(
+                    "reference bank provenance does not match preparation"
+                )
+            stage = ReferenceStage(
+                reference_manifest=reference,
+                checkpoint=checkpoint,
+                checkpoint_snapshot=checkpoint_snapshot,
+                artifacts=artifacts,
+                runtime_device=runtime_device,
+                runtime=deepcopy(runtime),
+                batch_size=batch_size,
+                shard_size=shard_size,
+                config=config,
+                provenance=deepcopy(provenance),
+                reference_metadata=deepcopy(reference_metadata),
+                reference_cache=artifacts / "reference-extractions",
+                reference_cache_snapshot=reference_snapshot,
+                bank_path=artifacts / "reference-bank.pt",
+                bank_snapshot=bank_snapshot,
+                bank_metadata=deepcopy(bank_metadata),
+                bank_binding_path=artifacts / _REFERENCE_BANK_BINDING_FILE,
+                bank_binding_snapshot=bank_binding_snapshot,
+                bank_binding=deepcopy(bank_binding),
+                bank=bank,
+            )
+            verified = _authenticate_reference_stage(stage)
+            _reference_terminal_sweep(
+                stage,
+                bank_binding_snapshot=verified["bank_binding_snapshot"],
+                checkpoint_snapshot=verified["checkpoint"],
+                reference_snapshot=verified["reference_cache"],
+                bank_snapshot=verified["bank_snapshot"],
+            )
+    return stage
+
+
+def _corruption_provenance(
+    reference: ReferenceStage, evaluation, corruption: _CorruptionSnapshot
+) -> dict:
+    provenance = _provenance(
+        reference.reference_manifest,
+        evaluation,
+        reference.checkpoint,
+        reference.config,
+        corruption,
+        reference.runtime,
+    )
+    provenance["shared_reference"] = _reference_binding(reference)
+    return provenance
+
+
+def _terminal_corruption_sweep(
+    reference: ReferenceStage,
+    evaluation,
+    *,
+    provenance_path: Path,
+    provenance_snapshot: tuple,
+    checkpoint_snapshot: tuple,
+    reference_snapshot: tuple,
+    evaluation_cache: Path,
+    evaluation_snapshot: tuple,
+    bank_snapshot: tuple,
+    bank_binding_snapshot: tuple,
+    score_path: Path,
+    score_snapshot: tuple,
+    report_path: Path,
+    report_snapshot: tuple,
+) -> None:
+    checks = [
+        (provenance_path, "run provenance", provenance_snapshot),
+        (reference.checkpoint, "checkpoint", checkpoint_snapshot),
+        (
+            reference.bank_binding_path,
+            "reference bank binding",
+            bank_binding_snapshot,
+        ),
+        (reference.bank_path, "reference bank", bank_snapshot),
+        (score_path, "score artifact", score_snapshot),
+    ]
+    checks.extend(
+        (
+            reference.reference_cache / name,
+            f"reference cache {name}",
+            snapshot,
+        )
+        for name, snapshot in reference_snapshot
+    )
+    checks.extend(
+        (
+            evaluation_cache / name,
+            f"evaluation cache {name}",
+            snapshot,
+        )
+        for name, snapshot in evaluation_snapshot
+    )
+    checks.extend(
+        (report_path / name, f"report file {name}", snapshot)
+        for name, snapshot in report_snapshot
+    )
+    for path, label, expected in checks:
+        if _regular_file_snapshot(path, label=label) != expected:
+            raise ValueError(f"{label} changed during the terminal audit")
+    for entry in (*reference.reference_manifest, *evaluation):
+        validate_image_signature(entry)
+
+
+def _final_corruption_audit(
+    reference: ReferenceStage,
+    evaluation,
+    output: Path,
+    *,
+    corruption: _CorruptionSnapshot,
+    provenance: dict,
+    artifacts: Path,
+    evaluation_cache: Path,
+    expected: dict,
+) -> None:
+    provenance_path = artifacts / "provenance.json"
+    provenance_before = _regular_file_snapshot(
+        provenance_path, label="run provenance"
+    )
+    validate_provenance(output, provenance, artifacts_directory=artifacts)
+    provenance_snapshot = _regular_file_snapshot(
+        provenance_path, label="run provenance"
+    )
+    if provenance_snapshot != provenance_before:
+        raise ValueError("run provenance changed while it was validated")
+
+    reference_state = _authenticate_reference_stage(reference)
+    if (
+        reference_state["reference_cache"] != expected["reference_cache"]
+        or reference_state["bank_snapshot"] != expected["bank"]
+        or reference_state["bank_metadata"] != expected["bank_metadata"]
+        or reference_state["bank_binding_snapshot"]
+        != expected["bank_binding"]
+    ):
+        raise ValueError("shared reference changed after it was consumed")
+    evaluation_metadata = _extraction_metadata(provenance, stage="evaluation")
+    evaluation_snapshot = _validated_cache_snapshot(
+        evaluation,
+        evaluation_cache,
+        evaluation_metadata,
+        corruption,
+        label="evaluation cache",
+    )
+    if evaluation_snapshot != expected["evaluation_cache"]:
+        raise ValueError("evaluation cache changed after it was consumed")
+
+    expected_ids = [entry.image_id for entry in evaluation]
+    score_path = artifacts / "scores.csv"
+    rows, score_snapshot = _load_stable_scores(score_path, expected_ids)
+    if score_snapshot != expected["scores"]:
+        raise ValueError("score artifact changed after it was consumed")
+    if rows != expected["rows"]:
+        raise ValueError("score artifact values changed after they were consumed")
+    evaluation_summary = evaluate_rows(rows, reference.config)
+    if evaluation_summary != expected["evaluation"]:
+        raise ValueError("evaluation changed during the final audit")
+
+    report_path = output / "report"
+    report_before = _named_file_snapshots(
+        report_path, REPORT_FILES, label="report file"
+    )
+    report_content = _bundle_bytes(
+        report_path, message="published report bundle changed"
+    )
+    report_snapshot = _named_file_snapshots(
+        report_path, REPORT_FILES, label="report file"
+    )
+    if report_snapshot != report_before:
+        raise ValueError("published report bundle changed while it was validated")
+    if report_content != expected["report"]:
+        raise ValueError("published report bundle changed")
+
+    try:
+        _validate_input_images(reference.reference_manifest, evaluation)
+    except ValueError as error:
+        raise ValueError("image changed after it was audited") from error
+    _terminal_corruption_sweep(
+        reference,
+        evaluation,
+        provenance_path=provenance_path,
+        provenance_snapshot=provenance_snapshot,
+        checkpoint_snapshot=reference_state["checkpoint"],
+        reference_snapshot=reference_state["reference_cache"],
+        evaluation_cache=evaluation_cache,
+        evaluation_snapshot=evaluation_snapshot,
+        bank_snapshot=reference_state["bank_snapshot"],
+        score_path=score_path,
+        bank_binding_snapshot=reference_state["bank_binding_snapshot"],
+        score_snapshot=score_snapshot,
+        report_path=report_path,
+        report_snapshot=report_snapshot,
+    )
+
+
+def run_corruption_stage(
+    reference: ReferenceStage,
+    evaluation_manifest,
+    output_dir,
+    corruption: Corruption,
+    *,
+    extractor_factory=RTDETRExtractor,
+) -> Path:
+    """Evaluate one independently resumable corruption against a reference."""
+    if not isinstance(reference, ReferenceStage):
+        raise ValueError("reference must be a ReferenceStage")
+    corruption = _snapshot_corruption(corruption, reference.config)
+    evaluation = load_manifest(evaluation_manifest)
+    validate_disjoint(reference.reference_manifest, evaluation)
+    _validate_input_images(reference.reference_manifest, evaluation)
+    reference_state = _authenticate_reference_stage(reference)
+    output = _absolute_output_path(output_dir)
+    provenance = _corruption_provenance(reference, evaluation, corruption)
+
+    with _coordinated_output(output) as (anchored_output, report_parent):
+        _validate_input_images(reference.reference_manifest, evaluation)
+        with _pinned_child_directory(
+            report_parent,
+            "artifacts",
+            label="artifacts",
+        ) as (artifacts, artifacts_parent):
+            try:
+                os.stat(
+                    "provenance.json",
+                    dir_fd=artifacts_parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                ensure_provenance(
+                    anchored_output,
+                    provenance,
+                    artifacts_directory=artifacts,
+                )
+            except OSError as error:
+                raise ValueError(
+                    "run provenance must be a regular file"
+                ) from error
+            else:
+                validate_provenance(
+                    anchored_output,
+                    provenance,
+                    artifacts_directory=artifacts,
+                )
+            with _pinned_child_directory(
+                artifacts_parent,
+                "evaluation-extractions",
+                label="evaluation cache",
+            ) as (evaluation_cache, _evaluation_parent):
+                evaluation_metadata = _extraction_metadata(
+                    provenance, stage="evaluation"
+                )
+                evaluation_complete = validate_extraction_cache(
+                    evaluation,
+                    evaluation_cache,
+                    evaluation_metadata,
+                    corruption,
+                )
+                if not evaluation_complete:
+                    with extractor_factory(
+                        reference.checkpoint,
+                        reference.runtime_device,
+                        reference.config,
+                    ) as extractor:
+                        extract_manifest(
+                            evaluation,
+                            evaluation_cache,
+                            evaluation_metadata,
+                            extractor,
+                            corruption,
+                            image_size=reference.config.image_size,
+                            batch_size=reference.batch_size,
+                            shard_size=reference.shard_size,
+                            anchored_directory=True,
+                        )
+                    del extractor
+                evaluation_snapshot = _validated_cache_snapshot(
+                    evaluation,
+                    evaluation_cache,
+                    evaluation_metadata,
+                    corruption,
+                    label="evaluation cache",
+                )
+                if _checkpoint_digest(reference.checkpoint) != provenance[
+                    "checkpoint_sha256"
+                ]:
+                    raise ValueError(
+                        "checkpoint_sha256 changed while the run was executing"
+                    )
+
+                expected_ids = [entry.image_id for entry in evaluation]
+                score_path = artifacts / "scores.csv"
+                if not _entry_present(score_path):
+                    score_rows = []
+                    groups = _iter_evaluation_groups(
+                        iter_records(evaluation_cache), expected_ids
+                    )
+                    for _image_id, image_records in groups:
+                        score_rows.extend(
+                            score_image_records(
+                                image_records,
+                                reference_state["bank"],
+                                reference.config,
+                            )
+                        )
+                    _atomic_score_csv(score_rows, score_path)
+                rows, score_snapshot = _load_stable_scores(
+                    score_path, expected_ids
+                )
+                evaluation_summary = evaluate_rows(rows, reference.config)
+                intended_report = {}
+                write_report(
+                    "report",
+                    rows,
+                    evaluation_summary,
+                    provenance,
+                    parent=report_parent,
+                    _expected_content=intended_report,
+                )
+                expected = {
+                    "reference_cache": reference_state["reference_cache"],
+                    "bank": reference_state["bank_snapshot"],
+                    "bank_metadata": reference_state["bank_metadata"],
+                    "evaluation_cache": evaluation_snapshot,
+                    "bank_binding": reference_state["bank_binding_snapshot"],
+                    "scores": score_snapshot,
+                    "rows": rows,
+                    "evaluation": evaluation_summary,
+                    "report": intended_report,
+                }
+                _final_corruption_audit(
+                    reference,
+                    evaluation,
+                    anchored_output,
+                    corruption=corruption,
+                    provenance=provenance,
+                    artifacts=artifacts,
+                    evaluation_cache=evaluation_cache,
+                    expected=expected,
+                )
+    return output
 def run_pipeline(
     reference_manifest,
     evaluation_manifest,

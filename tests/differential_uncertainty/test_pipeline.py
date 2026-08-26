@@ -85,6 +85,18 @@ class FakeExtractor:
         return records
 
 
+
+class CheckpointSensitiveExtractor(FakeExtractor):
+    def __init__(self, checkpoint, *args, **kwargs):
+        super().__init__(checkpoint, *args, **kwargs)
+        self.checkpoint_offset = float(sum(Path(checkpoint).read_bytes()))
+
+    def extract_batch(self, identities, samples):
+        records = super().extract_batch(identities, samples)
+        for record in records:
+            record["persistence"] += self.checkpoint_offset
+        return records
+
 class RejectingExtractor:
     def __init__(self, *_args, **_kwargs):
         raise AssertionError("completed stages must not construct an extractor")
@@ -299,6 +311,285 @@ def test_pipeline_builds_every_stage_and_second_run_constructs_no_extractor(
     assert FakeExtractor.calls == first_calls
 
 
+def test_shared_reference_stage_is_built_once_and_reused_by_corruptions(
+    tmp_path, small_config
+):
+    reference_manifest, evaluation_manifest, checkpoint, _output = _inputs(
+        tmp_path
+    )
+    shared_artifacts = tmp_path / "shared-reference"
+    first_output = tmp_path / "contrast-run"
+    second_output = tmp_path / "blur-run"
+
+    reference = cli.prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+        shared_artifacts,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=FakeExtractor,
+    )
+
+    assert FakeExtractor.identities == [("r1", 0), ("r2", 0)]
+    assert cli.run_corruption_stage(
+        reference,
+        evaluation_manifest,
+        first_output,
+        ContrastCorruption(),
+        extractor_factory=FakeExtractor,
+    ) == first_output.resolve()
+    assert cli.run_corruption_stage(
+        reference,
+        evaluation_manifest,
+        second_output,
+        GaussianBlur(),
+        extractor_factory=FakeExtractor,
+    ) == second_output.resolve()
+
+    for output in (first_output, second_output):
+        records = list(
+            iter_records(output / "artifacts" / "evaluation-extractions")
+        )
+        assert [
+            (record["image_id"], record["severity"])
+            for record in records
+        ] == [
+            (image_id, severity)
+            for image_id in ("e1", "e2", "e3")
+            for severity in range(6)
+        ]
+
+    assert [
+        identity
+        for identity in FakeExtractor.identities
+        if identity[0].startswith("r")
+    ] == [("r1", 0), ("r2", 0)]
+    reused_reference = cli.prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+
+        shared_artifacts,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=RejectingExtractor,
+    )
+    assert (
+        reused_reference.reference_cache_snapshot
+        == reference.reference_cache_snapshot
+    )
+
+def test_reprepared_reference_rebuilds_bank_after_cache_replacement(
+    tmp_path, small_config
+):
+    reference_manifest, _evaluation_manifest, checkpoint, _output = _inputs(
+        tmp_path
+    )
+    shared_artifacts = tmp_path / "shared-reference"
+    first = cli.prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+        shared_artifacts,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=CheckpointSensitiveExtractor,
+    )
+    first_bank = first.bank.clone()
+    shutil.rmtree(first.reference_cache)
+    checkpoint.write_bytes(b"changed checkpoint content")
+
+    second = cli.prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+        shared_artifacts,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=CheckpointSensitiveExtractor,
+    )
+
+    assert not torch.equal(second.bank, first_bank)
+
+
+def test_mutated_reference_runtime_is_rejected_before_corruption_work(
+    tmp_path, small_config
+):
+    reference_manifest, evaluation_manifest, checkpoint, _output = _inputs(
+        tmp_path
+    )
+    reference = cli.prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+        tmp_path / "shared-reference",
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=FakeExtractor,
+    )
+    reference.runtime["batch_size"] = 99
+
+    with pytest.raises(ValueError, match="reference stage runtime"):
+        cli.run_corruption_stage(
+            reference,
+            evaluation_manifest,
+            tmp_path / "output",
+            GaussianBlur(),
+            extractor_factory=RejectingExtractor,
+        )
+    assert not (tmp_path / "output").exists()
+
+
+
+def test_reference_stage_rejects_bank_from_a_prior_checkpoint(
+    tmp_path, small_config
+):
+    reference_manifest, _evaluation_manifest, checkpoint, _output = _inputs(
+        tmp_path
+    )
+    shared_artifacts = tmp_path / "shared-reference"
+    first = cli.prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+        shared_artifacts,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=CheckpointSensitiveExtractor,
+    )
+    stale_bank = tmp_path / "stale-reference-bank.pt"
+    shutil.copy2(first.bank_path, stale_bank)
+    shutil.rmtree(first.reference_cache)
+    checkpoint.write_bytes(b"changed checkpoint content")
+    second = cli.prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+        shared_artifacts,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=CheckpointSensitiveExtractor,
+    )
+    shutil.copy2(stale_bank, second.bank_path)
+
+    with pytest.raises(ValueError, match="reference bank binding"):
+        cli.prepare_reference_stage(
+            reference_manifest,
+            checkpoint,
+            shared_artifacts,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=RejectingExtractor,
+        )
+
+
+def test_reference_stage_recovers_interrupted_bank_binding_publication(
+    tmp_path, small_config, monkeypatch
+):
+    reference_manifest, _evaluation_manifest, checkpoint, _output = _inputs(
+        tmp_path
+    )
+    shared_artifacts = tmp_path / "shared-reference"
+    original_atomic_json = cli.atomic_json
+    writes = 0
+
+    def interrupt_final_binding(*args, **kwargs):
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            raise RuntimeError("binding publication interrupted")
+        return original_atomic_json(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "atomic_json", interrupt_final_binding)
+    with pytest.raises(RuntimeError, match="binding publication interrupted"):
+        cli.prepare_reference_stage(
+            reference_manifest,
+            checkpoint,
+            shared_artifacts,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=FakeExtractor,
+        )
+    assert writes == 3
+    monkeypatch.setattr(cli, "atomic_json", original_atomic_json)
+
+    recovered = cli.prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+        shared_artifacts,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=RejectingExtractor,
+    )
+    assert recovered.bank_binding_path.is_file()
+
+
+def test_reference_stage_journals_before_reference_cache_replacement(
+    tmp_path, small_config, monkeypatch
+):
+    reference_manifest, _evaluation_manifest, checkpoint, _output = _inputs(
+        tmp_path
+    )
+    shared_artifacts = tmp_path / "shared-reference"
+    first = cli.prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+        shared_artifacts,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=CheckpointSensitiveExtractor,
+    )
+    shutil.rmtree(first.reference_cache)
+    checkpoint.write_bytes(b"changed checkpoint content")
+    original_atomic_json = cli.atomic_json
+
+    def interrupt_cache_journal(*_args, **_kwargs):
+        raise RuntimeError("cache journal interrupted")
+
+    monkeypatch.setattr(cli, "atomic_json", interrupt_cache_journal)
+    with pytest.raises(RuntimeError, match="cache journal interrupted"):
+        cli.prepare_reference_stage(
+            reference_manifest,
+            checkpoint,
+            shared_artifacts,
+            device="cpu",
+            batch_size=2,
+            shard_size=2,
+            config=small_config,
+            extractor_factory=CheckpointSensitiveExtractor,
+        )
+
+    assert not (
+        shared_artifacts / "reference-extractions" / "manifest.json"
+    ).exists()
+    monkeypatch.setattr(cli, "atomic_json", original_atomic_json)
+    recovered = cli.prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+        shared_artifacts,
+        device="cpu",
+        batch_size=2,
+        shard_size=2,
+        config=small_config,
+        extractor_factory=CheckpointSensitiveExtractor,
+    )
+    assert not torch.equal(recovered.bank, first.bank)
 def test_pipeline_accepts_a_corruption_plugin_without_changing_scoring(
     tmp_path, small_config
 ):
