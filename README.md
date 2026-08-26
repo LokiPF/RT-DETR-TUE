@@ -201,9 +201,11 @@ python -m differential_uncertainty benchmark-coco --coco-annotations /home/yuche
 
 The command selects a deterministic, disjoint COCO-val split and runs a matrix of the
 legacy Gaussian blur plus 18 routines from ImageCorruptions. Every routine has clean
-level 0 and package severities 1--5. Some package routines are stochastic: a corrupted
-image is identified by its corruption name and severity, but the workflow does not
-promise identical corrupted pixels on a later rerun.
+level 0 and corruption levels 1--5. The ImageCorruptions adapters map levels 1--5
+to package severities; legacy Gaussian blur maps them to its configured radii. Some
+package routines are stochastic: a corrupted image is identified by its corruption
+name and severity, but the workflow does not promise identical corrupted pixels on a
+later rerun.
 
 The pilot prepares one shared clean-reference cache and fingerprint bank, then stores
 each corruption independently under `<output-dir>/corruptions/<corruption-name>/` so a
