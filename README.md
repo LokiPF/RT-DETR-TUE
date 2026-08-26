@@ -9,8 +9,9 @@ reports and planning documents are grouped so the runtime path stays easy to see
 .
 |-- differential_uncertainty/          # End-to-end experiment package
 |   |-- __main__.py                     # `python -m differential_uncertainty` entry point
-|   |-- cli.py                          # Validates inputs and coordinates run/resume/audits
-|   |-- config.py                       # Fixed scientific settings and blur severity ladder
+|   |-- cli.py                          # Validates inputs and coordinates run/benchmark resume/audits
+|   |-- config.py                       # Fixed scientific settings and score directions
+|   |-- benchmark.py                    # Deterministic COCO split and 19-corruption coordinator
 |   |-- manifests.py                    # Reads, fingerprints, and separates image manifests
 |   |-- extraction.py                   # Runs pretrained RT-DETR and creates query records
 |   |-- persistence.py                  # Computes layer-2 topological persistence features
@@ -21,7 +22,8 @@ reports and planning documents are grouped so the runtime path stays easy to see
 |   |-- reporting.py                    # Writes CSV, JSON, Markdown, and figure outputs
 |   |-- corruptions/
 |   |   |-- base.py                     # Small corruption interface and Severity record
-|   |   `-- gaussian_blur.py            # Current six-level Gaussian blur implementation
+|   |   |-- gaussian_blur.py            # Legacy six-level Gaussian blur implementation
+|   |   `-- imagecorruptions.py         # Eighteen ImageCorruptions adapters
 |   `-- __init__.py                     # Package version marker
 |-- src/                                # Minimal upstream detector closure kept for inference
 |   |-- nn/backbone/
@@ -36,6 +38,7 @@ reports and planning documents are grouped so the runtime path stays easy to see
 |       `-- utils.py                    # Detector tensor and initialization utilities
 |-- tests/differential_uncertainty/     # Tests for the retained workflow
 |   |-- fixtures/                       # Small frozen detector-parity reference
+|   |-- test_benchmark.py               # COCO inputs, benchmark resume, and leaderboard
 |   |-- test_artifacts.py               # Atomic storage, cache, and filesystem safety
 |   |-- test_bank.py                    # Clean-bank construction
 |   |-- test_cli.py                     # Public command-line surface
@@ -61,10 +64,11 @@ reports and planning documents are grouped so the runtime path stays easy to see
 `-- README.md                            # Setup, usage, outputs, and interpretation
 ```
 
-This repository runs one pretrained RT-DETRv2-R18 experiment. It asks a simple
-question: when an image is damaged more strongly, does the detector's uncertainty
-score usually rise? The workflow performs inference only. It does not train a model
-and it does not require COCO annotation files.
+This repository runs one pretrained RT-DETRv2-R18 inference experiment. It asks a
+simple question: when an image is damaged more strongly, does the detector's
+uncertainty score usually rise? The generic workflow accepts its own image manifests;
+the fixed COCO benchmark additionally uses COCO annotations to construct its split.
+Neither workflow trains a model.
 
 ## Requirements and install
 
@@ -162,7 +166,8 @@ CPU inference is supported but will normally be much slower than GPU inference.
 Scientific choices are fixed in code: layer 2, 335 persistence features, a seeded
 25,000-vector clean reference bank, 5-nearest-neighbour distance, responsive deciles
 50--60, reference deciles 90--100, relative gap, and Gaussian blur radii 0, 1, 2, 4,
-8, and 12.
+8, and 12. This generic `run` command is the legacy Gaussian-blur workflow. The
+complete 19-corruption matrix is run by `benchmark-coco` below.
 
 The command safely resumes compatible partial extraction. It refuses to mix changed
 image bytes or file identities, manifests, checkpoint bytes, workflow or detector source
@@ -184,14 +189,51 @@ The runtime regime includes the resolved device and index, batch and shard sizes
 Python and library versions, and CUDA/cuDNN/GPU details when CUDA is used. Therefore a
 partial run created with one batch size cannot be resumed with another batch size.
 
+## COCO ImageCorruptions 250/250 pilot
+
+The current COCO command is a **250-reference / 250-evaluation-image pilot**. It is
+explicitly **not** the final 2,500/2,500 experiment; do not add
+`--reference-count 2500` or `--evaluation-count 2500` to this run.
+
+```bash
+python -m differential_uncertainty benchmark-coco --coco-annotations /home/yuchen/YuchenZ/Datasets/coco/annotations/instances_val2017.json --coco-images /home/yuchen/YuchenZ/Datasets/coco/val2017 --checkpoint /home/yuchen/YuchenZ/UE/RT-DETRv2-UE/pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth --output-dir runs/coco-imagecorruptions-250 --device cuda:0 --batch-size 1 --shard-size 50
+```
+
+The command selects a deterministic, disjoint COCO-val split and runs a matrix of the
+legacy Gaussian blur plus 18 routines from ImageCorruptions. Every routine has clean
+level 0 and package severities 1--5. Some package routines are stochastic: a corrupted
+image is identified by its corruption name and severity, but the workflow does not
+promise identical corrupted pixels on a later rerun.
+
+The pilot prepares one shared clean-reference cache and fingerprint bank, then stores
+each corruption independently under `<output-dir>/corruptions/<corruption-name>/` so a
+compatible interruption can resume per corruption. The deterministic input manifests
+are under `<output-dir>/inputs/`, the shared reference artifacts are under
+`<output-dir>/reference-artifacts/`, and the reconciled leaderboard is under
+`<output-dir>/benchmark-report/`. That leaderboard contains `corruption-metrics.csv`,
+`summary.json`, and `report.md`.
+
+For every corruption, the leaderboard reports macro-AUROC: the average of separate
+clean-versus-severity-1 through -5 AUROCs. Its primary method is the persistence
+relative gap. The matched-confidence relative gap is a control on the same
+decile-selected queries, while direct global confidence mean and maximum are baselines
+over all valid detector queries; lower raw direct confidence is treated as more
+corrupted before ranking. Compare the primary method with both the matched-confidence
+control and the direct mean/maximum confidence baselines to determine whether any gain
+is specific to the fingerprint score rather than ordinary detector confidence.
+
+This benchmark evaluates how well each score ranks corrupted images ahead of clean
+images. It does not measure detector mAP, box quality, or detector accuracy.
+
 ## Outputs
 
-`<output-dir>/artifacts/` contains provenance, raw feature caches, the clean reference
-bank, and per-image scores. `<output-dir>/report/` contains one plain-language Markdown
-report, machine-readable metric tables, a JSON summary, and four detailed figures. The
-provenance and report record the runtime, corruption name, and ordered severity table.
-Re-run the same command after interruption; completed compatible stages are reused when
-the recorded experiment settings match.
+For the generic Gaussian-blur command, `<output-dir>/artifacts/` contains provenance,
+raw feature caches, the clean reference bank, and per-image scores.
+`<output-dir>/report/` contains one plain-language Markdown report, machine-readable
+metric tables, a JSON summary, and four detailed figures. The provenance and report
+record the runtime, corruption name, and ordered severity table. Re-run the same command
+after interruption; completed compatible stages are reused when the recorded experiment
+settings match. The COCO benchmark layout and resume behavior are described above.
 
 ## What the score means
 
@@ -205,9 +247,10 @@ relative gap = 2 * (responsive mean - reference mean)
 ```
 
 The primary score uses distance from the clean reference bank. The matched-confidence
-baseline uses `1 - max(sigmoid(class logits))` on the same selected queries. AUROC asks
+control uses `1 - max(sigmoid(class logits))` on the same selected queries. Direct
+confidence baselines use the mean or maximum of `max(sigmoid(class logits))` over all
+valid, non-padded queries, with lower confidence oriented as more corrupted. AUROC asks
 how often a randomly chosen corrupted image ranks above a randomly chosen clean image
 after the score's fixed direction is applied; it is a ranking measure, not a probability.
 Spearman correlation and adjacent-severity consistency check whether scores move as
-corruption becomes stronger. This workflow does not calculate detector accuracy or mAP
-because the generic manifests have no ground-truth boxes.
+corruption becomes stronger. This workflow does not calculate detector accuracy or mAP.
