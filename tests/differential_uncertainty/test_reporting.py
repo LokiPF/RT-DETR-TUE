@@ -15,7 +15,13 @@ from differential_uncertainty import reporting
 from differential_uncertainty.artifacts import _open_regular_file
 from differential_uncertainty.config import ExperimentConfig
 from differential_uncertainty.evaluation import evaluate_rows
-from differential_uncertainty.reporting import REPORT_FILES, write_report
+from differential_uncertainty.reporting import (
+    BENCHMARK_REPORT_FILES,
+    BENCHMARK_SERIES,
+    REPORT_FILES,
+    write_benchmark_report,
+    write_report,
+)
 
 
 def _rows():
@@ -1649,3 +1655,22 @@ def test_report_can_capture_the_exact_intended_bundle_without_changing_default_a
     assert intended == {
         relative: (output / relative).read_bytes() for relative in REPORT_FILES
     }
+
+
+def test_benchmark_root_report_is_exact_and_rejects_changed_content(tmp_path):
+    roster = {"schema_version": 1, "corruptions": ["gaussian_blur", "contrast"]}
+    metrics = {name: (index + 1) / 10 for index, name in enumerate(BENCHMARK_SERIES)}
+    entries = tuple({"corruption": name, "metrics": metrics, "provenance": {"name": name}} for name in roster["corruptions"])
+    output = tmp_path / "benchmark-report"
+    write_benchmark_report(output, entries, roster)
+    assert sorted(path.name for path in output.iterdir()) == sorted(BENCHMARK_REPORT_FILES)
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert set(summary["method_aggregate"]) == set(BENCHMARK_SERIES)
+    assert sorted(item["primary_rank"] for item in summary["method_aggregate"].values()) == list(range(1, 7))
+    text = (output / "report.md").read_text(encoding="utf-8").lower()
+    assert "higher auroc" in text and "differential" in text and "direct confidence" in text
+    write_benchmark_report(output, entries, roster)
+    changed = list(entries)
+    changed[0] = {**changed[0], "metrics": {**metrics, "persistence_relative_gap": 0.99}}
+    with pytest.raises(ValueError, match="existing benchmark report differs"):
+        write_benchmark_report(output, changed, roster)

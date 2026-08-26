@@ -5,6 +5,7 @@ import json
 import multiprocessing as mp
 import os
 
+import torch
 import numpy as np
 import pytest
 from PIL import Image
@@ -15,6 +16,84 @@ from differential_uncertainty.benchmark import (
     create_coco_manifests,
     run_coco_benchmark,
 )
+from differential_uncertainty.config import ExperimentConfig
+from differential_uncertainty.corruptions import GaussianBlur, Severity
+
+
+class FakeExtractor:
+    instances = 0
+    identities = []
+
+    def __init__(self, _checkpoint, _device, config):
+        type(self).instances += 1
+        self.config = config
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return None
+
+    def extract_batch(self, identities, samples):
+        type(self).identities.extend(identities)
+        records = []
+        for (image_id, severity), sample in zip(identities, samples):
+            query = torch.arange(self.config.query_count, dtype=torch.float32)
+            image_value = float(sample.mean())
+            boxes = torch.stack((query, query + 1, query + 2, query + 3), dim=1)
+            logits = (
+                query[:, None].repeat(1, self.config.class_count) / 10
+                + image_value
+                - severity / 20
+            )
+            persistence = torch.stack(
+                [
+                    query + image_value + severity * (query / self.config.query_count) ** power
+                    for power in range(1, self.config.persistence_dim + 1)
+                ],
+                dim=1,
+            )
+            for field in (boxes, logits, persistence):
+                field[-2] = field[-1]
+            records.append(
+                {
+                    "image_id": image_id,
+                    "severity": severity,
+                    "boxes": boxes,
+                    "logits": logits,
+                    "persistence": persistence,
+                }
+            )
+        return records
+
+
+class ContrastCorruption:
+    name = "contrast"
+    severities = tuple(Severity(level, float(level)) for level in range(6))
+
+    def apply(self, image, level):
+        output = image.copy()
+        if level:
+            output.putpixel((0, 0), (level, level, level))
+        return output
+
+
+@pytest.fixture(autouse=True)
+def _reset_fake_extractor():
+    FakeExtractor.instances = 0
+    FakeExtractor.identities = []
+
+@pytest.fixture
+def small_config():
+    return ExperimentConfig.for_tests(
+        bank_capacity=20,
+        k=2,
+        query_count=20,
+        persistence_dim=7,
+        bootstrap_samples=20,
+    )
+
+
 
 
 def test_coco_split_defaults_to_disjoint_250_250(tmp_path):
@@ -186,29 +265,6 @@ def test_coco_split_rejects_insufficient_available_images(tmp_path):
         )
 
 
-def test_run_coco_benchmark_only_materializes_the_input_split(tmp_path):
-    annotations, images = _coco_fixture(tmp_path, image_count=2)
-    checkpoint = tmp_path / "model.pth"
-    checkpoint.write_bytes(b"checkpoint")
-    output = tmp_path / "benchmark"
-
-    result = run_coco_benchmark(
-        annotations,
-        images,
-        checkpoint,
-        output,
-        device="cpu",
-        batch_size=1,
-        shard_size=1,
-        reference_count=1,
-        evaluation_count=1,
-    )
-
-    assert result == output.resolve()
-    assert (output / "inputs" / "benchmark-manifest.json").is_file()
-    assert not (output / "corruptions").exists()
-
-
 def test_coco_split_rejects_incomplete_existing_manifest_set(tmp_path):
     annotations, images = _coco_fixture(tmp_path, image_count=2)
     output = tmp_path / "inputs"
@@ -373,3 +429,116 @@ def test_coco_split_rejects_boolean_metadata_fields(tmp_path, field):
             reference_count=1,
             evaluation_count=1,
         )
+
+
+def test_run_coco_benchmark_shares_reference_and_writes_root_metrics(tmp_path, small_config, monkeypatch):
+    annotations, images = _coco_fixture(tmp_path, image_count=4)
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    output = tmp_path / "benchmark"
+    corruptions = (GaussianBlur(), ContrastCorruption())
+    monkeypatch.setattr(benchmark, "benchmark_corruptions", lambda: corruptions, raising=False)
+    import differential_uncertainty.cli as cli
+
+    original_prepare = cli.prepare_reference_stage
+    prepare_calls = []
+
+    def record_prepare(*args, **kwargs):
+        prepare_calls.append((args, kwargs))
+        return original_prepare(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "prepare_reference_stage", record_prepare)
+    result = run_coco_benchmark(
+        annotations, images, checkpoint, output,
+        device="cpu", batch_size=1, shard_size=1,
+        reference_count=2, evaluation_count=2,
+        config=small_config, extractor_factory=FakeExtractor,
+    )
+    assert result == output.resolve()
+    assert len(prepare_calls) == 1
+    assert [path.name for path in (output / "corruptions").iterdir()] == ["gaussian_blur", "contrast"]
+    assert len([item for item in FakeExtractor.identities if item[1] == 0]) == 6
+    with (output / "benchmark-report" / "corruption-metrics.csv").open(newline="", encoding="utf-8") as handle:
+        metrics = list(csv.DictReader(handle))
+    assert [row["corruption"] for row in metrics] == ["gaussian_blur", "contrast"]
+    assert list(metrics[0]) == ["corruption", "persistence_relative_gap_macro_auroc", "confidence_relative_gap_macro_auroc", "persistence_responsive_macro_auroc", "persistence_reference_macro_auroc", "direct_confidence_mean_macro_auroc", "direct_confidence_max_macro_auroc"]
+    summary = json.loads((output / "benchmark-report" / "summary.json").read_text(encoding="utf-8"))
+    assert set(summary["method_aggregate"]) == {"persistence_relative_gap", "confidence_relative_gap", "persistence_responsive", "persistence_reference", "direct_confidence_mean", "direct_confidence_max"}
+    assert sorted(item["primary_rank"] for item in summary["method_aggregate"].values()) == list(range(1, 7))
+    for row in metrics:
+        per_corruption = json.loads((output / "corruptions" / row["corruption"] / "report" / "summary.json").read_text(encoding="utf-8"))
+        assert float(row["persistence_relative_gap_macro_auroc"]) == pytest.approx(per_corruption["evaluation"]["series"]["persistence_relative_gap"]["macro_auroc"])
+
+
+def test_run_coco_benchmark_rejects_changed_roster(tmp_path, small_config, monkeypatch):
+    annotations, images = _coco_fixture(tmp_path, image_count=4)
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    output = tmp_path / "benchmark"
+    monkeypatch.setattr(benchmark, "benchmark_corruptions", lambda: (GaussianBlur(), ContrastCorruption()), raising=False)
+    run_coco_benchmark(
+        annotations, images, checkpoint, output,
+        device="cpu", batch_size=1, shard_size=1,
+        reference_count=2, evaluation_count=2,
+        config=small_config, extractor_factory=FakeExtractor,
+    )
+    monkeypatch.setattr(
+        benchmark, "benchmark_corruptions", lambda: (GaussianBlur(),), raising=False
+    )
+    with pytest.raises(ValueError, match="corruption roster"):
+        run_coco_benchmark(
+            annotations, images, checkpoint, output,
+            device="cpu", batch_size=1, shard_size=1,
+            reference_count=2, evaluation_count=2,
+            config=small_config, extractor_factory=FakeExtractor,
+        )
+
+
+def test_run_coco_benchmark_resumes_after_second_corruption_failure(
+    tmp_path, small_config, monkeypatch
+):
+    annotations, images = _coco_fixture(tmp_path, image_count=4)
+    checkpoint = tmp_path / "model.pth"
+    checkpoint.write_bytes(b"checkpoint")
+    output = tmp_path / "benchmark"
+    monkeypatch.setattr(
+        benchmark,
+        "benchmark_corruptions",
+        lambda: (GaussianBlur(), ContrastCorruption()),
+        raising=False,
+    )
+    import differential_uncertainty.cli as cli
+
+    original_stage = cli.run_corruption_stage
+    calls = []
+
+    def fail_second(*args, **kwargs):
+        calls.append(args[3].name)
+        if args[3].name == "contrast":
+            raise RuntimeError("second corruption failed")
+        return original_stage(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_corruption_stage", fail_second)
+    with pytest.raises(RuntimeError, match="second corruption failed"):
+        run_coco_benchmark(
+            annotations, images, checkpoint, output,
+            device="cpu", batch_size=1, shard_size=1,
+            reference_count=2, evaluation_count=2,
+            config=small_config, extractor_factory=FakeExtractor,
+        )
+    instances_after_failure = FakeExtractor.instances
+    identities_after_failure = list(FakeExtractor.identities)
+    assert calls == ["gaussian_blur", "contrast"]
+    assert (output / "corruptions" / "gaussian_blur" / "report").is_dir()
+
+    monkeypatch.setattr(cli, "run_corruption_stage", original_stage)
+    run_coco_benchmark(
+        annotations, images, checkpoint, output,
+        device="cpu", batch_size=1, shard_size=1,
+        reference_count=2, evaluation_count=2,
+        config=small_config, extractor_factory=FakeExtractor,
+    )
+
+    assert FakeExtractor.instances == instances_after_failure + 1
+    assert len(FakeExtractor.identities) == len(identities_after_failure) + 12
+    assert (output / "corruptions" / "contrast" / "report").is_dir()

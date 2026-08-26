@@ -24,6 +24,7 @@ from .artifacts import (
     _staged_file,
 )
 from .config import FIXED_CONFIG, ExperimentConfig
+from .corruptions import benchmark_corruptions
 from .extraction import RTDETRExtractor
 from .manifests import (
     ManifestEntry,
@@ -32,7 +33,12 @@ from .manifests import (
     manifest_digest,
     validate_disjoint,
 )
-from .reporting import _DirectoryLease
+from .reporting import (
+    BENCHMARK_SERIES,
+    _DirectoryLease,
+    _bundle_bytes,
+    write_benchmark_report,
+)
 
 
 _BENCHMARK_MANIFEST = "benchmark-manifest.json"
@@ -584,6 +590,152 @@ def create_coco_manifests(
 def _validate_regular_file(path: Path, *, label: str) -> None:
     with _open_regular_file(path, error_message=f"{label} must be a regular file"):
         pass
+_BENCHMARK_ROSTER = "corruption-roster.json"
+
+
+def _safe_corruption_name(value, *, index: int) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.strip()
+        or len(value) > 128
+        or "/" in value
+        or "\\" in value
+        or Path(value).name != value
+        or any(unicodedata.category(character).startswith("C") for character in value)
+    ):
+        raise ValueError(f"benchmark corruption {index} has an unsafe name")
+    return value
+
+
+def _corruption_roster(
+    corruptions,
+    split: CocoSplit,
+    checkpoint: Path,
+    config,
+    *,
+    device,
+    batch_size,
+    shard_size,
+) -> dict:
+    snapshots = []
+    for index, corruption in enumerate(corruptions):
+        try:
+            name = _safe_corruption_name(corruption.name, index=index)
+            severities = corruption.severities
+        except AttributeError as error:
+            raise ValueError(f"benchmark corruption {index} is invalid") from error
+        if not isinstance(severities, tuple) or len(severities) != 6:
+            raise ValueError("benchmark corruption must define six severities")
+        normalized_severities = []
+        for level, severity in enumerate(severities):
+            actual_level = getattr(severity, "level", None)
+            parameter = getattr(severity, "parameter", None)
+            if (
+                isinstance(actual_level, bool)
+                or not isinstance(actual_level, Integral)
+                or int(actual_level) != level
+                or isinstance(parameter, bool)
+                or not isinstance(parameter, (int, float, np.number))
+                or not np.isfinite(float(parameter))
+            ):
+                raise ValueError("benchmark corruption severity is invalid")
+            normalized_severities.append(
+                {"level": level, "parameter": float(parameter)}
+            )
+        snapshots.append({"name": name, "severities": normalized_severities})
+    if not snapshots or len({item["name"] for item in snapshots}) != len(snapshots):
+        raise ValueError("benchmark corruption roster must contain unique corruptions")
+    return {
+        "schema_version": 1,
+        "reference_manifest_sha256": manifest_digest(
+            load_manifest(split.reference_manifest)
+        ),
+        "evaluation_manifest_sha256": manifest_digest(
+            load_manifest(split.evaluation_manifest)
+        ),
+        "checkpoint_sha256": hashlib.sha256(
+            _regular_bytes(checkpoint, label="checkpoint")
+        ).hexdigest(),
+        "runtime": {
+            "device": device,
+            "batch_size": batch_size,
+            "shard_size": shard_size,
+        },
+        "config": config.scientific_dict(),
+        "corruptions": snapshots,
+    }
+
+
+@contextmanager
+def _coordinated_benchmark_directory(output_directory: Path):
+    message = "benchmark output directory must be a stable directory"
+    try:
+        output_directory.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise ValueError(message) from error
+    with _DirectoryLease(output_directory, message=message) as lease:
+        fcntl.flock(lease.fd, fcntl.LOCK_EX)
+        lease.verify_path()
+        try:
+            yield Path(f"/proc/self/fd/{lease.fd}")
+        finally:
+            lease.verify_path()
+
+
+def _ensure_corruption_roster(output_directory: Path, roster: dict) -> None:
+    expected = _canonical_json_bytes(roster)
+    with _coordinated_benchmark_directory(output_directory) as anchored_output:
+        roster_path = anchored_output / _BENCHMARK_ROSTER
+        if _entry_present(roster_path):
+            if _regular_bytes(
+                roster_path, label="corruption roster"
+            ) != expected:
+                raise ValueError("incompatible corruption roster")
+        else:
+            _atomic_bytes(expected, roster_path)
+        if _regular_bytes(roster_path, label="corruption roster") != expected:
+            raise ValueError("incompatible corruption roster")
+
+
+def _final_benchmark_entries(
+    output_directory: Path, roster: dict
+) -> tuple[dict, ...]:
+    entries = []
+    for item in roster["corruptions"]:
+        name = item["name"]
+        content = _bundle_bytes(
+            output_directory / "corruptions" / name / "report",
+            message=f"final report for corruption {name} is invalid",
+        )
+        try:
+            summary = json.loads(content["summary.json"])
+        except (json.JSONDecodeError, UnicodeDecodeError) as error:
+            raise ValueError(
+                f"final report for corruption {name} has invalid summary JSON"
+            ) from error
+        if type(summary) is not dict:
+            raise ValueError(f"final report for corruption {name} is invalid")
+        provenance = summary.get("provenance")
+        evaluation = summary.get("evaluation")
+        if type(provenance) is not dict or type(evaluation) is not dict:
+            raise ValueError(f"final report for corruption {name} is invalid")
+        series = evaluation.get("series")
+        if type(series) is not dict:
+            raise ValueError(f"final report for corruption {name} is invalid")
+        metrics = {}
+        for method in BENCHMARK_SERIES:
+            value = series.get(method)
+            if type(value) is not dict or "macro_auroc" not in value:
+                raise ValueError(f"final report for corruption {name} is invalid")
+            metrics[method] = value["macro_auroc"]
+        entries.append(
+            {
+                "corruption": name,
+                "metrics": metrics,
+                "provenance": provenance,
+            }
+        )
+    return tuple(entries)
 
 
 def run_coco_benchmark(
@@ -600,11 +752,11 @@ def run_coco_benchmark(
     config: ExperimentConfig = FIXED_CONFIG,
     extractor_factory: Callable = RTDETRExtractor,
 ) -> Path:
-    """Materialize benchmark inputs; later work coordinates corruption stages."""
+    """Run the fixed COCO corruption matrix with one shared clean reference."""
     if not isinstance(device, str) or not device.strip():
         raise ValueError("device must be a nonempty PyTorch device string")
-    _positive_integer(batch_size, name="batch_size")
-    _positive_integer(shard_size, name="shard_size")
+    batch_size = _positive_integer(batch_size, name="batch_size")
+    shard_size = _positive_integer(shard_size, name="shard_size")
     if not isinstance(config, ExperimentConfig):
         raise ValueError("config must be an ExperimentConfig")
     if not callable(extractor_factory):
@@ -614,11 +766,49 @@ def run_coco_benchmark(
     output_directory = _absolute_directory(
         output_directory, name="benchmark output directory"
     )
-    create_coco_manifests(
+    split = create_coco_manifests(
         annotations,
         image_directory,
         output_directory / "inputs",
         reference_count=reference_count,
         evaluation_count=evaluation_count,
+    )
+    corruptions = tuple(benchmark_corruptions())
+    roster = _corruption_roster(
+        corruptions,
+        split,
+        checkpoint,
+        config,
+        device=device,
+        batch_size=batch_size,
+        shard_size=shard_size,
+    )
+    _ensure_corruption_roster(output_directory, roster)
+
+    # Importing the staged APIs here avoids the CLI -> benchmark import cycle.
+    from .cli import prepare_reference_stage, run_corruption_stage
+
+    reference = prepare_reference_stage(
+        split.reference_manifest,
+        checkpoint,
+        output_directory / "reference-artifacts",
+        device=device,
+        batch_size=batch_size,
+        shard_size=shard_size,
+        config=config,
+        extractor_factory=extractor_factory,
+    )
+    for corruption in corruptions:
+        run_corruption_stage(
+            reference,
+            split.evaluation_manifest,
+            output_directory / "corruptions" / corruption.name,
+            corruption,
+            extractor_factory=extractor_factory,
+        )
+    write_benchmark_report(
+        output_directory / "benchmark-report",
+        _final_benchmark_entries(output_directory, roster),
+        roster,
     )
     return output_directory
