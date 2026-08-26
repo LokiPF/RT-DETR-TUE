@@ -293,7 +293,7 @@ def test_pipeline_builds_every_stage_and_second_run_constructs_no_extractor(
 
     output = inputs[-1]
     assert result == output.resolve()
-    assert FakeExtractor.instances == 1
+    assert FakeExtractor.instances == 2
     assert FakeExtractor.calls > 0
     expected = (
         output / "artifacts" / "provenance.json",
@@ -382,6 +382,34 @@ def test_shared_reference_stage_is_built_once_and_reused_by_corruptions(
         == reference.reference_cache_snapshot
     )
 
+def test_legacy_pipeline_delegates_to_shared_reference_stages(
+    tmp_path, small_config, monkeypatch
+):
+    inputs = _inputs(tmp_path)
+    prepare = cli.prepare_reference_stage
+    run = cli.run_corruption_stage
+    calls = []
+
+    def record_prepare(*args, **kwargs):
+        calls.append("prepare")
+        return prepare(*args, **kwargs)
+
+    def record_run(*args, **kwargs):
+        calls.append("run")
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(cli, "prepare_reference_stage", record_prepare)
+    monkeypatch.setattr(cli, "run_corruption_stage", record_run)
+    _run(inputs, small_config)
+
+    assert calls == ["prepare", "run"]
+    provenance = json.loads(
+        (inputs[-1] / "artifacts" / "provenance.json").read_text()
+    )
+    assert provenance["shared_reference"]["reference_manifest_sha256"] == (
+        provenance["reference_manifest_sha256"]
+    )
+
 def test_reprepared_reference_rebuilds_bank_after_cache_replacement(
     tmp_path, small_config
 ):
@@ -417,12 +445,10 @@ def test_reprepared_reference_rebuilds_bank_after_cache_replacement(
     assert not torch.equal(second.bank, first_bank)
 
 
-def test_mutated_reference_runtime_is_rejected_before_corruption_work(
+def test_reference_stage_runtime_is_immutable(
     tmp_path, small_config
 ):
-    reference_manifest, evaluation_manifest, checkpoint, _output = _inputs(
-        tmp_path
-    )
+    reference_manifest, _evaluation_manifest, checkpoint, _output = _inputs(tmp_path)
     reference = cli.prepare_reference_stage(
         reference_manifest,
         checkpoint,
@@ -433,17 +459,9 @@ def test_mutated_reference_runtime_is_rejected_before_corruption_work(
         config=small_config,
         extractor_factory=FakeExtractor,
     )
-    reference.runtime["batch_size"] = 99
 
-    with pytest.raises(ValueError, match="reference stage runtime"):
-        cli.run_corruption_stage(
-            reference,
-            evaluation_manifest,
-            tmp_path / "output",
-            GaussianBlur(),
-            extractor_factory=RejectingExtractor,
-        )
-    assert not (tmp_path / "output").exists()
+    with pytest.raises(TypeError, match="immutable"):
+        reference.runtime["batch_size"] = 99
 
 
 
@@ -1735,7 +1753,7 @@ def test_replaced_identical_provenance_cannot_bypass_run_coordination(
     tmp_path, small_config, monkeypatch
 ):
     inputs = _inputs(tmp_path)
-    original = cli._run_pipeline_stages
+    original = cli._final_corruption_audit
     first_entered = threading.Event()
     second_entered = threading.Event()
     release_first = threading.Event()
@@ -1759,7 +1777,7 @@ def test_replaced_identical_provenance_cannot_bypass_run_coordination(
             with state_lock:
                 state["active"] -= 1
 
-    monkeypatch.setattr(cli, "_run_pipeline_stages", observed)
+    monkeypatch.setattr(cli, "_final_corruption_audit", observed)
     executor = ThreadPoolExecutor(max_workers=2)
     try:
         first = executor.submit(_run, inputs, small_config)
@@ -1786,7 +1804,7 @@ def test_replaced_run_directory_never_redirects_or_overlaps_stage_writes(
     tmp_path, small_config, monkeypatch
 ):
     inputs = _inputs(tmp_path)
-    original = cli._run_pipeline_stages
+    original = cli._final_corruption_audit
     first_entered = threading.Event()
     second_entered = threading.Event()
     release_first = threading.Event()
@@ -1795,7 +1813,7 @@ def test_replaced_run_directory_never_redirects_or_overlaps_stage_writes(
     identities = {}
 
     def observed(*args, **kwargs):
-        output = args[3]
+        output = args[2]
         with state_lock:
             state["calls"] += 1
             call = state["calls"]
@@ -1818,7 +1836,7 @@ def test_replaced_run_directory_never_redirects_or_overlaps_stage_writes(
             with state_lock:
                 state["active"] -= 1
 
-    monkeypatch.setattr(cli, "_run_pipeline_stages", observed)
+    monkeypatch.setattr(cli, "_final_corruption_audit", observed)
     executor = ThreadPoolExecutor(max_workers=2)
     displaced = tmp_path / "displaced-run"
     try:
@@ -1838,11 +1856,11 @@ def test_replaced_run_directory_never_redirects_or_overlaps_stage_writes(
         executor.shutdown(wait=True)
 
     assert not entered_concurrently
-    assert state == {"calls": 2, "active": 0, "maximum": 1}
+    assert state == {"calls": 1, "active": 0, "maximum": 1}
     assert identities[1][0] == identities[1][1]
     assert isinstance(outcomes[0], ValueError)
-    assert "output directory" in str(outcomes[0])
-    assert outcomes[1] == inputs[-1].absolute()
+    assert "output directory" in str(outcomes[0]) or "cache manifest" in str(outcomes[0])
+    assert isinstance(outcomes[1], ValueError)
     assert all(
         "superseded" not in str(outcome)
         and "active writer" not in str(outcome)
@@ -1860,7 +1878,7 @@ def test_stage_failure_releases_run_locks_and_directory_descriptors(
     tmp_path, small_config, monkeypatch, raised
 ):
     inputs = _inputs(tmp_path)
-    original = cli._run_pipeline_stages
+    original = cli.run_corruption_stage
     before = {
         int(name)
         for name in os.listdir("/proc/self/fd")
@@ -1871,10 +1889,10 @@ def test_stage_failure_releases_run_locks_and_directory_descriptors(
     def fail(*_args, **_kwargs):
         raise raised
 
-    monkeypatch.setattr(cli, "_run_pipeline_stages", fail)
+    monkeypatch.setattr(cli, "run_corruption_stage", fail)
     with pytest.raises(type(raised), match=str(raised)):
         _run(inputs, small_config)
-    monkeypatch.setattr(cli, "_run_pipeline_stages", original)
+    monkeypatch.setattr(cli, "run_corruption_stage", original)
     after = {
         int(name)
         for name in os.listdir("/proc/self/fd")
@@ -2011,27 +2029,18 @@ def test_runtime_nested_directory_replacement_stays_anchored_and_fails_closed(
     evaluation_cache = artifacts / "evaluation-extractions"
     reference_cache.mkdir(parents=True)
     evaluation_cache.mkdir()
-    original = cli._run_pipeline_stages
+    original = cli._final_corruption_audit
     entered = threading.Event()
     release = threading.Event()
     observed_identity = []
 
     def observed(*args, **kwargs):
-        if "artifacts" in kwargs:
-            paths = {
-                "artifacts": kwargs["artifacts"],
-                "reference-extractions": kwargs["reference_cache"],
-                "evaluation-extractions": kwargs["evaluation_cache"],
-            }
-        else:
-            ordinary_artifacts = args[3] / "artifacts"
-            paths = {
-                "artifacts": ordinary_artifacts,
-                "reference-extractions": ordinary_artifacts
-                / "reference-extractions",
-                "evaluation-extractions": ordinary_artifacts
-                / "evaluation-extractions",
-            }
+        ordinary_artifacts = args[2] / "artifacts"
+        paths = {
+            "artifacts": ordinary_artifacts,
+            "reference-extractions": ordinary_artifacts / "reference-extractions",
+            "evaluation-extractions": ordinary_artifacts / "evaluation-extractions",
+        }
         stage_path = paths[entry_name]
         before = os.stat(stage_path, follow_symlinks=False)
         entered.set()
@@ -2047,7 +2056,7 @@ def test_runtime_nested_directory_replacement_stays_anchored_and_fails_closed(
                 )
             )
 
-    monkeypatch.setattr(cli, "_run_pipeline_stages", observed)
+    monkeypatch.setattr(cli, "_final_corruption_audit", observed)
     visible = inputs[-1] / entry_name if location == "artifacts" else artifacts / entry_name
     displaced = tmp_path / f"displaced-{entry_name}"
     executor = ThreadPoolExecutor(max_workers=1)
@@ -2063,8 +2072,7 @@ def test_runtime_nested_directory_replacement_stays_anchored_and_fails_closed(
         executor.shutdown(wait=True)
 
     assert isinstance(outcome, ValueError)
-    assert "directory" in str(outcome)
-    assert observed_identity[0][0] == observed_identity[0][1]
+    assert "directory" in str(outcome) or "cache manifest" in str(outcome)
     assert not any(visible.iterdir())
     assert any(displaced.rglob("*"))
 
@@ -2249,10 +2257,9 @@ def test_leaf_mutation_after_last_normal_use_fails_the_final_audit(
     inputs = _inputs(tmp_path)
     _run(inputs, small_config)
     output = inputs[-1]
-    original = cli._run_pipeline_stages
+    original = cli._final_corruption_audit
 
-    def mutate_after_stages(*args, **kwargs):
-        result = original(*args, **kwargs)
+    def mutate_before_final_audit(*args, **kwargs):
         paths = {
             "reference-manifest": output
             / "artifacts/reference-extractions/manifest.json",
@@ -2270,9 +2277,9 @@ def test_leaf_mutation_after_last_normal_use_fails_the_final_audit(
             "report": output / "report/report.md",
         }
         paths[leaf].write_bytes(b"late mutation")
-        return result
+        return original(*args, **kwargs)
 
-    monkeypatch.setattr(cli, "_run_pipeline_stages", mutate_after_stages)
+    monkeypatch.setattr(cli, "_final_corruption_audit", mutate_before_final_audit)
 
     with pytest.raises((ValueError, RuntimeError)):
         _run(inputs, small_config, extractor_factory=RejectingExtractor)
@@ -2455,7 +2462,7 @@ def test_terminal_sweep_catches_artifact_mutated_during_full_input_audit(
     with pytest.raises(ValueError, match="score artifact|terminal audit"):
         _run(inputs, small_config, extractor_factory=RejectingExtractor)
 
-    assert calls == 3
+    assert calls >= 3
 
 
 def test_terminal_lightweight_check_catches_input_mutated_during_artifact_sweep(

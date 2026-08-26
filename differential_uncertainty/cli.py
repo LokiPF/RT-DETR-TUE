@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from copy import deepcopy
 import csv
 import json
 import fcntl
@@ -116,6 +115,86 @@ class _CorruptionSnapshot:
     def apply(self, image, level):
         return self._apply(image, level)
 
+
+class _ImmutableDict(dict):
+    _error = "reference stage state is immutable"
+
+    def __setitem__(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def __delitem__(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def clear(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def pop(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def popitem(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def setdefault(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def update(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def __ior__(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+
+class _ImmutableList(list):
+    _error = "reference stage state is immutable"
+
+    def __setitem__(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def __delitem__(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def __iadd__(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def __imul__(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def append(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def clear(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def extend(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def insert(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def pop(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def remove(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def reverse(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+    def sort(self, *_args, **_kwargs):
+        raise TypeError(self._error)
+
+
+def _immutable_reference_value(value):
+    if type(value) is dict:
+        return _ImmutableDict(
+            {key: _immutable_reference_value(item) for key, item in value.items()}
+        )
+    if type(value) is list:
+        return _ImmutableList(_immutable_reference_value(item) for item in value)
+    if type(value) is tuple:
+        return tuple(_immutable_reference_value(item) for item in value)
+    return value
+
 @dataclass(frozen=True)
 class ReferenceStage:
     """Authenticated clean-reference artifacts reusable across corruptions."""
@@ -125,21 +204,28 @@ class ReferenceStage:
     checkpoint_snapshot: tuple
     artifacts: Path
     runtime_device: torch.device
-    runtime: dict
+    runtime: _ImmutableDict
     batch_size: int
     shard_size: int
     config: ExperimentConfig
-    provenance: dict
-    reference_metadata: dict
+    provenance: _ImmutableDict
+    reference_metadata: _ImmutableDict
     reference_cache: Path
     reference_cache_snapshot: tuple
     bank_path: Path
     bank_snapshot: tuple
-    bank_metadata: dict
+    bank_metadata: _ImmutableDict
     bank_binding_path: Path
     bank_binding_snapshot: tuple
-    bank_binding: dict
-    bank: torch.Tensor
+    bank_binding: _ImmutableDict
+    _bank: torch.Tensor
+
+    @property
+    def bank(self) -> torch.Tensor:
+        """Return an isolated bank copy for external inspection."""
+        return self._bank.clone()
+
+
 def _snapshot_corruption(
     corruption: Corruption, config: ExperimentConfig
 ) -> _CorruptionSnapshot:
@@ -1167,7 +1253,7 @@ def _authenticate_reference_stage(reference: ReferenceStage) -> dict:
         raise ValueError("reference stage device is invalid")
 
     provenance = reference.provenance
-    if type(provenance) is not dict:
+    if not isinstance(provenance, _ImmutableDict):
         raise ValueError("reference stage provenance is invalid")
     expected_metadata = _extraction_metadata(provenance, stage="reference")
     if reference.reference_metadata != expected_metadata:
@@ -1219,8 +1305,8 @@ def _authenticate_reference_stage(reference: ReferenceStage) -> dict:
         or bank_binding != reference.bank_binding
     ):
         raise ValueError("reference bank binding changed after preparation")
-    if not isinstance(reference.bank, torch.Tensor) or not torch.equal(
-        bank, reference.bank
+    if not isinstance(reference._bank, torch.Tensor) or not torch.equal(
+        bank, reference._bank
     ):
         raise ValueError("reference bank values changed after preparation")
     _validate_input_images(reference.reference_manifest)
@@ -1398,21 +1484,21 @@ def prepare_reference_stage(
                 checkpoint_snapshot=checkpoint_snapshot,
                 artifacts=artifacts,
                 runtime_device=runtime_device,
-                runtime=deepcopy(runtime),
+                runtime=_immutable_reference_value(runtime),
                 batch_size=batch_size,
                 shard_size=shard_size,
                 config=config,
-                provenance=deepcopy(provenance),
-                reference_metadata=deepcopy(reference_metadata),
+                provenance=_immutable_reference_value(provenance),
+                reference_metadata=_immutable_reference_value(reference_metadata),
                 reference_cache=artifacts / "reference-extractions",
                 reference_cache_snapshot=reference_snapshot,
                 bank_path=artifacts / "reference-bank.pt",
                 bank_snapshot=bank_snapshot,
-                bank_metadata=deepcopy(bank_metadata),
+                bank_metadata=_immutable_reference_value(bank_metadata),
                 bank_binding_path=artifacts / _REFERENCE_BANK_BINDING_FILE,
                 bank_binding_snapshot=bank_binding_snapshot,
-                bank_binding=deepcopy(bank_binding),
-                bank=bank,
+                bank_binding=_immutable_reference_value(bank_binding),
+                _bank=bank.clone(),
             )
             verified = _authenticate_reference_stage(stage)
             _reference_terminal_sweep(
@@ -1730,6 +1816,62 @@ def run_corruption_stage(
                     expected=expected,
                 )
     return output
+def _preflight_staged_legacy_run(
+    output: Path,
+    reference,
+    evaluation,
+    provenance: dict,
+) -> None:
+    """Preserve legacy refusal-before-mutation checks around staged execution."""
+    with _coordinated_output(output) as (anchored_output, report_parent):
+        _validate_input_images(reference, evaluation)
+        with _pinned_child_directory(
+            report_parent,
+            "artifacts",
+            label="artifacts",
+        ) as (artifacts, artifacts_parent):
+            try:
+                os.stat(
+                    "provenance.json",
+                    dir_fd=artifacts_parent.fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                pass
+            except OSError as error:
+                raise ValueError(
+                    "run provenance must be a regular file"
+                ) from error
+            else:
+                with _open_regular_file(
+                    artifacts / "provenance.json",
+                    error_message="run provenance must be a regular file",
+                ) as handle:
+                    actual = json.load(handle)
+                if type(actual) is not dict:
+                    raise ValueError("run provenance must contain a JSON object")
+                expected = dict(provenance)
+                expected["shared_reference"] = actual.get(
+                    "shared_reference", None
+                )
+                validate_provenance(
+                    anchored_output,
+                    expected,
+                    artifacts_directory=artifacts,
+                )
+            with _pinned_child_directory(
+                artifacts_parent,
+                "reference-extractions",
+                label="reference cache",
+            ):
+                with _pinned_child_directory(
+                    artifacts_parent,
+                    "evaluation-extractions",
+                    label="evaluation cache",
+                ):
+                    pass
+
+
 def run_pipeline(
     reference_manifest,
     evaluation_manifest,
@@ -1754,86 +1896,35 @@ def run_pipeline(
     if corruption is None:
         corruption = GaussianBlur()
     corruption = _snapshot_corruption(corruption, config)
-
-    reference = load_manifest(reference_manifest)
+    manifest_reference = load_manifest(reference_manifest)
     evaluation = load_manifest(evaluation_manifest)
-    validate_disjoint(reference, evaluation)
-    _validate_input_images(reference, evaluation)
+    validate_disjoint(manifest_reference, evaluation)
+    _validate_input_images(manifest_reference, evaluation)
     checkpoint = Path(checkpoint).resolve()
     output = _absolute_output_path(output_dir)
     provenance = _provenance(
-        reference, evaluation, checkpoint, config, corruption, runtime
+        manifest_reference, evaluation, checkpoint, config, corruption, runtime
     )
-    with _coordinated_output(output) as (anchored_output, report_parent):
-        _validate_input_images(reference, evaluation)
-        with _pinned_child_directory(
-            report_parent,
-            "artifacts",
-            label="artifacts",
-        ) as (artifacts, artifacts_parent):
-            try:
-                os.stat(
-                    "provenance.json",
-                    dir_fd=artifacts_parent.fd,
-                    follow_symlinks=False,
-                )
-            except FileNotFoundError:
-                ensure_provenance(
-                    anchored_output,
-                    provenance,
-                    artifacts_directory=artifacts,
-                )
-            except OSError as error:
-                raise ValueError(
-                    "run provenance must be a regular file"
-                ) from error
-            else:
-                validate_provenance(
-                    anchored_output,
-                    provenance,
-                    artifacts_directory=artifacts,
-                )
-            with _pinned_child_directory(
-                artifacts_parent,
-                "reference-extractions",
-                label="reference cache",
-            ) as (reference_cache, _reference_parent):
-                with _pinned_child_directory(
-                    artifacts_parent,
-                    "evaluation-extractions",
-                    label="evaluation cache",
-                ) as (evaluation_cache, _evaluation_parent):
-                    audit = _run_pipeline_stages(
-                        reference,
-                        evaluation,
-                        checkpoint,
-                        anchored_output,
-                        runtime_device=runtime_device,
-                        batch_size=batch_size,
-                        shard_size=shard_size,
-                        config=config,
-                        extractor_factory=extractor_factory,
-                        corruption=corruption,
-                        provenance=provenance,
-                        report_parent=report_parent,
-                        artifacts=artifacts,
-                        reference_cache=reference_cache,
-                        evaluation_cache=evaluation_cache,
-                    )
-                    _final_audit(
-                        reference,
-                        evaluation,
-                        checkpoint,
-                        anchored_output,
-                        config=config,
-                        corruption=corruption,
-                        provenance=provenance,
-                        artifacts=artifacts,
-                        reference_cache=reference_cache,
-                        evaluation_cache=evaluation_cache,
-                        expected=audit,
-                    )
-    return output
+    _preflight_staged_legacy_run(
+        output, manifest_reference, evaluation, provenance
+    )
+    reference = prepare_reference_stage(
+        reference_manifest,
+        checkpoint,
+        output / "artifacts",
+        device=device,
+        batch_size=batch_size,
+        shard_size=shard_size,
+        config=config,
+        extractor_factory=extractor_factory,
+    )
+    return run_corruption_stage(
+        reference,
+        evaluation_manifest,
+        output,
+        corruption,
+        extractor_factory=extractor_factory,
+    )
 
 
 def _positive(value: str) -> int:
