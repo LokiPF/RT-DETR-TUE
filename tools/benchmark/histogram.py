@@ -26,7 +26,7 @@ CONF_TH = 0.5
 SIZE = 640
 BATCH = 32
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CONFIG_FILE = "output/auroc/exp4/exp4_config.yaml"
+CONFIG_FILE = "output/auroc/exp6/exp6_config.yaml"
 ID_COLOR = "blue"
 OOD_COLORS = ["green", "red", "darkorange", "purple", "brown", "teal", "magenta"]
 
