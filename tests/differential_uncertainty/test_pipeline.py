@@ -1856,11 +1856,11 @@ def test_replaced_run_directory_never_redirects_or_overlaps_stage_writes(
         executor.shutdown(wait=True)
 
     assert not entered_concurrently
-    assert state == {"calls": 1, "active": 0, "maximum": 1}
+    assert state == {"calls": 2, "active": 0, "maximum": 1}
     assert identities[1][0] == identities[1][1]
     assert isinstance(outcomes[0], ValueError)
     assert "output directory" in str(outcomes[0]) or "cache manifest" in str(outcomes[0])
-    assert isinstance(outcomes[1], ValueError)
+    assert outcomes[1] == inputs[-1].absolute()
     assert all(
         "superseded" not in str(outcome)
         and "active writer" not in str(outcome)

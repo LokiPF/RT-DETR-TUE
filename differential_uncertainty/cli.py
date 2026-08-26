@@ -651,6 +651,35 @@ def _coordinated_output(output: Path):
                 run.verify_entry(parent.fd, output.name)
 
 
+
+@contextmanager
+def _coordinated_child_output(
+    output: Path, *, parent_run: _DirectoryLease | None, label: str
+):
+    """Coordinate an output independently or as a pinned child of a run."""
+    if parent_run is None:
+        with _coordinated_output(output) as coordinated:
+            yield coordinated
+        return
+    parent_run.verify_path()
+    with _pinned_child_directory(
+        parent_run, output.name, label=label
+    ) as coordinated:
+        yield coordinated
+
+
+@contextmanager
+def _borrow_coordinated_output(run: _DirectoryLease):
+    """Reuse the lock and pinned directory held by a legacy run."""
+    run.verify_path()
+    try:
+        yield Path(f"/proc/self/fd/{run.fd}"), run
+    except BaseException:
+        raise
+    else:
+        run.verify_path()
+
+
 def _iter_evaluation_groups(records, expected_image_ids):
     iterator = iter(records)
     for expected_image_id in expected_image_ids:
@@ -1331,6 +1360,7 @@ def prepare_reference_stage(
     shard_size: int,
     config: ExperimentConfig = FIXED_CONFIG,
     extractor_factory=RTDETRExtractor,
+    _parent_run: _DirectoryLease | None = None,
 ) -> ReferenceStage:
     """Create or resume the clean cache and reference bank for reuse."""
     batch_size = _positive_integer(batch_size, name="batch_size")
@@ -1349,7 +1379,11 @@ def prepare_reference_stage(
     provenance = _reference_provenance(reference, checkpoint, config, runtime)
     reference_metadata = _extraction_metadata(provenance, stage="reference")
 
-    with _coordinated_output(artifacts) as (
+    with _coordinated_child_output(
+        artifacts,
+        parent_run=_parent_run,
+        label="artifacts",
+    ) as (
         anchored_artifacts,
         artifacts_parent,
     ):
@@ -1671,6 +1705,39 @@ def _final_corruption_audit(
     )
 
 
+
+def _can_rebind_empty_corruption_run(
+    artifacts: Path, output: Path, provenance: dict
+) -> bool:
+    """Allow legacy recovery only before any derived corruption output exists."""
+    try:
+        with _open_regular_file(
+            artifacts / "provenance.json",
+            error_message="run provenance must be a regular file",
+        ) as handle:
+            actual = json.load(handle)
+    except (OSError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+        return False
+    if type(actual) is not dict:
+        return False
+    actual.pop("shared_reference", None)
+    expected = dict(provenance)
+    expected.pop("shared_reference", None)
+    if actual != expected:
+        return False
+    if _entry_present(artifacts / "scores.csv") or _entry_present(output / "report"):
+        return False
+    try:
+        with _DirectoryLease(
+            artifacts / "evaluation-extractions",
+            message="evaluation cache directory must be a stable directory",
+        ) as cache:
+            with os.scandir(f"/proc/self/fd/{cache.fd}") as entries:
+                return not any(entries)
+    except ValueError:
+        return False
+
+
 def run_corruption_stage(
     reference: ReferenceStage,
     evaluation_manifest,
@@ -1678,6 +1745,8 @@ def run_corruption_stage(
     corruption: Corruption,
     *,
     extractor_factory=RTDETRExtractor,
+    _run: _DirectoryLease | None = None,
+    _allow_reference_rebind: bool = False,
 ) -> Path:
     """Evaluate one independently resumable corruption against a reference."""
     if not isinstance(reference, ReferenceStage):
@@ -1690,7 +1759,12 @@ def run_corruption_stage(
     output = _absolute_output_path(output_dir)
     provenance = _corruption_provenance(reference, evaluation, corruption)
 
-    with _coordinated_output(output) as (anchored_output, report_parent):
+    coordinator = (
+        _coordinated_output(output)
+        if _run is None
+        else _borrow_coordinated_output(_run)
+    )
+    with coordinator as (anchored_output, report_parent):
         _validate_input_images(reference.reference_manifest, evaluation)
         with _pinned_child_directory(
             report_parent,
@@ -1714,11 +1788,26 @@ def run_corruption_stage(
                     "run provenance must be a regular file"
                 ) from error
             else:
-                validate_provenance(
-                    anchored_output,
-                    provenance,
-                    artifacts_directory=artifacts,
-                )
+                try:
+                    validate_provenance(
+                        anchored_output,
+                        provenance,
+                        artifacts_directory=artifacts,
+                    )
+                except ValueError:
+                    if (
+                        not _allow_reference_rebind
+                        or not _can_rebind_empty_corruption_run(
+                            artifacts, anchored_output, provenance
+                        )
+                    ):
+                        raise
+                    atomic_json(provenance, artifacts / "provenance.json")
+                    validate_provenance(
+                        anchored_output,
+                        provenance,
+                        artifacts_directory=artifacts,
+                    )
             with _pinned_child_directory(
                 artifacts_parent,
                 "evaluation-extractions",
@@ -1821,12 +1910,12 @@ def _preflight_staged_legacy_run(
     reference,
     evaluation,
     provenance: dict,
+    run: _DirectoryLease,
 ) -> None:
     """Preserve legacy refusal-before-mutation checks around staged execution."""
-    with _coordinated_output(output) as (anchored_output, report_parent):
-        _validate_input_images(reference, evaluation)
-        with _pinned_child_directory(
-            report_parent,
+    _validate_input_images(reference, evaluation)
+    with _pinned_child_directory(
+            run,
             "artifacts",
             label="artifacts",
         ) as (artifacts, artifacts_parent):
@@ -1855,7 +1944,7 @@ def _preflight_staged_legacy_run(
                     "shared_reference", None
                 )
                 validate_provenance(
-                    anchored_output,
+                    Path(f"/proc/self/fd/{run.fd}"),
                     expected,
                     artifacts_directory=artifacts,
                 )
@@ -1905,26 +1994,30 @@ def run_pipeline(
     provenance = _provenance(
         manifest_reference, evaluation, checkpoint, config, corruption, runtime
     )
-    _preflight_staged_legacy_run(
-        output, manifest_reference, evaluation, provenance
-    )
-    reference = prepare_reference_stage(
-        reference_manifest,
-        checkpoint,
-        output / "artifacts",
-        device=device,
-        batch_size=batch_size,
-        shard_size=shard_size,
-        config=config,
-        extractor_factory=extractor_factory,
-    )
-    return run_corruption_stage(
-        reference,
-        evaluation_manifest,
-        output,
-        corruption,
-        extractor_factory=extractor_factory,
-    )
+    with _coordinated_output(output) as (_anchored_output, run):
+        _preflight_staged_legacy_run(
+            output, manifest_reference, evaluation, provenance, run
+        )
+        reference = prepare_reference_stage(
+            reference_manifest,
+            checkpoint,
+            output / "artifacts",
+            device=device,
+            batch_size=batch_size,
+            shard_size=shard_size,
+            config=config,
+            extractor_factory=extractor_factory,
+            _parent_run=run,
+        )
+        return run_corruption_stage(
+            reference,
+            evaluation_manifest,
+            output,
+            corruption,
+            extractor_factory=extractor_factory,
+            _run=run,
+            _allow_reference_rebind=True,
+        )
 
 
 def _positive(value: str) -> int:
