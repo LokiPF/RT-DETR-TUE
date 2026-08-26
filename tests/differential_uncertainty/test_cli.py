@@ -13,12 +13,12 @@ def _run_parser(parser):
     return next(action for action in subparsers if action.choices).choices["run"]
 
 
-def test_cli_has_exactly_one_run_command_and_only_runtime_controls():
+def test_cli_has_run_and_coco_benchmark_commands_with_runtime_controls():
     parser = build_parser()
     command_action = next(
         action for action in parser._actions if getattr(action, "choices", None)
     )
-    assert set(command_action.choices) == {"run"}
+    assert set(command_action.choices) == {"run", "benchmark-coco"}
     run = _run_parser(parser)
     options = {
         option for action in run._actions for option in action.option_strings
@@ -125,3 +125,62 @@ def test_cli_rejects_nonpositive_runtime_sizes(option, value, capsys):
 
     assert error.value.code == 2
     assert "must be positive" in capsys.readouterr().err
+
+
+def _benchmark_parser(parser):
+    subparsers = [
+        action for action in parser._actions if hasattr(action, "choices")
+    ]
+    return next(action for action in subparsers if action.choices).choices[
+        "benchmark-coco"
+    ]
+
+
+def test_coco_benchmark_command_accepts_only_required_runtime_controls():
+    benchmark = _benchmark_parser(build_parser())
+    options = {
+        option for action in benchmark._actions for option in action.option_strings
+    }
+
+    assert {
+        "--coco-annotations",
+        "--coco-images",
+        "--checkpoint",
+        "--output-dir",
+        "--device",
+        "--batch-size",
+        "--shard-size",
+        "--reference-count",
+        "--evaluation-count",
+    } <= options
+
+
+def test_cli_forwards_default_coco_counts_to_the_benchmark(monkeypatch, tmp_path):
+    received = {}
+
+    def fake_run(*args, **kwargs):
+        received["args"] = args
+        received["kwargs"] = kwargs
+
+    monkeypatch.setattr(cli, "run_coco_benchmark", fake_run)
+    values = [
+        "benchmark-coco",
+        "--coco-annotations",
+        str(tmp_path / "instances_val2017.json"),
+        "--coco-images",
+        str(tmp_path / "val2017"),
+        "--checkpoint",
+        str(tmp_path / "model.pth"),
+        "--output-dir",
+        str(tmp_path / "run"),
+    ]
+
+    assert main(values) == 0
+    assert received["args"] == tuple(values[index] for index in (2, 4, 6, 8))
+    assert received["kwargs"] == {
+        "device": "cuda:0",
+        "batch_size": 1,
+        "shard_size": 50,
+        "reference_count": 250,
+        "evaluation_count": 250,
+    }

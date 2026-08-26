@@ -42,6 +42,7 @@ from .bank import (
     load_reference_bank,
     save_reference_bank,
 )
+from .benchmark import run_coco_benchmark
 from .config import FIXED_CONFIG, ExperimentConfig
 from .corruptions import Corruption, GaussianBlur, Severity
 from .evaluation import evaluate_rows
@@ -2042,21 +2043,46 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--device", default="cuda:0")
     run.add_argument("--batch-size", type=_positive, default=1)
     run.add_argument("--shard-size", type=_positive, default=50)
+    benchmark = commands.add_parser(
+        "benchmark-coco", help="materialize deterministic COCO benchmark inputs"
+    )
+    benchmark.add_argument("--coco-annotations", required=True)
+    benchmark.add_argument("--coco-images", required=True)
+    benchmark.add_argument("--checkpoint", required=True)
+    benchmark.add_argument("--output-dir", required=True)
+    benchmark.add_argument("--device", default="cuda:0")
+    benchmark.add_argument("--batch-size", type=_positive, default=1)
+    benchmark.add_argument("--shard-size", type=_positive, default=50)
+    benchmark.add_argument("--reference-count", type=_positive, default=250)
+    benchmark.add_argument("--evaluation-count", type=_positive, default=250)
     return parser
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        run_pipeline(
-            args.reference_manifest,
-            args.evaluation_manifest,
-            args.checkpoint,
-            args.output_dir,
-            device=args.device,
-            batch_size=args.batch_size,
-            shard_size=args.shard_size,
-        )
+        if args.command == "run":
+            run_pipeline(
+                args.reference_manifest,
+                args.evaluation_manifest,
+                args.checkpoint,
+                args.output_dir,
+                device=args.device,
+                batch_size=args.batch_size,
+                shard_size=args.shard_size,
+            )
+        else:
+            run_coco_benchmark(
+                args.coco_annotations,
+                args.coco_images,
+                args.checkpoint,
+                args.output_dir,
+                device=args.device,
+                batch_size=args.batch_size,
+                shard_size=args.shard_size,
+                reference_count=args.reference_count,
+                evaluation_count=args.evaluation_count,
+            )
     except (OSError, ValueError, RuntimeError, KeyError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
