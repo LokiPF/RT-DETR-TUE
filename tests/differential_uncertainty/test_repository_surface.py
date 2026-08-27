@@ -27,11 +27,13 @@ RETAINED_PYTHON = {
     "differential_uncertainty/__main__.py",
     "differential_uncertainty/artifacts.py",
     "differential_uncertainty/bank.py",
+    "differential_uncertainty/benchmark.py",
     "differential_uncertainty/cli.py",
     "differential_uncertainty/config.py",
     "differential_uncertainty/corruptions/__init__.py",
     "differential_uncertainty/corruptions/base.py",
     "differential_uncertainty/corruptions/gaussian_blur.py",
+    "differential_uncertainty/corruptions/imagecorruptions.py",
     "differential_uncertainty/evaluation.py",
     "differential_uncertainty/extraction.py",
     "differential_uncertainty/manifests.py",
@@ -53,6 +55,7 @@ RETAINED_PYTHON = {
     "src/zoo/rtdetr/utils.py",
     "tests/differential_uncertainty/test_artifacts.py",
     "tests/differential_uncertainty/test_bank.py",
+    "tests/differential_uncertainty/test_benchmark.py",
     "tests/differential_uncertainty/test_cli.py",
     "tests/differential_uncertainty/test_config.py",
     "tests/differential_uncertainty/test_corruptions.py",
@@ -184,7 +187,7 @@ def test_repository_python_surface_is_exact():
         )
     }
 
-    assert len(RETAINED_PYTHON) == 43
+    assert len(RETAINED_PYTHON) == 46
     assert actual == RETAINED_PYTHON
 
 

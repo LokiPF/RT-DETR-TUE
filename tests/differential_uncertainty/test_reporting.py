@@ -15,7 +15,13 @@ from differential_uncertainty import reporting
 from differential_uncertainty.artifacts import _open_regular_file
 from differential_uncertainty.config import ExperimentConfig
 from differential_uncertainty.evaluation import evaluate_rows
-from differential_uncertainty.reporting import REPORT_FILES, write_report
+from differential_uncertainty.reporting import (
+    BENCHMARK_REPORT_FILES,
+    BENCHMARK_SERIES,
+    REPORT_FILES,
+    write_benchmark_report,
+    write_report,
+)
 
 
 def _rows():
@@ -26,6 +32,8 @@ def _rows():
             persistence_responsive = 1.0 + 0.2 * severity + offset
             confidence_reference = 0.2 + 0.05 * severity
             confidence_responsive = 0.8 - 0.05 * severity
+            direct_confidence_mean = 0.60 - 0.04 * severity + 0.01 * offset
+            direct_confidence_max = 0.85 - 0.03 * severity + 0.01 * offset
             rows.append({
                 "image_id": image_id, "severity": severity,
                 "padded_count": 0, "valid_count": 20,
@@ -38,6 +46,8 @@ def _rows():
                 "confidence_responsive": confidence_responsive,
                 "confidence_relative_gap": 2 * (confidence_responsive - confidence_reference)
                 / (confidence_responsive + confidence_reference),
+                "direct_confidence_mean": direct_confidence_mean,
+                "direct_confidence_max": direct_confidence_max,
             })
     return rows
 
@@ -87,6 +97,8 @@ def test_report_writes_the_exact_dedicated_bundle(tmp_path):
     summary = json.loads((output / "summary.json").read_text())
     assert summary["evaluation"]["series"]["persistence_relative_gap"]["orientation"] == 1
     corruption = summary["provenance"]["corruption"]
+    assert summary["evaluation"]["series"]["direct_confidence_mean"]["orientation"] == -1
+    assert summary["evaluation"]["series"]["direct_confidence_max"]["orientation"] == -1
     assert set(corruption) == {"name", "severities"}
     assert corruption["name"] == "gaussian_blur"
     text = (output / "report.md").read_text(encoding="utf-8").lower()
@@ -94,11 +106,20 @@ def test_report_writes_the_exact_dedicated_bundle(tmp_path):
         "what was tested", "relative gap", "nearest clean", "sigmoid", "spearman",
         "3.5 / 4 = 0.875", "not a probability", "adjacent consistency",
         "paired bootstrap", "does not measure map",
+        "direct global confidence", "all valid queries",
+        "lower confidence ranks as more corrupted",
         "corruption code or hidden settings change", "new output folder",
     ):
         assert phrase in text
     assert "authoritative build sha-256" not in text
     assert "corruption implementation was" not in text
+
+
+def test_report_rejects_rows_missing_direct_confidence_mean(tmp_path):
+    rows, evaluation, provenance = _inputs()
+    del rows[0]["direct_confidence_mean"]
+    with pytest.raises(ValueError, match="missing=.*direct_confidence_mean"):
+        write_report(tmp_path / "report", rows, evaluation, provenance)
 
 
 def test_report_writes_through_an_active_pinned_parent_lease(tmp_path):
@@ -608,6 +629,8 @@ def test_report_explains_calculations_limits_and_uses_concrete_run_values(tmp_pa
     example = sorted(rows, key=lambda row: (row["image_id"], row["severity"]))[0]
     primary = evaluation["series"]["persistence_relative_gap"]
     confidence = evaluation["series"]["confidence_relative_gap"]
+    direct_mean = evaluation["series"]["direct_confidence_mean"]
+    direct_max = evaluation["series"]["direct_confidence_max"]
     for concrete in (
         f"{example['persistence_reference']:.6f}",
         f"{example['persistence_responsive']:.6f}",
@@ -615,6 +638,8 @@ def test_report_explains_calculations_limits_and_uses_concrete_run_values(tmp_pa
         f"{example['confidence_reference']:.6f}",
         f"{example['confidence_responsive']:.6f}",
         f"{example['confidence_relative_gap']:.6f}",
+        f"{example['direct_confidence_mean']:.6f}",
+        f"{example['direct_confidence_max']:.6f}",
         f"{primary['median_signed_spearman']:+.3f}",
         f"{primary['oriented_adjacent_consistency']:.1%}",
     ):
@@ -622,7 +647,9 @@ def test_report_explains_calculations_limits_and_uses_concrete_run_values(tmp_pa
     for severity in range(1, 6):
         assert (
             f"| {severity} | {primary['auroc_by_severity'][severity]:.3f} | "
-            f"{confidence['auroc_by_severity'][severity]:.3f} |"
+            f"{confidence['auroc_by_severity'][severity]:.3f} | "
+            f"{direct_mean['auroc_by_severity'][severity]:.3f} | "
+            f"{direct_max['auroc_by_severity'][severity]:.3f} |"
         ) in text
     for phrase in (
         "level 0 is the clean image",
@@ -644,6 +671,9 @@ def test_report_explains_calculations_limits_and_uses_concrete_run_values(tmp_pa
         "calibration",
         "object labels",
         "padded",
+        "direct global confidence",
+        "all valid queries",
+        "lower confidence ranks as more corrupted",
     ):
         assert phrase in lower
 
@@ -1359,6 +1389,9 @@ def test_report_and_figure_labels_follow_the_validated_test_config(
     assert "Layer-4 distance" in labels["titles"]
     assert "10-20% reference" in labels["labels"]
     assert "70-80% responsive" in labels["labels"]
+    ranking_labels = captured["auroc-by-corruption-severity.png"]["labels"]
+    assert "Direct global confidence mean" in ranking_labels
+    assert "Direct global confidence maximum" in ranking_labels
 
 
 def test_gaussian_parameters_must_match_scientific_config(tmp_path):
@@ -1622,3 +1655,22 @@ def test_report_can_capture_the_exact_intended_bundle_without_changing_default_a
     assert intended == {
         relative: (output / relative).read_bytes() for relative in REPORT_FILES
     }
+
+
+def test_benchmark_root_report_is_exact_and_rejects_changed_content(tmp_path):
+    roster = {"schema_version": 1, "corruptions": ["gaussian_blur", "contrast"]}
+    metrics = {name: (index + 1) / 10 for index, name in enumerate(BENCHMARK_SERIES)}
+    entries = tuple({"corruption": name, "metrics": metrics, "provenance": {"name": name}} for name in roster["corruptions"])
+    output = tmp_path / "benchmark-report"
+    write_benchmark_report(output, entries, roster)
+    assert sorted(path.name for path in output.iterdir()) == sorted(BENCHMARK_REPORT_FILES)
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert set(summary["method_aggregate"]) == set(BENCHMARK_SERIES)
+    assert sorted(item["primary_rank"] for item in summary["method_aggregate"].values()) == list(range(1, 7))
+    text = (output / "report.md").read_text(encoding="utf-8").lower()
+    assert "higher auroc" in text and "differential" in text and "direct confidence" in text
+    write_benchmark_report(output, entries, roster)
+    changed = list(entries)
+    changed[0] = {**changed[0], "metrics": {**metrics, "persistence_relative_gap": 0.99}}
+    with pytest.raises(ValueError, match="existing benchmark report differs"):
+        write_benchmark_report(output, changed, roster)

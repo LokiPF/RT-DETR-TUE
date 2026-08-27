@@ -182,6 +182,9 @@ def score_image_records(
     rows: list[dict] = []
     for record in records:
         confidence = confidence_from_logits(record["logits"])
+        direct_confidence = confidence.index_select(0, valid)
+        direct_confidence_mean = float(direct_confidence.mean())
+        direct_confidence_max = float(direct_confidence.max())
         bins = confidence_deciles(confidence, valid)
         reference_ids = bins[config.reference_decile]
         responsive_ids = bins[config.responsive_decile]
@@ -208,5 +211,7 @@ def score_image_records(
             "confidence_reference": reference_uncertainty,
             "confidence_responsive": responsive_uncertainty,
             "confidence_relative_gap": relative_gap(reference_uncertainty, responsive_uncertainty),
+            "direct_confidence_mean": direct_confidence_mean,
+            "direct_confidence_max": direct_confidence_max,
         })
     return rows

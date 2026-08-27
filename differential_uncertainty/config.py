@@ -22,6 +22,7 @@ class ExperimentConfig:
     responsive_decile: int = 5
     persistence_orientation: int = 1
     confidence_orientation: int = -1
+    direct_confidence_orientation: int = -1
     raw_responsive_orientation: int = 1
     raw_reference_orientation: int = -1
     bootstrap_samples: int = 10_000
@@ -52,6 +53,7 @@ class ExperimentConfig:
         orientations = (
             self.persistence_orientation,
             self.confidence_orientation,
+            self.direct_confidence_orientation,
             self.raw_responsive_orientation,
             self.raw_reference_orientation,
         )
@@ -77,6 +79,8 @@ class ExperimentConfig:
             "responsive_decile": self.responsive_decile,
             "orientations": {
                 "persistence_relative_gap": self.persistence_orientation,
+                "direct_confidence_mean": self.direct_confidence_orientation,
+                "direct_confidence_max": self.direct_confidence_orientation,
                 "confidence_relative_gap": self.confidence_orientation,
                 "raw_responsive": self.raw_responsive_orientation,
                 "raw_reference": self.raw_reference_orientation,

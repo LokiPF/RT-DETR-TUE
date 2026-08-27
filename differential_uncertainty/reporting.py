@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import ctypes
+import csv
 import errno
 import html
+import io
 import json
 import math
 import os
@@ -55,6 +57,8 @@ _SCORE_COLUMNS = (
     "confidence_reference",
     "confidence_responsive",
     "confidence_relative_gap",
+    "direct_confidence_mean",
+    "direct_confidence_max",
 )
 _COUNT_COLUMNS = (
     "padded_count",
@@ -69,21 +73,36 @@ _SCORE_FIELDS = (
     "confidence_reference",
     "confidence_responsive",
     "confidence_relative_gap",
+    "direct_confidence_mean",
+    "direct_confidence_max",
 )
 _SERIES = (
     "persistence_relative_gap",
     "confidence_relative_gap",
     "persistence_responsive",
     "persistence_reference",
+    "direct_confidence_mean",
+    "direct_confidence_max",
 )
 _CONTROLS = (
     "confidence_relative_gap",
     "persistence_responsive",
     "persistence_reference",
+    "direct_confidence_mean",
+    "direct_confidence_max",
 )
+BENCHMARK_SERIES = _SERIES
+BENCHMARK_REPORT_FILES = (
+    "corruption-metrics.csv",
+    "summary.json",
+    "report.md",
+)
+
 _FIXED_ORIENTATIONS = {
     "persistence_relative_gap": 1,
     "confidence_relative_gap": -1,
+    "direct_confidence_mean": -1,
+    "direct_confidence_max": -1,
     "raw_responsive": 1,
     "raw_reference": -1,
 }
@@ -92,6 +111,8 @@ _SERIES_ORIENTATION_KEYS = {
     "confidence_relative_gap": "confidence_relative_gap",
     "persistence_responsive": "raw_responsive",
     "persistence_reference": "raw_reference",
+    "direct_confidence_mean": "direct_confidence_mean",
+    "direct_confidence_max": "direct_confidence_max",
 }
 _PYPLOT_LOCK = threading.RLock()
 
@@ -482,6 +503,13 @@ def _validated_frame(rows, *, config: Mapping) -> pd.DataFrame:
             and 0.0 <= row["confidence_responsive"] <= 1.0
         ):
             raise ValueError("confidence means must lie in [0, 1]")
+        if not (
+            0.0 <= row["direct_confidence_mean"]
+            <= row["direct_confidence_max"] <= 1.0
+        ):
+            raise ValueError(
+                "direct confidence mean and maximum must lie in [0, 1] and be ordered"
+            )
         for prefix in ("persistence", "confidence"):
             expected = _expected_gap(
                 row[f"{prefix}_reference"], row[f"{prefix}_responsive"]
@@ -524,7 +552,7 @@ def _validate_evaluation(evaluation, frame: pd.DataFrame, provenance: dict) -> d
         raise ValueError("evaluation must keep the exact Task 8 structure")
     series = evaluation["series"]
     if not isinstance(series, Mapping) or set(series) != set(_SERIES):
-        raise ValueError("evaluation series must contain the four fixed scores")
+        raise ValueError("evaluation series must contain the six fixed scores")
 
     score_rows = frame.to_dict(orient="records")
     canonical_series = {}
@@ -561,7 +589,7 @@ def _validate_evaluation(evaluation, frame: pd.DataFrame, provenance: dict) -> d
 
     comparisons = evaluation["bootstrap_comparisons"]
     if not isinstance(comparisons, list) or len(comparisons) != len(_CONTROLS):
-        raise ValueError("evaluation needs the three fixed bootstrap comparisons")
+        raise ValueError("evaluation needs the five fixed bootstrap comparisons")
     config = provenance["config"]
     canonical_comparisons = []
     for index, (item, control) in enumerate(zip(comparisons, _CONTROLS)):
@@ -754,6 +782,8 @@ def _write_figures_impl(
         "confidence_relative_gap": "Matched confidence",
         "persistence_responsive": "Raw responsive control",
         "persistence_reference": "Raw reference control",
+        "direct_confidence_mean": "Direct global confidence mean",
+        "direct_confidence_max": "Direct global confidence maximum",
     }
     for name, label in labels.items():
         values = evaluation["series"][name]["auroc_by_severity"]
@@ -803,6 +833,8 @@ def render_report(
 ) -> str:
     primary = evaluation["series"]["persistence_relative_gap"]
     confidence = evaluation["series"]["confidence_relative_gap"]
+    direct_mean = evaluation["series"]["direct_confidence_mean"]
+    direct_max = evaluation["series"]["direct_confidence_max"]
     example = frame.sort_values(
         ["image_id", "severity"], kind="stable"
     ).iloc[0]
@@ -812,6 +844,8 @@ def render_report(
     confidence_reference = example["confidence_reference"]
     confidence_responsive = example["confidence_responsive"]
     confidence_gap = example["confidence_relative_gap"]
+    direct_confidence_mean = example["direct_confidence_mean"]
+    direct_confidence_max = example["direct_confidence_max"]
     config = provenance["config"]
     corruption_name = _markdown_text(
         provenance["corruption"]["name"].replace("_", " ")
@@ -841,7 +875,9 @@ def render_report(
     )
     auroc_lines = "\n".join(
         f"| {level} | {primary['auroc_by_severity'][level]:.3f} | "
-        f"{confidence['auroc_by_severity'][level]:.3f} |"
+        f"{confidence['auroc_by_severity'][level]:.3f} | "
+        f"{direct_mean['auroc_by_severity'][level]:.3f} | "
+        f"{direct_max['auroc_by_severity'][level]:.3f} |"
         for level in SEVERITIES[1:]
     )
     bootstrap_lines = "\n".join(
@@ -926,12 +962,26 @@ maximum sigmoid class confidence. The archived experiment fixed this score's
 direction at -1, which means a smaller raw confidence gap ranks as more
 corrupted.
 
+
+## Direct global confidence baselines
+
+Unlike the matched-confidence relative-gap control above, these two direct global
+confidence controls use **all valid queries** for each image and severity, not
+the decile-matched reference and responsive groups. For every retained query we
+take its maximum sigmoid confidence, then summarize the global mean and maximum.
+
+For image {example_id} at corruption level {int(example['severity'])}, the
+direct global confidence mean was {direct_confidence_mean:.6f} and the direct
+global confidence maximum was {direct_confidence_max:.6f}.
+
+They are raw confidence controls rather than relative gaps. Their fixed
+orientation is -1: lower confidence ranks as more corrupted.
 ## Results
 
-| Corruption level | Persistence AUROC | Matched confidence AUROC |
-|---|---:|---:|
+| Corruption level | Persistence AUROC | Matched confidence relative-gap AUROC | Direct global confidence mean AUROC | Direct global confidence maximum AUROC |
+|---|---:|---:|---:|---:|
 {auroc_lines}
-| Average | {primary['macro_auroc']:.3f} | {confidence['macro_auroc']:.3f} |
+| Average | {primary['macro_auroc']:.3f} | {confidence['macro_auroc']:.3f} | {direct_mean['macro_auroc']:.3f} | {direct_max['macro_auroc']:.3f} |
 
 ### How AUROC was calculated for each severity
 
@@ -1602,6 +1652,282 @@ def write_report(
                 raise ValueError(
                     "existing report bundle differs; choose a new output "
                     "directory"
+                ) from None
+            staging.mark_published(output_name)
+            parent.verify_path()
+
+
+def _benchmark_name(value, *, label: str) -> str:
+    value = _validated_text(value, name=label, maximum_length=128)
+    if "/" in value or "\\" in value or Path(value).name != value:
+        raise ValueError(f"{label} must be a safe basename")
+    return value
+
+
+def _normalized_benchmark_inputs(entries, roster):
+    normalized_roster = _json_copy(roster, name="benchmark roster")
+    if type(normalized_roster) is not dict:
+        raise ValueError("benchmark roster must be a JSON object")
+    roster_items = normalized_roster.get("corruptions")
+    if type(roster_items) is not list or not roster_items:
+        raise ValueError("benchmark roster must contain corruptions")
+    roster_names = []
+    for index, item in enumerate(roster_items):
+        if type(item) is str:
+            name = item
+        elif type(item) is dict:
+            name = item.get("name")
+        else:
+            raise ValueError("benchmark roster corruption is invalid")
+        roster_names.append(
+            _benchmark_name(name, label=f"benchmark roster corruption {index}")
+        )
+    if len(set(roster_names)) != len(roster_names):
+        raise ValueError("benchmark roster contains duplicate corruptions")
+
+    if not isinstance(entries, (list, tuple)) or not entries:
+        raise ValueError("benchmark report entries must be a nonempty sequence")
+    normalized_entries = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, Mapping) or set(entry) != {
+            "corruption", "metrics", "provenance"
+        }:
+            raise ValueError("benchmark report entry has invalid fields")
+        name = _benchmark_name(
+            entry["corruption"], label=f"benchmark report corruption {index}"
+        )
+        metrics = entry["metrics"]
+        if not isinstance(metrics, Mapping) or set(metrics) != set(BENCHMARK_SERIES):
+            raise ValueError("benchmark report metrics must contain every series")
+        normalized_metrics = {}
+        for series in BENCHMARK_SERIES:
+            value = metrics[series]
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, Real)
+                or not math.isfinite(float(value))
+                or not 0.0 <= float(value) <= 1.0
+            ):
+                raise ValueError("benchmark macro-AUROC must be finite in [0, 1]")
+            normalized_metrics[series] = float(value)
+        normalized_entries.append(
+            {
+                "corruption": name,
+                "metrics": normalized_metrics,
+                "provenance": _json_copy(
+                    entry["provenance"], name="benchmark report provenance"
+                ),
+            }
+        )
+    if [entry["corruption"] for entry in normalized_entries] != roster_names:
+        raise ValueError("benchmark report entries do not match corruption roster")
+    return tuple(normalized_entries), normalized_roster
+
+
+def _benchmark_report_content(entries, roster) -> dict[str, bytes]:
+    normalized_entries, normalized_roster = _normalized_benchmark_inputs(
+        entries, roster
+    )
+    stream = io.StringIO(newline="")
+    writer = csv.writer(stream, lineterminator="\n")
+    headers = ["corruption", *(f"{name}_macro_auroc" for name in BENCHMARK_SERIES)]
+    writer.writerow(headers)
+    for entry in normalized_entries:
+        writer.writerow(
+            [
+                entry["corruption"],
+                *(
+                    format(entry["metrics"][series], ".17g")
+                    for series in BENCHMARK_SERIES
+                ),
+            ]
+        )
+    means = {
+        series: sum(
+            entry["metrics"][series] for entry in normalized_entries
+        )
+        / len(normalized_entries)
+        for series in BENCHMARK_SERIES
+    }
+    ranking = sorted(
+        BENCHMARK_SERIES,
+        key=lambda series: (-means[series], BENCHMARK_SERIES.index(series)),
+    )
+    ranks = {series: rank for rank, series in enumerate(ranking, start=1)}
+    method_aggregate = {
+        series: {
+            "mean_macro_auroc": means[series],
+            "median_macro_auroc": float(
+                np.median(
+                    [entry["metrics"][series] for entry in normalized_entries]
+                )
+            ),
+            "primary_rank": ranks[series],
+        }
+        for series in BENCHMARK_SERIES
+    }
+    summary = {
+        "schema_version": 1,
+        "roster": normalized_roster,
+        "corruptions": [
+            {
+                "name": entry["corruption"],
+                "metrics": entry["metrics"],
+                "provenance": entry["provenance"],
+            }
+            for entry in normalized_entries
+        ],
+        "method_aggregate": method_aggregate,
+    }
+    aggregate_rows = "\n".join(
+        f"| {series.replace('_', ' ')} | "
+        f"{method_aggregate[series]['mean_macro_auroc']:.3f} | "
+        f"{method_aggregate[series]['median_macro_auroc']:.3f} | "
+        f"{method_aggregate[series]['primary_rank']} |"
+        for series in BENCHMARK_SERIES
+    )
+    report = f"""# COCO ImageCorruptions leaderboard
+
+Each corruption receives a separate macro-AUROC: the average of its five
+clean-versus-corrupted severity comparisons. Higher AUROC means the score ranks
+corrupted images ahead of clean images more reliably. We do not pool or average
+raw severity values across corruption families.
+
+The primary differential score is the persistence relative gap. The
+matched-confidence relative gap is a control that uses the same decile-selected
+queries. Persistence responsive and persistence reference are raw fingerprint
+controls. Direct confidence mean and direct confidence max are direct global
+confidence baselines over all valid queries; lower raw confidence is oriented as
+more corrupted before AUROC is computed.
+
+## Method aggregates across corruption families
+
+| Method | Mean macro-AUROC | Median macro-AUROC | Rank |
+|---|---:|---:|---:|
+{aggregate_rows}
+
+Per-corruption macro-AUROCs are in `corruption-metrics.csv`; the exact input
+roster and the final per-corruption provenance are recorded in `summary.json`.
+"""
+    return {
+        "corruption-metrics.csv": stream.getvalue().encode("utf-8"),
+        "summary.json": (
+            json.dumps(summary, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        ).encode("utf-8"),
+        "report.md": report.encode("utf-8"),
+    }
+
+
+def _benchmark_bundle_bytes(root: Path, *, message: str) -> dict[str, bytes]:
+    with _DirectoryLease(root, message=message) as root_lease:
+        if _directory_entries(root_lease) != (set(BENCHMARK_REPORT_FILES), set()):
+            raise ValueError(message)
+        content = {}
+        for name in BENCHMARK_REPORT_FILES:
+            with _open_regular_file(
+                name, directory_fd=root_lease.fd, error_message=message
+            ) as handle:
+                before = os.fstat(handle.fileno())
+                content[name] = handle.read()
+                after = os.fstat(handle.fileno())
+                visible = os.stat(
+                    name, dir_fd=root_lease.fd, follow_symlinks=False
+                )
+                before_state = (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_mode,
+                    before.st_size,
+                    before.st_mtime_ns,
+                    before.st_ctime_ns,
+                )
+                after_state = (
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_mode,
+                    after.st_size,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                )
+                visible_state = (
+                    visible.st_dev,
+                    visible.st_ino,
+                    visible.st_mode,
+                    visible.st_size,
+                    visible.st_mtime_ns,
+                    visible.st_ctime_ns,
+                )
+                if not stat.S_ISREG(before.st_mode) or (
+                    before_state != after_state or after_state != visible_state
+                ):
+                    raise ValueError(message)
+        root_lease.verify_path()
+        return content
+
+
+def _same_benchmark_bundle(existing: Path, intended: Path) -> bool:
+    try:
+        return _benchmark_bundle_bytes(
+            existing, message="existing benchmark report differs"
+        ) == _benchmark_bundle_bytes(
+            intended, message="intended benchmark report changed"
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _write_benchmark_bundle(staging: Path, content: Mapping[str, bytes]) -> None:
+    for name in BENCHMARK_REPORT_FILES:
+        value = content[name]
+        with (staging / name).open("wb") as handle:
+            handle.write(value)
+            handle.flush()
+            os.fsync(handle.fileno())
+    if _benchmark_bundle_bytes(
+        staging, message="benchmark report bundle is incomplete"
+    ) != content:
+        raise RuntimeError("benchmark report bundle changed while it was written")
+
+
+def write_benchmark_report(output, entries, roster) -> None:
+    """Atomically publish one exact root leaderboard report bundle."""
+    content = _benchmark_report_content(entries, roster)
+    output = Path(output)
+    output_name = output.name
+    if not output_name or Path(output_name).name != output_name:
+        raise ValueError("benchmark report output must name a directory")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with _DirectoryLease(
+        output.parent, message="benchmark report parent directory changed"
+    ) as parent:
+        with _StagingOwner(parent, prefix=f".{output_name}.staging-") as staging:
+            staging.detach_temporary_finalizer()
+            _write_benchmark_bundle(staging.path, content)
+            parent.verify_path()
+            staging.verify()
+            anchored_output = Path(f"/proc/self/fd/{parent.fd}") / output_name
+            try:
+                os.stat(output_name, dir_fd=parent.fd, follow_symlinks=False)
+            except FileNotFoundError:
+                output_exists = False
+            else:
+                output_exists = True
+            if output_exists:
+                if _same_benchmark_bundle(anchored_output, staging.path):
+                    parent.verify_path()
+                    return
+                raise ValueError(
+                    "existing benchmark report differs; choose a new output directory"
+                )
+            staging.prepare_publish(output_name)
+            try:
+                _publish_no_replace(staging.name, output_name, parent.fd)
+            except FileExistsError:
+                if _same_benchmark_bundle(anchored_output, staging.path):
+                    parent.verify_path()
+                    return
+                raise ValueError(
+                    "existing benchmark report differs; choose a new output directory"
                 ) from None
             staging.mark_published(output_name)
             parent.verify_path()
