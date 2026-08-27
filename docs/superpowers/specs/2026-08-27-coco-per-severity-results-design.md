@@ -8,9 +8,9 @@ the five-level macro-AUROC.
 
 ## Evidence source
 
-Derive values only from the tracked pilot summary artifact:
+Derive values from the completed, per-corruption pilot reports:
 
-`docs/results/coco-imagecorruptions-250/summary.json`
+`.worktrees/imagecorruptions-coco-benchmark/runs/coco-imagecorruptions-250/corruptions/<family>/report/summary.json`
 
 For every corruption family, use
 `evaluation.series.<method>.auroc_by_severity["1".."5"]`. Each entry compares
@@ -37,5 +37,5 @@ unchanged.
 ## Validation
 
 The generated table values must reconcile to all 19 x 5 entries for both
-methods in the tracked JSON artifact. The document must retain portable
-relative links and pass `git diff --check`.
+methods in the completed per-corruption reports. The document must retain
+portable relative links and pass `git diff --check`.
