@@ -2,7 +2,7 @@
 
 ## Scope
 
-This pilot evaluates exactly **250 clean COCO-val reference images** and **250 COCO-val evaluation images** across **19 corruption families**. It is explicitly **not** a 2,500/2,500 evaluation. The per-family macro-AUROC measurements are recorded in [corruption-metrics.csv](/home/yuchen/YuchenZ/UE/philip_sa/.worktrees/imagecorruptions-coco-benchmark/runs/coco-imagecorruptions-250/benchmark-report/corruption-metrics.csv), with provenance and aggregates in [summary.json](/home/yuchen/YuchenZ/UE/philip_sa/.worktrees/imagecorruptions-coco-benchmark/runs/coco-imagecorruptions-250/benchmark-report/summary.json).
+This pilot evaluates exactly **250 clean COCO-val reference images** and **250 COCO-val evaluation images** across **19 corruption families**. It is explicitly **not** a 2,500/2,500 evaluation. The per-family macro-AUROC measurements are recorded in [corruption-metrics.csv](results/coco-imagecorruptions-250/corruption-metrics.csv), with provenance and aggregates in [summary.json](results/coco-imagecorruptions-250/summary.json).
 
 ## Headline comparison
 
