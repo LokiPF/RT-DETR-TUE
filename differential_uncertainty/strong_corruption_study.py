@@ -2271,9 +2271,10 @@ def _conditional_coverage_line(counts) -> str:
     counts = tuple(counts)
     return (
         "Exploratory coverage: nonempty family/severity tasks="
-        f"{sum(count > 0 for count in counts)}/{len(counts)}; tasks with at most "
-        f"5 eligible pairs={sum(0 < count <= 5 for count in counts)}; tasks with "
-        f"exactly 1 eligible pair={sum(count == 1 for count in counts)}. Coverage "
+        f"{sum(count > 0 for count in counts)}/{len(counts)}; nonempty tasks with "
+        f"at most 5 eligible pairs={sum(0 < count <= 5 for count in counts)}; "
+        "tasks with exactly 1 eligible pair="
+        f"{sum(count == 1 for count in counts)}. Coverage "
         "alone does not establish uniform per-corruption complementarity."
     )
 
