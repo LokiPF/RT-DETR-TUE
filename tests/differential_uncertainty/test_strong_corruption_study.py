@@ -459,7 +459,33 @@ def test_standardized_distance_uses_bank_moments():
     assert result.item() == pytest.approx(1.2)
 
 
-def test_top_confidence_ties_use_the_lowest_query_id():
+def test_cosine_distance_normalizes_and_uses_the_five_nearest_rows(bank_fixture):
+    queries = torch.tensor([[1.0, 1.0], [1.0, 0.0]])
+    vectors = torch.tensor(
+        [
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0],
+            [-1.0, 0.0],
+            [0.0, -1.0],
+            [-1.0, -1.0],
+            [2.0, 1.0],
+        ]
+    )
+    normalized_queries = queries / queries.norm(dim=1, keepdim=True)
+    normalized_vectors = vectors / vectors.norm(dim=1, keepdim=True)
+    expected = (1 - normalized_queries @ normalized_vectors.T).topk(
+        5, largest=False, dim=1
+    ).values.mean(dim=1)
+
+    actual = query_distances(
+        queries, bank_fixture(vectors), "mean_5_cosine"
+    )
+
+    assert torch.allclose(actual, expected)
+
+
+def test_public_top_query_callers_break_ties_by_lowest_actual_query_id():
     distances = torch.tensor([8.0, 2.0])
     confidence = torch.tensor([0.7, 0.7])
     query_ids = torch.tensor([9, 3])

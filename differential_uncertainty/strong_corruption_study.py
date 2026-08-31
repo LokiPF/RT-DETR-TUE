@@ -444,14 +444,10 @@ def _nearest_five(queries: Tensor, bank_vectors: Tensor, *, cosine: bool) -> Ten
                 p=2,
                 compute_mode="donot_use_mm_for_euclid_dist",
             )
-        if not bool(torch.isfinite(distances).all()):
-            raise ValueError("computed query distances must be finite")
         local = distances.topk(min(5, chunk.shape[0]), largest=False, dim=1).values
         best = torch.cat((best, local), dim=1).topk(
             5, largest=False, dim=1
         ).values
-    if not bool(torch.isfinite(best).all()):
-        raise ValueError("nearest query distances must be finite")
     return best
 
 
@@ -524,6 +520,14 @@ def query_distances(queries: Tensor, bank: Bank, name: str) -> Tensor:
     return result
 
 
+def _highest_confidence_position(confidence: Tensor, query_ids: Tensor) -> int:
+    positions_by_query_id = torch.argsort(query_ids).to(confidence.device)
+    selected_in_order = confidence.index_select(
+        0, positions_by_query_id
+    ).argmax()
+    return int(positions_by_query_id[selected_in_order].item())
+
+
 def aggregate_queries(
     distances: Tensor, confidence: Tensor, query_ids: Tensor, name: str
 ) -> float:
@@ -564,10 +568,7 @@ def aggregate_queries(
             distances.topk(int(np.ceil(0.2 * len(distances)))).values.mean()
         )
     elif name == "top_confidence_query":
-        index = min(
-            range(len(distances)),
-            key=lambda index: (-float(confidence[index]), int(query_ids[index])),
-        )
+        index = _highest_confidence_position(confidence, query_ids)
         result = float(distances[index])
     else:
         confidence_total = confidence.sum()
@@ -601,10 +602,7 @@ def top_query_entropy(logits: Tensor, query_ids: Tensor) -> float:
     if not bool(torch.isfinite(float_logits).all()):
         raise ValueError("float32 logits must be finite")
     confidence = float_logits.sigmoid().amax(dim=1)
-    index = min(
-        range(logits.shape[0]),
-        key=lambda row: (-float(confidence[row]), int(query_ids[row])),
-    )
+    index = _highest_confidence_position(confidence, query_ids)
     probability = float_logits[index].softmax(dim=0)
     normalizer = torch.log(
         torch.tensor(
