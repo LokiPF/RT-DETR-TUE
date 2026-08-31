@@ -290,7 +290,8 @@ def _validate_candidates(candidates: CandidateRows) -> tuple[Tensor, Tensor, Ten
 
 
 def _derived_reservoir_seed(seed: int, population: str) -> int:
-    return int.from_bytes(hashlib.sha256(f"{seed}:{population}".encode()).digest(), "big")
+    digest = hashlib.sha256(f"{seed}:{population}".encode()).digest()
+    return int.from_bytes(digest[:8], "big", signed=False) % (2**63)
 
 
 def _require_population(variant: str, population: str, required: int, available: int) -> None:

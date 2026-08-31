@@ -187,6 +187,24 @@ def test_balanced_standardization_weights_each_population_one_half():
     assert bank.scale.item() == pytest.approx(39.0**0.5)
 
 
+def test_balanced_bank_uses_truncated_sha256_reservoir_seeds():
+    candidates = CandidateRows(
+        vectors=torch.tensor([[float(value)] for value in (*range(6), *range(10, 16))]),
+        matched=torch.tensor([True] * 6 + [False] * 6),
+        confidence=torch.ones(12),
+    )
+
+    bank = build_bank(
+        candidates,
+        variant="balanced",
+        distance="mean_5_euclidean",
+        capacity=4,
+        seed=44,
+    )
+
+    assert bank.vectors.squeeze(1).tolist() == [3.0, 1.0, 14.0, 15.0]
+
+
 @pytest.mark.parametrize("variant", BANK_VARIANTS)
 def test_all_bank_variants_have_exact_capacity(reference_candidates, variant):
     bank = build_bank(
