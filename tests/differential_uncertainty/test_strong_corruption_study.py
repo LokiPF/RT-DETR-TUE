@@ -1625,6 +1625,33 @@ def test_conditional_bootstrap_weights_tasks_instead_of_pooling_pairs():
     )
 
 
+def test_original_conditional_point_is_incomplete_when_one_task_is_empty():
+    rows = synthetic_scores(
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 1.0],
+        split="validation",
+        confidence=([0.0, 0.0], [1.0, 1.0], [1.0, 1.0]),
+        entropy=([0.0, 0.0], [1.0, 1.0], [1.0, 1.0]),
+        raw_confidence=([0.2, 0.2], [0.2, 0.2], [0.8, 0.8]),
+    )
+
+    result = study.paired_validation_bootstrap(
+        rows,
+        boundaries_by_severity={4: (0.5,), 5: (0.5,)},
+        samples=20,
+        seed=7,
+        family="fog",
+    )
+
+    assert result.conditional == study.ScoreInterval(
+        point=None,
+        lower=None,
+        upper=None,
+        count=2,
+    )
+
+
 def test_paired_bootstrap_reuses_draws_for_methods_and_differences():
     rows = []
     for family, shift in (("fog", 0.0), ("snow", 0.25)):

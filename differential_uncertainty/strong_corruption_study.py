@@ -1061,9 +1061,11 @@ def _conditional_metric(
     *,
     families: tuple[str, ...],
     severities: tuple[int, ...],
+    require_all_tasks: bool = False,
 ) -> tuple[float | None, int]:
     family_means = []
     pair_count = 0
+    all_tasks_present = True
     for family in families:
         task_means = []
         for severity in severities:
@@ -1075,6 +1077,7 @@ def _conditional_metric(
                 boundaries=boundaries_by_severity[severity],
             )
             pair_count += len(credits)
+            all_tasks_present = all_tasks_present and bool(credits)
             task_means.append(np.nan if not credits else float(np.mean(credits)))
         finite_tasks = np.asarray(task_means, dtype=float)
         finite_tasks = finite_tasks[np.isfinite(finite_tasks)]
@@ -1083,6 +1086,8 @@ def _conditional_metric(
         )
     finite_families = np.asarray(family_means, dtype=float)
     finite_families = finite_families[np.isfinite(finite_families)]
+    if require_all_tasks and not all_tasks_present:
+        return None, pair_count
     if not finite_families.size:
         return None, 0
     return float(finite_families.mean()), pair_count
@@ -1156,6 +1161,7 @@ def paired_validation_bootstrap(
         boundaries,
         families=families,
         severities=severities,
+        require_all_tasks=True,
     )
 
     generator = np.random.default_rng(int(seed))
