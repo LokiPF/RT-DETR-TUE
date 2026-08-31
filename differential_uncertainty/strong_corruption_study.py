@@ -34,6 +34,7 @@ AGGREGATIONS = (
     "confidence_weighted_mean",
 )
 FAMILIES = ("gaussian_blur", *ADDITIONAL_IMAGECORRUPTIONS)
+BANK_ROW_CHUNK_SIZE = 512
 
 
 @dataclass(frozen=True)
@@ -433,7 +434,7 @@ def _nearest_five(queries: Tensor, bank_vectors: Tensor, *, cosine: bool) -> Ten
         dtype=queries.dtype,
         device=queries.device,
     )
-    for chunk in bank_vectors.split(8_192):
+    for chunk in bank_vectors.split(BANK_ROW_CHUNK_SIZE):
         if cosine:
             distances = (1 - queries @ chunk.T).clamp(0, 2)
         else:
@@ -443,10 +444,14 @@ def _nearest_five(queries: Tensor, bank_vectors: Tensor, *, cosine: bool) -> Ten
                 p=2,
                 compute_mode="donot_use_mm_for_euclid_dist",
             )
+        if not bool(torch.isfinite(distances).all()):
+            raise ValueError("computed query distances must be finite")
         local = distances.topk(min(5, chunk.shape[0]), largest=False, dim=1).values
         best = torch.cat((best, local), dim=1).topk(
             5, largest=False, dim=1
         ).values
+    if not bool(torch.isfinite(best).all()):
+        raise ValueError("nearest query distances must be finite")
     return best
 
 
@@ -468,6 +473,10 @@ def query_distances(queries: Tensor, bank: Bank, name: str) -> Tensor:
 
     transformed = queries.detach().float()
     bank_vectors = bank.vectors.detach().float().to(transformed.device)
+    if not bool(torch.isfinite(transformed).all()) or not bool(
+        torch.isfinite(bank_vectors).all()
+    ):
+        raise ValueError("float32 queries and bank vectors must be finite")
     if name == "mean_5_standardized_euclidean":
         if bank.mean is None or bank.scale is None:
             raise ValueError("standardized Euclidean requires bank mean and scale")
@@ -482,47 +491,94 @@ def query_distances(queries: Tensor, bank: Bank, name: str) -> Tensor:
             raise ValueError("bank mean and scale must match the feature dimension")
         if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(scale).all()):
             raise ValueError("bank mean and scale must be finite")
-        if bool((scale == 0).any()):
-            raise ValueError("standardized Euclidean requires non-zero scale")
+        if bool((scale <= 0).any()):
+            raise ValueError("standardized Euclidean requires positive scale")
         transformed = (transformed - mean) / scale
+        if not bool(torch.isfinite(transformed).all()):
+            raise ValueError("standardized queries must be finite")
 
     cosine = name == "mean_5_cosine"
     if cosine:
         query_norms = transformed.norm(dim=1, keepdim=True)
         bank_norms = bank_vectors.norm(dim=1, keepdim=True)
+        if not bool(torch.isfinite(query_norms).all()) or not bool(
+            torch.isfinite(bank_norms).all()
+        ):
+            raise ValueError("cosine norms must be finite")
         if bool((query_norms == 0).any()) or bool((bank_norms == 0).any()):
             raise ValueError("cosine distance does not allow zero-norm rows")
         transformed = transformed / query_norms
         bank_vectors = bank_vectors / bank_norms
+        if not bool(torch.isfinite(transformed).all()) or not bool(
+            torch.isfinite(bank_vectors).all()
+        ):
+            raise ValueError("normalized cosine rows must be finite")
 
     nearest = _nearest_five(transformed, bank_vectors, cosine=cosine)
     if name == "fifth_neighbor_euclidean":
-        return nearest[:, -1]
-    return nearest.mean(dim=1)
+        result = nearest[:, -1]
+    else:
+        result = nearest.mean(dim=1)
+    if not bool(torch.isfinite(result).all()):
+        raise ValueError("query distance results must be finite")
+    return result
 
 
 def aggregate_queries(
     distances: Tensor, confidence: Tensor, query_ids: Tensor, name: str
 ) -> float:
+    if name not in AGGREGATIONS:
+        raise ValueError(f"unknown aggregation: {name}")
+    if not all(isinstance(values, Tensor) for values in (distances, confidence, query_ids)):
+        raise ValueError("distances, confidence, and query IDs must be tensors")
+    if distances.ndim != 1 or confidence.ndim != 1 or query_ids.ndim != 1:
+        raise ValueError("aggregation inputs must be one-dimensional")
+    if distances.numel() == 0:
+        raise ValueError("aggregation requires at least one query")
+    if (
+        distances.numel() != confidence.numel()
+        or distances.numel() != query_ids.numel()
+    ):
+        raise ValueError("distances, confidence, and query IDs must align")
+    if not bool(torch.isfinite(distances).all()) or not bool(
+        torch.isfinite(confidence).all()
+    ):
+        raise ValueError("distances and confidence must be finite")
+    if (
+        query_ids.dtype == torch.bool
+        or query_ids.is_floating_point()
+        or query_ids.is_complex()
+    ):
+        raise ValueError("query IDs must have an integer dtype")
+    if query_ids.unique().numel() != query_ids.numel():
+        raise ValueError("query IDs must be unique")
+
     if name == "mean_all":
-        return float(distances.mean())
-    if name == "q90_all":
-        return float(
+        result = float(distances.mean())
+    elif name == "q90_all":
+        result = float(
             distances.sort().values[int(np.ceil(0.9 * len(distances))) - 1]
         )
-    if name == "top20_mean_all":
-        return float(
+    elif name == "top20_mean_all":
+        result = float(
             distances.topk(int(np.ceil(0.2 * len(distances)))).values.mean()
         )
-    if name == "top_confidence_query":
+    elif name == "top_confidence_query":
         index = min(
             range(len(distances)),
             key=lambda index: (-float(confidence[index]), int(query_ids[index])),
         )
-        return float(distances[index])
-    if name == "confidence_weighted_mean":
-        return float((distances * confidence).sum() / confidence.sum())
-    raise ValueError(f"unknown aggregation: {name}")
+        result = float(distances[index])
+    else:
+        confidence_total = confidence.sum()
+        if float(confidence_total) == 0:
+            raise ValueError(
+                "confidence-weighted mean requires non-zero total confidence"
+            )
+        result = float((distances * confidence).sum() / confidence_total)
+    if not np.isfinite(result):
+        raise ValueError("aggregated query score must be finite")
+    return result
 
 
 def top_query_entropy(logits: Tensor, query_ids: Tensor) -> float:

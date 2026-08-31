@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+import differential_uncertainty.strong_corruption_study as study
 from differential_uncertainty.strong_corruption_study import (
     AGGREGATIONS,
     BANK_VARIANTS,
@@ -488,6 +489,191 @@ def test_score_image_group_rejects_mixed_images(strong_group, bank_fixture):
     malformed = [dict(record) for record in strong_group]
     malformed[0]["image_id"] = "other"
     with pytest.raises(ValueError, match="exactly one image"):
+        score_image_group(
+            malformed,
+            bank_fixture(
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 2.0]]
+            ),
+            "mean_5_euclidean",
+        )
+
+
+def test_query_distance_chunking_matches_the_direct_oracle(bank_fixture):
+    bank_rows = study.BANK_ROW_CHUNK_SIZE + 1
+    vectors = torch.arange(bank_rows * 2, dtype=torch.float32).reshape(bank_rows, 2)
+    queries = torch.tensor([[0.25, 0.75], [513.0, 514.0]])
+    direct = torch.cdist(
+        queries,
+        vectors,
+        p=2,
+        compute_mode="donot_use_mm_for_euclid_dist",
+    ).topk(5, largest=False, dim=1).values.mean(dim=1)
+
+    actual = query_distances(
+        queries, bank_fixture(vectors), "mean_5_euclidean"
+    )
+
+    assert bank_rows > study.BANK_ROW_CHUNK_SIZE
+    assert torch.allclose(actual, direct)
+
+
+@pytest.mark.parametrize(
+    ("distances", "confidence", "query_ids", "name", "error"),
+    [
+        (
+            torch.tensor([[1.0]]),
+            torch.tensor([1.0]),
+            torch.tensor([0]),
+            "mean_all",
+            "one-dimensional",
+        ),
+        (
+            torch.tensor([]),
+            torch.tensor([]),
+            torch.tensor([], dtype=torch.long),
+            "mean_all",
+            "at least one",
+        ),
+        (
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([1.0]),
+            torch.tensor([0, 1]),
+            "mean_all",
+            "align",
+        ),
+        (
+            torch.tensor([float("nan")]),
+            torch.tensor([1.0]),
+            torch.tensor([0]),
+            "mean_all",
+            "finite",
+        ),
+        (
+            torch.tensor([1.0]),
+            torch.tensor([float("inf")]),
+            torch.tensor([0]),
+            "mean_all",
+            "finite",
+        ),
+        (
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([0.5, 0.5]),
+            torch.tensor([3, 3]),
+            "top_confidence_query",
+            "unique",
+        ),
+        (
+            torch.tensor([1.0]),
+            torch.tensor([0.5]),
+            torch.tensor([0.0]),
+            "top_confidence_query",
+            "integer",
+        ),
+        (
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([0.0, 0.0]),
+            torch.tensor([0, 1]),
+            "confidence_weighted_mean",
+            "non-zero total",
+        ),
+    ],
+)
+def test_aggregate_queries_rejects_invalid_inputs(
+    distances, confidence, query_ids, name, error
+):
+    with pytest.raises(ValueError, match=error):
+        aggregate_queries(distances, confidence, query_ids, name)
+
+
+def test_aggregate_queries_rejects_a_nonfinite_computed_result():
+    with pytest.raises(ValueError, match="finite"):
+        aggregate_queries(
+            torch.tensor([3e38, 3e38]),
+            torch.tensor([1.0, 1.0]),
+            torch.tensor([0, 1]),
+            "confidence_weighted_mean",
+        )
+
+
+def test_standardized_distance_requires_bank_moments(bank_fixture):
+    with pytest.raises(ValueError, match="mean and scale"):
+        query_distances(
+            torch.tensor([[0.0]]),
+            bank_fixture([[0.0], [1.0], [2.0], [3.0], [4.0]]),
+            "mean_5_standardized_euclidean",
+        )
+
+
+@pytest.mark.parametrize("scale", [0.0, -1.0])
+def test_standardized_distance_requires_positive_scale(scale):
+    bank = Bank(
+        torch.tensor([[0.0], [1.0], [2.0], [3.0], [4.0]]),
+        torch.tensor([0.0]),
+        torch.tensor([scale]),
+        0,
+        5,
+    )
+    with pytest.raises(ValueError, match="positive"):
+        query_distances(
+            torch.tensor([[0.0]]), bank, "mean_5_standardized_euclidean"
+        )
+
+
+def test_standardized_distance_rejects_float32_transform_overflow():
+    bank = Bank(
+        torch.zeros((5, 1)),
+        torch.tensor([0.0]),
+        torch.tensor([torch.finfo(torch.float32).tiny]),
+        0,
+        5,
+    )
+    with pytest.raises(ValueError, match="finite"):
+        query_distances(
+            torch.tensor([[torch.finfo(torch.float32).max]]),
+            bank,
+            "mean_5_standardized_euclidean",
+        )
+
+
+def test_query_distances_rejects_nonfinite_computed_distances(bank_fixture):
+    largest = torch.finfo(torch.float32).max
+    bank = bank_fixture([[-largest]] * 5)
+    with pytest.raises(ValueError, match="finite"):
+        query_distances(
+            torch.tensor([[largest]]), bank, "mean_5_euclidean"
+        )
+
+
+def test_score_image_group_rejects_a_union_mask_with_no_valid_queries(
+    strong_group, bank_fixture
+):
+    malformed = []
+    for record in strong_group:
+        changed = dict(record)
+        changed["boxes"] = torch.zeros_like(record["boxes"])
+        changed["logits"] = torch.zeros_like(record["logits"])
+        changed["persistence"] = torch.zeros_like(record["persistence"])
+        malformed.append(changed)
+
+    with pytest.raises(ValueError, match="no valid queries"):
+        score_image_group(
+            malformed,
+            bank_fixture(
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 2.0]]
+            ),
+            "mean_5_euclidean",
+        )
+
+
+@pytest.mark.parametrize("severities", [(0, 4, 4), (0, 4, 6)])
+def test_score_image_group_rejects_duplicate_or_out_of_scope_severities(
+    strong_group, bank_fixture, severities
+):
+    malformed = [
+        dict(record, severity=severity)
+        for record, severity in zip(strong_group, severities, strict=True)
+    ]
+    with pytest.raises(ValueError, match="exactly levels 0, 4, and 5"):
         score_image_group(
             malformed,
             bank_fixture(
