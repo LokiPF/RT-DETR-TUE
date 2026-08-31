@@ -10,7 +10,7 @@ from scipy.optimize import linear_sum_assignment
 from torch import Tensor
 
 from .corruptions.imagecorruptions import ADDITIONAL_IMAGECORRUPTIONS
-from .scoring import detect_padded_tail
+from .scoring import detect_padded_tail, union_padded_query_ids
 
 
 BANK_VARIANTS = (
@@ -83,6 +83,18 @@ class Bank:
     scale: Tensor | None
     matched_count: int
     background_count: int
+
+
+@dataclass(frozen=True)
+class ImageScore:
+    image_id: str
+    family: str
+    severity: int
+    valid_query_ids: tuple[int, ...]
+    fingerprint_scores: dict[str, float]
+    raw_confidence: float
+    confidence_score: float
+    entropy_score: float
 
 
 def split_image_ids(image_ids, selection_count: int) -> ImageSplit:
@@ -412,3 +424,184 @@ def build_bank(
         matched_count=int(sampled_matched.sum()),
         background_count=int((~sampled_matched).sum()),
     )
+
+
+def _nearest_five(queries: Tensor, bank_vectors: Tensor, *, cosine: bool) -> Tensor:
+    best = torch.full(
+        (queries.shape[0], 5),
+        float("inf"),
+        dtype=queries.dtype,
+        device=queries.device,
+    )
+    for chunk in bank_vectors.split(8_192):
+        if cosine:
+            distances = (1 - queries @ chunk.T).clamp(0, 2)
+        else:
+            distances = torch.cdist(
+                queries,
+                chunk,
+                p=2,
+                compute_mode="donot_use_mm_for_euclid_dist",
+            )
+        local = distances.topk(min(5, chunk.shape[0]), largest=False, dim=1).values
+        best = torch.cat((best, local), dim=1).topk(
+            5, largest=False, dim=1
+        ).values
+    return best
+
+
+def query_distances(queries: Tensor, bank: Bank, name: str) -> Tensor:
+    if name not in DISTANCES:
+        raise ValueError(f"unknown distance: {name}")
+    if not isinstance(queries, Tensor) or not isinstance(bank.vectors, Tensor):
+        raise ValueError("queries and bank vectors must be tensors")
+    if queries.ndim != 2 or bank.vectors.ndim != 2:
+        raise ValueError("queries and bank vectors must be two-dimensional")
+    if queries.shape[1] != bank.vectors.shape[1]:
+        raise ValueError("queries and bank must have matching feature dimensions")
+    if bank.vectors.shape[0] < 5:
+        raise ValueError("distance scoring requires at least five bank rows")
+    if not bool(torch.isfinite(queries).all()) or not bool(
+        torch.isfinite(bank.vectors).all()
+    ):
+        raise ValueError("queries and bank vectors must be finite")
+
+    transformed = queries.detach().float()
+    bank_vectors = bank.vectors.detach().float().to(transformed.device)
+    if name == "mean_5_standardized_euclidean":
+        if bank.mean is None or bank.scale is None:
+            raise ValueError("standardized Euclidean requires bank mean and scale")
+        mean = bank.mean.detach().float().to(transformed.device)
+        scale = bank.scale.detach().float().to(transformed.device)
+        if (
+            mean.ndim != 1
+            or scale.ndim != 1
+            or mean.shape[0] != transformed.shape[1]
+            or scale.shape[0] != transformed.shape[1]
+        ):
+            raise ValueError("bank mean and scale must match the feature dimension")
+        if not bool(torch.isfinite(mean).all()) or not bool(torch.isfinite(scale).all()):
+            raise ValueError("bank mean and scale must be finite")
+        if bool((scale == 0).any()):
+            raise ValueError("standardized Euclidean requires non-zero scale")
+        transformed = (transformed - mean) / scale
+
+    cosine = name == "mean_5_cosine"
+    if cosine:
+        query_norms = transformed.norm(dim=1, keepdim=True)
+        bank_norms = bank_vectors.norm(dim=1, keepdim=True)
+        if bool((query_norms == 0).any()) or bool((bank_norms == 0).any()):
+            raise ValueError("cosine distance does not allow zero-norm rows")
+        transformed = transformed / query_norms
+        bank_vectors = bank_vectors / bank_norms
+
+    nearest = _nearest_five(transformed, bank_vectors, cosine=cosine)
+    if name == "fifth_neighbor_euclidean":
+        return nearest[:, -1]
+    return nearest.mean(dim=1)
+
+
+def aggregate_queries(
+    distances: Tensor, confidence: Tensor, query_ids: Tensor, name: str
+) -> float:
+    if name == "mean_all":
+        return float(distances.mean())
+    if name == "q90_all":
+        return float(
+            distances.sort().values[int(np.ceil(0.9 * len(distances))) - 1]
+        )
+    if name == "top20_mean_all":
+        return float(
+            distances.topk(int(np.ceil(0.2 * len(distances)))).values.mean()
+        )
+    if name == "top_confidence_query":
+        index = min(
+            range(len(distances)),
+            key=lambda index: (-float(confidence[index]), int(query_ids[index])),
+        )
+        return float(distances[index])
+    if name == "confidence_weighted_mean":
+        return float((distances * confidence).sum() / confidence.sum())
+    raise ValueError(f"unknown aggregation: {name}")
+
+
+def top_query_entropy(logits: Tensor, query_ids: Tensor) -> float:
+    if logits.ndim != 2 or logits.shape[0] == 0 or logits.shape[1] < 2:
+        raise ValueError("logits must contain retained queries and at least two classes")
+    if query_ids.ndim != 1 or query_ids.numel() != logits.shape[0]:
+        raise ValueError("query IDs must align with retained logits")
+    if not bool(torch.isfinite(logits).all()):
+        raise ValueError("logits must be finite")
+
+    confidence = logits.float().sigmoid().amax(dim=1)
+    index = min(
+        range(logits.shape[0]),
+        key=lambda row: (-float(confidence[row]), int(query_ids[row])),
+    )
+    probability = logits[index].float().softmax(dim=0)
+    normalizer = torch.log(
+        torch.tensor(
+            probability.numel(), dtype=probability.dtype, device=probability.device
+        )
+    )
+    return float(-torch.xlogy(probability, probability).sum() / normalizer)
+
+
+def score_image_group(records, bank: Bank, distance: str) -> list[ImageScore]:
+    records = list(records)
+    severities = [record.get("severity") for record in records]
+    if (
+        any(
+            isinstance(severity, bool)
+            or not isinstance(severity, (int, np.integer))
+            for severity in severities
+        )
+        or sorted(int(severity) for severity in severities) != [0, 4, 5]
+    ):
+        raise ValueError("image group must contain exactly levels 0, 4, and 5")
+    image_ids = {str(record["image_id"]) for record in records}
+    if len(image_ids) != 1:
+        raise ValueError("image group must contain exactly one image")
+    families = {str(record["family"]) for record in records}
+    if len(families) != 1:
+        raise ValueError("image group must contain exactly one family")
+
+    records.sort(key=lambda record: int(record["severity"]))
+    padded_ids = union_padded_query_ids(records)
+    query_count = int(records[0]["persistence"].shape[0])
+    keep = torch.ones(query_count, dtype=torch.bool)
+    keep[padded_ids] = False
+    valid_ids = torch.arange(query_count, dtype=torch.long)[keep]
+    if valid_ids.numel() == 0:
+        raise ValueError("padding leaves no valid queries")
+    valid_query_ids = tuple(int(value) for value in valid_ids)
+
+    rows = []
+    for record in records:
+        logits = record["logits"].detach().float().index_select(
+            0, valid_ids.to(record["logits"].device)
+        )
+        persistence = record["persistence"].detach().float().index_select(
+            0, valid_ids.to(record["persistence"].device)
+        )
+        confidence = logits.sigmoid().amax(dim=1)
+        raw_confidence = float(confidence.max())
+        distances = query_distances(persistence, bank, distance)
+        rows.append(
+            ImageScore(
+                image_id=next(iter(image_ids)),
+                family=next(iter(families)),
+                severity=int(record["severity"]),
+                valid_query_ids=valid_query_ids,
+                fingerprint_scores={
+                    aggregation: aggregate_queries(
+                        distances, confidence, valid_ids, aggregation
+                    )
+                    for aggregation in AGGREGATIONS
+                },
+                raw_confidence=raw_confidence,
+                confidence_score=1.0 - raw_confidence,
+                entropy_score=top_query_entropy(logits, valid_ids),
+            )
+        )
+    return rows

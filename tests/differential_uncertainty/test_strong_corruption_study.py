@@ -8,11 +8,15 @@ from differential_uncertainty.strong_corruption_study import (
     Bank,
     CandidateRows,
     StudyConfig,
+    aggregate_queries,
     build_bank,
     build_reference_candidates,
     match_reference_queries,
+    query_distances,
     reservoir_indices,
+    score_image_group,
     split_image_ids,
+    top_query_entropy,
 )
 
 
@@ -34,6 +38,61 @@ def reference_candidates():
         matched=torch.tensor([True, True, True, True, False, False, False, False]),
         confidence=torch.tensor([0.9, 0.8, 0.7, 0.6, 0.9, 0.8, 0.4, 0.3]),
     )
+
+
+@pytest.fixture
+def bank_fixture():
+    def make_bank(vectors):
+        values = torch.as_tensor(vectors, dtype=torch.float32, device="cpu")
+        return Bank(values, None, None, 0, len(values))
+
+    return make_bank
+
+
+@pytest.fixture
+def strong_group():
+    def record(severity):
+        offset = float(severity) / 10
+        return {
+            "image_id": "image-1",
+            "family": "fog",
+            "severity": severity,
+            "boxes": torch.tensor(
+                [
+                    [0.1, 0.1, 0.1, 0.1],
+                    [0.2, 0.2, 0.1, 0.1],
+                    [0.3, 0.3, 0.1, 0.1],
+                    [0.4, 0.4, 0.1, 0.1],
+                    [0.5, 0.5, 0.1, 0.1],
+                    [0.9, 0.9, 0.1, 0.1],
+                    [0.9, 0.9, 0.1, 0.1],
+                ]
+            ),
+            "logits": torch.tensor(
+                [
+                    [4.0 - offset, -4.0],
+                    [2.0 - offset, 0.0],
+                    [1.0 - offset, 1.0 - offset],
+                    [0.0, 0.0],
+                    [-1.0, -1.0],
+                    [10.0, -10.0],
+                    [10.0, -10.0],
+                ]
+            ),
+            "persistence": torch.tensor(
+                [
+                    [0.0 + offset, 0.0],
+                    [1.0 + offset, 0.0],
+                    [0.0, 1.0 + offset],
+                    [1.0, 1.0 + offset],
+                    [2.0 + offset, 2.0],
+                    [9.0, 9.0],
+                    [9.0, 9.0],
+                ]
+            ),
+        }
+
+    return tuple(record(severity) for severity in (0, 4, 5))
 
 
 def _single_reference_record():
@@ -273,3 +332,166 @@ def test_all_bank_variants_have_exact_capacity(reference_candidates, variant):
     assert bank.vectors.shape == (4, 2)
     if variant == "balanced":
         assert (bank.matched_count, bank.background_count) == (2, 2)
+
+
+def test_distance_and_aggregation_oracles(bank_fixture):
+    bank = bank_fixture([[1.0], [3.0], [8.0], [9.0], [10.0]])
+    query = torch.tensor([[0.0]])
+    assert query_distances(query, bank, "mean_5_euclidean").item() == pytest.approx(
+        6.2
+    )
+    assert query_distances(query, bank, "fifth_neighbor_euclidean").item() == 10.0
+
+    distances = torch.tensor([1.0, 2.0, 3.0, 4.0, 100.0])
+    confidence = torch.tensor([0.1, 0.9, 0.3, 0.2, 0.4])
+    query_ids = torch.arange(5)
+    assert aggregate_queries(distances, confidence, query_ids, "mean_all") == 22.0
+    assert aggregate_queries(distances, confidence, query_ids, "q90_all") == 100.0
+    assert aggregate_queries(
+        distances, confidence, query_ids, "top20_mean_all"
+    ) == 100.0
+    assert aggregate_queries(
+        distances, confidence, query_ids, "top_confidence_query"
+    ) == 2.0
+    assert aggregate_queries(
+        distances, confidence, query_ids, "confidence_weighted_mean"
+    ) == pytest.approx(43.6 / 1.9)
+
+
+def test_entropy_uses_softmax_on_the_highest_confidence_query():
+    logits = torch.tensor([[2.0, 0.0], [1.0, 1.0]])
+    probability = logits[0].softmax(0)
+    expected = -torch.xlogy(probability, probability).sum() / torch.log(
+        torch.tensor(2.0)
+    )
+    assert top_query_entropy(logits, torch.tensor([0, 1])) == pytest.approx(
+        float(expected)
+    )
+
+
+def test_one_union_mask_is_reused_for_fingerprint_confidence_and_entropy(
+    strong_group, bank_fixture
+):
+    bank = bank_fixture(
+        [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 2.0]]
+    )
+    rows = score_image_group(strong_group, bank, "mean_5_euclidean")
+    assert {row.severity for row in rows} == {0, 4, 5}
+    assert len({row.valid_query_ids for row in rows}) == 1
+    assert all(row.valid_query_ids == (0, 1, 2, 3, 4) for row in rows)
+    assert all(row.confidence_score == 1.0 - row.raw_confidence for row in rows)
+    clean = next(row for row in rows if row.severity == 0)
+    expected_confidence = torch.sigmoid(torch.tensor(4.0)).item()
+    expected_probability = strong_group[0]["logits"][0].softmax(0)
+    expected_entropy = float(
+        -torch.xlogy(expected_probability, expected_probability).sum()
+        / torch.log(torch.tensor(2.0))
+    )
+    assert clean.raw_confidence == pytest.approx(expected_confidence)
+    assert clean.entropy_score == pytest.approx(expected_entropy)
+
+
+@pytest.mark.parametrize(
+    ("queries", "bank", "error"),
+    [
+        (
+            torch.tensor([[float("nan")]]),
+            [[0.0], [1.0], [2.0], [3.0], [4.0]],
+            "finite",
+        ),
+        (
+            torch.tensor([[0.0]]),
+            [[0.0], [1.0], [2.0], [3.0], [float("inf")]],
+            "finite",
+        ),
+        (
+            torch.tensor([[0.0, 1.0]]),
+            [[0.0], [1.0], [2.0], [3.0], [4.0]],
+            "matching feature dimensions",
+        ),
+    ],
+)
+def test_query_distances_reject_invalid_numeric_inputs(
+    queries, bank, error, bank_fixture
+):
+    with pytest.raises(ValueError, match=error):
+        query_distances(queries, bank_fixture(bank), "mean_5_euclidean")
+
+
+def test_query_distances_reject_a_bank_smaller_than_five(bank_fixture):
+    with pytest.raises(ValueError, match="at least five"):
+        query_distances(
+            torch.tensor([[0.0]]),
+            bank_fixture([[0.0], [1.0], [2.0], [3.0]]),
+            "mean_5_euclidean",
+        )
+
+
+@pytest.mark.parametrize(
+    ("queries", "bank"),
+    [
+        (
+            torch.tensor([[0.0, 0.0]]),
+            [[1.0, 0.0], [1.0, 1.0], [2.0, 1.0], [1.0, 2.0], [2.0, 2.0]],
+        ),
+        (
+            torch.tensor([[1.0, 0.0]]),
+            [[0.0, 0.0], [1.0, 1.0], [2.0, 1.0], [1.0, 2.0], [2.0, 2.0]],
+        ),
+    ],
+)
+def test_cosine_distance_rejects_zero_norm_rows(queries, bank, bank_fixture):
+    with pytest.raises(ValueError, match="zero-norm"):
+        query_distances(queries, bank_fixture(bank), "mean_5_cosine")
+
+
+def test_standardized_distance_uses_bank_moments():
+    raw = torch.tensor([[1.0], [3.0], [5.0], [7.0], [9.0]])
+    mean = torch.tensor([5.0])
+    scale = torch.tensor([2.0])
+    bank = Bank((raw - mean) / scale, mean, scale, 0, 5)
+
+    result = query_distances(
+        torch.tensor([[5.0]]), bank, "mean_5_standardized_euclidean"
+    )
+
+    assert result.item() == pytest.approx(1.2)
+
+
+def test_top_confidence_ties_use_the_lowest_query_id():
+    distances = torch.tensor([8.0, 2.0])
+    confidence = torch.tensor([0.7, 0.7])
+    query_ids = torch.tensor([9, 3])
+    assert (
+        aggregate_queries(
+            distances, confidence, query_ids, "top_confidence_query"
+        )
+        == 2.0
+    )
+
+    logits = torch.tensor([[2.0, 0.0], [2.0, 2.0]])
+    assert top_query_entropy(logits, torch.tensor([9, 3])) == pytest.approx(1.0)
+
+
+def test_score_image_group_rejects_missing_levels(strong_group, bank_fixture):
+    with pytest.raises(ValueError, match="exactly levels 0, 4, and 5"):
+        score_image_group(
+            strong_group[:-1],
+            bank_fixture(
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 2.0]]
+            ),
+            "mean_5_euclidean",
+        )
+
+
+def test_score_image_group_rejects_mixed_images(strong_group, bank_fixture):
+    malformed = [dict(record) for record in strong_group]
+    malformed[0]["image_id"] = "other"
+    with pytest.raises(ValueError, match="exactly one image"):
+        score_image_group(
+            malformed,
+            bank_fixture(
+                [[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0], [2.0, 2.0]]
+            ),
+            "mean_5_euclidean",
+        )
