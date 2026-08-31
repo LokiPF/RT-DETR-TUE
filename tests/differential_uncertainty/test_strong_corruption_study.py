@@ -36,6 +36,15 @@ def reference_candidates():
     )
 
 
+def _single_reference_record():
+    return {
+        "image_id": "one",
+        "logits": torch.tensor([[0.0, 0.0]]),
+        "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]]),
+        "persistence": torch.tensor([[1.0, 2.0]]),
+    }
+
+
 def test_public_panel_is_fixed_and_contains_100_candidates():
     config = StudyConfig()
     assert (config.reference_count, config.evaluation_count) == (1_000, 250)
@@ -79,6 +88,29 @@ def test_hungarian_matching_marks_only_the_assigned_query():
         category_ids=(3, 5),
     )
     assert result.tolist() == [False, True, False]
+
+
+def test_historical_focal_cost_does_not_clip_saturated_probabilities():
+    record = {
+        "image_id": "1",
+        "logits": torch.tensor([[-100.0], [-20.0]]),
+        "boxes": torch.tensor([[0.5, 0.5, 0.2, 0.2]] * 2),
+        "persistence": torch.zeros((2, 1)),
+    }
+    annotations = [
+        {"id": 17, "category_id": 3, "bbox": [40, 40, 20, 20], "iscrowd": 0}
+    ]
+
+    result = match_reference_queries(
+        record,
+        annotations,
+        valid_query_ids=torch.tensor([0, 1]),
+        width=100,
+        height=100,
+        category_ids=(3,),
+    )
+
+    assert result.tolist() == [False, True]
 
 
 def test_reference_candidates_are_sorted_and_remove_the_padded_tail():
@@ -134,6 +166,29 @@ def test_reference_candidates_are_sorted_and_remove_the_padded_tail():
     assert candidates.confidence.tolist() == pytest.approx(
         [torch.sigmoid(torch.tensor(8.0)).item()] * 4
     )
+
+
+def test_reference_candidates_reject_missing_annotation_entries():
+    with pytest.raises(
+        ValueError, match="missing annotations for reference image 'one'"
+    ):
+        build_reference_candidates(
+            (_single_reference_record(),),
+            annotations_by_image={},
+            image_sizes={"one": (100, 100)},
+            category_ids=(3, 5),
+        )
+
+
+def test_reference_candidates_accept_explicit_empty_annotations():
+    candidates = build_reference_candidates(
+        (_single_reference_record(),),
+        annotations_by_image={"one": []},
+        image_sizes={"one": (100, 100)},
+        category_ids=(3, 5),
+    )
+
+    assert candidates.matched.tolist() == [False]
 
 
 def test_infeasible_bank_names_population_and_counts(reference_candidates):

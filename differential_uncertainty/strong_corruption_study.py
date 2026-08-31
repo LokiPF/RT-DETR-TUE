@@ -190,10 +190,12 @@ def match_reference_queries(
     logits = record["logits"].detach().cpu().float().index_select(0, valid_ids)
     boxes = record["boxes"].detach().cpu().float().index_select(0, valid_ids)
     probabilities = logits.sigmoid()
-    epsilon = torch.finfo(probabilities.dtype).eps
-    probabilities = probabilities.clamp(epsilon, 1 - epsilon)
-    negative_cost = 0.75 * probabilities.pow(2) * (-(1 - probabilities).log())
-    positive_cost = 0.25 * (1 - probabilities).pow(2) * (-probabilities.log())
+    negative_cost = (
+        0.75 * probabilities.pow(2) * (-(1 - probabilities + 1e-8).log())
+    )
+    positive_cost = (
+        0.25 * (1 - probabilities).pow(2) * (-(probabilities + 1e-8).log())
+    )
     class_cost = positive_cost[:, target_classes] - negative_cost[:, target_classes]
     box_cost = torch.cdist(boxes, targets_cxcywh, p=1)
     giou_cost = -_generalized_box_iou(
@@ -234,6 +236,8 @@ def build_reference_candidates(
         valid_ids = torch.arange(query_count, dtype=torch.long)[keep]
         if image_id not in size_lookup:
             raise ValueError(f"missing image size for reference image {image_id!r}")
+        if image_id not in annotation_lookup:
+            raise ValueError(f"missing annotations for reference image {image_id!r}")
         width, height = size_lookup[image_id]
 
         vectors = (
@@ -250,7 +254,7 @@ def build_reference_candidates(
         matched_parts.append(
             match_reference_queries(
                 record,
-                annotation_lookup.get(image_id, ()),
+                annotation_lookup[image_id],
                 valid_query_ids=valid_ids,
                 width=width,
                 height=height,
@@ -368,10 +372,6 @@ def build_bank(
                 ),
             )
         )
-        moment_vectors = (
-            vectors.index_select(0, matched_ids),
-            vectors.index_select(0, background_ids),
-        )
     else:
         masks = {
             "matched": matched,
@@ -390,16 +390,18 @@ def build_bank(
         sampled_ids = eligible_ids.index_select(
             0, reservoir_indices(eligible_ids.numel(), capacity, seed)
         )
-        moment_vectors = (vectors.index_select(0, eligible_ids),)
 
     sampled = vectors.index_select(0, sampled_ids)
     mean = None
     scale = None
     if distance == "mean_5_standardized_euclidean":
         if variant == "balanced":
-            mean, scale = _balanced_moments(*moment_vectors)
+            mean, scale = _balanced_moments(
+                vectors.index_select(0, matched_ids),
+                vectors.index_select(0, background_ids),
+            )
         else:
-            mean, scale = _population_moments(moment_vectors[0])
+            mean, scale = _population_moments(vectors.index_select(0, eligible_ids))
         sampled = (sampled - mean) / scale
 
     sampled_matched = matched.index_select(0, sampled_ids)
