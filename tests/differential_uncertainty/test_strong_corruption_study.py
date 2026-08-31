@@ -421,13 +421,26 @@ def test_tiny_study_writes_exact_cache_and_report_contract(tiny_study, tmp_path)
     ) in report
     assert "family/image union-unpadded query set" in report
     assert (
-        "Exploratory coverage: all 4 family/severity tasks were nonempty, but 4 "
-        "had at most 5 eligible pairs and 0 had 1; this supports a conditional "
-        "signal, not uniform per-corruption complementarity."
+        "Exploratory coverage: nonempty family/severity tasks=4/4; tasks with at "
+        "most 5 eligible pairs=4; tasks with exactly 1 eligible pair=0. Coverage "
+        "alone does not establish uniform per-corruption complementarity."
     ) in report
     for family in tiny_study.config.families:
         assert report.count(f"{family} |") == 2
     assert report.rstrip().endswith("Levels 1 through 3 were not evaluated.")
+
+
+def test_conditional_coverage_wording_handles_partial_and_zero_coverage():
+    assert study._conditional_coverage_line((0, 1, 6)) == (
+        "Exploratory coverage: nonempty family/severity tasks=2/3; tasks with at "
+        "most 5 eligible pairs=1; tasks with exactly 1 eligible pair=1. Coverage "
+        "alone does not establish uniform per-corruption complementarity."
+    )
+    assert study._conditional_coverage_line((0, 0)) == (
+        "Exploratory coverage: nonempty family/severity tasks=0/2; tasks with at "
+        "most 5 eligible pairs=0; tasks with exactly 1 eligible pair=0. Coverage "
+        "alone does not establish uniform per-corruption complementarity."
+    )
 
 
 def test_evidence_conclusions_use_the_three_fixed_thresholds():

@@ -2267,6 +2267,17 @@ def _controlled_lines(
     return lines
 
 
+def _conditional_coverage_line(counts) -> str:
+    counts = tuple(counts)
+    return (
+        "Exploratory coverage: nonempty family/severity tasks="
+        f"{sum(count > 0 for count in counts)}/{len(counts)}; tasks with at most "
+        f"5 eligible pairs={sum(0 < count <= 5 for count in counts)}; tasks with "
+        f"exactly 1 eligible pair={sum(count == 1 for count in counts)}. Coverage "
+        "alone does not establish uniform per-corruption complementarity."
+    )
+
+
 def _render_report(
     selected_rows,
     selected: Policy,
@@ -2285,21 +2296,8 @@ def _render_report(
         method: per_family_aurocs(validation_rows, method=method)
         for method in ("fingerprint", "confidence", "entropy")
     }
-    conditional_counts = [
+    coverage_line = _conditional_coverage_line(
         result.conditional.count for result in task_bootstraps.values()
-    ]
-    nonempty = sum(count > 0 for count in conditional_counts)
-    coverage = (
-        f"all {len(conditional_counts)}"
-        if nonempty == len(conditional_counts)
-        else f"{nonempty} of {len(conditional_counts)}"
-    )
-    coverage_line = (
-        f"Exploratory coverage: {coverage} family/severity tasks were nonempty, "
-        f"but {sum(0 < count <= 5 for count in conditional_counts)} had at most "
-        f"5 eligible pairs and {sum(count == 1 for count in conditional_counts)} "
-        "had 1; this supports a conditional signal, not uniform per-corruption "
-        "complementarity."
     )
     lines = [
         "# Strong corruption fingerprint study",
