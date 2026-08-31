@@ -47,6 +47,7 @@ AGGREGATIONS = (
 )
 FAMILIES = ("gaussian_blur", *ADDITIONAL_IMAGECORRUPTIONS)
 BANK_ROW_CHUNK_SIZE = 512
+CACHE_SCHEMA_VERSION = 1
 
 
 @dataclass(frozen=True)
@@ -634,9 +635,9 @@ def aggregate_queries(
         result = float(distances[index])
     else:
         confidence_total = confidence.sum()
-        if float(confidence_total) == 0:
+        if float(confidence_total) <= 0:
             raise ValueError(
-                "confidence-weighted mean requires non-zero total confidence"
+                "confidence-weighted mean requires positive total confidence"
             )
         result = float((distances * confidence).sum() / confidence_total)
     if not np.isfinite(result):
@@ -1320,6 +1321,11 @@ def _json_object(path: Path, *, label: str) -> dict:
     return value
 
 
+def _canonical_json_digest(value: Mapping) -> str:
+    payload = json.dumps(value, separators=(",", ":"), sort_keys=True).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _load_annotations(
     path: Path, reference_ids: set[str], class_count: int
 ) -> tuple[dict[str, list[Mapping]], dict[str, tuple[int, int]], tuple[int, ...]]:
@@ -1385,7 +1391,7 @@ def _load_evaluation_groups(
     evaluation_ids: set[str],
     families: tuple[str, ...],
     expected_science: tuple,
-) -> tuple[list[tuple[dict, ...]], frozenset[int]]:
+) -> tuple[list[tuple[dict, ...]], frozenset[int], dict]:
     roster = _json_object(
         evaluation_root / "corruption-roster.json",
         label="benchmark corruption roster",
@@ -1413,6 +1419,7 @@ def _load_evaluation_groups(
         for severity in (0, 4, 5)
     }
     seen_keys = set()
+    family_manifest_digests = {}
     for family in families:
         cache = (
             evaluation_root
@@ -1422,6 +1429,7 @@ def _load_evaluation_groups(
             / "evaluation-extractions"
         )
         metadata = load_artifact_manifest(cache)
+        family_manifest_digests[family] = _canonical_json_digest(metadata)
         if _scientific_metadata(metadata, label=f"{family} artifact") != expected_science:
             raise ValueError(
                 f"corruption family {family!r} scientific metadata differs "
@@ -1463,7 +1471,10 @@ def _load_evaluation_groups(
             groups.append(image_records)
     if seen_keys != expected_keys:
         raise ValueError("evaluation artifacts do not cover the configured panel")
-    return groups, frozenset(levels_read)
+    return groups, frozenset(levels_read), {
+        "corruption_roster_sha256": _canonical_json_digest(roster),
+        "family_artifact_manifests_sha256": family_manifest_digests,
+    }
 
 
 def _prepare_image_group(records) -> list[dict]:
@@ -1546,8 +1557,10 @@ def _cache_metadata(
     evaluation_digest: str,
     evaluation_ids: tuple[str, ...],
     families: tuple[str, ...],
+    source_digests: Mapping,
 ) -> dict:
     return {
+        "cache_schema_version": CACHE_SCHEMA_VERSION,
         "geometry": geometry,
         "bank": bank,
         "bank_capacity": bank_capacity,
@@ -1556,6 +1569,7 @@ def _cache_metadata(
         "evaluation_manifest_sha256": evaluation_digest,
         "evaluation_image_ids": list(evaluation_ids),
         "families": list(families),
+        "source_digests": dict(source_digests),
     }
 
 
@@ -1583,6 +1597,7 @@ def _open_distance_cache(
     reference_digest: str,
     evaluation_digest: str,
     evaluation_ids: tuple[str, ...],
+    source_digests: Mapping,
     device: torch.device,
 ):
     metadata = _cache_metadata(
@@ -1594,6 +1609,7 @@ def _open_distance_cache(
         evaluation_digest=evaluation_digest,
         evaluation_ids=evaluation_ids,
         families=config.families,
+        source_digests=source_digests,
     )
     path = cache_directory / f"{bank_name}-{geometry}-seed{seed}.pt"
     cached = _load_distance_cache(path, metadata)
@@ -1693,9 +1709,17 @@ def _score_primary_arms(
     reference_digest: str,
     evaluation_digest: str,
     evaluation_ids: tuple[str, ...],
+    source_digests: Mapping,
     device: torch.device,
-) -> tuple[list[dict], list[dict]]:
+) -> tuple[list[dict], list[dict], Policy]:
     selection_ids = set(split.selection)
+    selection_groups = [
+        group for group in groups if str(group[0]["image_id"]) in selection_ids
+    ]
+    validation_groups = [
+        group for group in groups if str(group[0]["image_id"]) not in selection_ids
+    ]
+
     states = {}
     infeasible = []
     for bank_name in BANK_VARIANTS:
@@ -1712,6 +1736,7 @@ def _score_primary_arms(
                 reference_digest=reference_digest,
                 evaluation_digest=evaluation_digest,
                 evaluation_ids=evaluation_ids,
+                source_digests=source_digests,
                 device=device,
             )
             if error is not None:
@@ -1727,52 +1752,52 @@ def _score_primary_arms(
             state["rows"] = []
             states[key] = state
 
+    def append_record(key, state, record, split_name):
+        neighbors = _cache_neighbors(state, record, key[1])
+        scores = _neighbor_scores(
+            neighbors,
+            record["confidence_by_query"],
+            record["query_ids"],
+            geometry=key[1],
+        )
+        state["rows"].extend(
+            (
+                {
+                    "image_id": record["image_id"],
+                    "family": record["family"],
+                    "severity": record["severity"],
+                    "split": split_name,
+                    "policy": Policy(
+                        bank=key[0],
+                        distance=distance,
+                        aggregation=aggregation,
+                        seed=key[2],
+                    ),
+                    "fingerprint": fingerprint,
+                    "confidence": record["confidence"],
+                    "entropy": record["entropy"],
+                    "raw_confidence": record["raw_confidence"],
+                }
+                for (distance, aggregation), fingerprint in scores.items()
+            )
+        )
+
     failed = {}
-    for group in groups:
+    for group in selection_groups:
         prepared = _prepare_image_group(group)
         for record in prepared:
             for key, state in states.items():
                 if key in failed:
                     continue
                 try:
-                    neighbors = _cache_neighbors(state, record, key[1])
-                    scores = _neighbor_scores(
-                        neighbors,
-                        record["confidence_by_query"],
-                        record["query_ids"],
-                        geometry=key[1],
-                    )
+                    append_record(key, state, record, "selection")
                 except ValueError as error:
                     failed[key] = str(error)
                     state["rows"].clear()
                     state["records"] = None
-                    continue
-                for (distance, aggregation), fingerprint in scores.items():
-                    policy = Policy(
-                        bank=key[0],
-                        distance=distance,
-                        aggregation=aggregation,
-                        seed=key[2],
-                    )
-                    state["rows"].append(
-                        {
-                            "image_id": record["image_id"],
-                            "family": record["family"],
-                            "severity": record["severity"],
-                            "split": (
-                                "selection"
-                                if record["image_id"] in selection_ids
-                                else "validation"
-                            ),
-                            "policy": policy,
-                            "fingerprint": fingerprint,
-                            "confidence": record["confidence"],
-                            "entropy": record["entropy"],
-                            "raw_confidence": record["raw_confidence"],
-                        }
-                    )
 
-    rows = []
+    selection_rows = []
+    active_states = {}
     for key, state in states.items():
         if key in failed:
             infeasible.append(
@@ -1784,11 +1809,29 @@ def _score_primary_arms(
                 }
             )
             continue
+        active_states[key] = state
+        selection_rows.extend(state["rows"])
+    if not selection_rows:
+        raise ValueError("no feasible fingerprint candidate remains")
+
+    selected = select_policy(selection_rows)
+    try:
+        for group in validation_groups:
+            prepared = _prepare_image_group(group)
+            for record in prepared:
+                for key, state in active_states.items():
+                    append_record(key, state, record, "validation")
+    except ValueError as error:
+        raise ValueError(
+            "validation scoring failed after freezing policy "
+            f"{selected.policy_id}: {error}"
+        ) from error
+
+    rows = []
+    for state in active_states.values():
         _save_distance_cache(state)
         rows.extend(state["rows"])
-    if not rows:
-        raise ValueError("no feasible fingerprint candidate remains")
-    return rows, infeasible
+    return rows, infeasible, selected
 
 
 def _evidence_status(interval: ScoreInterval, threshold: float) -> str:
@@ -1845,6 +1888,7 @@ def _score_sensitivity_seeds(
     reference_digest: str,
     evaluation_digest: str,
     evaluation_ids: tuple[str, ...],
+    source_digests: Mapping,
     device: torch.device,
 ) -> dict[int, float]:
     geometry = _DISTANCE_GEOMETRIES[selected.distance]
@@ -1868,6 +1912,7 @@ def _score_sensitivity_seeds(
             reference_digest=reference_digest,
             evaluation_digest=evaluation_digest,
             evaluation_ids=evaluation_ids,
+            source_digests=source_digests,
             device=device,
         )
         if error is not None:
@@ -2249,6 +2294,17 @@ def _render_report(
         ),
         "",
         (
+            "Fingerprint distance: the selected nearest-bank query distance, "
+            "aggregated across retained queries with the selected rule."
+        ),
+        "Confidence score: 1 - maximum sigmoid confidence.",
+        (
+            "Entropy score: normalized Shannon entropy of the "
+            "highest-confidence retained query."
+        ),
+        "All three scores use the family/image union-unpadded query set.",
+        "",
+        (
             "Corruption | Fingerprint L4 | Fingerprint L5 | Confidence L4 | "
             "Confidence L5 | Entropy L4 | Entropy L5"
         ),
@@ -2410,6 +2466,7 @@ def run_study(
         reference_root / "reference-artifacts" / "reference-extractions"
     )
     reference_metadata = load_artifact_manifest(reference_cache)
+    reference_artifact_digest = _canonical_json_digest(reference_metadata)
     expected_science = _scientific_metadata(
         reference_metadata, label="reference artifact"
     )
@@ -2431,6 +2488,7 @@ def run_study(
         reference_ids,
         expected_science[2],
     )
+    annotations_digest = hashlib.sha256(annotations.read_bytes()).hexdigest()
     candidates = build_reference_candidates(
         reference_records,
         annotations_by_image=annotations_by_image,
@@ -2439,15 +2497,20 @@ def run_study(
     )
     del reference_records
 
-    groups, levels_read = _load_evaluation_groups(
+    groups, levels_read, evaluation_source_digests = _load_evaluation_groups(
         evaluation_root,
         evaluation_ids=set(evaluation_ids),
         families=config.families,
         expected_science=expected_science,
     )
+    source_digests = {
+        "annotations_sha256": annotations_digest,
+        "reference_artifact_manifest_sha256": reference_artifact_digest,
+        **evaluation_source_digests,
+    }
     reference_digest = manifest_digest(reference_manifest)
     evaluation_digest = manifest_digest(evaluation_manifest)
-    candidate_rows, infeasible = _score_primary_arms(
+    candidate_rows, infeasible, selected = _score_primary_arms(
         groups,
         candidates,
         split=split,
@@ -2456,9 +2519,9 @@ def run_study(
         reference_digest=reference_digest,
         evaluation_digest=evaluation_digest,
         evaluation_ids=evaluation_ids,
+        source_digests=source_digests,
         device=torch.device(device),
     )
-    selected = select_policy(candidate_rows)
     seed_scores = _score_sensitivity_seeds(
         groups,
         candidates,
@@ -2470,6 +2533,7 @@ def run_study(
         reference_digest=reference_digest,
         evaluation_digest=evaluation_digest,
         evaluation_ids=evaluation_ids,
+        source_digests=source_digests,
         device=torch.device(device),
     )
     del groups, candidates
@@ -2548,6 +2612,7 @@ def run_study(
             "reference": reference_digest,
             "evaluation": evaluation_digest,
         },
+        "source_digests": source_digests,
         "selected_policy": selected_payload,
         "selection_ranking": ranking,
         "aggregate_validation": aggregate_metrics,

@@ -413,6 +413,13 @@ def test_tiny_study_writes_exact_cache_and_report_contract(tiny_study, tmp_path)
     report.encode("ascii")
     assert "0.714" not in report
     assert report.count("Corruption |") == 2
+    assert "Fingerprint distance:" in report
+    assert "Confidence score: 1 - maximum sigmoid confidence." in report
+    assert (
+        "Entropy score: normalized Shannon entropy of the "
+        "highest-confidence retained query."
+    ) in report
+    assert "family/image union-unpadded query set" in report
     for family in tiny_study.config.families:
         assert report.count(f"{family} |") == 2
     assert report.rstrip().endswith("Levels 1 through 3 were not evaluated.")
@@ -630,6 +637,104 @@ def test_bank_capacity_change_recomputes_and_overwrites_caches(
     payload = torch.load(changed, map_location="cpu", weights_only=True)
     assert payload["metadata"]["bank_capacity"] == 5
     assert calls > 0
+
+
+def test_source_digest_change_recomputes_caches_and_is_reported(
+    tiny_study, tmp_path, monkeypatch
+):
+    output = tmp_path / "output"
+    study.run_study(
+        tiny_study.reference_root,
+        tiny_study.evaluation_root,
+        tiny_study.annotations,
+        output,
+        config=tiny_study.config,
+        device="cpu",
+    )
+    changed = output / "cache" / "matched-cosine-seed44.pt"
+    before = torch.load(changed, map_location="cpu", weights_only=True)
+
+    annotations = json.loads(tiny_study.annotations.read_text(encoding="utf-8"))
+    annotations["source_revision"] = "changed"
+    tiny_study.annotations.write_text(json.dumps(annotations), encoding="utf-8")
+
+    calls = 0
+    original = study._compute_neighbor_tensor
+
+    def count_compute(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(study, "_compute_neighbor_tensor", count_compute)
+    study.run_study(
+        tiny_study.reference_root,
+        tiny_study.evaluation_root,
+        tiny_study.annotations,
+        output,
+        config=tiny_study.config,
+        device="cpu",
+    )
+
+    after = torch.load(changed, map_location="cpu", weights_only=True)
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert after["metadata"]["cache_schema_version"] == 1
+    assert before["metadata"].get("source_digests") != after["metadata"][
+        "source_digests"
+    ]
+    assert after["metadata"]["source_digests"] == summary["source_digests"]
+    assert set(summary["source_digests"]) == {
+        "annotations_sha256",
+        "corruption_roster_sha256",
+        "reference_artifact_manifest_sha256",
+        "family_artifact_manifests_sha256",
+    }
+    assert set(summary["source_digests"]["family_artifact_manifests_sha256"]) == {
+        "fog",
+        "snow",
+    }
+    assert calls > 0
+
+
+def test_validation_failure_happens_after_selection_is_frozen(
+    tiny_study, tmp_path, monkeypatch
+):
+    validation_ids = set(
+        split_image_ids(("10", "11", "12", "13"), 2).validation
+    )
+    original_neighbors = study._cache_neighbors
+    original_selector = study.select_policy
+    selected = []
+
+    def fail_on_validation(state, record, geometry):
+        if record["image_id"] in validation_ids:
+            raise ValueError("validation-only sentinel")
+        return original_neighbors(state, record, geometry)
+
+    def observe_selector(rows):
+        policy = original_selector(rows)
+        selected.append(policy)
+        return policy
+
+    monkeypatch.setattr(study, "_cache_neighbors", fail_on_validation)
+    monkeypatch.setattr(study, "select_policy", observe_selector)
+
+    with pytest.raises(
+        ValueError,
+        match="validation scoring failed after freezing policy",
+    ) as caught:
+        study.run_study(
+            tiny_study.reference_root,
+            tiny_study.evaluation_root,
+            tiny_study.annotations,
+            tmp_path / "output",
+            config=tiny_study.config,
+            device="cpu",
+        )
+
+    assert len(selected) == 1
+    assert selected[0].policy_id in str(caught.value)
+    assert "validation-only sentinel" in str(caught.value)
 
 
 def test_module_cli_accepts_only_the_study_runtime_arguments(tmp_path):
@@ -1178,7 +1283,14 @@ def test_query_distance_chunking_matches_the_direct_oracle(bank_fixture):
             torch.tensor([0.0, 0.0]),
             torch.tensor([0, 1]),
             "confidence_weighted_mean",
-            "non-zero total",
+            "positive total",
+        ),
+        (
+            torch.tensor([1.0, 2.0]),
+            torch.tensor([-2.0, 1.0]),
+            torch.tensor([0, 1]),
+            "confidence_weighted_mean",
+            "positive total",
         ),
     ],
 )
