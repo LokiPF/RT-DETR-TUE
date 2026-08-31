@@ -775,6 +775,12 @@ def _complete_score_groups(rows, fields: tuple[str, ...]):
     return groups
 
 
+def _require_shared_image_roster(groups, *, context: str) -> None:
+    rosters = {frozenset(image_rows) for image_rows in groups.values()}
+    if len(rosters) != 1:
+        raise ValueError(f"{context} families must use the same image-ID roster")
+
+
 def per_family_aurocs(rows, *, method: str) -> dict[str, FamilyResult]:
     if not isinstance(method, str) or not method:
         raise ValueError("method must be a nonempty score-field name")
@@ -855,6 +861,10 @@ def select_policy(candidate_rows) -> Policy:
             panel = current_panel
         elif current_panel != panel:
             raise ValueError("selection candidates must cover the same score panel")
+        _require_shared_image_roster(
+            _complete_score_groups(rows, ("fingerprint",)),
+            context="policy selection",
+        )
         family_results = per_family_aurocs(rows, method="fingerprint")
         strong = np.asarray(
             [result.strong for result in family_results.values()], dtype=float
@@ -880,6 +890,7 @@ def confidence_decile_boundaries(rows, *, severity: int) -> tuple[float, ...]:
     ):
         raise ValueError("confidence deciles require selection-only rows")
     groups = _complete_score_groups(rows, ("raw_confidence",))
+    _require_shared_image_roster(groups, context="confidence deciles")
     values = []
     for family in sorted(groups):
         for image_id in sorted(groups[family]):

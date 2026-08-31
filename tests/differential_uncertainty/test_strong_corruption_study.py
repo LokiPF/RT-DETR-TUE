@@ -901,6 +901,26 @@ def test_select_policy_uses_lexicographic_policy_id_as_final_tie_breaker():
     assert study.select_policy(rows) == min((first, second), key=lambda item: item.policy_id)
 
 
+def test_select_policy_rejects_different_image_rosters_between_families():
+    policy = study.Policy("matched", "mean_5_euclidean", "mean_all", 44)
+    rows = synthetic_scores([0.0, 1.0], [2.0, 3.0], [2.0, 3.0], policy=policy)
+    rows += synthetic_scores(
+        [0.0, 1.0],
+        [2.0, 3.0],
+        [2.0, 3.0],
+        family="snow",
+        policy=policy,
+    )
+    rows = [
+        row
+        for row in rows
+        if not (row["family"] == "snow" and row["image_id"] == "image-1")
+    ]
+
+    with pytest.raises(ValueError, match="same image-ID roster"):
+        study.select_policy(rows)
+
+
 def test_confidence_deciles_accept_selection_rows_only():
     rows = synthetic_scores(
         [0.2, 0.3],
@@ -918,6 +938,48 @@ def test_confidence_deciles_accept_selection_rows_only():
             rows + synthetic_scores([0.0], [0.0], [0.0], split="validation"),
             severity=4,
         )
+
+
+def test_confidence_deciles_reject_different_image_rosters_between_families():
+    rows = synthetic_scores([0.2, 0.3], [0.7, 0.8], [0.4, 0.5])
+    rows += synthetic_scores(
+        [0.2, 0.3],
+        [0.7, 0.8],
+        [0.4, 0.5],
+        family="snow",
+    )
+    rows = [
+        row
+        for row in rows
+        if not (row["family"] == "snow" and row["image_id"] == "image-1")
+    ]
+
+    with pytest.raises(ValueError, match="same image-ID roster"):
+        study.confidence_decile_boundaries(rows, severity=4)
+
+
+def test_repeated_confidence_quantiles_collapse_and_boundary_uses_upper_stratum():
+    fitting_rows = synthetic_scores(
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 1.0],
+        raw_confidence=([0.5, 0.5], [0.5, 0.5], [0.5, 0.5]),
+    )
+    boundaries = study.confidence_decile_boundaries(fitting_rows, severity=4)
+    evaluation_rows = synthetic_scores(
+        [0.0, 0.0],
+        [1.0, 1.0],
+        [1.0, 1.0],
+        raw_confidence=([0.5, 0.4], [0.6, 0.5], [0.6, 0.5]),
+    )
+
+    result = study.confidence_conditioned_concordance(
+        evaluation_rows, family="fog", severity=4, boundaries=boundaries
+    )
+
+    assert boundaries == (0.5,)
+    assert result.point == pytest.approx(1.0)
+    assert result.pair_count == 1
 
 
 def synthetic_cross_stratum_pair():
@@ -1012,6 +1074,37 @@ def test_paired_bootstrap_reuses_draws_for_methods_and_differences():
         )["fog"].level4
     )
     assert fog_level4.conditional.count == 3
+
+
+def test_paired_bootstrap_percentile_interval_has_a_fixed_nonzero_oracle():
+    rows = synthetic_scores(
+        [0.0, 10.0],
+        [1.0, 11.0],
+        [1.0, 11.0],
+        split="validation",
+        confidence=([0.0, 10.0], [-1.0, 9.0], [-1.0, 9.0]),
+        entropy=([0.0, 10.0], [-1.0, 9.0], [-1.0, 9.0]),
+        raw_confidence=([0.7, 0.7], [0.7, 0.7], [0.7, 0.7]),
+    )
+
+    result = study.paired_validation_bootstrap(
+        rows,
+        boundaries_by_severity={4: (), 5: ()},
+        samples=20,
+        seed=7,
+        family="fog",
+        severity=4,
+    )
+
+    assert result.fingerprint.point == pytest.approx(0.75)
+    assert (result.fingerprint.lower, result.fingerprint.upper) == pytest.approx(
+        (0.75, 1.0)
+    )
+    assert result.fingerprint_minus_confidence.point == pytest.approx(0.5)
+    assert (
+        result.fingerprint_minus_confidence.lower,
+        result.fingerprint_minus_confidence.upper,
+    ) == pytest.approx((0.5, 1.0))
 
 
 def test_seed_summary_is_numeric_and_uses_population_standard_deviation():
