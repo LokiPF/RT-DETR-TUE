@@ -1,8 +1,13 @@
+import csv
+import json
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 import torch
 
 import differential_uncertainty.strong_corruption_study as study
+from differential_uncertainty.artifacts import ShardWriter
 from differential_uncertainty.strong_corruption_study import (
     AGGREGATIONS,
     BANK_VARIANTS,
@@ -95,6 +100,413 @@ def strong_group():
         }
 
     return tuple(record(severity) for severity in (0, 4, 5))
+
+
+@pytest.fixture
+def tiny_study(tmp_path):
+    reference_root = tmp_path / "reference"
+    evaluation_root = tmp_path / "evaluation"
+    image_root = tmp_path / "images"
+    image_root.mkdir()
+
+    def write_manifest(path, image_ids):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(("image_id", "image_path"))
+            for image_id in image_ids:
+                image = image_root / f"{image_id}.jpg"
+                image.write_bytes(f"image-{image_id}".encode())
+                writer.writerow((str(image_id), image))
+
+    reference_ids = (1, 2)
+    evaluation_ids = (10, 11, 12, 13)
+    write_manifest(
+        reference_root / "inputs" / "reference-manifest.csv", reference_ids
+    )
+    write_manifest(
+        evaluation_root / "inputs" / "evaluation-manifest.csv", evaluation_ids
+    )
+
+    config_metadata = {
+        "query_count": 8,
+        "class_count": 2,
+        "persistence_layer": 2,
+        "persistence_dim": 3,
+    }
+    shared_metadata = {
+        "checkpoint_sha256": "a" * 64,
+        "config": config_metadata,
+    }
+
+    def record(image_id, severity, *, family_offset=0.0):
+        query = torch.arange(8, dtype=torch.float32)
+        image_offset = float(int(image_id) % 10) / 20
+        severity_offset = float(severity) / 5
+        return {
+            "image_id": str(image_id),
+            "severity": severity,
+            "boxes": torch.stack(
+                (
+                    0.1 + query / 10,
+                    0.1 + query / 12,
+                    0.05 + query / 100,
+                    0.06 + query / 100,
+                ),
+                dim=1,
+            ),
+            "logits": torch.stack(
+                (
+                    3.0 - severity_offset - query / 20,
+                    -1.0 + query / 30,
+                ),
+                dim=1,
+            ),
+            "persistence": torch.stack(
+                (
+                    1.0 + query + image_offset + severity_offset + family_offset,
+                    2.0 + query.square() / 10 + severity_offset,
+                    3.0 + query / 7 + image_offset + family_offset,
+                ),
+                dim=1,
+            ),
+        }
+
+    reference_cache = (
+        reference_root / "reference-artifacts" / "reference-extractions"
+    )
+    with ShardWriter(
+        reference_cache,
+        {"stage": "reference", "input_id": "reference", **shared_metadata},
+        shard_size=2,
+    ) as writer:
+        for image_id in reference_ids:
+            writer.add(record(image_id, 0))
+
+    families = ("fog", "snow")
+    for family_index, family in enumerate(families):
+        cache = (
+            evaluation_root
+            / "corruptions"
+            / family
+            / "artifacts"
+            / "evaluation-extractions"
+        )
+        with ShardWriter(
+            cache,
+            {
+                "stage": "evaluation",
+                "input_id": family,
+                "corruption": {"name": family},
+                **shared_metadata,
+            },
+            shard_size=8,
+        ) as writer:
+            for image_id in evaluation_ids:
+                for severity in range(6):
+                    writer.add(
+                        record(
+                            image_id,
+                            severity,
+                            family_offset=float(family_index) / 10,
+                        )
+                    )
+
+    roster = {
+        "schema_version": 1,
+        "checkpoint_sha256": shared_metadata["checkpoint_sha256"],
+        "reference_manifest_sha256": "b" * 64,
+        "evaluation_manifest_sha256": "c" * 64,
+        "source_sha256": "d" * 64,
+        "config": config_metadata,
+        "runtime": {},
+        "corruptions": [
+            {
+                "name": family,
+                "severities": [
+                    {"level": level, "parameter": float(level)}
+                    for level in range(6)
+                ],
+            }
+            for family in families
+        ],
+    }
+    (evaluation_root / "corruption-roster.json").write_text(
+        json.dumps(roster), encoding="utf-8"
+    )
+
+    images = [
+        {"id": image_id, "width": 100, "height": 100}
+        for image_id in (*reference_ids, *evaluation_ids)
+    ]
+    annotations = []
+    for image_id in reference_ids:
+        for index in range(3):
+            annotations.append(
+                {
+                    "id": image_id * 10 + index,
+                    "image_id": image_id,
+                    "category_id": 1 + index % 2,
+                    "bbox": [8 + index * 10, 8 + index * 8, 6, 6],
+                    "iscrowd": 0,
+                }
+            )
+    annotation_path = tmp_path / "instances.json"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "images": images,
+                "annotations": annotations,
+                "categories": [{"id": 1}, {"id": 2}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return SimpleNamespace(
+        reference_root=reference_root,
+        evaluation_root=evaluation_root,
+        annotations=annotation_path,
+        config=StudyConfig(
+            reference_count=2,
+            evaluation_count=4,
+            selection_count=2,
+            validation_count=2,
+            families=families,
+            bank_capacity=6,
+            bootstrap_draws=50,
+        ),
+    )
+
+
+def test_tiny_study_filters_levels_and_reports_each_family(tiny_study, tmp_path):
+    result = study.run_study(
+        tiny_study.reference_root,
+        tiny_study.evaluation_root,
+        tiny_study.annotations,
+        tmp_path / "output",
+        config=tiny_study.config,
+        device="cpu",
+    )
+    assert result.levels_read == {0, 4, 5}
+    assert result.reported_families == {"fog", "snow"}
+    assert {
+        path.name for path in (tmp_path / "output").iterdir() if path.is_file()
+    } == {"results.csv", "summary.json", "report.md"}
+
+
+def test_tiny_study_writes_exact_cache_and_report_contract(tiny_study, tmp_path):
+    output = tmp_path / "output"
+    result = study.run_study(
+        tiny_study.reference_root,
+        tiny_study.evaluation_root,
+        tiny_study.annotations,
+        output,
+        config=tiny_study.config,
+        device="cpu",
+    )
+
+    geometry_by_distance = {
+        "mean_5_euclidean": "euclidean",
+        "fifth_neighbor_euclidean": "euclidean",
+        "mean_5_standardized_euclidean": "standardized_euclidean",
+        "mean_5_cosine": "cosine",
+    }
+    expected_caches = {
+        f"{bank}-{geometry}-seed44.pt"
+        for bank in BANK_VARIANTS
+        for geometry in ("euclidean", "standardized_euclidean", "cosine")
+    }
+    selected_geometry = geometry_by_distance[result.selected_policy.distance]
+    expected_caches.update(
+        f"{result.selected_policy.bank}-{selected_geometry}-seed{seed}.pt"
+        for seed in (42, 43, 45, 46)
+    )
+    assert {path.name for path in (output / "cache").iterdir()} == expected_caches
+
+    with (output / "results.csv").open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = list(reader)
+    assert reader.fieldnames == [
+        "row_type",
+        "split",
+        "policy_id",
+        "bank",
+        "distance",
+        "aggregation",
+        "seed",
+        "corruption",
+        "severity",
+        "method",
+        "point",
+        "lower",
+        "upper",
+        "count",
+    ]
+    assert {row["row_type"] for row in rows} == {
+        "candidate_family",
+        "selected_method",
+        "paired_difference",
+        "conditional",
+        "seed",
+    }
+    selected_methods = {
+        (row["corruption"], int(row["severity"]), row["method"])
+        for row in rows
+        if row["row_type"] == "selected_method"
+    }
+    assert selected_methods == {
+        (family, severity, method)
+        for family in tiny_study.config.families
+        for severity in (4, 5)
+        for method in (
+            "fingerprint",
+            "direct_confidence_max",
+            "softmax_entropy_top_confidence_query",
+        )
+    }
+    candidate_rows = [
+        row for row in rows if row["row_type"] == "candidate_family"
+    ]
+    assert len(candidate_rows) == 100 * 2 * len(tiny_study.config.families)
+    assert {
+        (row["corruption"], row["severity"], row["method"])
+        for row in rows
+        if row["row_type"] == "paired_difference"
+    } == {
+        (family, severity, method)
+        for family in tiny_study.config.families
+        for severity in ("4", "5")
+        for method in (
+            "fingerprint_minus_confidence",
+            "fingerprint_minus_entropy",
+        )
+    }
+    assert len([row for row in rows if row["row_type"] == "seed"]) == 5
+
+    summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
+    assert set(summary["conclusions"]) == {
+        "detects_corruption",
+        "better_than_confidence",
+        "information_after_confidence",
+    }
+    report = (output / "report.md").read_text(encoding="utf-8")
+    report.encode("ascii")
+    assert "0.714" not in report
+    assert report.count("Corruption |") == 2
+    for family in tiny_study.config.families:
+        assert report.count(f"{family} |") == 2
+    assert report.rstrip().endswith("Levels 1 through 3 were not evaluated.")
+
+
+def test_evidence_conclusions_use_the_three_fixed_thresholds():
+    interval = study.ScoreInterval
+    result = study._evidence_conclusions(
+        study.ValidationBootstrap(
+            fingerprint=interval(0.7, 0.6, 0.8, 2),
+            confidence=interval(0.6, 0.4, 0.8, 2),
+            entropy=interval(0.5, 0.3, 0.7, 2),
+            fingerprint_minus_confidence=interval(-0.1, -0.2, 0.0, 2),
+            fingerprint_minus_entropy=interval(0.2, 0.1, 0.3, 2),
+            conditional=interval(0.7, 0.5, 0.8, 3),
+        )
+    )
+
+    assert result == {
+        "detects_corruption": "supported",
+        "better_than_confidence": "not_supported",
+        "information_after_confidence": "inconclusive",
+    }
+    assert study._evidence_status(interval(None, None, None, 0), 0.5) == (
+        "inconclusive"
+    )
+
+
+def test_valid_distance_caches_are_reused(tiny_study, tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    study.run_study(
+        tiny_study.reference_root,
+        tiny_study.evaluation_root,
+        tiny_study.annotations,
+        output,
+        config=tiny_study.config,
+        device="cpu",
+    )
+
+    def must_not_compute(*_args, **_kwargs):
+        raise AssertionError("valid distance cache should be reused")
+
+    monkeypatch.setattr(study, "_compute_neighbor_tensor", must_not_compute)
+    study.run_study(
+        tiny_study.reference_root,
+        tiny_study.evaluation_root,
+        tiny_study.annotations,
+        output,
+        config=tiny_study.config,
+        device="cpu",
+    )
+
+
+def test_cache_metadata_mismatch_recomputes_only_that_cache(
+    tiny_study, tmp_path, monkeypatch
+):
+    output = tmp_path / "output"
+    study.run_study(
+        tiny_study.reference_root,
+        tiny_study.evaluation_root,
+        tiny_study.annotations,
+        output,
+        config=tiny_study.config,
+        device="cpu",
+    )
+    changed = output / "cache" / "matched-cosine-seed44.pt"
+    payload = torch.load(changed, map_location="cpu", weights_only=True)
+    payload["metadata"]["families"] = ["different"]
+    torch.save(payload, changed)
+
+    calls = 0
+    original = study._compute_neighbor_tensor
+
+    def count_compute(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(study, "_compute_neighbor_tensor", count_compute)
+    study.run_study(
+        tiny_study.reference_root,
+        tiny_study.evaluation_root,
+        tiny_study.annotations,
+        output,
+        config=tiny_study.config,
+        device="cpu",
+    )
+
+    repaired = torch.load(changed, map_location="cpu", weights_only=True)
+    assert repaired["metadata"]["families"] == ["fog", "snow"]
+    assert calls == 2 * 4 * 3
+
+
+def test_module_cli_accepts_only_the_study_runtime_arguments(tmp_path):
+    args = study._build_parser().parse_args(
+        [
+            "--reference-run",
+            str(tmp_path / "reference"),
+            "--evaluation-benchmark",
+            str(tmp_path / "evaluation"),
+            "--annotations",
+            str(tmp_path / "instances.json"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--device",
+            "cuda:0",
+        ]
+    )
+
+    assert args.reference_run == str(tmp_path / "reference")
+    assert args.evaluation_benchmark == str(tmp_path / "evaluation")
+    assert args.annotations == str(tmp_path / "instances.json")
+    assert args.output_dir == str(tmp_path / "output")
+    assert args.device == "cuda:0"
 
 
 def _single_reference_record():

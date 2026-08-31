@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import json
+from argparse import ArgumentParser
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from numbers import Integral, Real
+from pathlib import Path
 
 import numpy as np
 import torch
 from scipy.optimize import linear_sum_assignment
 from torch import Tensor
 
+from .artifacts import iter_records, load_manifest as load_artifact_manifest
 from .corruptions.imagecorruptions import ADDITIONAL_IMAGECORRUPTIONS
 from .evaluation import binary_auroc
+from .manifests import (
+    load_manifest,
+    manifest_digest,
+    validate_disjoint,
+)
 from .scoring import detect_padded_tail, union_padded_query_ids
 
 
@@ -140,6 +150,14 @@ class SeedSummary:
     standard_deviation: float
     minimum: float
     maximum: float
+
+
+@dataclass(frozen=True)
+class StudyRunResult:
+    selected_policy: Policy
+    levels_read: frozenset[int]
+    reported_families: frozenset[str]
+    output_dir: Path
 
 
 def split_image_ids(image_ids, selection_count: int) -> ImageSplit:
@@ -1220,3 +1238,1365 @@ def summarize_seed_scores(scores: Mapping[int, Real]) -> SeedSummary:
         minimum=float(array.min()),
         maximum=float(array.max()),
     )
+
+
+_GEOMETRY_DISTANCES = {
+    "euclidean": ("mean_5_euclidean", "fifth_neighbor_euclidean"),
+    "standardized_euclidean": ("mean_5_standardized_euclidean",),
+    "cosine": ("mean_5_cosine",),
+}
+_DISTANCE_GEOMETRIES = {
+    distance: geometry
+    for geometry, distances in _GEOMETRY_DISTANCES.items()
+    for distance in distances
+}
+
+
+def _study_config(config: StudyConfig) -> StudyConfig:
+    if not isinstance(config, StudyConfig):
+        raise ValueError("config must be a StudyConfig")
+    positive_fields = (
+        "reference_count",
+        "evaluation_count",
+        "selection_count",
+        "validation_count",
+        "bank_capacity",
+        "bootstrap_draws",
+    )
+    for field in positive_fields:
+        value = getattr(config, field)
+        if isinstance(value, bool) or not isinstance(value, Integral) or value <= 0:
+            raise ValueError(f"{field} must be a positive integer")
+    if config.selection_count + config.validation_count != config.evaluation_count:
+        raise ValueError(
+            "selection_count plus validation_count must equal evaluation_count"
+        )
+    if config.levels != (0, 4, 5):
+        raise ValueError("strong corruption study levels must be exactly 0, 4, and 5")
+    if not config.families or len(set(config.families)) != len(config.families):
+        raise ValueError("study families must be nonempty and unique")
+    return config
+
+
+def _scientific_metadata(metadata: Mapping, *, label: str) -> tuple:
+    if not isinstance(metadata, Mapping):
+        raise ValueError(f"{label} metadata must be an object")
+    config = metadata.get("config")
+    if not isinstance(config, Mapping):
+        raise ValueError(f"{label} metadata must contain config")
+    fields = (
+        "query_count",
+        "class_count",
+        "persistence_layer",
+        "persistence_dim",
+    )
+    values = []
+    checkpoint = metadata.get("checkpoint_sha256")
+    if not isinstance(checkpoint, str) or not checkpoint:
+        raise ValueError(f"{label} metadata must contain checkpoint_sha256")
+    values.append(checkpoint)
+    for field in fields:
+        value = config.get(field)
+        if isinstance(value, bool) or not isinstance(value, Integral):
+            raise ValueError(f"{label} config must contain integer {field}")
+        values.append(int(value))
+    return tuple(values)
+
+
+def _json_object(path: Path, *, label: str) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise ValueError(f"{label} must be valid JSON") from error
+    if type(value) is not dict:
+        raise ValueError(f"{label} must be a JSON object")
+    return value
+
+
+def _load_annotations(
+    path: Path, reference_ids: set[str], class_count: int
+) -> tuple[dict[str, list[Mapping]], dict[str, tuple[int, int]], tuple[int, ...]]:
+    payload = _json_object(path, label="COCO annotations")
+    images = payload.get("images")
+    annotations = payload.get("annotations")
+    categories = payload.get("categories")
+    if not all(isinstance(values, list) for values in (images, annotations, categories)):
+        raise ValueError(
+            "COCO annotations must contain images, annotations, and categories lists"
+        )
+
+    image_sizes = {}
+    for image in images:
+        if not isinstance(image, Mapping) or "id" not in image:
+            raise ValueError("COCO image entries must contain IDs")
+        image_id = str(image["id"])
+        if image_id not in reference_ids:
+            continue
+        width = image.get("width")
+        height = image.get("height")
+        if (
+            isinstance(width, bool)
+            or not isinstance(width, Integral)
+            or width <= 0
+            or isinstance(height, bool)
+            or not isinstance(height, Integral)
+            or height <= 0
+        ):
+            raise ValueError(f"COCO image {image_id!r} has invalid dimensions")
+        image_sizes[image_id] = (int(width), int(height))
+    if set(image_sizes) != reference_ids:
+        missing = sorted(reference_ids - set(image_sizes))
+        raise ValueError(f"COCO annotations are missing reference images: {missing}")
+
+    annotations_by_image: dict[str, list[Mapping]] = {
+        image_id: [] for image_id in reference_ids
+    }
+    for annotation in annotations:
+        if not isinstance(annotation, Mapping) or "image_id" not in annotation:
+            raise ValueError("COCO annotation entries must contain image_id")
+        image_id = str(annotation["image_id"])
+        if image_id in annotations_by_image:
+            annotations_by_image[image_id].append(annotation)
+
+    try:
+        category_ids = tuple(
+            sorted({int(category["id"]) for category in categories})
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("COCO categories must contain integer IDs") from error
+    if len(category_ids) != class_count:
+        raise ValueError(
+            f"COCO categories contain {len(category_ids)} classes; "
+            f"artifacts require {class_count}"
+        )
+    return annotations_by_image, image_sizes, category_ids
+
+
+def _load_evaluation_groups(
+    evaluation_root: Path,
+    *,
+    evaluation_ids: set[str],
+    families: tuple[str, ...],
+    expected_science: tuple,
+) -> tuple[list[tuple[dict, ...]], frozenset[int]]:
+    roster = _json_object(
+        evaluation_root / "corruption-roster.json",
+        label="benchmark corruption roster",
+    )
+    if _scientific_metadata(roster, label="benchmark roster") != expected_science:
+        raise ValueError("benchmark roster scientific metadata differs from reference")
+    corruptions = roster.get("corruptions")
+    if not isinstance(corruptions, list):
+        raise ValueError("benchmark corruption roster must contain corruptions")
+    roster_names = [
+        item.get("name") for item in corruptions if isinstance(item, Mapping)
+    ]
+    for family in families:
+        if roster_names.count(family) != 1:
+            raise ValueError(
+                f"configured corruption family {family!r} must occur exactly once"
+            )
+
+    groups = []
+    levels_read: set[int] = set()
+    expected_keys = {
+        (family, image_id, severity)
+        for family in families
+        for image_id in evaluation_ids
+        for severity in (0, 4, 5)
+    }
+    seen_keys = set()
+    for family in families:
+        cache = (
+            evaluation_root
+            / "corruptions"
+            / family
+            / "artifacts"
+            / "evaluation-extractions"
+        )
+        metadata = load_artifact_manifest(cache)
+        if _scientific_metadata(metadata, label=f"{family} artifact") != expected_science:
+            raise ValueError(
+                f"corruption family {family!r} scientific metadata differs "
+                "from reference"
+            )
+        by_image: dict[str, list[dict]] = {}
+        for record in iter_records(cache):
+            severity = record.get("severity")
+            if (
+                isinstance(severity, bool)
+                or not isinstance(severity, Integral)
+                or int(severity) not in (0, 4, 5)
+            ):
+                continue
+            severity = int(severity)
+            image_id = str(record.get("image_id"))
+            if image_id not in evaluation_ids:
+                raise ValueError(
+                    f"corruption family {family!r} contains unexpected image "
+                    f"{image_id!r}"
+                )
+            key = (family, image_id, severity)
+            if key in seen_keys:
+                raise ValueError(f"duplicate evaluation record: {key!r}")
+            seen_keys.add(key)
+            levels_read.add(severity)
+            by_image.setdefault(image_id, []).append(
+                {**record, "image_id": image_id, "family": family}
+            )
+        for image_id in sorted(evaluation_ids):
+            image_records = tuple(
+                sorted(by_image.get(image_id, ()), key=lambda item: item["severity"])
+            )
+            if [record["severity"] for record in image_records] != [0, 4, 5]:
+                raise ValueError(
+                    f"family {family!r}, image {image_id!r} must contain "
+                    "exactly levels 0, 4, and 5"
+                )
+            groups.append(image_records)
+    if seen_keys != expected_keys:
+        raise ValueError("evaluation artifacts do not cover the configured panel")
+    return groups, frozenset(levels_read)
+
+
+def _prepare_image_group(records) -> list[dict]:
+    records = sorted(records, key=lambda record: int(record["severity"]))
+    padded_ids = union_padded_query_ids(records)
+    query_count = int(records[0]["persistence"].shape[0])
+    keep = torch.ones(query_count, dtype=torch.bool)
+    keep[padded_ids] = False
+    valid_ids = torch.arange(query_count, dtype=torch.long)[keep]
+    if valid_ids.numel() == 0:
+        raise ValueError("padding leaves no valid queries")
+
+    prepared = []
+    for record in records:
+        logits = record["logits"].detach().float().index_select(
+            0, valid_ids.to(record["logits"].device)
+        )
+        confidence = logits.sigmoid().amax(dim=1).cpu()
+        raw_confidence = float(confidence.max())
+        prepared.append(
+            {
+                "image_id": str(record["image_id"]),
+                "family": str(record["family"]),
+                "severity": int(record["severity"]),
+                "query_ids": valid_ids,
+                "confidence_by_query": confidence,
+                "persistence": record["persistence"].detach().index_select(
+                    0, valid_ids.to(record["persistence"].device)
+                ),
+                "raw_confidence": raw_confidence,
+                "confidence": 1.0 - raw_confidence,
+                "entropy": top_query_entropy(logits, valid_ids),
+            }
+        )
+    return prepared
+
+
+def _bank_on_device(bank: Bank, geometry: str, device: torch.device) -> Bank:
+    vectors = bank.vectors.to(device=device, dtype=torch.float32)
+    if geometry == "cosine":
+        norms = vectors.norm(dim=1, keepdim=True)
+        if bool((norms == 0).any()) or not bool(torch.isfinite(norms).all()):
+            raise ValueError("cosine distance does not allow zero-norm bank rows")
+        vectors = vectors / norms
+    return Bank(
+        vectors=vectors,
+        mean=None if bank.mean is None else bank.mean.to(device),
+        scale=None if bank.scale is None else bank.scale.to(device),
+        matched_count=bank.matched_count,
+        background_count=bank.background_count,
+    )
+
+
+def _compute_neighbor_tensor(queries: Tensor, bank: Bank, geometry: str) -> Tensor:
+    transformed = queries.detach().to(
+        device=bank.vectors.device, dtype=torch.float32
+    )
+    cosine = geometry == "cosine"
+    if geometry == "standardized_euclidean":
+        if bank.mean is None or bank.scale is None:
+            raise ValueError("standardized Euclidean requires bank moments")
+        transformed = (transformed - bank.mean) / bank.scale
+    elif cosine:
+        norms = transformed.norm(dim=1, keepdim=True)
+        if bool((norms == 0).any()) or not bool(torch.isfinite(norms).all()):
+            raise ValueError("cosine distance does not allow zero-norm query rows")
+        transformed = transformed / norms
+    if not bool(torch.isfinite(transformed).all()):
+        raise ValueError(f"{geometry} queries must be finite")
+    return _nearest_five(transformed, bank.vectors, cosine=cosine)
+
+
+def _cache_metadata(
+    *,
+    geometry: str,
+    bank: str,
+    seed: int,
+    reference_digest: str,
+    evaluation_digest: str,
+    evaluation_ids: tuple[str, ...],
+    families: tuple[str, ...],
+) -> dict:
+    return {
+        "geometry": geometry,
+        "bank": bank,
+        "seed": seed,
+        "reference_manifest_sha256": reference_digest,
+        "evaluation_manifest_sha256": evaluation_digest,
+        "evaluation_image_ids": list(evaluation_ids),
+        "families": list(families),
+    }
+
+
+def _load_distance_cache(path: Path, expected_metadata: dict):
+    if not path.is_file():
+        return None
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if (
+        not isinstance(payload, Mapping)
+        or payload.get("metadata") != expected_metadata
+    ):
+        return None
+    return payload["records"]
+
+
+def _open_distance_cache(
+    candidates: CandidateRows,
+    *,
+    bank_name: str,
+    geometry: str,
+    distance: str,
+    seed: int,
+    config: StudyConfig,
+    cache_directory: Path,
+    reference_digest: str,
+    evaluation_digest: str,
+    evaluation_ids: tuple[str, ...],
+    device: torch.device,
+):
+    metadata = _cache_metadata(
+        geometry=geometry,
+        bank=bank_name,
+        seed=seed,
+        reference_digest=reference_digest,
+        evaluation_digest=evaluation_digest,
+        evaluation_ids=evaluation_ids,
+        families=config.families,
+    )
+    path = cache_directory / f"{bank_name}-{geometry}-seed{seed}.pt"
+    cached = _load_distance_cache(path, metadata)
+    if cached is not None:
+        return {
+            "metadata": metadata,
+            "path": path,
+            "loaded": {
+                _record_key(record): record["neighbors"] for record in cached
+            },
+            "records": None,
+            "bank": None,
+        }, None
+    try:
+        bank = build_bank(
+            candidates,
+            variant=bank_name,
+            distance=distance,
+            capacity=config.bank_capacity,
+            seed=seed,
+        )
+        bank = _bank_on_device(bank, geometry, device)
+    except ValueError as error:
+        return None, str(error)
+    return {
+        "metadata": metadata,
+        "path": path,
+        "loaded": None,
+        "records": [],
+        "bank": bank,
+    }, None
+
+
+def _cache_neighbors(state: dict, record: Mapping, geometry: str) -> Tensor:
+    record_key = _record_key(record)
+    if state["loaded"] is not None:
+        return state["loaded"][record_key]
+    neighbors = _compute_neighbor_tensor(
+        record["persistence"], state["bank"], geometry
+    ).detach().cpu()
+    state["records"].append(
+        {
+            "family": str(record["family"]),
+            "image_id": str(record["image_id"]),
+            "severity": int(record["severity"]),
+            "neighbors": neighbors,
+        }
+    )
+    return neighbors
+
+
+def _save_distance_cache(state: dict) -> None:
+    if state["records"] is not None:
+        torch.save(
+            {"metadata": state["metadata"], "records": state["records"]},
+            state["path"],
+        )
+
+
+def _record_key(record: Mapping) -> tuple[str, str, int]:
+    return (
+        str(record["family"]),
+        str(record["image_id"]),
+        int(record["severity"]),
+    )
+
+
+def _neighbor_scores(
+    neighbors: Tensor,
+    confidence: Tensor,
+    query_ids: Tensor,
+    *,
+    geometry: str,
+) -> dict[tuple[str, str], float]:
+    results = {}
+    for distance in _GEOMETRY_DISTANCES[geometry]:
+        distances = (
+            neighbors[:, -1]
+            if distance == "fifth_neighbor_euclidean"
+            else neighbors.mean(dim=1)
+        )
+        for aggregation in AGGREGATIONS:
+            results[(distance, aggregation)] = aggregate_queries(
+                distances, confidence, query_ids, aggregation
+            )
+    return results
+
+
+def _score_primary_arms(
+    groups,
+    candidates: CandidateRows,
+    *,
+    split: ImageSplit,
+    config: StudyConfig,
+    cache_directory: Path,
+    reference_digest: str,
+    evaluation_digest: str,
+    evaluation_ids: tuple[str, ...],
+    device: torch.device,
+) -> tuple[list[dict], list[dict]]:
+    selection_ids = set(split.selection)
+    states = {}
+    infeasible = []
+    for bank_name in BANK_VARIANTS:
+        for geometry in _GEOMETRY_DISTANCES:
+            key = (bank_name, geometry, config.primary_seed)
+            state, error = _open_distance_cache(
+                candidates,
+                bank_name=bank_name,
+                geometry=geometry,
+                distance=_GEOMETRY_DISTANCES[geometry][0],
+                seed=config.primary_seed,
+                config=config,
+                cache_directory=cache_directory,
+                reference_digest=reference_digest,
+                evaluation_digest=evaluation_digest,
+                evaluation_ids=evaluation_ids,
+                device=device,
+            )
+            if error is not None:
+                infeasible.append(
+                    {
+                        "bank": bank_name,
+                        "geometry": geometry,
+                        "seed": config.primary_seed,
+                        "reason": error,
+                    }
+                )
+                continue
+            state["rows"] = []
+            states[key] = state
+
+    failed = {}
+    for group in groups:
+        prepared = _prepare_image_group(group)
+        for record in prepared:
+            for key, state in states.items():
+                if key in failed:
+                    continue
+                try:
+                    neighbors = _cache_neighbors(state, record, key[1])
+                    scores = _neighbor_scores(
+                        neighbors,
+                        record["confidence_by_query"],
+                        record["query_ids"],
+                        geometry=key[1],
+                    )
+                except ValueError as error:
+                    failed[key] = str(error)
+                    state["rows"].clear()
+                    state["records"] = None
+                    continue
+                for (distance, aggregation), fingerprint in scores.items():
+                    policy = Policy(
+                        bank=key[0],
+                        distance=distance,
+                        aggregation=aggregation,
+                        seed=key[2],
+                    )
+                    state["rows"].append(
+                        {
+                            "image_id": record["image_id"],
+                            "family": record["family"],
+                            "severity": record["severity"],
+                            "split": (
+                                "selection"
+                                if record["image_id"] in selection_ids
+                                else "validation"
+                            ),
+                            "policy": policy,
+                            "fingerprint": fingerprint,
+                            "confidence": record["confidence"],
+                            "entropy": record["entropy"],
+                            "raw_confidence": record["raw_confidence"],
+                        }
+                    )
+
+    rows = []
+    for key, state in states.items():
+        if key in failed:
+            infeasible.append(
+                {
+                    "bank": key[0],
+                    "geometry": key[1],
+                    "seed": key[2],
+                    "reason": failed[key],
+                }
+            )
+            continue
+        _save_distance_cache(state)
+        rows.extend(state["rows"])
+    if not rows:
+        raise ValueError("no feasible fingerprint candidate remains")
+    return rows, infeasible
+
+
+def _evidence_status(interval: ScoreInterval, threshold: float) -> str:
+    if (
+        interval.point is None
+        or interval.lower is None
+        or interval.upper is None
+        or interval.count <= 0
+    ):
+        return "inconclusive"
+    if interval.lower > threshold:
+        return "supported"
+    if interval.upper <= threshold:
+        return "not_supported"
+    return "inconclusive"
+
+
+def _evidence_conclusions(bootstrap: ValidationBootstrap) -> dict[str, str]:
+    return {
+        "detects_corruption": _evidence_status(bootstrap.fingerprint, 0.5),
+        "better_than_confidence": _evidence_status(
+            bootstrap.fingerprint_minus_confidence, 0.0
+        ),
+        "information_after_confidence": _evidence_status(
+            bootstrap.conditional, 0.5
+        ),
+    }
+
+
+def _validation_strong(rows) -> float:
+    values = [
+        result.strong
+        for result in per_family_aurocs(
+            [row for row in rows if row["split"] == "validation"],
+            method="fingerprint",
+        ).values()
+    ]
+    return float(np.mean(values))
+
+
+def _score_sensitivity_seeds(
+    groups,
+    candidates: CandidateRows,
+    primary_rows,
+    selected: Policy,
+    *,
+    split: ImageSplit,
+    config: StudyConfig,
+    cache_directory: Path,
+    reference_digest: str,
+    evaluation_digest: str,
+    evaluation_ids: tuple[str, ...],
+    device: torch.device,
+) -> dict[int, float]:
+    geometry = _DISTANCE_GEOMETRIES[selected.distance]
+    rows_by_seed = {
+        config.primary_seed: [
+            row for row in primary_rows if row["policy"] == selected
+        ]
+    }
+    states = {}
+    for seed in config.sensitivity_seeds:
+        if seed == config.primary_seed:
+            continue
+        state, error = _open_distance_cache(
+            candidates,
+            bank_name=selected.bank,
+            geometry=geometry,
+            distance=selected.distance,
+            seed=seed,
+            config=config,
+            cache_directory=cache_directory,
+            reference_digest=reference_digest,
+            evaluation_digest=evaluation_digest,
+            evaluation_ids=evaluation_ids,
+            device=device,
+        )
+        if error is not None:
+            raise ValueError(
+                f"selected sensitivity seed {seed} is infeasible: {error}"
+            )
+        state["rows"] = []
+        states[seed] = state
+
+    selection_ids = set(split.selection)
+    for group in groups:
+        for record in _prepare_image_group(group):
+            for seed, state in states.items():
+                neighbors = _cache_neighbors(state, record, geometry)
+                fingerprint = _neighbor_scores(
+                    neighbors,
+                    record["confidence_by_query"],
+                    record["query_ids"],
+                    geometry=geometry,
+                )[(selected.distance, selected.aggregation)]
+                state["rows"].append(
+                    {
+                        "image_id": record["image_id"],
+                        "family": record["family"],
+                        "severity": record["severity"],
+                        "split": (
+                            "selection"
+                            if record["image_id"] in selection_ids
+                            else "validation"
+                        ),
+                        "policy": Policy(
+                            selected.bank,
+                            selected.distance,
+                            selected.aggregation,
+                            seed,
+                        ),
+                        "fingerprint": fingerprint,
+                        "confidence": record["confidence"],
+                        "entropy": record["entropy"],
+                        "raw_confidence": record["raw_confidence"],
+                    }
+                )
+
+    for seed, state in states.items():
+        _save_distance_cache(state)
+        rows_by_seed[seed] = state["rows"]
+    if set(rows_by_seed) != set(config.sensitivity_seeds):
+        raise ValueError("sensitivity scoring did not cover every configured seed")
+    scores = {
+        seed: _validation_strong(rows)
+        for seed, rows in sorted(rows_by_seed.items())
+    }
+    return scores
+
+
+def _policy_statistics(candidate_rows) -> list[dict]:
+    by_policy: dict[Policy, list[Mapping]] = {}
+    for row in candidate_rows:
+        by_policy.setdefault(row["policy"], []).append(row)
+    ranking = []
+    for policy, rows in by_policy.items():
+        split_results = {}
+        for split_name in ("selection", "validation"):
+            family_results = per_family_aurocs(
+                [row for row in rows if row["split"] == split_name],
+                method="fingerprint",
+            )
+            values = np.asarray(
+                [result.strong for result in family_results.values()], dtype=float
+            )
+            split_results[split_name] = {
+                "family_mean": float(values.mean()),
+                "family_median": float(np.median(values)),
+            }
+        ranking.append(
+            {
+                "policy_id": policy.policy_id,
+                **asdict(policy),
+                "selection_family_mean": split_results["selection"]["family_mean"],
+                "selection_family_median": split_results["selection"][
+                    "family_median"
+                ],
+                "exploratory_validation_family_mean": split_results["validation"][
+                    "family_mean"
+                ],
+                "exploratory_validation_family_median": split_results[
+                    "validation"
+                ]["family_median"],
+            }
+        )
+    return sorted(
+        ranking,
+        key=lambda item: (
+            -item["selection_family_mean"],
+            -item["selection_family_median"],
+            item["policy_id"],
+        ),
+    )
+
+
+def _blankable(value):
+    return "" if value is None else value
+
+
+def _result_row(
+    row_type: str,
+    *,
+    split: str = "",
+    policy: Policy | None = None,
+    corruption: str = "",
+    severity="",
+    method: str = "",
+    interval: ScoreInterval | None = None,
+    point=None,
+    count=0,
+) -> dict:
+    if interval is not None:
+        point = interval.point
+        lower = interval.lower
+        upper = interval.upper
+        count = interval.count
+    else:
+        lower = None
+        upper = None
+    return {
+        "row_type": row_type,
+        "split": split,
+        "policy_id": "" if policy is None else policy.policy_id,
+        "bank": "" if policy is None else policy.bank,
+        "distance": "" if policy is None else policy.distance,
+        "aggregation": "" if policy is None else policy.aggregation,
+        "seed": "" if policy is None else policy.seed,
+        "corruption": corruption,
+        "severity": severity,
+        "method": method,
+        "point": _blankable(point),
+        "lower": _blankable(lower),
+        "upper": _blankable(upper),
+        "count": count,
+    }
+
+
+def _candidate_audit_rows(candidate_rows, config: StudyConfig) -> list[dict]:
+    by_policy: dict[Policy, list[Mapping]] = {}
+    for row in candidate_rows:
+        by_policy.setdefault(row["policy"], []).append(row)
+    output = []
+    for bank_name in BANK_VARIANTS:
+        for distance in DISTANCES:
+            for aggregation in AGGREGATIONS:
+                policy = Policy(
+                    bank_name, distance, aggregation, config.primary_seed
+                )
+                rows = by_policy.get(policy)
+                for split_name, count in (
+                    ("selection", config.selection_count),
+                    ("validation", config.validation_count),
+                ):
+                    results = (
+                        {}
+                        if rows is None
+                        else per_family_aurocs(
+                            [
+                                row
+                                for row in rows
+                                if row["split"] == split_name
+                            ],
+                            method="fingerprint",
+                        )
+                    )
+                    for family in config.families:
+                        result = results.get(family)
+                        output.append(
+                            _result_row(
+                                "candidate_family",
+                                split=split_name,
+                                policy=policy,
+                                corruption=family,
+                                severity="strong",
+                                method="fingerprint",
+                                point=None if result is None else result.strong,
+                                count=0 if result is None else count,
+                            )
+                        )
+    return output
+
+
+def _validation_evidence(
+    selected_rows,
+    *,
+    config: StudyConfig,
+) -> tuple[dict[int, tuple[float, ...]], ValidationBootstrap]:
+    selection_rows = [
+        row for row in selected_rows if row["split"] == "selection"
+    ]
+    validation_rows = [
+        row for row in selected_rows if row["split"] == "validation"
+    ]
+    boundaries = {
+        severity: confidence_decile_boundaries(
+            selection_rows, severity=severity
+        )
+        for severity in (4, 5)
+    }
+    aggregate = paired_validation_bootstrap(
+        validation_rows,
+        boundaries_by_severity=boundaries,
+        samples=config.bootstrap_draws,
+        seed=config.bootstrap_seed,
+    )
+    return boundaries, aggregate
+
+
+def _selected_csv_rows(
+    selected_rows,
+    selected: Policy,
+    boundaries: Mapping[int, Sequence[float]],
+    seed_scores: Mapping[int, float],
+    *,
+    config: StudyConfig,
+) -> list[dict]:
+    validation_rows = [
+        row for row in selected_rows if row["split"] == "validation"
+    ]
+    output = []
+    methods = (
+        ("fingerprint", "fingerprint"),
+        ("direct_confidence_max", "confidence"),
+        (
+            "softmax_entropy_top_confidence_query",
+            "entropy",
+        ),
+    )
+    family_results = {
+        field: per_family_aurocs(validation_rows, method=field)
+        for _name, field in methods
+    }
+    for family in config.families:
+        for severity in (4, 5):
+            for method_name, field in methods:
+                result = family_results[field][family]
+                point = result.level4 if severity == 4 else result.level5
+                output.append(
+                    _result_row(
+                        "selected_method",
+                        split="validation",
+                        policy=selected,
+                        corruption=family,
+                        severity=severity,
+                        method=method_name,
+                        point=point,
+                        count=config.validation_count,
+                    )
+                )
+            fingerprint = family_results["fingerprint"][family]
+            confidence = family_results["confidence"][family]
+            entropy = family_results["entropy"][family]
+            fingerprint_point = (
+                fingerprint.level4 if severity == 4 else fingerprint.level5
+            )
+            confidence_point = (
+                confidence.level4 if severity == 4 else confidence.level5
+            )
+            entropy_point = entropy.level4 if severity == 4 else entropy.level5
+            output.append(
+                _result_row(
+                    "paired_difference",
+                    split="validation",
+                    policy=selected,
+                    corruption=family,
+                    severity=severity,
+                    method="fingerprint_minus_confidence",
+                    point=fingerprint_point - confidence_point,
+                    count=config.validation_count,
+                )
+            )
+            output.append(
+                _result_row(
+                    "paired_difference",
+                    split="validation",
+                    policy=selected,
+                    corruption=family,
+                    severity=severity,
+                    method="fingerprint_minus_entropy",
+                    point=fingerprint_point - entropy_point,
+                    count=config.validation_count,
+                )
+            )
+            conditional = confidence_conditioned_concordance(
+                validation_rows,
+                family=family,
+                severity=severity,
+                boundaries=boundaries[severity],
+            )
+            output.append(
+                _result_row(
+                    "conditional",
+                    split="validation",
+                    policy=selected,
+                    corruption=family,
+                    severity=severity,
+                    method="confidence_conditioned_concordance",
+                    point=conditional.point,
+                    count=conditional.pair_count,
+                )
+            )
+    for seed in config.sensitivity_seeds:
+        output.append(
+            _result_row(
+                "seed",
+                split="validation",
+                policy=Policy(
+                    selected.bank,
+                    selected.distance,
+                    selected.aggregation,
+                    seed,
+                ),
+                severity="strong",
+                method="fingerprint",
+                point=seed_scores[seed],
+                count=config.validation_count,
+            )
+        )
+    return output
+
+
+def _format_number(value) -> str:
+    if value is None:
+        return "NA"
+    return f"{float(value):.4f}"
+
+
+def _controlled_lines(
+    ranking: Sequence[Mapping],
+    values: Sequence[str],
+    *,
+    field: str,
+    selected: Policy,
+) -> list[str]:
+    by_value = {}
+    for item in ranking:
+        if (
+            (field == "bank" or item["bank"] == selected.bank)
+            and (field == "distance" or item["distance"] == selected.distance)
+            and (
+                field == "aggregation"
+                or item["aggregation"] == selected.aggregation
+            )
+        ):
+            by_value[item[field]] = item
+    lines = []
+    for value in values:
+        item = by_value.get(value)
+        if item is None:
+            lines.append(
+                f"- {value}: selection=NA; exploratory validation=NA"
+            )
+        else:
+            lines.append(
+                f"- {value}: "
+                f"selection={_format_number(item['selection_family_mean'])}; "
+                "exploratory validation="
+                f"{_format_number(item['exploratory_validation_family_mean'])}"
+            )
+    return lines
+
+
+def _render_report(
+    selected_rows,
+    selected: Policy,
+    ranking,
+    aggregate: ValidationBootstrap,
+    seed_summary: SeedSummary,
+    conclusions: Mapping[str, str],
+    *,
+    config: StudyConfig,
+) -> str:
+    validation_rows = [
+        row for row in selected_rows if row["split"] == "validation"
+    ]
+    results = {
+        method: per_family_aurocs(validation_rows, method=method)
+        for method in ("fingerprint", "confidence", "entropy")
+    }
+    lines = [
+        "# Strong corruption fingerprint study",
+        "",
+        (
+            "Selected tuple: "
+            f"bank={selected.bank}, distance={selected.distance}, "
+            f"aggregation={selected.aggregation}, seed={selected.seed}"
+        ),
+        "",
+        (
+            "Corruption | Fingerprint L4 | Fingerprint L5 | Confidence L4 | "
+            "Confidence L5 | Entropy L4 | Entropy L5"
+        ),
+        "--- | --- | --- | --- | --- | --- | ---",
+    ]
+    for family in config.families:
+        fingerprint = results["fingerprint"][family]
+        confidence = results["confidence"][family]
+        entropy = results["entropy"][family]
+        lines.append(
+            " | ".join(
+                (
+                    family,
+                    _format_number(fingerprint.level4),
+                    _format_number(fingerprint.level5),
+                    _format_number(confidence.level4),
+                    _format_number(confidence.level5),
+                    _format_number(entropy.level4),
+                    _format_number(entropy.level5),
+                )
+            )
+        )
+    lines.extend(
+        (
+            "",
+            (
+                "Corruption | Fingerprint strong | Confidence strong | "
+                "Entropy strong | Fingerprint minus confidence | "
+                "Fingerprint minus entropy"
+            ),
+            "--- | --- | --- | --- | --- | ---",
+        )
+    )
+    for family in config.families:
+        fingerprint = results["fingerprint"][family].strong
+        confidence = results["confidence"][family].strong
+        entropy = results["entropy"][family].strong
+        lines.append(
+            " | ".join(
+                (
+                    family,
+                    _format_number(fingerprint),
+                    _format_number(confidence),
+                    _format_number(entropy),
+                    _format_number(fingerprint - confidence),
+                    _format_number(fingerprint - entropy),
+                )
+            )
+        )
+    lines.append("")
+    for method, label in (
+        ("fingerprint", "Fingerprint"),
+        ("confidence", "Confidence"),
+        ("entropy", "Entropy"),
+    ):
+        values = np.asarray(
+            [result.strong for result in results[method].values()], dtype=float
+        )
+        lines.append(
+            f"{label} family strong mean={values.mean():.4f}; "
+            f"median={np.median(values):.4f}."
+        )
+    lines.extend(
+        (
+            "",
+            (
+                "Conditional diagnostic: "
+                f"point={_format_number(aggregate.conditional.point)}, "
+                f"interval=[{_format_number(aggregate.conditional.lower)}, "
+                f"{_format_number(aggregate.conditional.upper)}], "
+                f"eligible pairs={aggregate.conditional.count}."
+            ),
+            (
+                "Seed sensitivity: "
+                f"mean={seed_summary.mean:.4f}, "
+                f"population std={seed_summary.standard_deviation:.4f}, "
+                f"min={seed_summary.minimum:.4f}, "
+                f"max={seed_summary.maximum:.4f}."
+            ),
+            "",
+            "Banks at selected distance and aggregation:",
+            *_controlled_lines(
+                ranking,
+                BANK_VARIANTS,
+                field="bank",
+                selected=selected,
+            ),
+            "",
+            "Distances at selected bank and aggregation:",
+            *_controlled_lines(
+                ranking,
+                DISTANCES,
+                field="distance",
+                selected=selected,
+            ),
+            "",
+            "Aggregators at selected bank and distance:",
+            *_controlled_lines(
+                ranking,
+                AGGREGATIONS,
+                field="aggregation",
+                selected=selected,
+            ),
+            "",
+            "Evidence conclusions:",
+            *(
+                f"- {name}: {status}"
+                for name, status in conclusions.items()
+            ),
+            "",
+            "Levels 1 through 3 were not evaluated.",
+        )
+    )
+    return "\n".join(lines) + "\n"
+
+
+def run_study(
+    reference_run,
+    evaluation_benchmark,
+    annotations,
+    output_dir,
+    *,
+    config: StudyConfig = StudyConfig(),
+    device: str = "cpu",
+) -> StudyRunResult:
+    config = _study_config(config)
+    reference_root = Path(reference_run).resolve()
+    evaluation_root = Path(evaluation_benchmark).resolve()
+    annotations = Path(annotations).resolve()
+    output = Path(output_dir).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    cache_directory = output / "cache"
+    cache_directory.mkdir(exist_ok=True)
+
+    reference_manifest = load_manifest(
+        reference_root / "inputs" / "reference-manifest.csv"
+    )
+    evaluation_manifest = load_manifest(
+        evaluation_root / "inputs" / "evaluation-manifest.csv"
+    )
+    if len(reference_manifest) != config.reference_count:
+        raise ValueError(
+            f"reference manifest must contain {config.reference_count} images"
+        )
+    if len(evaluation_manifest) != config.evaluation_count:
+        raise ValueError(
+            f"evaluation manifest must contain {config.evaluation_count} images"
+        )
+    validate_disjoint(reference_manifest, evaluation_manifest)
+    evaluation_ids = tuple(entry.image_id for entry in evaluation_manifest)
+    split = split_image_ids(evaluation_ids, config.selection_count)
+    if (
+        len(split.selection) != config.selection_count
+        or len(split.validation) != config.validation_count
+    ):
+        raise ValueError("deterministic image split has unexpected sizes")
+
+    reference_cache = (
+        reference_root / "reference-artifacts" / "reference-extractions"
+    )
+    reference_metadata = load_artifact_manifest(reference_cache)
+    expected_science = _scientific_metadata(
+        reference_metadata, label="reference artifact"
+    )
+    reference_ids = {entry.image_id for entry in reference_manifest}
+    reference_records = list(iter_records(reference_cache))
+    if len(reference_records) != config.reference_count:
+        raise ValueError(
+            f"reference artifacts must contain {config.reference_count} records"
+        )
+    if {
+        str(record.get("image_id")) for record in reference_records
+    } != reference_ids:
+        raise ValueError("reference artifacts do not match the reference manifest")
+    if any(int(record.get("severity", 0)) != 0 for record in reference_records):
+        raise ValueError("reference artifacts must contain clean records only")
+
+    annotations_by_image, image_sizes, category_ids = _load_annotations(
+        annotations,
+        reference_ids,
+        expected_science[2],
+    )
+    candidates = build_reference_candidates(
+        reference_records,
+        annotations_by_image=annotations_by_image,
+        image_sizes=image_sizes,
+        category_ids=category_ids,
+    )
+    del reference_records
+
+    groups, levels_read = _load_evaluation_groups(
+        evaluation_root,
+        evaluation_ids=set(evaluation_ids),
+        families=config.families,
+        expected_science=expected_science,
+    )
+    reference_digest = manifest_digest(reference_manifest)
+    evaluation_digest = manifest_digest(evaluation_manifest)
+    candidate_rows, infeasible = _score_primary_arms(
+        groups,
+        candidates,
+        split=split,
+        config=config,
+        cache_directory=cache_directory,
+        reference_digest=reference_digest,
+        evaluation_digest=evaluation_digest,
+        evaluation_ids=evaluation_ids,
+        device=torch.device(device),
+    )
+    selected = select_policy(candidate_rows)
+    seed_scores = _score_sensitivity_seeds(
+        groups,
+        candidates,
+        candidate_rows,
+        selected,
+        split=split,
+        config=config,
+        cache_directory=cache_directory,
+        reference_digest=reference_digest,
+        evaluation_digest=evaluation_digest,
+        evaluation_ids=evaluation_ids,
+        device=torch.device(device),
+    )
+    del groups, candidates
+    selected_rows = [
+        row for row in candidate_rows if row["policy"] == selected
+    ]
+    boundaries, aggregate = _validation_evidence(
+        selected_rows, config=config
+    )
+    ranking = _policy_statistics(candidate_rows)
+    seed_summary = summarize_seed_scores(seed_scores)
+    conclusions = _evidence_conclusions(aggregate)
+
+    csv_rows = _candidate_audit_rows(candidate_rows, config)
+    csv_rows.extend(
+        _selected_csv_rows(
+            selected_rows,
+            selected,
+            boundaries,
+            seed_scores,
+            config=config,
+        )
+    )
+    fieldnames = (
+        "row_type",
+        "split",
+        "policy_id",
+        "bank",
+        "distance",
+        "aggregation",
+        "seed",
+        "corruption",
+        "severity",
+        "method",
+        "point",
+        "lower",
+        "upper",
+        "count",
+    )
+    with (output / "results.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+
+    aggregate_metrics = {
+        name: asdict(getattr(aggregate, name))
+        for name in (
+            "fingerprint",
+            "confidence",
+            "entropy",
+            "fingerprint_minus_confidence",
+            "fingerprint_minus_entropy",
+            "conditional",
+        )
+    }
+    selected_payload = {**asdict(selected), "policy_id": selected.policy_id}
+    summary = {
+        "configuration": asdict(config),
+        "source_paths": {
+            "reference_run": str(reference_root),
+            "evaluation_benchmark": str(evaluation_root),
+            "annotations": str(annotations),
+            "output_dir": str(output),
+        },
+        "manifest_digests": {
+            "reference": reference_digest,
+            "evaluation": evaluation_digest,
+        },
+        "selected_policy": selected_payload,
+        "selection_ranking": ranking,
+        "aggregate_validation": aggregate_metrics,
+        "confidence_decile_boundaries": {
+            str(severity): list(values)
+            for severity, values in boundaries.items()
+        },
+        "seed_scores": {
+            str(seed): score for seed, score in sorted(seed_scores.items())
+        },
+        "seed_summary": asdict(seed_summary),
+        "infeasible_arms": infeasible,
+        "conclusions": conclusions,
+    }
+    (output / "summary.json").write_text(
+        json.dumps(summary, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    (output / "report.md").write_text(
+        _render_report(
+            selected_rows,
+            selected,
+            ranking,
+            aggregate,
+            seed_summary,
+            conclusions,
+            config=config,
+        ),
+        encoding="utf-8",
+    )
+    return StudyRunResult(
+        selected_policy=selected,
+        levels_read=levels_read,
+        reported_families=frozenset(config.families),
+        output_dir=output,
+    )
+
+
+def _build_parser() -> ArgumentParser:
+    parser = ArgumentParser(description="Run the lean strong-corruption study")
+    parser.add_argument("--reference-run", required=True)
+    parser.add_argument("--evaluation-benchmark", required=True)
+    parser.add_argument("--annotations", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--device", default="cuda:0")
+    return parser
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
+    run_study(
+        args.reference_run,
+        args.evaluation_benchmark,
+        args.annotations,
+        args.output_dir,
+        device=args.device,
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

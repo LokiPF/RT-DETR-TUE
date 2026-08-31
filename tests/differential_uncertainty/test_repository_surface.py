@@ -40,6 +40,7 @@ RETAINED_PYTHON = {
     "differential_uncertainty/persistence.py",
     "differential_uncertainty/reporting.py",
     "differential_uncertainty/scoring.py",
+    "differential_uncertainty/strong_corruption_study.py",
     "src/__init__.py",
     "src/nn/__init__.py",
     "src/nn/backbone/__init__.py",
@@ -69,6 +70,7 @@ RETAINED_PYTHON = {
     "tests/differential_uncertainty/test_reporting.py",
     "tests/differential_uncertainty/test_repository_surface.py",
     "tests/differential_uncertainty/test_scoring.py",
+    "tests/differential_uncertainty/test_strong_corruption_study.py",
 }
 
 
@@ -187,7 +189,7 @@ def test_repository_python_surface_is_exact():
         )
     }
 
-    assert len(RETAINED_PYTHON) == 46
+    assert len(RETAINED_PYTHON) == 48
     assert actual == RETAINED_PYTHON
 
 
