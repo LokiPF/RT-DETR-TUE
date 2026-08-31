@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 import torch
 
@@ -726,3 +727,304 @@ def test_score_image_group_rejects_duplicate_or_out_of_scope_severities(
             ),
             "mean_5_euclidean",
         )
+
+
+def synthetic_scores(
+    clean,
+    level4,
+    level5,
+    *,
+    family="fog",
+    split="selection",
+    policy=None,
+    confidence=None,
+    entropy=None,
+    raw_confidence=None,
+):
+    count = len(clean)
+    assert len(level4) == count and len(level5) == count
+    confidence = (clean, level4, level5) if confidence is None else confidence
+    entropy = (clean, level4, level5) if entropy is None else entropy
+    raw_confidence = (
+        ([0.8] * count, [0.8] * count, [0.8] * count)
+        if raw_confidence is None
+        else raw_confidence
+    )
+    rows = []
+    for severity, fingerprint_values, confidence_values, entropy_values, raw_values in zip(
+        (0, 4, 5),
+        (clean, level4, level5),
+        confidence,
+        entropy,
+        raw_confidence,
+        strict=True,
+    ):
+        for index, (fingerprint, confidence_value, entropy_value, raw_value) in enumerate(
+            zip(
+                fingerprint_values,
+                confidence_values,
+                entropy_values,
+                raw_values,
+                strict=True,
+            )
+        ):
+            row = {
+                "image_id": f"image-{index}",
+                "family": family,
+                "severity": severity,
+                "split": split,
+                "fingerprint": fingerprint,
+                "confidence": confidence_value,
+                "entropy": entropy_value,
+                "raw_confidence": raw_value,
+            }
+            if policy is not None:
+                row["policy"] = policy
+            rows.append(row)
+    return rows
+
+
+def synthetic_candidate_table(*, selection_winner, validation_offset):
+    policies = {
+        name: study.Policy(name, "mean_5_euclidean", "mean_all", 44)
+        for name in ("matched", "background")
+    }
+    loser = next(name for name in policies if name != selection_winner)
+    rows = []
+    rows.extend(
+        synthetic_scores(
+            [0.0, 0.0],
+            [2.0, 2.0],
+            [2.0, 2.0],
+            policy=policies[selection_winner],
+        )
+    )
+    rows.extend(
+        synthetic_scores(
+            [0.0, 1.0],
+            [0.5, 0.5],
+            [0.5, 0.5],
+            policy=policies[loser],
+        )
+    )
+    winner_validation = -validation_offset
+    loser_validation = validation_offset
+    rows.extend(
+        synthetic_scores(
+            [0.0, 0.0],
+            [2.0 + winner_validation] * 2,
+            [2.0 + winner_validation] * 2,
+            split="validation",
+            policy=policies[selection_winner],
+        )
+    )
+    rows.extend(
+        synthetic_scores(
+            [0.0, 1.0],
+            [0.5 + loser_validation] * 2,
+            [0.5 + loser_validation] * 2,
+            split="validation",
+            policy=policies[loser],
+        )
+    )
+    return rows
+
+
+def test_level_four_and_five_are_not_pooled():
+    rows = synthetic_scores(clean=[0, 1], level4=[2, 3], level5=[0.5, 1.5])
+
+    result = study.per_family_aurocs(rows, method="fingerprint")["fog"]
+
+    assert (result.level4, result.level5, result.strong) == (1.0, 0.75, 0.875)
+
+
+def test_auroc_counts_score_ties_as_one_half_and_higher_as_corruption():
+    rows = synthetic_scores(clean=[0, 1], level4=[1, 2], level5=[1, 2])
+
+    result = study.per_family_aurocs(rows, method="fingerprint")["fog"]
+
+    assert result.level4 == pytest.approx(0.875)
+    assert result.level5 == pytest.approx(0.875)
+
+
+def test_validation_values_cannot_change_selection():
+    first = synthetic_candidate_table(
+        selection_winner="matched", validation_offset=0
+    )
+    changed = synthetic_candidate_table(
+        selection_winner="matched", validation_offset=10_000
+    )
+
+    assert study.select_policy(first).policy_id == study.select_policy(changed).policy_id
+
+
+def _policy_rows(policy, family_aurocs):
+    rows = []
+    score_values = {
+        1.0: ([0.0, 1.0], [2.0, 3.0]),
+        0.75: ([0.0, 1.0], [0.5, 1.5]),
+        0.5: ([0.0, 1.0], [0.5, 0.5]),
+    }
+    for family, auroc in family_aurocs.items():
+        clean, corrupted = score_values[auroc]
+        rows.extend(
+            synthetic_scores(
+                clean,
+                corrupted,
+                corrupted,
+                family=family,
+                policy=policy,
+            )
+        )
+    return rows
+
+
+def test_select_policy_uses_family_median_after_equal_family_mean():
+    lower_median = study.Policy("matched", "mean_5_euclidean", "mean_all", 44)
+    higher_median = study.Policy(
+        "background", "mean_5_euclidean", "mean_all", 44
+    )
+    rows = _policy_rows(lower_median, {"fog": 1.0, "snow": 0.5, "frost": 0.5})
+    rows += _policy_rows(
+        higher_median, {"fog": 0.75, "snow": 0.75, "frost": 0.5}
+    )
+
+    assert study.select_policy(rows) == higher_median
+
+
+def test_select_policy_uses_lexicographic_policy_id_as_final_tie_breaker():
+    first = study.Policy("background", "mean_5_euclidean", "mean_all", 44)
+    second = study.Policy("matched", "mean_5_euclidean", "mean_all", 44)
+    rows = _policy_rows(first, {"fog": 0.75})
+    rows += _policy_rows(second, {"fog": 0.75})
+
+    assert study.select_policy(rows) == min((first, second), key=lambda item: item.policy_id)
+
+
+def test_confidence_deciles_accept_selection_rows_only():
+    rows = synthetic_scores(
+        [0.2, 0.3],
+        [0.7, 0.8],
+        [0.4, 0.5],
+        raw_confidence=([0.2, 0.3], [0.7, 0.8], [0.4, 0.5]),
+    )
+    expected = tuple(np.quantile([0.2, 0.3, 0.7, 0.8], np.arange(0.1, 1.0, 0.1)))
+
+    assert study.confidence_decile_boundaries(rows, severity=4) == pytest.approx(
+        expected
+    )
+    with pytest.raises(ValueError, match="selection-only"):
+        study.confidence_decile_boundaries(
+            rows + synthetic_scores([0.0], [0.0], [0.0], split="validation"),
+            severity=4,
+        )
+
+
+def synthetic_cross_stratum_pair():
+    return synthetic_scores(
+        [0.0],
+        [1.0],
+        [1.0],
+        raw_confidence=([0.4], [0.6], [0.6]),
+    )
+
+
+def test_empty_confidence_conditioned_task_is_inconclusive():
+    result = study.confidence_conditioned_concordance(
+        synthetic_cross_stratum_pair(), family="fog", severity=4, boundaries=(0.5,)
+    )
+
+    assert result.pair_count == 0
+    assert result.point is None
+
+
+def test_confidence_conditioned_concordance_uses_same_strata_and_half_ties():
+    rows = synthetic_scores(
+        [0.0, 1.0, 0.0],
+        [1.0, 1.0, 2.0],
+        [1.0, 1.0, 2.0],
+        raw_confidence=(
+            [0.2, 0.8, 0.2],
+            [0.3, 0.7, 0.8],
+            [0.3, 0.7, 0.8],
+        ),
+    )
+
+    result = study.confidence_conditioned_concordance(
+        rows, family="fog", severity=4, boundaries=(0.5,)
+    )
+
+    assert result.point == pytest.approx(0.75)
+    assert result.pair_count == 2
+
+
+def test_paired_bootstrap_reuses_draws_for_methods_and_differences():
+    rows = []
+    for family, shift in (("fog", 0.0), ("snow", 0.25)):
+        fingerprint = (
+            [0.0 + shift, 1.0 + shift, 2.0 + shift],
+            [0.5 + shift, 2.0 + shift, 3.0 + shift],
+            [0.25 + shift, 1.5 + shift, 4.0 + shift],
+        )
+        rows.extend(
+            synthetic_scores(
+                *fingerprint,
+                family=family,
+                split="validation",
+                confidence=fingerprint,
+                entropy=(fingerprint[0], fingerprint[2], fingerprint[1]),
+                raw_confidence=([0.7] * 3, [0.7] * 3, [0.7] * 3),
+            )
+        )
+
+    result = study.paired_validation_bootstrap(
+        rows,
+        boundaries_by_severity={4: (), 5: ()},
+        samples=50,
+        seed=17,
+    )
+    repeated = study.paired_validation_bootstrap(
+        rows,
+        boundaries_by_severity={4: (), 5: ()},
+        samples=50,
+        seed=17,
+    )
+    fog_level4 = study.paired_validation_bootstrap(
+        rows,
+        boundaries_by_severity={4: (), 5: ()},
+        samples=50,
+        seed=17,
+        family="fog",
+        severity=4,
+    )
+
+    assert result == repeated
+    assert result.fingerprint == result.confidence
+    assert result.fingerprint_minus_confidence.point == pytest.approx(0.0)
+    assert result.fingerprint_minus_confidence.lower == pytest.approx(0.0)
+    assert result.fingerprint_minus_confidence.upper == pytest.approx(0.0)
+    assert result.fingerprint.count == 3
+    assert result.conditional.count == 12
+    assert fog_level4.fingerprint.point == pytest.approx(
+        study.per_family_aurocs(
+            [row for row in rows if row["family"] == "fog"],
+            method="fingerprint",
+        )["fog"].level4
+    )
+    assert fog_level4.conditional.count == 3
+
+
+def test_seed_summary_is_numeric_and_uses_population_standard_deviation():
+    result = study.summarize_seed_scores({42: 0.5, 43: 0.7})
+
+    assert result.mean == pytest.approx(0.6)
+    assert result.standard_deviation == pytest.approx(0.1)
+    assert result.minimum == pytest.approx(0.5)
+    assert result.maximum == pytest.approx(0.7)
+
+
+def test_per_family_aurocs_rejects_incomplete_groups():
+    rows = synthetic_scores([0.0], [1.0], [2.0])
+
+    with pytest.raises(ValueError, match="exactly one score at levels 0, 4, and 5"):
+        study.per_family_aurocs(rows[:-1], method="fingerprint")

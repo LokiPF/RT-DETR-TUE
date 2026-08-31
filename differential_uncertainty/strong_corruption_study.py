@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from numbers import Integral, Real
 
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ from scipy.optimize import linear_sum_assignment
 from torch import Tensor
 
 from .corruptions.imagecorruptions import ADDITIONAL_IMAGECORRUPTIONS
+from .evaluation import binary_auroc
 from .scoring import detect_padded_tail, union_padded_query_ids
 
 
@@ -96,6 +98,48 @@ class ImageScore:
     raw_confidence: float
     confidence_score: float
     entropy_score: float
+
+
+@dataclass(frozen=True)
+class FamilyResult:
+    family: str
+    level4: float
+    level5: float
+    strong: float
+
+
+@dataclass(frozen=True)
+class ConditionalResult:
+    family: str
+    severity: int
+    point: float | None
+    pair_count: int
+
+
+@dataclass(frozen=True)
+class ScoreInterval:
+    point: float | None
+    lower: float | None
+    upper: float | None
+    count: int
+
+
+@dataclass(frozen=True)
+class ValidationBootstrap:
+    fingerprint: ScoreInterval
+    confidence: ScoreInterval
+    entropy: ScoreInterval
+    fingerprint_minus_confidence: ScoreInterval
+    fingerprint_minus_entropy: ScoreInterval
+    conditional: ScoreInterval
+
+
+@dataclass(frozen=True)
+class SeedSummary:
+    mean: float
+    standard_deviation: float
+    minimum: float
+    maximum: float
 
 
 def split_image_ids(image_ids, selection_count: int) -> ImageSplit:
@@ -673,3 +717,495 @@ def score_image_group(records, bank: Bank, distance: str) -> list[ImageScore]:
             )
         )
     return rows
+
+
+def _finite_row_score(row: Mapping, field: str, *, context: str) -> float:
+    if field not in row:
+        raise ValueError(f"{context} is missing required score {field!r}")
+    value = row[field]
+    if isinstance(value, (bool, np.bool_)) or not isinstance(value, Real):
+        raise ValueError(f"{context} score {field!r} must be a real number")
+    result = float(value)
+    if not np.isfinite(result):
+        raise ValueError(f"{context} score {field!r} must be finite")
+    return result
+
+
+def _complete_score_groups(rows, fields: tuple[str, ...]):
+    groups: dict[str, dict[str, dict[int, Mapping]]] = {}
+    for row_index, row in enumerate(rows):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"score row {row_index} must be a mapping")
+        context = f"score row {row_index}"
+        for field in ("image_id", "family", "severity"):
+            if field not in row:
+                raise ValueError(f"{context} is missing required field {field!r}")
+        image_id = row["image_id"]
+        family = row["family"]
+        severity = row["severity"]
+        if not isinstance(image_id, str) or not image_id.strip():
+            raise ValueError(f"{context} image_id must be a nonempty string")
+        if not isinstance(family, str) or not family.strip():
+            raise ValueError(f"{context} family must be a nonempty string")
+        if isinstance(severity, bool) or not isinstance(severity, Integral):
+            raise ValueError(f"{context} severity must be an integer")
+        severity = int(severity)
+        if severity not in (0, 4, 5):
+            raise ValueError(f"{context} severity must be one of 0, 4, and 5")
+        for field in fields:
+            _finite_row_score(row, field, context=context)
+
+        severity_rows = groups.setdefault(family, {}).setdefault(image_id, {})
+        if severity in severity_rows:
+            raise ValueError(
+                f"duplicate score for family {family!r}, image {image_id!r}, "
+                f"severity {severity}"
+            )
+        severity_rows[severity] = row
+
+    if not groups:
+        raise ValueError("score evaluation needs at least one complete image group")
+    for family, image_rows in groups.items():
+        for image_id, severity_rows in image_rows.items():
+            if set(severity_rows) != {0, 4, 5}:
+                raise ValueError(
+                    f"family {family!r}, image {image_id!r} must have exactly one "
+                    "score at levels 0, 4, and 5"
+                )
+    return groups
+
+
+def per_family_aurocs(rows, *, method: str) -> dict[str, FamilyResult]:
+    if not isinstance(method, str) or not method:
+        raise ValueError("method must be a nonempty score-field name")
+    groups = _complete_score_groups(rows, (method,))
+    results = {}
+    for family in sorted(groups):
+        image_rows = groups[family]
+        ordered_ids = sorted(image_rows)
+        clean = [
+            _finite_row_score(
+                image_rows[image_id][0], method, context=f"{family}/{image_id}/0"
+            )
+            for image_id in ordered_ids
+        ]
+        level4 = binary_auroc(
+            clean,
+            [
+                _finite_row_score(
+                    image_rows[image_id][4],
+                    method,
+                    context=f"{family}/{image_id}/4",
+                )
+                for image_id in ordered_ids
+            ],
+            orientation=1,
+        )
+        level5 = binary_auroc(
+            clean,
+            [
+                _finite_row_score(
+                    image_rows[image_id][5],
+                    method,
+                    context=f"{family}/{image_id}/5",
+                )
+                for image_id in ordered_ids
+            ],
+            orientation=1,
+        )
+        results[family] = FamilyResult(
+            family=family,
+            level4=level4,
+            level5=level5,
+            strong=(level4 + level5) / 2,
+        )
+    return results
+
+
+def select_policy(candidate_rows) -> Policy:
+    selection_by_policy: dict[Policy, list[Mapping]] = {}
+    for row_index, row in enumerate(candidate_rows):
+        if not isinstance(row, Mapping):
+            raise ValueError(f"candidate row {row_index} must be a mapping")
+        split = row.get("split")
+        if split not in ("selection", "validation"):
+            raise ValueError(
+                f"candidate row {row_index} split must be selection or validation"
+            )
+        if split == "validation":
+            continue
+        policy = row.get("policy")
+        if not isinstance(policy, Policy):
+            raise ValueError(
+                f"selection candidate row {row_index} must contain a Policy"
+            )
+        selection_by_policy.setdefault(policy, []).append(row)
+
+    if not selection_by_policy:
+        raise ValueError("policy selection needs at least one selection candidate")
+
+    panel = None
+    ranking = []
+    for policy, rows in selection_by_policy.items():
+        current_panel = {
+            (str(row["family"]), str(row["image_id"]), int(row["severity"]))
+            for row in rows
+        }
+        if panel is None:
+            panel = current_panel
+        elif current_panel != panel:
+            raise ValueError("selection candidates must cover the same score panel")
+        family_results = per_family_aurocs(rows, method="fingerprint")
+        strong = np.asarray(
+            [result.strong for result in family_results.values()], dtype=float
+        )
+        ranking.append(
+            (
+                -float(strong.mean()),
+                -float(np.median(strong)),
+                policy.policy_id,
+                policy,
+            )
+        )
+    return min(ranking)[-1]
+
+
+def confidence_decile_boundaries(rows, *, severity: int) -> tuple[float, ...]:
+    if severity not in (4, 5):
+        raise ValueError("confidence deciles require severity 4 or 5")
+    rows = list(rows)
+    if any(
+        not isinstance(row, Mapping) or row.get("split") != "selection"
+        for row in rows
+    ):
+        raise ValueError("confidence deciles require selection-only rows")
+    groups = _complete_score_groups(rows, ("raw_confidence",))
+    values = []
+    for family in sorted(groups):
+        for image_id in sorted(groups[family]):
+            for level in (0, severity):
+                values.append(
+                    _finite_row_score(
+                        groups[family][image_id][level],
+                        "raw_confidence",
+                        context=f"{family}/{image_id}/{level}",
+                    )
+                )
+    quantiles = np.quantile(values, np.arange(0.1, 1.0, 0.1))
+    return tuple(float(value) for value in np.unique(quantiles))
+
+
+def _validated_boundaries(boundaries) -> tuple[float, ...]:
+    values = np.asarray(tuple(boundaries), dtype=float)
+    if values.ndim != 1 or not bool(np.isfinite(values).all()):
+        raise ValueError("confidence boundaries must be a finite sequence")
+    if values.size > 1 and bool(np.any(np.diff(values) < 0)):
+        raise ValueError("confidence boundaries must be sorted")
+    return tuple(float(value) for value in np.unique(values))
+
+
+def _stratum(value: float, boundaries: tuple[float, ...]) -> int:
+    return int(np.searchsorted(boundaries, value, side="right"))
+
+
+def _ordering_credit(clean: float, corrupted: float) -> float:
+    if corrupted > clean:
+        return 1.0
+    if corrupted == clean:
+        return 0.5
+    return 0.0
+
+
+def confidence_conditioned_concordance(
+    rows, *, family: str, severity: int, boundaries
+) -> ConditionalResult:
+    if not isinstance(family, str) or not family:
+        raise ValueError("conditional concordance requires a nonempty family")
+    if severity not in (4, 5):
+        raise ValueError("conditional concordance requires severity 4 or 5")
+    boundaries = _validated_boundaries(boundaries)
+    family_rows = [
+        row
+        for row in rows
+        if isinstance(row, Mapping) and row.get("family") == family
+    ]
+    groups = _complete_score_groups(
+        family_rows, ("fingerprint", "raw_confidence")
+    )
+    image_rows = groups[family]
+    credits = []
+    for image_id in sorted(image_rows):
+        clean = image_rows[image_id][0]
+        corrupted = image_rows[image_id][severity]
+        clean_confidence = _finite_row_score(
+            clean, "raw_confidence", context=f"{family}/{image_id}/0"
+        )
+        corrupted_confidence = _finite_row_score(
+            corrupted,
+            "raw_confidence",
+            context=f"{family}/{image_id}/{severity}",
+        )
+        if _stratum(clean_confidence, boundaries) != _stratum(
+            corrupted_confidence, boundaries
+        ):
+            continue
+        credits.append(
+            _ordering_credit(
+                _finite_row_score(
+                    clean, "fingerprint", context=f"{family}/{image_id}/0"
+                ),
+                _finite_row_score(
+                    corrupted,
+                    "fingerprint",
+                    context=f"{family}/{image_id}/{severity}",
+                ),
+            )
+        )
+    return ConditionalResult(
+        family=family,
+        severity=severity,
+        point=None if not credits else float(np.mean(credits)),
+        pair_count=len(credits),
+    )
+
+
+def _selected_families_and_severities(groups, family, severity):
+    if family is not None:
+        if family not in groups:
+            raise ValueError(f"unknown validation family {family!r}")
+        families = (family,)
+    else:
+        families = tuple(sorted(groups))
+    if severity is not None and severity not in (4, 5):
+        raise ValueError("validation bootstrap severity must be 4 or 5")
+    severities = (4, 5) if severity is None else (severity,)
+    return families, severities
+
+
+def _validation_metric(
+    groups,
+    sampled_ids,
+    method: str,
+    *,
+    families: tuple[str, ...],
+    severities: tuple[int, ...],
+) -> float:
+    family_values = []
+    for family in families:
+        image_rows = groups[family]
+        clean = [
+            _finite_row_score(
+                image_rows[image_id][0], method, context=f"{family}/{image_id}/0"
+            )
+            for image_id in sampled_ids
+        ]
+        level_values = []
+        for severity in severities:
+            corrupted = [
+                _finite_row_score(
+                    image_rows[image_id][severity],
+                    method,
+                    context=f"{family}/{image_id}/{severity}",
+                )
+                for image_id in sampled_ids
+            ]
+            level_values.append(binary_auroc(clean, corrupted, orientation=1))
+        family_values.append(float(np.mean(level_values)))
+    return float(np.mean(family_values))
+
+
+def _conditional_metric(
+    groups,
+    sampled_ids,
+    boundaries_by_severity,
+    *,
+    families: tuple[str, ...],
+    severities: tuple[int, ...],
+) -> tuple[float | None, int]:
+    credits = []
+    for image_id in sampled_ids:
+        for family in families:
+            image_rows = groups[family][image_id]
+            clean = image_rows[0]
+            clean_confidence = _finite_row_score(
+                clean, "raw_confidence", context=f"{family}/{image_id}/0"
+            )
+            clean_fingerprint = _finite_row_score(
+                clean, "fingerprint", context=f"{family}/{image_id}/0"
+            )
+            for severity in severities:
+                corrupted = image_rows[severity]
+                corrupted_confidence = _finite_row_score(
+                    corrupted,
+                    "raw_confidence",
+                    context=f"{family}/{image_id}/{severity}",
+                )
+                boundaries = boundaries_by_severity[severity]
+                if _stratum(clean_confidence, boundaries) != _stratum(
+                    corrupted_confidence, boundaries
+                ):
+                    continue
+                credits.append(
+                    _ordering_credit(
+                        clean_fingerprint,
+                        _finite_row_score(
+                            corrupted,
+                            "fingerprint",
+                            context=f"{family}/{image_id}/{severity}",
+                        ),
+                    )
+                )
+    return (None, 0) if not credits else (float(np.mean(credits)), len(credits))
+
+
+def _score_interval(point, draws, *, count: int) -> ScoreInterval:
+    values = np.asarray(draws, dtype=float)
+    finite = values[np.isfinite(values)]
+    if point is None or finite.size == 0:
+        return ScoreInterval(point=point, lower=None, upper=None, count=count)
+    lower, upper = np.percentile(finite, (2.5, 97.5))
+    return ScoreInterval(
+        point=float(point),
+        lower=float(lower),
+        upper=float(upper),
+        count=count,
+    )
+
+
+def paired_validation_bootstrap(
+    rows,
+    *,
+    boundaries_by_severity: Mapping[int, Sequence[float]],
+    samples: int,
+    seed: int,
+    family: str | None = None,
+    severity: int | None = None,
+) -> ValidationBootstrap:
+    if isinstance(samples, bool) or not isinstance(samples, Integral) or samples <= 0:
+        raise ValueError("bootstrap samples must be a positive integer")
+    if isinstance(seed, bool) or not isinstance(seed, Integral) or seed < 0:
+        raise ValueError("bootstrap seed must be a non-negative integer")
+    rows = list(rows)
+    if any(
+        not isinstance(row, Mapping) or row.get("split") != "validation"
+        for row in rows
+    ):
+        raise ValueError("paired bootstrap requires validation-only rows")
+    groups = _complete_score_groups(
+        rows, ("fingerprint", "confidence", "entropy", "raw_confidence")
+    )
+    if set(boundaries_by_severity) != {4, 5}:
+        raise ValueError("confidence boundaries are required for severities 4 and 5")
+    boundaries = {
+        level: _validated_boundaries(boundaries_by_severity[level])
+        for level in (4, 5)
+    }
+    families, severities = _selected_families_and_severities(
+        groups, family, severity
+    )
+
+    image_id_sets = {frozenset(image_rows) for image_rows in groups.values()}
+    if len(image_id_sets) != 1:
+        raise ValueError("every validation family must cover the same image IDs")
+    ordered_ids = tuple(sorted(next(iter(image_id_sets))))
+    count = len(ordered_ids)
+    identity_ids = ordered_ids
+    method_points = {
+        method: _validation_metric(
+            groups,
+            identity_ids,
+            method,
+            families=families,
+            severities=severities,
+        )
+        for method in ("fingerprint", "confidence", "entropy")
+    }
+    conditional_point, conditional_count = _conditional_metric(
+        groups,
+        identity_ids,
+        boundaries,
+        families=families,
+        severities=severities,
+    )
+
+    generator = np.random.default_rng(int(seed))
+    draw_indices = generator.integers(0, count, size=(int(samples), count))
+    method_draws = {
+        method: np.empty(int(samples), dtype=float)
+        for method in ("fingerprint", "confidence", "entropy")
+    }
+    conditional_draws = np.full(int(samples), np.nan, dtype=float)
+    for draw_index, indices in enumerate(draw_indices):
+        sampled_ids = tuple(ordered_ids[int(index)] for index in indices)
+        for method in method_draws:
+            method_draws[method][draw_index] = _validation_metric(
+                groups,
+                sampled_ids,
+                method,
+                families=families,
+                severities=severities,
+            )
+        conditional_value, _ = _conditional_metric(
+            groups,
+            sampled_ids,
+            boundaries,
+            families=families,
+            severities=severities,
+        )
+        if conditional_value is not None:
+            conditional_draws[draw_index] = conditional_value
+
+    fingerprint_minus_confidence = (
+        method_draws["fingerprint"] - method_draws["confidence"]
+    )
+    fingerprint_minus_entropy = (
+        method_draws["fingerprint"] - method_draws["entropy"]
+    )
+    return ValidationBootstrap(
+        fingerprint=_score_interval(
+            method_points["fingerprint"], method_draws["fingerprint"], count=count
+        ),
+        confidence=_score_interval(
+            method_points["confidence"], method_draws["confidence"], count=count
+        ),
+        entropy=_score_interval(
+            method_points["entropy"], method_draws["entropy"], count=count
+        ),
+        fingerprint_minus_confidence=_score_interval(
+            method_points["fingerprint"] - method_points["confidence"],
+            fingerprint_minus_confidence,
+            count=count,
+        ),
+        fingerprint_minus_entropy=_score_interval(
+            method_points["fingerprint"] - method_points["entropy"],
+            fingerprint_minus_entropy,
+            count=count,
+        ),
+        conditional=_score_interval(
+            conditional_point,
+            conditional_draws,
+            count=conditional_count,
+        ),
+    )
+
+
+def summarize_seed_scores(scores: Mapping[int, Real]) -> SeedSummary:
+    if not isinstance(scores, Mapping) or not scores:
+        raise ValueError("seed summary needs at least one supplied score")
+    values = []
+    for seed, score in scores.items():
+        if isinstance(seed, bool) or not isinstance(seed, Integral):
+            raise ValueError("seed summary keys must be integers")
+        if isinstance(score, (bool, np.bool_)) or not isinstance(score, Real):
+            raise ValueError("seed summary scores must be real numbers")
+        value = float(score)
+        if not np.isfinite(value):
+            raise ValueError("seed summary scores must be finite")
+        values.append(value)
+    array = np.asarray(values, dtype=float)
+    return SeedSummary(
+        mean=float(array.mean()),
+        standard_deviation=float(array.std(ddof=0)),
+        minimum=float(array.min()),
+        maximum=float(array.max()),
+    )
