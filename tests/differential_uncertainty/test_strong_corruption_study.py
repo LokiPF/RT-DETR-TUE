@@ -420,6 +420,11 @@ def test_tiny_study_writes_exact_cache_and_report_contract(tiny_study, tmp_path)
         "highest-confidence retained query."
     ) in report
     assert "family/image union-unpadded query set" in report
+    assert (
+        "Exploratory coverage: all 4 family/severity tasks were nonempty, but 4 "
+        "had at most 5 eligible pairs and 0 had 1; this supports a conditional "
+        "signal, not uniform per-corruption complementarity."
+    ) in report
     for family in tiny_study.config.families:
         assert report.count(f"{family} |") == 2
     assert report.rstrip().endswith("Levels 1 through 3 were not evaluated.")

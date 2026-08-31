@@ -2272,6 +2272,7 @@ def _render_report(
     selected: Policy,
     ranking,
     aggregate: ValidationBootstrap,
+    task_bootstraps: Mapping[tuple[str, int], ValidationBootstrap],
     seed_summary: SeedSummary,
     conclusions: Mapping[str, str],
     *,
@@ -2284,6 +2285,22 @@ def _render_report(
         method: per_family_aurocs(validation_rows, method=method)
         for method in ("fingerprint", "confidence", "entropy")
     }
+    conditional_counts = [
+        result.conditional.count for result in task_bootstraps.values()
+    ]
+    nonempty = sum(count > 0 for count in conditional_counts)
+    coverage = (
+        f"all {len(conditional_counts)}"
+        if nonempty == len(conditional_counts)
+        else f"{nonempty} of {len(conditional_counts)}"
+    )
+    coverage_line = (
+        f"Exploratory coverage: {coverage} family/severity tasks were nonempty, "
+        f"but {sum(0 < count <= 5 for count in conditional_counts)} had at most "
+        f"5 eligible pairs and {sum(count == 1 for count in conditional_counts)} "
+        "had 1; this supports a conditional signal, not uniform per-corruption "
+        "complementarity."
+    )
     lines = [
         "# Strong corruption fingerprint study",
         "",
@@ -2377,6 +2394,7 @@ def _render_report(
                 f"{_format_number(aggregate.conditional.upper)}], "
                 f"eligible pairs={aggregate.conditional.count}."
             ),
+            coverage_line,
             (
                 "Seed sensitivity: "
                 f"mean={seed_summary.mean:.4f}, "
@@ -2637,6 +2655,7 @@ def run_study(
             selected,
             ranking,
             aggregate,
+            task_bootstraps,
             seed_summary,
             conclusions,
             config=config,
