@@ -157,7 +157,7 @@ def tiny_study(tmp_path):
             ),
             "logits": torch.stack(
                 (
-                    3.0 - severity_offset - query / 20,
+                    3.0 - query / 20,
                     -1.0 + query / 30,
                 ),
                 dim=1,
@@ -382,6 +382,25 @@ def test_tiny_study_writes_exact_cache_and_report_contract(tiny_study, tmp_path)
         )
     }
     assert len([row for row in rows if row["row_type"] == "seed"]) == 5
+    interval_rows = [
+        row
+        for row in rows
+        if row["row_type"]
+        in {"selected_method", "paired_difference", "conditional"}
+    ]
+    assert interval_rows
+    for row in interval_rows:
+        assert row["lower"] != "" and row["upper"] != ""
+        lower = float(row["lower"])
+        upper = float(row["upper"])
+        point = float(row["point"])
+        assert lower <= upper
+        if row["row_type"] != "paired_difference":
+            assert 0.0 <= lower <= upper <= 1.0
+            assert 0.0 <= point <= 1.0
+        else:
+            assert -1.0 <= lower <= upper <= 1.0
+            assert -1.0 <= point <= 1.0
 
     summary = json.loads((output / "summary.json").read_text(encoding="utf-8"))
     assert set(summary["conclusions"]) == {
@@ -408,7 +427,8 @@ def test_evidence_conclusions_use_the_three_fixed_thresholds():
             fingerprint_minus_confidence=interval(-0.1, -0.2, 0.0, 2),
             fingerprint_minus_entropy=interval(0.2, 0.1, 0.3, 2),
             conditional=interval(0.7, 0.5, 0.8, 3),
-        )
+        ),
+        conditional_complete=True,
     )
 
     assert result == {
@@ -419,6 +439,93 @@ def test_evidence_conclusions_use_the_three_fixed_thresholds():
     assert study._evidence_status(interval(None, None, None, 0), 0.5) == (
         "inconclusive"
     )
+
+
+def test_incomplete_conditional_tasks_override_a_supported_pooled_interval():
+    interval = study.ScoreInterval
+    pooled = study.ValidationBootstrap(
+        fingerprint=interval(0.9, 0.8, 1.0, 2),
+        confidence=interval(0.5, 0.4, 0.6, 2),
+        entropy=interval(0.5, 0.4, 0.6, 2),
+        fingerprint_minus_confidence=interval(0.4, 0.2, 0.6, 2),
+        fingerprint_minus_entropy=interval(0.4, 0.2, 0.6, 2),
+        conditional=interval(1.0, 1.0, 1.0, 3),
+    )
+
+    assert study._evidence_conclusions(
+        pooled, conditional_complete=False
+    )["information_after_confidence"] == "inconclusive"
+
+
+def test_selected_csv_rows_preserve_each_task_interval():
+    interval = study.ScoreInterval
+    bootstrap = study.ValidationBootstrap(
+        fingerprint=interval(0.61, 0.51, 0.71, 2),
+        confidence=interval(0.62, 0.52, 0.72, 2),
+        entropy=interval(0.63, 0.53, 0.73, 2),
+        fingerprint_minus_confidence=interval(-0.01, -0.11, 0.09, 2),
+        fingerprint_minus_entropy=interval(-0.02, -0.12, 0.08, 2),
+        conditional=interval(0.64, 0.54, 0.74, 3),
+    )
+    config = StudyConfig(families=("fog",))
+    policy = study.Policy(
+        "matched", "mean_5_euclidean", "mean_all", config.primary_seed
+    )
+    rows = study._selected_csv_rows(
+        policy,
+        {("fog", 4): bootstrap, ("fog", 5): bootstrap},
+        {seed: 0.5 for seed in config.sensitivity_seeds},
+        config=config,
+    )
+    expected = {
+        "fingerprint": bootstrap.fingerprint,
+        "direct_confidence_max": bootstrap.confidence,
+        "softmax_entropy_top_confidence_query": bootstrap.entropy,
+        "fingerprint_minus_confidence": bootstrap.fingerprint_minus_confidence,
+        "fingerprint_minus_entropy": bootstrap.fingerprint_minus_entropy,
+        "confidence_conditioned_concordance": bootstrap.conditional,
+    }
+
+    for row in rows:
+        if row["row_type"] not in {
+            "selected_method",
+            "paired_difference",
+            "conditional",
+        }:
+            continue
+        wanted = expected[row["method"]]
+        assert (
+            row["point"],
+            row["lower"],
+            row["upper"],
+            row["count"],
+        ) == (wanted.point, wanted.lower, wanted.upper, wanted.count)
+
+
+def test_tiny_study_requires_every_configured_roster_family(
+    tiny_study, tmp_path
+):
+    roster_path = tiny_study.evaluation_root / "corruption-roster.json"
+    roster = json.loads(roster_path.read_text(encoding="utf-8"))
+    roster["corruptions"] = [
+        corruption
+        for corruption in roster["corruptions"]
+        if corruption["name"] != "snow"
+    ]
+    roster_path.write_text(json.dumps(roster), encoding="utf-8")
+
+    with pytest.raises(
+        ValueError,
+        match="configured corruption family 'snow' must occur exactly once",
+    ):
+        study.run_study(
+            tiny_study.reference_root,
+            tiny_study.evaluation_root,
+            tiny_study.annotations,
+            tmp_path / "output",
+            config=tiny_study.config,
+            device="cpu",
+        )
 
 
 def test_valid_distance_caches_are_reused(tiny_study, tmp_path, monkeypatch):

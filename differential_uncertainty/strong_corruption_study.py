@@ -1795,14 +1795,18 @@ def _evidence_status(interval: ScoreInterval, threshold: float) -> str:
     return "inconclusive"
 
 
-def _evidence_conclusions(bootstrap: ValidationBootstrap) -> dict[str, str]:
+def _evidence_conclusions(
+    bootstrap: ValidationBootstrap, *, conditional_complete: bool
+) -> dict[str, str]:
     return {
         "detects_corruption": _evidence_status(bootstrap.fingerprint, 0.5),
         "better_than_confidence": _evidence_status(
             bootstrap.fingerprint_minus_confidence, 0.0
         ),
-        "information_after_confidence": _evidence_status(
-            bootstrap.conditional, 0.5
+        "information_after_confidence": (
+            _evidence_status(bootstrap.conditional, 0.5)
+            if conditional_complete
+            else "inconclusive"
         ),
     }
 
@@ -2044,7 +2048,11 @@ def _validation_evidence(
     selected_rows,
     *,
     config: StudyConfig,
-) -> tuple[dict[int, tuple[float, ...]], ValidationBootstrap]:
+) -> tuple[
+    dict[int, tuple[float, ...]],
+    ValidationBootstrap,
+    dict[tuple[str, int], ValidationBootstrap],
+]:
     selection_rows = [
         row for row in selected_rows if row["split"] == "selection"
     ]
@@ -2063,20 +2071,28 @@ def _validation_evidence(
         samples=config.bootstrap_draws,
         seed=config.bootstrap_seed,
     )
-    return boundaries, aggregate
+    by_task = {
+        (family, severity): paired_validation_bootstrap(
+            validation_rows,
+            boundaries_by_severity=boundaries,
+            samples=config.bootstrap_draws,
+            seed=config.bootstrap_seed,
+            family=family,
+            severity=severity,
+        )
+        for family in config.families
+        for severity in (4, 5)
+    }
+    return boundaries, aggregate, by_task
 
 
 def _selected_csv_rows(
-    selected_rows,
     selected: Policy,
-    boundaries: Mapping[int, Sequence[float]],
+    task_bootstraps: Mapping[tuple[str, int], ValidationBootstrap],
     seed_scores: Mapping[int, float],
     *,
     config: StudyConfig,
 ) -> list[dict]:
-    validation_rows = [
-        row for row in selected_rows if row["split"] == "validation"
-    ]
     output = []
     methods = (
         ("fingerprint", "fingerprint"),
@@ -2086,15 +2102,10 @@ def _selected_csv_rows(
             "entropy",
         ),
     )
-    family_results = {
-        field: per_family_aurocs(validation_rows, method=field)
-        for _name, field in methods
-    }
     for family in config.families:
         for severity in (4, 5):
-            for method_name, field in methods:
-                result = family_results[field][family]
-                point = result.level4 if severity == 4 else result.level5
+            bootstrap = task_bootstraps[(family, severity)]
+            for method_name, interval_name in methods:
                 output.append(
                     _result_row(
                         "selected_method",
@@ -2103,20 +2114,9 @@ def _selected_csv_rows(
                         corruption=family,
                         severity=severity,
                         method=method_name,
-                        point=point,
-                        count=config.validation_count,
+                        interval=getattr(bootstrap, interval_name),
                     )
                 )
-            fingerprint = family_results["fingerprint"][family]
-            confidence = family_results["confidence"][family]
-            entropy = family_results["entropy"][family]
-            fingerprint_point = (
-                fingerprint.level4 if severity == 4 else fingerprint.level5
-            )
-            confidence_point = (
-                confidence.level4 if severity == 4 else confidence.level5
-            )
-            entropy_point = entropy.level4 if severity == 4 else entropy.level5
             output.append(
                 _result_row(
                     "paired_difference",
@@ -2125,8 +2125,7 @@ def _selected_csv_rows(
                     corruption=family,
                     severity=severity,
                     method="fingerprint_minus_confidence",
-                    point=fingerprint_point - confidence_point,
-                    count=config.validation_count,
+                    interval=bootstrap.fingerprint_minus_confidence,
                 )
             )
             output.append(
@@ -2137,15 +2136,8 @@ def _selected_csv_rows(
                     corruption=family,
                     severity=severity,
                     method="fingerprint_minus_entropy",
-                    point=fingerprint_point - entropy_point,
-                    count=config.validation_count,
+                    interval=bootstrap.fingerprint_minus_entropy,
                 )
-            )
-            conditional = confidence_conditioned_concordance(
-                validation_rows,
-                family=family,
-                severity=severity,
-                boundaries=boundaries[severity],
             )
             output.append(
                 _result_row(
@@ -2155,8 +2147,7 @@ def _selected_csv_rows(
                     corruption=family,
                     severity=severity,
                     method="confidence_conditioned_concordance",
-                    point=conditional.point,
-                    count=conditional.pair_count,
+                    interval=bootstrap.conditional,
                 )
             )
     for seed in config.sensitivity_seeds:
@@ -2474,19 +2465,27 @@ def run_study(
     selected_rows = [
         row for row in candidate_rows if row["policy"] == selected
     ]
-    boundaries, aggregate = _validation_evidence(
+    boundaries, aggregate, task_bootstraps = _validation_evidence(
         selected_rows, config=config
     )
     ranking = _policy_statistics(candidate_rows)
     seed_summary = summarize_seed_scores(seed_scores)
-    conclusions = _evidence_conclusions(aggregate)
+    conditional_complete = all(
+        result.conditional.point is not None
+        and result.conditional.lower is not None
+        and result.conditional.upper is not None
+        and result.conditional.count > 0
+        for result in task_bootstraps.values()
+    )
+    conclusions = _evidence_conclusions(
+        aggregate, conditional_complete=conditional_complete
+    )
 
     csv_rows = _candidate_audit_rows(candidate_rows, config)
     csv_rows.extend(
         _selected_csv_rows(
-            selected_rows,
             selected,
-            boundaries,
+            task_bootstraps,
             seed_scores,
             config=config,
         )
