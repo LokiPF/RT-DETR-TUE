@@ -1486,7 +1486,7 @@ def test_confidence_deciles_accept_selection_rows_only():
         [0.4, 0.5],
         raw_confidence=([0.2, 0.3], [0.7, 0.8], [0.4, 0.5]),
     )
-    expected = tuple(np.quantile([0.2, 0.3, 0.7, 0.8], np.arange(0.1, 1.0, 0.1)))
+    expected = (0.25, 0.5, 0.75)
 
     assert study.confidence_decile_boundaries(rows, severity=4) == pytest.approx(
         expected
@@ -1496,6 +1496,23 @@ def test_confidence_deciles_accept_selection_rows_only():
             rows + synthetic_scores([0.0], [0.0], [0.0], split="validation"),
             severity=4,
         )
+
+
+def test_confidence_deciles_use_adjacent_order_statistic_midpoints():
+    rows = synthetic_scores(
+        [0.0, 2.0, 4.0, 6.0, 8.0],
+        [1.0, 3.0, 5.0, 7.0, 9.0],
+        [1.0, 3.0, 5.0, 7.0, 9.0],
+        raw_confidence=(
+            [0.0, 0.2, 0.4, 0.6, 0.8],
+            [0.1, 0.3, 0.5, 0.7, 0.9],
+            [0.1, 0.3, 0.5, 0.7, 0.9],
+        ),
+    )
+
+    assert study.confidence_decile_boundaries(rows, severity=4) == pytest.approx(
+        tuple(value / 100 for value in range(5, 90, 10))
+    )
 
 
 def test_confidence_deciles_reject_different_image_rosters_between_families():
@@ -1576,6 +1593,36 @@ def test_confidence_conditioned_concordance_uses_same_strata_and_half_ties():
 
     assert result.point == pytest.approx(0.75)
     assert result.pair_count == 2
+
+
+def test_conditional_bootstrap_weights_tasks_instead_of_pooling_pairs():
+    rows = synthetic_scores(
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        [-1.0, 1.0, 1.0],
+        split="validation",
+        confidence=([0.0] * 3, [1.0] * 3, [1.0] * 3),
+        entropy=([0.0] * 3, [1.0] * 3, [1.0] * 3),
+        raw_confidence=(
+            [0.2, 0.2, 0.2],
+            [0.2, 0.2, 0.2],
+            [0.2, 0.8, 0.8],
+        ),
+    )
+
+    result = study.paired_validation_bootstrap(
+        rows,
+        boundaries_by_severity={4: (0.5,), 5: (0.5,)},
+        samples=20,
+        seed=7,
+        family="fog",
+    )
+
+    assert result.conditional.point == pytest.approx(0.5)
+    assert result.conditional.count == 4
+    assert (result.conditional.lower, result.conditional.upper) == pytest.approx(
+        (0.5, 1.0)
+    )
 
 
 def test_paired_bootstrap_reuses_draws_for_methods_and_differences():

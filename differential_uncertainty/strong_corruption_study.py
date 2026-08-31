@@ -906,8 +906,15 @@ def confidence_decile_boundaries(rows, *, severity: int) -> tuple[float, ...]:
                         context=f"{family}/{image_id}/{level}",
                     )
                 )
-    quantiles = np.quantile(values, np.arange(0.1, 1.0, 0.1))
-    return tuple(float(value) for value in np.unique(quantiles))
+    ordered = np.sort(np.asarray(values, dtype=float))
+    cut_indices = np.ceil(
+        np.arange(1, 10, dtype=float) * ordered.size / 10
+    ).astype(int)
+    cut_indices = np.unique(
+        cut_indices[(cut_indices > 0) & (cut_indices < ordered.size)]
+    )
+    midpoints = (ordered[cut_indices - 1] + ordered[cut_indices]) / 2
+    return tuple(float(value) for value in np.unique(midpoints))
 
 
 def _validated_boundaries(boundaries) -> tuple[float, ...]:
@@ -931,25 +938,16 @@ def _ordering_credit(clean: float, corrupted: float) -> float:
     return 0.0
 
 
-def confidence_conditioned_concordance(
-    rows, *, family: str, severity: int, boundaries
-) -> ConditionalResult:
-    if not isinstance(family, str) or not family:
-        raise ValueError("conditional concordance requires a nonempty family")
-    if severity not in (4, 5):
-        raise ValueError("conditional concordance requires severity 4 or 5")
-    boundaries = _validated_boundaries(boundaries)
-    family_rows = [
-        row
-        for row in rows
-        if isinstance(row, Mapping) and row.get("family") == family
-    ]
-    groups = _complete_score_groups(
-        family_rows, ("fingerprint", "raw_confidence")
-    )
-    image_rows = groups[family]
+def _conditional_task_credits(
+    image_rows,
+    sampled_ids,
+    *,
+    family: str,
+    severity: int,
+    boundaries: tuple[float, ...],
+) -> list[float]:
     credits = []
-    for image_id in sorted(image_rows):
+    for image_id in sampled_ids:
         clean = image_rows[image_id][0]
         corrupted = image_rows[image_id][severity]
         clean_confidence = _finite_row_score(
@@ -976,6 +974,33 @@ def confidence_conditioned_concordance(
                 ),
             )
         )
+    return credits
+
+
+def confidence_conditioned_concordance(
+    rows, *, family: str, severity: int, boundaries
+) -> ConditionalResult:
+    if not isinstance(family, str) or not family:
+        raise ValueError("conditional concordance requires a nonempty family")
+    if severity not in (4, 5):
+        raise ValueError("conditional concordance requires severity 4 or 5")
+    boundaries = _validated_boundaries(boundaries)
+    family_rows = [
+        row
+        for row in rows
+        if isinstance(row, Mapping) and row.get("family") == family
+    ]
+    groups = _complete_score_groups(
+        family_rows, ("fingerprint", "raw_confidence")
+    )
+    image_rows = groups[family]
+    credits = _conditional_task_credits(
+        image_rows,
+        sorted(image_rows),
+        family=family,
+        severity=severity,
+        boundaries=boundaries,
+    )
     return ConditionalResult(
         family=family,
         severity=severity,
@@ -1037,40 +1062,30 @@ def _conditional_metric(
     families: tuple[str, ...],
     severities: tuple[int, ...],
 ) -> tuple[float | None, int]:
-    credits = []
-    for image_id in sampled_ids:
-        for family in families:
-            image_rows = groups[family][image_id]
-            clean = image_rows[0]
-            clean_confidence = _finite_row_score(
-                clean, "raw_confidence", context=f"{family}/{image_id}/0"
+    family_means = []
+    pair_count = 0
+    for family in families:
+        task_means = []
+        for severity in severities:
+            credits = _conditional_task_credits(
+                groups[family],
+                sampled_ids,
+                family=family,
+                severity=severity,
+                boundaries=boundaries_by_severity[severity],
             )
-            clean_fingerprint = _finite_row_score(
-                clean, "fingerprint", context=f"{family}/{image_id}/0"
-            )
-            for severity in severities:
-                corrupted = image_rows[severity]
-                corrupted_confidence = _finite_row_score(
-                    corrupted,
-                    "raw_confidence",
-                    context=f"{family}/{image_id}/{severity}",
-                )
-                boundaries = boundaries_by_severity[severity]
-                if _stratum(clean_confidence, boundaries) != _stratum(
-                    corrupted_confidence, boundaries
-                ):
-                    continue
-                credits.append(
-                    _ordering_credit(
-                        clean_fingerprint,
-                        _finite_row_score(
-                            corrupted,
-                            "fingerprint",
-                            context=f"{family}/{image_id}/{severity}",
-                        ),
-                    )
-                )
-    return (None, 0) if not credits else (float(np.mean(credits)), len(credits))
+            pair_count += len(credits)
+            task_means.append(np.nan if not credits else float(np.mean(credits)))
+        finite_tasks = np.asarray(task_means, dtype=float)
+        finite_tasks = finite_tasks[np.isfinite(finite_tasks)]
+        family_means.append(
+            np.nan if not finite_tasks.size else float(finite_tasks.mean())
+        )
+    finite_families = np.asarray(family_means, dtype=float)
+    finite_families = finite_families[np.isfinite(finite_families)]
+    if not finite_families.size:
+        return None, 0
+    return float(finite_families.mean()), pair_count
 
 
 def _score_interval(point, draws, *, count: int) -> ScoreInterval:
