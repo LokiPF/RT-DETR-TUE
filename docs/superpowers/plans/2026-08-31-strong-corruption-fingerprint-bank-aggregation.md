@@ -41,7 +41,7 @@ Keep the same union-unpadded query IDs for fingerprint, confidence, and entropy.
 
 Defer global k-means, capacity search, additional neighbor counts, nested leave-one-family-out selection, qualification gates, strong-only cache generation, production CLI integration, adversarial artifact hardening, and the final experiment.
 
-When implementation encounters complicated existing code, first check its callers with \`rg\`. Simplify it only when the study directly needs that path, the replacement is smaller, and existing focused tests preserve its observable behavior. Otherwise bypass it from the self-contained study module. Do not perform unrelated cleanup in \`artifacts.py\`, \`cli.py\`, or \`reporting.py\` merely because those files are complex.
+When implementation encounters complicated existing code, first check its callers with `rg`. Simplify it only when the study directly needs that path, the replacement is smaller, and existing focused tests preserve its observable behavior. Otherwise bypass it from the self-contained study module. Do not perform unrelated cleanup in `artifacts.py`, `cli.py`, or `reporting.py` merely because those files are complex.
 
 ## Files
 
@@ -250,7 +250,7 @@ all_valid      = every valid row
 confidence_0_5 = rows whose maximum sigmoid confidence is at least 0.5
 ```
 
-For balanced banks, derive independent reservoir seeds from SHA-256 of `seed:matched` and `seed:background`. For standardized Euclidean, calculate mean and population standard deviation from the complete eligible population; balanced moments give matched and background total weight one half each. Record an infeasible candidate when a population cannot fill its allocation.
+For balanced banks, derive independent reservoir seeds from SHA-256 of `seed:matched` and `seed:background`. For standardized Euclidean, calculate mean and population standard deviation from the complete eligible reference population, then transform both sampled bank rows and evaluation queries with those same moments before computing distances. Balanced moments give matched and background total weight one half each. Record an infeasible candidate when a population cannot fill its allocation.
 
 - [ ] **Step 4: Run and commit**
 
@@ -427,7 +427,7 @@ For every candidate, calculate clean-versus-level-4 and clean-versus-level-5 AUR
 
 Fit confidence-decile boundaries separately for levels 4 and 5 using selection pairs only. On validation, retain a clean/corrupted pair only when both maximum-confidence values fall in the same frozen stratum. Count correct fingerprint ordering as 1, a tie as 0.5, and reversal as 0. Return `None` with pair count zero instead of failing the whole study.
 
-Use 2,000 paired bootstrap draws of complete validation image IDs. Each sampled ID brings all families, both severities, and all methods. Use identical draws for fingerprint, confidence, entropy, fingerprint-minus-confidence, and fingerprint-minus-entropy intervals.
+Use 2,000 paired bootstrap draws of complete validation image IDs. Each sampled ID brings all families, both severities, and all methods. Use identical draws for fingerprint, confidence, entropy, fingerprint-minus-confidence, fingerprint-minus-entropy, and confidence-conditioned concordance intervals.
 
 After freezing the selected tuple, rebuild only that bank at seeds 42 through 46 and record validation mean, minimum, maximum, and standard deviation. Seed stability is descriptive, not a selection gate.
 
@@ -504,9 +504,9 @@ row_type,split,policy_id,bank,distance,aggregation,seed,corruption,
 severity,method,point,lower,upper,count
 ```
 
-It includes all candidate-family rows, selected validation method rows for every family and level, paired family differences, conditional rows with pair counts, and five seed rows.
+It uses exactly these row types: `candidate_family`, `selected_method`, `paired_difference`, `conditional`, and `seed`. It includes all candidate-family rows, selected validation method rows for every family and level, paired family differences, conditional rows with pair counts, and five seed rows.
 
-`summary.json` contains configuration, source paths and manifest digests, selected policy, selection ranking, aggregate validation metrics, seed summary, and four independent conclusions: detects corruption, better than confidence, information after confidence stratification, and stable across seeds. Each conclusion is `supported`, `not_supported`, or `inconclusive`; none suppresses output.
+`summary.json` contains configuration, source paths and manifest digests, selected policy, selection ranking, aggregate validation metrics, seed summary, and three independent evidence conclusions. `detects_corruption` is `supported` when the aggregate validation fingerprint strong-AUROC interval has lower bound above 0.5, `not_supported` when its upper bound is at most 0.5, and otherwise `inconclusive`. `better_than_confidence` applies the same rule at zero to the paired fingerprint-minus-confidence interval. `information_after_confidence` applies the same rule at 0.5 to the confidence-conditioned concordance interval; it is `inconclusive` when no eligible pairs exist. Missing or incomplete required evidence also yields `inconclusive`. Seed stability remains a numeric mean, standard deviation, minimum, and maximum rather than a thresholded conclusion. None of these statuses suppresses output.
 
 `report.md` is plain terminal-safe text with two 19-row tables:
 
