@@ -586,21 +586,35 @@ def top_query_entropy(logits: Tensor, query_ids: Tensor) -> float:
         raise ValueError("logits must contain retained queries and at least two classes")
     if query_ids.ndim != 1 or query_ids.numel() != logits.shape[0]:
         raise ValueError("query IDs must align with retained logits")
+    if (
+        query_ids.dtype == torch.bool
+        or query_ids.is_floating_point()
+        or query_ids.is_complex()
+    ):
+        raise ValueError("query IDs must have an integer dtype")
+    if query_ids.unique().numel() != query_ids.numel():
+        raise ValueError("query IDs must be unique")
     if not bool(torch.isfinite(logits).all()):
         raise ValueError("logits must be finite")
 
-    confidence = logits.float().sigmoid().amax(dim=1)
+    float_logits = logits.detach().float()
+    if not bool(torch.isfinite(float_logits).all()):
+        raise ValueError("float32 logits must be finite")
+    confidence = float_logits.sigmoid().amax(dim=1)
     index = min(
         range(logits.shape[0]),
         key=lambda row: (-float(confidence[row]), int(query_ids[row])),
     )
-    probability = logits[index].float().softmax(dim=0)
+    probability = float_logits[index].softmax(dim=0)
     normalizer = torch.log(
         torch.tensor(
             probability.numel(), dtype=probability.dtype, device=probability.device
         )
     )
-    return float(-torch.xlogy(probability, probability).sum() / normalizer)
+    entropy = float(-torch.xlogy(probability, probability).sum() / normalizer)
+    if not np.isfinite(entropy):
+        raise ValueError("normalized entropy must be finite")
+    return entropy
 
 
 def score_image_group(records, bank: Bank, distance: str) -> list[ImageScore]:

@@ -474,6 +474,25 @@ def test_top_confidence_ties_use_the_lowest_query_id():
     assert top_query_entropy(logits, torch.tensor([9, 3])) == pytest.approx(1.0)
 
 
+@pytest.mark.parametrize(
+    ("query_ids", "error"),
+    [
+        (torch.tensor([0.0, 1.0]), "integer"),
+        (torch.tensor([3, 3]), "unique"),
+    ],
+)
+def test_top_query_entropy_rejects_malformed_query_ids(query_ids, error):
+    with pytest.raises(ValueError, match=error):
+        top_query_entropy(torch.tensor([[2.0, 0.0], [1.0, 1.0]]), query_ids)
+
+
+def test_top_query_entropy_rejects_float32_conversion_overflow():
+    logits = torch.tensor([[1e300, 0.0], [1.0, 1.0]], dtype=torch.float64)
+    assert bool(torch.isfinite(logits).all())
+    with pytest.raises(ValueError, match="finite"):
+        top_query_entropy(logits, torch.tensor([0, 1]))
+
+
 def test_score_image_group_rejects_missing_levels(strong_group, bank_fixture):
     with pytest.raises(ValueError, match="exactly levels 0, 4, and 5"):
         score_image_group(
