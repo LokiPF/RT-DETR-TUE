@@ -1,5 +1,6 @@
 import csv
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -591,6 +592,44 @@ def test_cache_metadata_mismatch_recomputes_only_that_cache(
     repaired = torch.load(changed, map_location="cpu", weights_only=True)
     assert repaired["metadata"]["families"] == ["fog", "snow"]
     assert calls == 2 * 4 * 3
+
+
+def test_bank_capacity_change_recomputes_and_overwrites_caches(
+    tiny_study, tmp_path, monkeypatch
+):
+    output = tmp_path / "output"
+    study.run_study(
+        tiny_study.reference_root,
+        tiny_study.evaluation_root,
+        tiny_study.annotations,
+        output,
+        config=tiny_study.config,
+        device="cpu",
+    )
+    changed = output / "cache" / "matched-cosine-seed44.pt"
+
+    calls = 0
+    original = study._compute_neighbor_tensor
+
+    def count_compute(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(study, "_compute_neighbor_tensor", count_compute)
+    changed_config = replace(tiny_study.config, bank_capacity=5)
+    study.run_study(
+        tiny_study.reference_root,
+        tiny_study.evaluation_root,
+        tiny_study.annotations,
+        output,
+        config=changed_config,
+        device="cpu",
+    )
+
+    payload = torch.load(changed, map_location="cpu", weights_only=True)
+    assert payload["metadata"]["bank_capacity"] == 5
+    assert calls > 0
 
 
 def test_module_cli_accepts_only_the_study_runtime_arguments(tmp_path):

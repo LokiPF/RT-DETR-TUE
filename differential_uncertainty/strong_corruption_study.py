@@ -696,42 +696,28 @@ def score_image_group(records, bank: Bank, distance: str) -> list[ImageScore]:
     if len(families) != 1:
         raise ValueError("image group must contain exactly one family")
 
-    records.sort(key=lambda record: int(record["severity"]))
-    padded_ids = union_padded_query_ids(records)
-    query_count = int(records[0]["persistence"].shape[0])
-    keep = torch.ones(query_count, dtype=torch.bool)
-    keep[padded_ids] = False
-    valid_ids = torch.arange(query_count, dtype=torch.long)[keep]
-    if valid_ids.numel() == 0:
-        raise ValueError("padding leaves no valid queries")
-    valid_query_ids = tuple(int(value) for value in valid_ids)
-
+    prepared = _prepare_image_group(records)
+    valid_query_ids = tuple(int(value) for value in prepared[0]["query_ids"])
     rows = []
-    for record in records:
-        logits = record["logits"].detach().float().index_select(
-            0, valid_ids.to(record["logits"].device)
-        )
-        persistence = record["persistence"].detach().float().index_select(
-            0, valid_ids.to(record["persistence"].device)
-        )
-        confidence = logits.sigmoid().amax(dim=1)
-        raw_confidence = float(confidence.max())
+    for record in prepared:
+        persistence = record["persistence"].detach().float()
         distances = query_distances(persistence, bank, distance)
+        confidence = record["confidence_by_query"].to(distances.device)
         rows.append(
             ImageScore(
-                image_id=next(iter(image_ids)),
-                family=next(iter(families)),
-                severity=int(record["severity"]),
+                image_id=record["image_id"],
+                family=record["family"],
+                severity=record["severity"],
                 valid_query_ids=valid_query_ids,
                 fingerprint_scores={
                     aggregation: aggregate_queries(
-                        distances, confidence, valid_ids, aggregation
+                        distances, confidence, record["query_ids"], aggregation
                     )
                     for aggregation in AGGREGATIONS
                 },
-                raw_confidence=raw_confidence,
-                confidence_score=1.0 - raw_confidence,
-                entropy_score=top_query_entropy(logits, valid_ids),
+                raw_confidence=record["raw_confidence"],
+                confidence_score=record["confidence"],
+                entropy_score=record["entropy"],
             )
         )
     return rows
@@ -1474,7 +1460,7 @@ def _prepare_image_group(records) -> list[dict]:
         logits = record["logits"].detach().float().index_select(
             0, valid_ids.to(record["logits"].device)
         )
-        confidence = logits.sigmoid().amax(dim=1).cpu()
+        confidence = logits.sigmoid().amax(dim=1)
         raw_confidence = float(confidence.max())
         prepared.append(
             {
@@ -1533,6 +1519,7 @@ def _cache_metadata(
     *,
     geometry: str,
     bank: str,
+    bank_capacity: int,
     seed: int,
     reference_digest: str,
     evaluation_digest: str,
@@ -1542,6 +1529,7 @@ def _cache_metadata(
     return {
         "geometry": geometry,
         "bank": bank,
+        "bank_capacity": bank_capacity,
         "seed": seed,
         "reference_manifest_sha256": reference_digest,
         "evaluation_manifest_sha256": evaluation_digest,
@@ -1579,6 +1567,7 @@ def _open_distance_cache(
     metadata = _cache_metadata(
         geometry=geometry,
         bank=bank_name,
+        bank_capacity=config.bank_capacity,
         seed=seed,
         reference_digest=reference_digest,
         evaluation_digest=evaluation_digest,
@@ -1658,6 +1647,7 @@ def _neighbor_scores(
     *,
     geometry: str,
 ) -> dict[tuple[str, str], float]:
+    confidence = confidence.to(neighbors.device)
     results = {}
     for distance in _GEOMETRY_DISTANCES[geometry]:
         distances = (
