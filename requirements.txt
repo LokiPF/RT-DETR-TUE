@@ -2,7 +2,6 @@ torch>=2.3.0
 torchvision>=0.18.0
 matplotlib>=3.5
 numpy
-pandas
 pillow
 scipy
 imagecorruptions==1.1.2
