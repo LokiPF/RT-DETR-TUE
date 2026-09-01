@@ -63,6 +63,15 @@ class SparseExtractor(FakeExtractor):
         return records
 
 
+class BatchSensitiveExtractor(FakeExtractor):
+    def extract_batch(self, images):
+        records = super().extract_batch(images)
+        marker = float(images.shape[0] * 10 + images[:, 0, 0, 0].sum())
+        for record in records:
+            record["persistence"][:, -1] += marker
+        return records
+
+
 @pytest.fixture(autouse=True)
 def _reset_extractor():
     FakeExtractor.calls = 0
@@ -202,6 +211,46 @@ def test_interrupted_bank_resume_matches_uninterrupted(inputs, tmp_path):
     assert not (resumed / "bank_progress.pt").exists()
 
 
+def test_partial_batch_resume_reextracts_the_original_batch(
+    inputs, tmp_path, monkeypatch
+):
+    baseline = tmp_path / "baseline-batched"
+    run(
+        inputs, baseline, reference_count=2, batch_size=2,
+        extractor_factory=BatchSensitiveExtractor,
+    )
+    expected = torch.load(baseline / "bank.pt", weights_only=False)
+
+    resumed = tmp_path / "resumed-batched"
+    original_atomic_torch = benchmark._atomic_torch
+    interrupted = False
+
+    def interrupt_after_first_progress(path, value):
+        nonlocal interrupted
+        original_atomic_torch(path, value)
+        if (
+            not interrupted
+            and path.name == "bank_progress.pt"
+            and value["next_image"] == 1
+        ):
+            interrupted = True
+            raise RuntimeError("interrupted after checkpoint")
+
+    monkeypatch.setattr(benchmark, "_atomic_torch", interrupt_after_first_progress)
+    with pytest.raises(RuntimeError, match="after checkpoint"):
+        run(
+            inputs, resumed, reference_count=2, batch_size=2,
+            extractor_factory=BatchSensitiveExtractor,
+        )
+    monkeypatch.setattr(benchmark, "_atomic_torch", original_atomic_torch)
+    BatchSensitiveExtractor.calls = 0
+    run(
+        inputs, resumed, reference_count=2, batch_size=2,
+        extractor_factory=BatchSensitiveExtractor,
+    )
+    assert torch.equal(torch.load(resumed / "bank.pt", weights_only=False), expected)
+
+
 def test_stochastic_evaluation_resume_matches_score_files(inputs, tmp_path):
     baseline = tmp_path / "baseline"
     run(inputs, baseline)
@@ -222,6 +271,27 @@ def test_stochastic_evaluation_resume_matches_score_files(inputs, tmp_path):
         path.name: path.read_bytes() for path in sorted((resumed / "scores").glob("*.json"))
     }
     assert actual == expected
+
+
+def test_resume_validates_progress_covered_scores_before_extracting(
+    inputs, tmp_path
+):
+    output = tmp_path / "malformed-covered-score"
+    run(inputs, output)
+    progress_path = output / "evaluation_progress.pt"
+    progress = torch.load(progress_path, weights_only=False)
+    progress["next_image"] = 1
+    torch.save(progress, progress_path)
+    first_image = benchmark._select_images(inputs[2], 2, seed=7)[0]
+    benchmark._score_path(output / "scores", first_image).write_text(
+        "not json", encoding="utf-8"
+    )
+
+    FakeExtractor.calls = 0
+    with pytest.raises(ValueError, match="malformed score file"):
+        run(inputs, output)
+    assert FakeExtractor.calls == 0
+    assert torch.load(progress_path, weights_only=False)["next_image"] == 1
 
 
 def test_nonfinite_evaluation_extraction_is_rejected(inputs, tmp_path):

@@ -215,12 +215,12 @@ def write_results(output: Path, score_rows: list[dict], evaluation: dict, famili
         handle.write("\n")
     summary_temporary.replace(output / "summary.json")
 
+    chart_temporary = output / ".corruption_auroc_bars.tmp.png"
+    _write_chart(chart_temporary, checked_evaluation["tasks"], ordered_families)
+    chart_temporary.replace(output / "corruption_auroc_bars.png")
+
     report_temporary = output / ".report.tmp.md"
     report_temporary.write_text(
         _render_report(checked_evaluation, ordered_families), encoding="utf-8"
     )
     report_temporary.replace(output / "report.md")
-
-    chart_temporary = output / ".corruption_auroc_bars.tmp.png"
-    _write_chart(chart_temporary, checked_evaluation["tasks"], ordered_families)
-    chart_temporary.replace(output / "corruption_auroc_bars.png")

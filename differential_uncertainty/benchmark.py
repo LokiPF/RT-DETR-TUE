@@ -219,10 +219,13 @@ def _build_bank(
         return normalized
 
     next_image, reservoir = _bank_progress(progress_path, config, len(paths), seed)
-    for start in range(next_image, len(paths), batch_size):
+    first_batch = (next_image // batch_size) * batch_size
+    for start in range(first_batch, len(paths), batch_size):
         batch_paths = paths[start : start + batch_size]
         records = _extract_paths(extractor, batch_paths, config, batch_size)
         for offset, record in enumerate(records):
+            if start + offset < next_image:
+                continue
             reservoir.add_record(record, config.bank_confidence_threshold)
             completed = start + offset + 1
             _atomic_torch(progress_path, {
@@ -337,8 +340,12 @@ def _evaluate_images(
     progress_path = output / "evaluation_progress.pt"
     next_image = _evaluation_progress(progress_path, len(paths))
     for index in range(next_image):
-        if not _score_path(scores, paths[index]).is_file():
+        score_path = _score_path(scores, paths[index])
+        if not score_path.is_file():
             raise ValueError("evaluation progress refers to a missing score file")
+        _validate_score_rows(
+            _load_json(score_path, "score file"), paths[index].name
+        )
     for index in range(next_image, len(paths)):
         rows = _score_image(
             paths[index], extractor, normalized_bank, config, batch_size, corruption_fn

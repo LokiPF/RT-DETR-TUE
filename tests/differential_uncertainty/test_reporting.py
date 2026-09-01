@@ -107,14 +107,19 @@ def test_report_has_all_family_rows_real_chart_and_required_final_line(tmp_path)
 def test_chart_closes_its_figure_when_saving_fails(tmp_path, monkeypatch):
     rows, evaluation = _inputs()
     before = set(plt.get_fignums())
+    output = tmp_path / "evidence"
+    output.mkdir()
+    report = output / "report.md"
+    report.write_text("previous report\n", encoding="utf-8")
 
     def fail_savefig(_self, *_args, **_kwargs):
         raise RuntimeError("save failed")
 
     monkeypatch.setattr("matplotlib.figure.Figure.savefig", fail_savefig)
     with pytest.raises(RuntimeError, match="save failed"):
-        write_results(tmp_path / "evidence", rows, evaluation, FAMILIES)
+        write_results(output, rows, evaluation, FAMILIES)
     assert set(plt.get_fignums()) == before
+    assert report.read_text(encoding="utf-8") == "previous report\n"
 
 
 @pytest.mark.parametrize("families", [
