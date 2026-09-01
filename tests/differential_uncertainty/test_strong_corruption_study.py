@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+from PIL import Image
 
 import differential_uncertainty.strong_corruption_study as study
 from differential_uncertainty.artifacts import ShardWriter
@@ -292,7 +293,12 @@ def test_tiny_study_filters_levels_and_reports_each_family(tiny_study, tmp_path)
     assert result.reported_families == {"fog", "snow"}
     assert {
         path.name for path in (tmp_path / "output").iterdir() if path.is_file()
-    } == {"results.csv", "summary.json", "report.md"}
+    } == {
+        "corruption_auroc_bars.png",
+        "results.csv",
+        "summary.json",
+        "report.md",
+    }
 
 
 def test_tiny_study_writes_exact_cache_and_report_contract(tiny_study, tmp_path):
@@ -427,7 +433,16 @@ def test_tiny_study_writes_exact_cache_and_report_contract(tiny_study, tmp_path)
     ) in report
     for family in tiny_study.config.families:
         assert report.count(f"{family} |") == 2
-    assert report.rstrip().endswith("Levels 1 through 3 were not evaluated.")
+    assert "Levels 1 through 3 were not evaluated." in report
+    assert report.rstrip().endswith(
+        "![Per-corruption AUROC grouped bar chart](corruption_auroc_bars.png)"
+    )
+    chart = output / "corruption_auroc_bars.png"
+    with Image.open(chart) as image:
+        assert image.format == "PNG"
+        assert image.width >= 1_000
+        assert image.height >= 800
+        assert image.getbbox() is not None
 
 
 def test_conditional_coverage_wording_handles_partial_and_zero_coverage():

@@ -2279,6 +2279,84 @@ def _conditional_coverage_line(counts) -> str:
     )
 
 
+def _write_auroc_chart(
+    selected_rows,
+    path: Path,
+    *,
+    config: StudyConfig,
+) -> None:
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    from matplotlib.figure import Figure
+
+    validation_rows = [
+        row for row in selected_rows if row["split"] == "validation"
+    ]
+    results = {
+        method: per_family_aurocs(validation_rows, method=method)
+        for method in ("fingerprint", "confidence", "entropy")
+    }
+    methods = (
+        ("fingerprint", "Fingerprint", "#0072B2"),
+        ("confidence", "1 - max confidence", "#E69F00"),
+        ("entropy", "Top-query entropy", "#009E73"),
+    )
+    families = tuple(config.families)
+    positions = np.arange(len(families), dtype=float)
+    figure = Figure(figsize=(16, 11), dpi=160)
+    FigureCanvasAgg(figure)
+    axes = figure.subplots(1, 2, sharey=True)
+    bar_height = 0.24
+    legend_handles = []
+    for axis, severity, attribute in zip(
+        axes, (4, 5), ("level4", "level5"), strict=True
+    ):
+        for offset, (method, label, color) in zip(
+            (-bar_height, 0.0, bar_height), methods, strict=True
+        ):
+            values = [
+                getattr(results[method][family], attribute)
+                for family in families
+            ]
+            bars = axis.barh(
+                positions + offset,
+                values,
+                height=bar_height,
+                color=color,
+                label=label,
+            )
+            if severity == 4:
+                legend_handles.append(bars)
+        axis.axvline(0.5, color="#666666", linestyle="--", linewidth=1)
+        axis.set_xlim(0.0, 1.0)
+        axis.set_xlabel("AUROC (higher is better)")
+        axis.set_title(f"Severity {severity}")
+        axis.grid(axis="x", color="#dddddd", linewidth=0.8)
+        axis.set_axisbelow(True)
+    axes[0].set_yticks(
+        positions,
+        labels=[family.replace("_", " ") for family in families],
+    )
+    axes[0].invert_yaxis()
+    figure.suptitle("Held-out corruption AUROC by family", fontsize=16)
+    figure.legend(
+        legend_handles,
+        [label for _method, label, _color in methods],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.95),
+        ncol=3,
+        frameon=False,
+    )
+    figure.subplots_adjust(
+        left=0.19,
+        right=0.98,
+        bottom=0.07,
+        top=0.88,
+        wspace=0.08,
+    )
+    figure.savefig(path, format="png", dpi=160)
+    figure.clear()
+
+
 def _render_report(
     selected_rows,
     selected: Policy,
@@ -2433,6 +2511,10 @@ def _render_report(
             ),
             "",
             "Levels 1 through 3 were not evaluated.",
+            "",
+            "## Per-corruption AUROC bar chart",
+            "",
+            "![Per-corruption AUROC grouped bar chart](corruption_auroc_bars.png)",
         )
     )
     return "\n".join(lines) + "\n"
@@ -2647,6 +2729,11 @@ def run_study(
     (output / "summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
+    )
+    _write_auroc_chart(
+        selected_rows,
+        output / "corruption_auroc_bars.png",
+        config=config,
     )
     (output / "report.md").write_text(
         _render_report(

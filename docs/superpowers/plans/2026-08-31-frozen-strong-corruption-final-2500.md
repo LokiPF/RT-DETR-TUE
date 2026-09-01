@@ -37,7 +37,7 @@ The saved confidence boundaries come from the 150-image development selection sp
 | `differential_uncertainty/strong_corruption_study.py` | Add one frozen-policy loader and one frozen final-run path. |
 | `tests/differential_uncertainty/test_strong_corruption_study.py` | Frozen-mode leakage, cache-count, roster, and report tests. |
 | `runs/coco-imagecorruptions-2500-final/` | Ignored resumable final detector artifacts. |
-| `runs/strong-corruption-final-2500x2500/` | Ignored final fingerprint cache and three reports. |
+| `runs/strong-corruption-final-2500x2500/` | Ignored final fingerprint cache, three tabular/text reports, and one AUROC chart. |
 
 ### Task 1: Commit the frozen policy before final data exists
 
@@ -186,7 +186,7 @@ The implementation performs these operations in order:
 3. Reuse the existing annotation, shard, metadata, candidate, group-preparation, bank, and cache helpers. Build only `confidence_0_5`, capacity 2,000, seed 44; open only `confidence_0_5-cosine-seed44.pt`.
 4. Score only `(mean_5_cosine, confidence_weighted_mean)`. Mark every final row as `split="validation"`. Never call `select_policy`, `confidence_decile_boundaries`, `_score_primary_arms`, or `_score_sensitivity_seeds`.
 5. Pass the frozen level-4/level-5 boundaries to `paired_validation_bootstrap` for the aggregate and all 38 family/severity tasks.
-6. Write `results.csv`, `summary.json`, and `report.md`. Let `_selected_csv_rows` accept `seed_scores=None` and skip its seed loop in final mode; reuse its selected-method, difference, and conditional interval rows. Do not write candidate, controlled-comparison, or seed-sensitivity rows. The Markdown report retains both 19-row tables, aggregate intervals, conditional evidence, the frozen tuple/provenance, and the final sentence `Levels 1 through 3 were not evaluated.`
+6. Write `results.csv`, `summary.json`, `report.md`, and `corruption_auroc_bars.png`. Let `_selected_csv_rows` accept `seed_scores=None` and skip its seed loop in final mode; reuse its selected-method, difference, and conditional interval rows. Do not write candidate, controlled-comparison, or seed-sensitivity rows. The Markdown report retains both 19-row tables, aggregate intervals, conditional evidence, and the frozen tuple/provenance. Keep `Levels 1 through 3 were not evaluated.` immediately before the final chart embed. The chart has severity-4 and severity-5 horizontal grouped-bar panels for all three methods and all 19 families.
 
 Add CLI arguments without changing the production package CLI:
 
@@ -289,7 +289,7 @@ This command is resumable. Do not inspect its benchmark metrics to change the fr
   --development-evaluation-manifest /home/yuchen/YuchenZ/UE/philip_sa/.worktrees/imagecorruptions-coco-benchmark/runs/coco-imagecorruptions-250/inputs/evaluation-manifest.csv
 ```
 
-Expected: one distance cache and the three top-level report files.
+Expected: one distance cache and four top-level report artifacts.
 
 - [ ] **Step 2: Verify the frozen result shape**
 
@@ -321,9 +321,12 @@ assert all(
     if row["row_type"] == "conditional"
 )
 assert len(list((root / "cache").glob("*.pt"))) == 1
-assert (root / "report.md").read_text().rstrip().endswith(
-    "Levels 1 through 3 were not evaluated."
+report = (root / "report.md").read_text()
+assert "Levels 1 through 3 were not evaluated." in report
+assert report.rstrip().endswith(
+    "![Per-corruption AUROC grouped bar chart](corruption_auroc_bars.png)"
 )
+assert (root / "corruption_auroc_bars.png").is_file()
 print(summary["conclusions"])
 PY
 ```

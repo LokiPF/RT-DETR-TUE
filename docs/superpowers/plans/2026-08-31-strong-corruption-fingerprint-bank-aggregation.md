@@ -4,7 +4,7 @@
 
 **Goal:** Determine whether a persistent-fingerprint bank helps detect severity-4 and severity-5 corruption, identify which tested bank/distance/aggregation combination is most informative, and report every corruption family beside freshly computed confidence and Shannon-entropy baselines.
 
-**Architecture:** Add one self-contained experiment module that reads the existing authenticated 1,000-reference and 250-evaluation caches, evaluates a fixed panel on a deterministic 150/100 image split, and writes one CSV, one JSON file, and one terminal-safe Markdown report. Reuse existing cache readers and scoring helpers; do not build a new cache format, production CLI subsystem, nested selector, or final 2,500/2,500 workflow in this phase.
+**Architecture:** Add one self-contained experiment module that reads the existing authenticated 1,000-reference and 250-evaluation caches, evaluates a fixed panel on a deterministic 150/100 image split, and writes one CSV, one JSON file, one terminal-safe Markdown report, and one grouped-bar PNG. Reuse existing cache readers and scoring helpers; do not build a new cache format, production CLI subsystem, nested selector, or final 2,500/2,500 workflow in this phase.
 
 **Tech Stack:** Python 3.11, PyTorch, NumPy, SciPy Hungarian matching, scikit-learn AUROC, pytest, and the repository's existing cache readers.
 
@@ -51,7 +51,7 @@ When implementation encounters complicated existing code, first check its caller
 | `tests/differential_uncertainty/test_strong_corruption_study.py` | Focused unit and tiny end-to-end tests. |
 | `tests/differential_uncertainty/test_repository_surface.py` | Add exactly the two new Python files to the protected allowlist. |
 
-The experiment writes only three report files plus an ordinary reusable cache:
+The experiment writes four report artifacts plus an ordinary reusable cache:
 
 ```text
 <output>/
@@ -59,6 +59,7 @@ The experiment writes only three report files plus an ordinary reusable cache:
   results.csv
   summary.json
   report.md
+  corruption_auroc_bars.png
 ```
 
 ### Task 0: Isolate the work and verify the baseline
@@ -441,7 +442,7 @@ git commit -m "feat: select and evaluate strong corruption policy"
 
 Expected: all study tests pass before the commit.
 
-### Task 4: Load existing caches and write the three-file report
+### Task 4: Load existing caches and write the report artifacts
 
 **Files:**
 - Modify: `differential_uncertainty/strong_corruption_study.py`
@@ -468,7 +469,7 @@ def test_tiny_study_filters_levels_and_reports_each_family(tiny_study, tmp_path)
     assert result.levels_read == {0, 4, 5}
     assert result.reported_families == {"fog", "snow"}
     assert {path.name for path in (tmp_path / "output").iterdir() if path.is_file()} == {
-        "results.csv", "summary.json", "report.md",
+        "results.csv", "summary.json", "report.md", "corruption_auroc_bars.png",
     }
 ```
 
@@ -518,7 +519,7 @@ Corruption | Fingerprint strong | Confidence strong | Entropy strong |
 Fingerprint minus confidence | Fingerprint minus entropy
 ```
 
-Follow them with mean and median summaries, the selected tuple, conditional diagnostic, seed range, and three controlled comparisons: banks at the selected distance/aggregation, distances at the selected bank/aggregation, and aggregators at the selected bank/distance. Show both selection and exploratory validation values for these comparisons. End with `Levels 1 through 3 were not evaluated.` Never include a presumed AUROC such as 0.714.
+Follow them with mean and median summaries, the selected tuple, conditional diagnostic, seed range, and three controlled comparisons: banks at the selected distance/aggregation, distances at the selected bank/aggregation, and aggregators at the selected bank/distance. Show both selection and exploratory validation values for these comparisons. Keep `Levels 1 through 3 were not evaluated.` immediately before a final Markdown embed of `corruption_auroc_bars.png`. The PNG has severity-4 and severity-5 horizontal grouped-bar panels for fingerprint, confidence, and entropy AUROC across all 19 families. Never include a presumed AUROC such as 0.714.
 
 Expose only:
 
