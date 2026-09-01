@@ -15,20 +15,32 @@ def _finite_matrix(values: Tensor, name: str) -> None:
         raise ValueError(f"{name} must be finite")
 
 
+def _float32_matrix(values: Tensor, name: str) -> Tensor:
+    _finite_matrix(values, name)
+    converted = values.detach().to(device="cpu", dtype=torch.float32)
+    if not bool(torch.isfinite(converted).all()):
+        raise ValueError(f"{name} must remain finite after float32 conversion")
+    return converted
+
+
 def normalize_bank(bank: Tensor) -> Tensor:
-    _finite_matrix(bank, "bank")
-    if bank.shape[0] < 5:
+    values = _float32_matrix(bank, "bank")
+    if values.shape[0] < 5:
         raise ValueError("bank needs at least five rows")
-    values = bank.detach().to(device="cpu", dtype=torch.float32)
     norms = values.norm(dim=1)
+    if not bool(torch.isfinite(norms).all()):
+        raise ValueError("bank norms must be finite")
     if bool((norms == 0).any()):
         raise ValueError("bank contains a zero norm row")
-    return values / norms[:, None]
+    normalized = values / norms[:, None]
+    if not bool(torch.isfinite(normalized).all()):
+        raise ValueError("normalized bank must be finite")
+    return normalized
 
 
 def mean_five_cosine(queries: Tensor, normalized_bank: Tensor, chunk_size: int = 512) -> Tensor:
-    _finite_matrix(queries, "queries")
-    _finite_matrix(normalized_bank, "normalized_bank")
+    queries = _float32_matrix(queries, "queries")
+    normalized_bank = _float32_matrix(normalized_bank, "normalized_bank")
     if queries.shape[0] == 0:
         raise ValueError("queries must be nonempty")
     if queries.shape[1] != normalized_bank.shape[1]:
@@ -37,30 +49,44 @@ def mean_five_cosine(queries: Tensor, normalized_bank: Tensor, chunk_size: int =
         raise ValueError("bank needs at least five rows")
     if type(chunk_size) is not int or chunk_size <= 0:
         raise ValueError("chunk_size must be a positive integer")
-    queries = queries.detach().to(device="cpu", dtype=torch.float32)
     query_norms = queries.norm(dim=1)
+    if not bool(torch.isfinite(query_norms).all()):
+        raise ValueError("query norms must be finite")
     if bool((query_norms == 0).any()):
         raise ValueError("queries contain a zero norm row")
-    bank_norms = normalized_bank.detach().to(device="cpu", dtype=torch.float32).norm(dim=1)
+    bank_norms = normalized_bank.norm(dim=1)
+    if not bool(torch.isfinite(bank_norms).all()):
+        raise ValueError("normalized bank norms must be finite")
     if bool((bank_norms == 0).any()):
         raise ValueError("normalized_bank contains a zero norm row")
     normalized_queries = queries / query_norms[:, None]
+    if not bool(torch.isfinite(normalized_queries).all()):
+        raise ValueError("normalized queries must be finite")
     best = torch.full((queries.shape[0], 5), float("inf"))
-    for chunk in normalized_bank.detach().to(device="cpu", dtype=torch.float32).split(chunk_size):
+    for chunk in normalized_bank.split(chunk_size):
         distances = 1.0 - normalized_queries @ chunk.T
+        if not bool(torch.isfinite(distances).all()):
+            raise ValueError("cosine distances must be finite")
         local = distances.topk(min(5, chunk.shape[0]), largest=False, dim=1).values
         best = torch.cat((best, local), dim=1).topk(5, largest=False, dim=1).values
-    return best.mean(dim=1)
+    result = best.mean(dim=1)
+    if not bool(torch.isfinite(result).all()):
+        raise ValueError("mean cosine distances must be finite")
+    return result
 
 
 def top_query_entropy(logits: Tensor) -> float:
-    _finite_matrix(logits, "logits")
+    logits = _float32_matrix(logits, "logits")
     if logits.shape[0] == 0 or logits.shape[1] < 2:
         raise ValueError("logits need a nonempty query axis and at least two classes")
-    confidence = logits.float().sigmoid().amax(dim=1)
-    selected = logits.float()[int(confidence.argmax())]
+    confidence = logits.sigmoid().amax(dim=1)
+    selected = logits[int(confidence.argmax())]
     probabilities = selected.softmax(dim=0)
+    if not bool(torch.isfinite(probabilities).all()):
+        raise ValueError("softmax probabilities must be finite")
     entropy = -torch.xlogy(probabilities, probabilities).sum() / math.log(logits.shape[1])
+    if not bool(torch.isfinite(entropy)):
+        raise ValueError("entropy must be finite")
     return float(entropy)
 
 

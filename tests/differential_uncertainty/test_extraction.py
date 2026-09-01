@@ -36,6 +36,12 @@ def test_prepare_image_returns_rgb_float32_nchw_values():
     assert float(actual.min()) == pytest.approx(128 / 255)
 
 
+def test_prepare_image_keeps_an_already_exact_rgb_image_open_until_tensorized():
+    actual = prepare_image(Image.new("RGB", (640, 640), "red"), (640, 640))
+    assert actual.shape == (3, 640, 640)
+    assert actual.dtype == torch.float32
+
+
 class _InnerDecoder(nn.Module):
     def __init__(self):
         super().__init__()
@@ -79,6 +85,17 @@ class _Detector(nn.Module):
         return {"pred_logits": logits, "pred_boxes": boxes}
 
 
+class _OverflowDetector(_Detector):
+    def __init__(self):
+        super().__init__()
+        self.decoder.dec_score_head[2].weight.data.fill_(1e10)
+
+    def forward(self, images):
+        outputs = super().forward(images)
+        outputs["pred_logits"].fill_(1e10)
+        return outputs
+
+
 def test_extractor_discards_boxes_after_deriving_padded_ids(monkeypatch):
     config = ExperimentConfig(
         image_size=(4, 4), class_count=2, query_count=3,
@@ -93,3 +110,14 @@ def test_extractor_discards_boxes_after_deriving_padded_ids(monkeypatch):
     assert records[0]["persistence"].dtype == torch.float16
     assert records[0]["padded_ids"].dtype == torch.int64
     assert records[0]["padded_ids"].tolist() == [1, 2]
+
+
+def test_extractor_rejects_finite_float32_outputs_that_overflow_float16(monkeypatch):
+    config = ExperimentConfig(
+        image_size=(4, 4), class_count=2, query_count=3,
+        persistence_dim=3, bank_capacity=5,
+    )
+    monkeypatch.setattr(extraction, "load_frozen_detector", lambda *_: _OverflowDetector())
+    with RTDETRExtractor(Path("ignored"), torch.device("cpu"), config) as extractor:
+        with pytest.raises(ValueError, match="finite"):
+            extractor.extract_batch(torch.zeros(1, 3, 4, 4))

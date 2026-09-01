@@ -29,3 +29,26 @@ def test_config_accepts_small_direct_test_overrides_and_validates_them():
         ExperimentConfig(bank_capacity=4, neighbors=5)
     with pytest.raises(ValueError, match="levels"):
         ExperimentConfig(levels=(0, 4, 5))
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"image_size": [640, 640]}, {"image_size": (640.0, 640)},
+        {"image_size": (True, 640)}, {"image_size": (640,)},
+        {"class_count": True}, {"query_count": 300.0},
+        {"persistence_layer": 2.0}, {"persistence_dim": True},
+        {"bank_capacity": 2_000.0}, {"neighbors": True},
+        {"bank_chunk_size": 512.0}, {"bootstrap_samples": True},
+        {"levels": [4, 5]}, {"levels": (4.0, 5)}, {"levels": (True, 5)},
+    ],
+)
+def test_config_requires_exact_integer_fields_and_tuple_containers(changes):
+    with pytest.raises(ValueError):
+        ExperimentConfig(**changes)
+
+
+@pytest.mark.parametrize("threshold", [True, float("nan"), float("inf"), "0.5"])
+def test_config_requires_a_finite_non_boolean_real_confidence_threshold(threshold):
+    with pytest.raises(ValueError, match="threshold"):
+        ExperimentConfig(bank_confidence_threshold=threshold)

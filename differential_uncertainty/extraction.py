@@ -59,10 +59,14 @@ def load_frozen_detector(checkpoint_path: str | Path, device: torch.device) -> n
 def resize_image(image: Image.Image, image_size: tuple[int, int]) -> Image.Image:
     rgb = image.convert("RGB")
     try:
-        return vision.resize(rgb, list(image_size), antialias=True)
-    finally:
+        resized = vision.resize(rgb, list(image_size), antialias=True)
+    except Exception:
         if rgb is not image:
             rgb.close()
+        raise
+    if rgb is not image and resized is not rgb:
+        rgb.close()
+    return resized
 
 
 def prepare_image(image: Image.Image, image_size: tuple[int, int]) -> Tensor:
@@ -117,14 +121,19 @@ class RTDETRExtractor:
         expected_persistence = (images.shape[0], self.config.query_count, self.config.persistence_dim)
         if tuple(logits.shape) != expected_logits or tuple(boxes.shape) != expected_boxes or tuple(persistence.shape) != expected_persistence:
             raise ValueError("detector output shapes do not match the fixed configuration")
-        return [
-            {
-                "logits": item_logits.detach().to("cpu", torch.float16, copy=True),
-                "persistence": item_persistence.detach().to("cpu", torch.float16, copy=True),
-                "padded_ids": _padded_ids(item_boxes, item_logits, item_persistence),
-            }
-            for item_logits, item_boxes, item_persistence in zip(logits, boxes, persistence, strict=True)
-        ]
+        records = []
+        for item_logits, item_boxes, item_persistence in zip(logits, boxes, persistence, strict=True):
+            padded_ids = _padded_ids(item_boxes, item_logits, item_persistence)
+            stored_logits = item_logits.detach().to("cpu", torch.float16, copy=True)
+            stored_persistence = item_persistence.detach().to("cpu", torch.float16, copy=True)
+            if not bool(torch.isfinite(stored_logits).all()) or not bool(torch.isfinite(stored_persistence).all()):
+                raise ValueError("stored detector outputs must be finite after float16 conversion")
+            records.append({
+                "logits": stored_logits,
+                "persistence": stored_persistence,
+                "padded_ids": padded_ids,
+            })
+        return records
 
     def close(self) -> None:
         if self.capture is not None:

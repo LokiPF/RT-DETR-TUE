@@ -74,6 +74,25 @@ def test_top_query_entropy_is_softmax_entropy_normalized_by_class_count():
     assert top_query_entropy(torch.tensor([[0.0, 0.0]])) == pytest.approx(1.0)
 
 
+def test_scoring_rejects_finite_wide_dtype_values_that_overflow_narrowing_conversions():
+    with pytest.raises(ValueError, match="finite"):
+        normalize_bank(torch.full((5, 2), 1e300, dtype=torch.float64))
+    bank = normalize_bank(torch.tensor([
+        [1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3], [0.6, 0.4],
+    ]))
+    with pytest.raises(ValueError, match="finite"):
+        mean_five_cosine(torch.full((1, 2), 1e300, dtype=torch.float64), bank)
+    with pytest.raises(ValueError, match="finite"):
+        top_query_entropy(torch.tensor([[1e300, -1e300]], dtype=torch.float64))
+
+
+def test_mean_five_cosine_rejects_nonfinite_distances_after_matmul():
+    queries = torch.tensor([[1.0, 1.0]])
+    bank = torch.full((5, 2), 1e38)
+    with pytest.raises(ValueError, match="finite"):
+        mean_five_cosine(queries, bank)
+
+
 def test_top_query_entropy_handles_exact_zero_softmax_probabilities():
     entropy = top_query_entropy(torch.tensor([[1000.0, -1000.0]]))
     assert math.isfinite(entropy)

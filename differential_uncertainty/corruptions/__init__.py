@@ -17,7 +17,7 @@ _BLUR_RADII = {4: 8, 5: 12}
 def apply_corruption(image: Image.Image, name: str, severity: int) -> Image.Image:
     if name not in CORRUPTION_NAMES:
         raise ValueError(f"unknown corruption {name!r}")
-    if severity not in (4, 5):
+    if type(severity) is not int or severity not in (4, 5):
         raise ValueError("corruption severity must be 4 or 5")
     if name == "gaussian_blur":
         return image.convert("RGB").filter(ImageFilter.GaussianBlur(_BLUR_RADII[severity]))

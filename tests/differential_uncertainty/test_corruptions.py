@@ -45,3 +45,9 @@ def test_other_families_delegate_to_imagecorruptions(monkeypatch):
 def test_only_levels_four_and_five_are_accepted(level):
     with pytest.raises(ValueError, match="severity"):
         apply_corruption(Image.new("RGB", (5, 5)), "gaussian_blur", level)
+
+
+@pytest.mark.parametrize("level", [True, 4.0, 5.0])
+def test_corruption_severity_must_be_an_exact_non_boolean_integer(level):
+    with pytest.raises(ValueError, match="severity"):
+        apply_corruption(Image.new("RGB", (5, 5)), "gaussian_blur", level)
