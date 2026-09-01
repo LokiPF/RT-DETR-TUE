@@ -1,238 +1,93 @@
 from __future__ import annotations
 
-import tempfile
-from collections.abc import Iterator
-from numbers import Integral
+import random
 
-import numpy as np
 import torch
 from torch import Tensor
 
-from .artifacts import (
-    _open_regular_file,
-    atomic_torch,
-)
-from .config import ExperimentConfig, FIXED_CONFIG
-from .scoring import detect_padded_tail
 
+class Reservoir:
+    def __init__(self, capacity: int, dimension: int, seed: int = 44) -> None:
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("capacity must be a positive integer")
+        if type(dimension) is not int or dimension <= 0:
+            raise ValueError("dimension must be a positive integer")
+        self.capacity = capacity
+        self.dimension = dimension
+        self._vectors = torch.empty((capacity, dimension), dtype=torch.float16, device="cpu")
+        self.size = 0
+        self.seen = 0
+        self._rng = random.Random(seed)
 
-def _validate_record(record, config: ExperimentConfig) -> None:
-    severity = record.get("severity", 0)
-    if (
-        isinstance(severity, bool)
-        or not isinstance(severity, Integral)
-        or int(severity) != 0
-    ):
-        raise ValueError("reference bank records must be clean severity 0")
-    expected_shapes = {
-        "boxes": (config.query_count, 4),
-        "logits": (config.query_count, config.class_count),
-        "persistence": (config.query_count, config.persistence_dim),
-    }
-    for name, expected in expected_shapes.items():
-        value = record[name]
-        if not isinstance(value, Tensor) or tuple(value.shape) != expected:
-            raise ValueError(f"unexpected {name} shape; expected {expected}")
-        if value.layout != torch.strided:
-            raise ValueError(f"{name} must have a strided layout")
-        if not value.is_floating_point():
-            raise ValueError(f"{name} must have a floating-point dtype")
-        if not bool(torch.isfinite(value).all()):
-            raise ValueError(f"{name} must be finite")
-
-
-def _stage_clean_vectors(
-    records,
-    config: ExperimentConfig,
-    spool,
-) -> list[tuple[str, int, int]]:
-    index: list[tuple[str, int, int]] = []
-    image_ids: set[str] = set()
-    query_ids = torch.arange(config.query_count)
-    for record in records:
-        _validate_record(record, config)
-        image_id = str(record["image_id"])
-        if image_id in image_ids:
-            raise ValueError(
-                "reference bank has a duplicate or string-colliding image ID"
-            )
-        image_ids.add(image_id)
-        padded = detect_padded_tail(record)
-        keep = torch.ones(config.query_count, dtype=torch.bool)
-        keep[padded] = False
-        persistence = record["persistence"]
-        valid_ids = query_ids[keep].to(persistence.device)
-        cleaned = (
-            persistence.index_select(0, valid_ids)
-            .detach()
-            .cpu()
-            .float()
-            .contiguous()
-        )
-        if not bool(torch.isfinite(cleaned).all()):
-            raise ValueError(
-                "persistence must remain finite after float32 conversion"
-            )
-        payload = cleaned.numpy().tobytes(order="C")
-        offset = spool.tell()
-        if spool.write(payload) != len(payload):
-            raise OSError("could not write the complete reference-bank spool record")
-        index.append((image_id, offset, int(cleaned.shape[0])))
-    return index
-
-
-def _iter_staged_vectors(
-    spool,
-    index: list[tuple[str, int, int]],
-    persistence_dim: int,
-) -> Iterator[Tensor]:
-    item_size = np.dtype(np.float32).itemsize
-    for _image_id, offset, valid_count in sorted(
-        index, key=lambda item: item[0]
-    ):
-        byte_count = valid_count * persistence_dim * item_size
-        spool.seek(offset)
-        payload = spool.read(byte_count)
-        if len(payload) != byte_count:
-            raise OSError("could not read the complete reference-bank spool record")
-        values = np.frombuffer(payload, dtype=np.float32).copy()
-        vectors = torch.from_numpy(
-            values.reshape(valid_count, persistence_dim)
-        )
-        for vector in vectors:
-            yield vector.clone()
-
-
-def build_reference_bank(
-    records, config: ExperimentConfig = FIXED_CONFIG
-) -> Tensor:
-    rng = np.random.default_rng(config.bank_seed)
-    reservoir: list[Tensor] = []
-    seen = 0
-    with tempfile.TemporaryFile(mode="w+b") as spool:
-        index = _stage_clean_vectors(records, config, spool)
-        spool.flush()
-        for seen, vector in enumerate(
-            _iter_staged_vectors(spool, index, config.persistence_dim),
-            start=1,
-        ):
-            if len(reservoir) < config.bank_capacity:
-                reservoir.append(vector)
+    def add(self, vectors: Tensor) -> None:
+        if not isinstance(vectors, Tensor) or vectors.ndim != 2 or vectors.shape[1] != self.dimension:
+            raise ValueError("vectors must have shape (rows, dimension)")
+        if not vectors.is_floating_point() or not bool(torch.isfinite(vectors).all()):
+            raise ValueError("vectors must be finite floating tensors")
+        for vector in vectors.detach().to(device="cpu", dtype=torch.float16):
+            self.seen += 1
+            if self.size < self.capacity:
+                self._vectors[self.size].copy_(vector)
+                self.size += 1
             else:
-                replacement = int(rng.integers(0, seen))
-                if replacement < config.bank_capacity:
-                    reservoir[replacement] = vector
-    if seen < config.bank_capacity:
-        raise ValueError(
-            f"reference bank needs exactly {config.bank_capacity} valid vectors; got {seen}"
-        )
-    return torch.stack(reservoir)
+                replacement = self._rng.randrange(self.seen)
+                if replacement < self.capacity:
+                    self._vectors[replacement].copy_(vector)
 
-
-def _validate_bank_vectors(bank: Tensor, config: ExperimentConfig) -> None:
-    if not isinstance(bank, Tensor) or bank.ndim != 2:
-        raise ValueError("reference bank vectors must be a two-dimensional tensor")
-    if bank.layout != torch.strided:
-        raise ValueError("reference bank vectors must have a strided layout")
-    if bank.dtype != torch.float32:
-        raise ValueError("reference bank vectors must have dtype float32")
-    if bank.shape[0] == 0:
-        raise ValueError("reference bank vectors need at least one row")
-    if bank.shape[1] == 0:
-        raise ValueError("reference bank vectors need at least one feature")
-    expected_shape = (config.bank_capacity, config.persistence_dim)
-    if tuple(bank.shape) != expected_shape:
-        raise ValueError(
-            f"reference bank vectors must have shape {expected_shape}"
-        )
-    if not bool(torch.isfinite(bank).all()):
-        raise ValueError("reference bank vectors must be finite")
-
-
-def _validated_metadata(metadata, config: ExperimentConfig) -> dict:
-    if type(metadata) is not dict:
-        raise TypeError("reference bank metadata must be a plain dictionary")
-    expected_keys = {
-        "reference_manifest_sha256",
-        "capacity",
-        "seed",
-        "padding_removed",
-    }
-    if set(metadata) != expected_keys:
-        raise ValueError("reference bank metadata must have the exact metadata keys")
-    digest = metadata["reference_manifest_sha256"]
-    if (
-        type(digest) is not str
-        or len(digest) != 64
-        or any(character not in "0123456789abcdef" for character in digest)
-    ):
-        raise ValueError(
-            "reference_manifest_sha256 must be lowercase 64-character hexadecimal"
-        )
-    capacity = metadata["capacity"]
-    if (
-        isinstance(capacity, bool)
-        or not isinstance(capacity, Integral)
-        or capacity <= 0
-    ):
-        raise ValueError("reference bank capacity must be a positive integer")
-    if int(capacity) != config.bank_capacity:
-        raise ValueError(
-            "reference bank capacity must equal the active configuration"
-        )
-    seed = metadata["seed"]
-    if isinstance(seed, bool) or not isinstance(seed, Integral):
-        raise ValueError("reference bank seed must be an integer")
-    if int(seed) < 0:
-        raise ValueError("reference bank seed must be a non-negative integer")
-    if int(seed) != config.bank_seed:
-        raise ValueError(
-            "reference bank seed must equal the active configuration"
-        )
-    if metadata["padding_removed"] is not True:
-        raise ValueError("reference bank padding_removed must be true")
-    return {
-        "reference_manifest_sha256": digest,
-        "capacity": int(capacity),
-        "seed": int(seed),
-        "padding_removed": True,
-    }
-
-
-def save_reference_bank(
-    bank: Tensor,
-    path,
-    metadata: dict,
-    config: ExperimentConfig = FIXED_CONFIG,
-) -> None:
-    _validate_bank_vectors(bank, config)
-    validated_metadata = _validated_metadata(metadata, config)
-    atomic_torch(
-        {
-            "vectors": bank.detach().cpu().clone(),
-            "metadata": validated_metadata,
-        },
-        path,
-    )
-
-
-def load_reference_bank(
-    path, config: ExperimentConfig = FIXED_CONFIG
-) -> tuple[Tensor, dict]:
-    with _open_regular_file(
-        path,
-        error_message="reference bank must be a regular file",
-    ) as handle:
+    def add_record(self, record: dict, threshold: float) -> None:
         try:
-            artifact = torch.load(handle, map_location="cpu", weights_only=True)
-        except Exception as error:
-            raise ValueError("could not load reference bank artifact") from error
-    if type(artifact) is not dict or set(artifact) != {"vectors", "metadata"}:
-        raise ValueError(
-            "reference bank artifact must contain exactly vectors and metadata"
-        )
-    vectors = artifact["vectors"]
-    metadata = artifact["metadata"]
-    _validate_bank_vectors(vectors, config)
-    validated_metadata = _validated_metadata(metadata, config)
-    return vectors.clone(), validated_metadata
+            persistence = record["persistence"]
+            logits = record["logits"]
+            padded_ids = record["padded_ids"]
+        except (KeyError, TypeError) as error:
+            raise ValueError("record needs persistence, logits, and padded_ids") from error
+        if not isinstance(persistence, Tensor) or not isinstance(logits, Tensor) or persistence.ndim != 2 or logits.ndim != 2:
+            raise ValueError("record persistence and logits must be rank-two tensors")
+        if persistence.shape[0] != logits.shape[0] or persistence.shape[1] != self.dimension:
+            raise ValueError("record shapes do not match reservoir dimension")
+        if not isinstance(padded_ids, Tensor) or padded_ids.ndim != 1:
+            raise ValueError("padded_ids must be a one-dimensional tensor")
+        if padded_ids.is_floating_point() or padded_ids.dtype == torch.bool:
+            raise ValueError("padded_ids must have integer dtype")
+        if not isinstance(threshold, (int, float)) or not 0.0 <= float(threshold) <= 1.0:
+            raise ValueError("threshold must lie in [0, 1]")
+        keep = torch.ones(persistence.shape[0], dtype=torch.bool)
+        if padded_ids.numel():
+            ids = padded_ids.to(dtype=torch.long, device="cpu")
+            if int(ids.min()) < 0 or int(ids.max()) >= persistence.shape[0]:
+                raise ValueError("padded_ids lie outside record rows")
+            keep[ids] = False
+        confidence = logits.float().sigmoid().amax(dim=1).cpu()
+        self.add(persistence.cpu()[keep & (confidence >= float(threshold))])
+
+    def bank(self) -> Tensor:
+        if self.size != self.capacity:
+            raise ValueError("reservoir bank is not full")
+        return self._vectors.clone()
+
+    def state_dict(self) -> dict:
+        return {
+            "capacity": self.capacity,
+            "dimension": self.dimension,
+            "vectors": self._vectors[:self.size].clone(),
+            "size": self.size,
+            "seen": self.seen,
+            "rng": self._rng.getstate(),
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: dict) -> Reservoir:
+        if not isinstance(state, dict) or set(state) != {"capacity", "dimension", "vectors", "size", "seen", "rng"}:
+            raise ValueError("invalid reservoir state")
+        reservoir = cls(state["capacity"], state["dimension"])
+        vectors, size, seen = state["vectors"], state["size"], state["seen"]
+        if not isinstance(vectors, Tensor) or tuple(vectors.shape) != (size, reservoir.dimension) or not 0 <= size <= reservoir.capacity or not isinstance(seen, int) or seen < size:
+            raise ValueError("invalid reservoir state values")
+        reservoir._vectors[:size].copy_(vectors.to(dtype=torch.float16, device="cpu"))
+        reservoir.size = size
+        reservoir.seen = seen
+        try:
+            reservoir._rng.setstate(state["rng"])
+        except (TypeError, ValueError) as error:
+            raise ValueError("invalid reservoir random state") from error
+        return reservoir

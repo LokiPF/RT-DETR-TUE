@@ -1,85 +1,38 @@
 from __future__ import annotations
 
 import inspect
+
 import numpy as np
 from PIL import Image
 
-from .base import Severity
 
-
-ADDITIONAL_IMAGECORRUPTIONS = (
-    "gaussian_noise",
-    "shot_noise",
-    "impulse_noise",
-    "defocus_blur",
-    "glass_blur",
-    "motion_blur",
-    "zoom_blur",
-    "snow",
-    "frost",
-    "fog",
-    "brightness",
-    "contrast",
-    "elastic_transform",
-    "pixelate",
-    "jpeg_compression",
-    "speckle_noise",
-    "spatter",
-    "saturate",
-)
-
-
-class _ImageCorruptionsNumpyCompatibility:
+class _NumpyCompatibility:
     def __getattr__(self, name: str):
         if name == "float_":
             return np.float64
         return getattr(np, name)
 
 
-def _prepare_imagecorruptions_compatibility() -> None:
+def _prepare_compatibility() -> None:
     import imagecorruptions.corruptions as upstream
 
     if not hasattr(upstream.np, "float_"):
-        upstream.np = _ImageCorruptionsNumpyCompatibility()
-
+        upstream.np = _NumpyCompatibility()
     if "multichannel" not in inspect.signature(upstream.gaussian).parameters:
         gaussian = upstream.gaussian
 
-        def compatibility_gaussian(
-            image, *args, multichannel=None, **kwargs,
-        ):
+        def compatible_gaussian(image, *args, multichannel=None, **kwargs):
             if multichannel:
                 kwargs["channel_axis"] = -1
             return gaussian(image, *args, **kwargs)
 
-        upstream.gaussian = compatibility_gaussian
+        upstream.gaussian = compatible_gaussian
 
 
-class ImageCorruption:
-    severities = tuple(Severity(level, float(level)) for level in range(6))
+def apply_imagecorruption(image: Image.Image, name: str, severity: int) -> Image.Image:
+    from imagecorruptions import corrupt
 
-    def __init__(self, upstream_name: str) -> None:
-        if upstream_name not in ADDITIONAL_IMAGECORRUPTIONS:
-            raise ValueError(
-                f"unknown ImageCorruptions corruption {upstream_name!r}"
-            )
-        self.name = upstream_name
-
-    def apply(self, image: Image.Image, level: int) -> Image.Image:
-        if level < 0 or level >= len(self.severities):
-            raise ValueError(f"unknown imagecorruptions severity {level}")
-        if level == 0:
-            return image
-
-        from imagecorruptions import corrupt
-        _prepare_imagecorruptions_compatibility()
-
-        pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
-        output = corrupt(
-            pixels, corruption_name=self.name, severity=level,
-        )
-        return Image.fromarray(np.asarray(output, dtype=np.uint8), mode="RGB")
-
-
-def additional_corruption_names() -> tuple[str, ...]:
-    return ADDITIONAL_IMAGECORRUPTIONS
+    _prepare_compatibility()
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    output = corrupt(pixels, corruption_name=name, severity=severity)
+    return Image.fromarray(np.asarray(output, dtype=np.uint8), mode="RGB")
