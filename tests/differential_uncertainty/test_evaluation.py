@@ -27,6 +27,67 @@ def _rows(families=FAMILIES, image_ids=("a", "b", "c")):
     return rows
 
 
+def _overlapping_rows():
+    rows = []
+    image_ids = ("a", "b", "c")
+    clean = (0.0, 2.0, 4.0)
+    for family_index, family in enumerate(FAMILIES):
+        for image_index, image_id in enumerate(image_ids):
+            for severity in (0, 4, 5):
+                if severity == 0:
+                    fingerprint = confidence = entropy = clean[image_index]
+                else:
+                    fingerprint = float(
+                        clean[image_index] + ((family_index + severity + image_index) % 3) - 1
+                    )
+                    confidence = float(
+                        clean[image_index] + ((2 * family_index + severity + image_index) % 3) - 2
+                    )
+                    entropy = float(clean[image_index] + ((family_index + image_index) % 2))
+                rows.append({
+                    "image_id": image_id,
+                    "corruption": family,
+                    "severity": severity,
+                    "fingerprint": fingerprint,
+                    "confidence": confidence,
+                    "entropy": entropy,
+                })
+    return rows
+
+
+def _pairwise_auroc(clean, corrupted):
+    return sum(
+        1.0 if corrupted_value > clean_value else 0.5 if corrupted_value == clean_value else 0.0
+        for clean_value in clean
+        for corrupted_value in corrupted
+    ) / (len(clean) * len(corrupted))
+
+
+def _independent_macro_difference(rows, draws, left, right):
+    columns = {
+        (family, image_id, severity, method): row[method]
+        for row in rows
+        for family in (row["corruption"],)
+        for image_id in (row["image_id"],)
+        for severity in (row["severity"],)
+        for method in ("fingerprint", "confidence", "entropy")
+    }
+    image_ids = ("a", "b", "c")
+    differences = []
+    for draw in draws:
+        macros = []
+        for method in (left, right):
+            task_aurocs = []
+            for family in FAMILIES:
+                clean = [columns[(family, image_ids[index], 0, method)] for index in draw]
+                for severity in (4, 5):
+                    corrupted = [columns[(family, image_ids[index], severity, method)] for index in draw]
+                    task_aurocs.append(_pairwise_auroc(clean, corrupted))
+            macros.append(sum(task_aurocs) / len(task_aurocs))
+        differences.append(macros[0] - macros[1])
+    return np.asarray(differences)
+
+
 def test_binary_auroc_is_tie_correct_and_uses_larger_as_corrupted():
     assert binary_auroc([0, 1], [1, 2]) == pytest.approx(0.875)
     assert binary_auroc([1, 2], [0, 1]) == pytest.approx(0.125)
@@ -136,6 +197,28 @@ def test_paired_bootstrap_is_deterministic_and_comparison_point_matches_aggregat
     assert first["comparisons"]["fingerprint_minus_entropy"]["point"] == pytest.approx(
         first["aggregate"]["fingerprint"] - first["aggregate"]["entropy"]
     )
+
+
+def test_paired_bootstrap_matches_an_independent_nonzero_tied_overlap_oracle():
+    rows = _overlapping_rows()
+    samples = 37
+    seed = 43
+    result = evaluate_scores(rows, FAMILIES, samples=samples, seed=seed)
+    draws = np.random.default_rng(seed).integers(0, 3, size=(samples, 3))
+    differences = _independent_macro_difference(
+        rows, draws, "fingerprint", "confidence"
+    )
+
+    expected_point = _independent_macro_difference(
+        rows, np.arange(3, dtype=int)[None, :], "fingerprint", "confidence"
+    )[0]
+    expected_low, expected_high = np.percentile(differences, (2.5, 97.5))
+    comparison = result["comparisons"]["fingerprint_minus_confidence"]
+    assert comparison["point"] == pytest.approx(expected_point)
+    assert comparison["low"] == pytest.approx(expected_low)
+    assert comparison["high"] == pytest.approx(expected_high)
+    assert comparison["point"] != 0.0
+    assert comparison["low"] != 0.0 or comparison["high"] != 0.0
 
 
 def test_private_paired_draw_helper_uses_the_same_draw_for_both_methods():

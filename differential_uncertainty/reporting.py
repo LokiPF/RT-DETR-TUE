@@ -129,6 +129,7 @@ def _render_report(evaluation: dict, families: tuple[str, ...]) -> str:
         "Fingerprint is, for each retained query, the mean cosine distance to the five nearest bank vectors, then the confidence-weighted mean across the retained scene queries.",
         "Confidence is one minus the maximum sigmoid confidence across retained queries.",
         "Entropy is normalized Shannon entropy of the highest-confidence retained query.",
+        "Paired comparisons report the equal-weight macro-AUROC difference as the point estimate. The 2.5th and 97.5th percentiles from paired whole-image bootstrap resampling of the supplied evaluation set are descriptive stability intervals, not population or analytic confidence intervals.",
         "",
         "## Aggregate AUROC",
         "",
@@ -172,22 +173,24 @@ def _render_report(evaluation: dict, families: tuple[str, ...]) -> str:
 def _write_chart(path: Path, tasks: list[dict], families: tuple[str, ...]) -> None:
     task_index = {(task["corruption"], task["severity"]): task for task in tasks}
     figure, axes = plt.subplots(1, 2, figsize=(13, 9), sharey=True, constrained_layout=True)
-    positions = np.arange(len(families))
-    offsets = (-0.24, 0.0, 0.24)
-    colors = ("#3b6fb6", "#d48536", "#4f9d69")
-    for axis, severity in zip(axes, (4, 5)):
-        for method, offset, color in zip(_METHODS, offsets, colors):
-            values = [task_index[(family, severity)][f"{method}_auroc"] for family in families]
-            axis.barh(positions + offset, values, height=0.22, label=method.capitalize(), color=color)
-        axis.set_title(f"Severity {severity}")
-        axis.set_xlim(0, 1)
-        axis.axvline(0.5, color="black", linewidth=0.9, linestyle="--")
-        axis.set_xlabel("AUROC")
-        axis.set_yticks(positions, families, fontsize=8)
-        axis.invert_yaxis()
-    axes[1].legend(loc="lower right")
-    figure.savefig(path, dpi=160)
-    plt.close(figure)
+    try:
+        positions = np.arange(len(families))
+        offsets = (-0.24, 0.0, 0.24)
+        colors = ("#3b6fb6", "#d48536", "#4f9d69")
+        for axis, severity in zip(axes, (4, 5)):
+            for method, offset, color in zip(_METHODS, offsets, colors):
+                values = [task_index[(family, severity)][f"{method}_auroc"] for family in families]
+                axis.barh(positions + offset, values, height=0.22, label=method.capitalize(), color=color)
+            axis.set_title(f"Severity {severity}")
+            axis.set_xlim(0, 1)
+            axis.axvline(0.5, color="black", linewidth=0.9, linestyle="--")
+            axis.set_xlabel("AUROC")
+            axis.set_yticks(positions, families, fontsize=8)
+            axis.invert_yaxis()
+        axes[1].legend(loc="lower right")
+        figure.savefig(path, dpi=160)
+    finally:
+        plt.close(figure)
 
 
 def write_results(output: Path, score_rows: list[dict], evaluation: dict, families) -> None:

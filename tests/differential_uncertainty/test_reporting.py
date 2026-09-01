@@ -3,6 +3,7 @@ import copy
 import json
 
 import matplotlib.image as mpimg
+import matplotlib.pyplot as plt
 import pytest
 
 from differential_uncertainty.corruptions import CORRUPTION_NAMES
@@ -58,6 +59,9 @@ def test_report_has_all_family_rows_real_chart_and_required_final_line(tmp_path)
     assert "one minus the maximum sigmoid confidence across retained queries" in text
     assert "normalized Shannon entropy of the highest-confidence retained query" in text
     assert "model confidence score" not in text.lower()
+    assert "2.5th and 97.5th percentiles from paired whole-image bootstrap resampling of the supplied evaluation set" in text
+    assert "descriptive stability intervals" in text
+    assert "equal-weight macro-AUROC difference" in text
     assert "Levels 1 through 3 were not evaluated." in text
     assert all(f"| {family} |" in text for family in FAMILIES)
     assert text.rstrip().splitlines()[-1] == "![Per-corruption AUROC](corruption_auroc_bars.png)"
@@ -68,6 +72,19 @@ def test_report_has_all_family_rows_real_chart_and_required_final_line(tmp_path)
     assert chart.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     pixels = mpimg.imread(chart)
     assert pixels.shape[0] > 100 and pixels.shape[1] > 100
+
+
+def test_chart_closes_its_figure_when_saving_fails(tmp_path, monkeypatch):
+    rows, evaluation = _inputs()
+    before = set(plt.get_fignums())
+
+    def fail_savefig(_self, *_args, **_kwargs):
+        raise RuntimeError("save failed")
+
+    monkeypatch.setattr("matplotlib.figure.Figure.savefig", fail_savefig)
+    with pytest.raises(RuntimeError, match="save failed"):
+        write_results(tmp_path / "evidence", rows, evaluation, FAMILIES)
+    assert set(plt.get_fignums()) == before
 
 
 @pytest.mark.parametrize("families", [
