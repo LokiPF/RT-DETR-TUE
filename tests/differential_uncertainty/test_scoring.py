@@ -59,5 +59,95 @@ def test_scoring_rejects_zero_norms_and_banks_smaller_than_five():
         mean_five_cosine(torch.tensor([[1.0, 0.0]]), torch.ones(4, 2))
 
 
+def test_mean_five_cosine_rejects_empty_queries_and_zero_norm_normalized_bank_rows():
+    bank = normalize_bank(torch.tensor([
+        [1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3], [0.6, 0.4],
+    ]))
+    with pytest.raises(ValueError, match="nonempty"):
+        mean_five_cosine(torch.empty(0, 2), bank)
+    bank[2].zero_()
+    with pytest.raises(ValueError, match="zero norm"):
+        mean_five_cosine(torch.tensor([[1.0, 0.0]]), bank)
+
+
 def test_top_query_entropy_is_softmax_entropy_normalized_by_class_count():
     assert top_query_entropy(torch.tensor([[0.0, 0.0]])) == pytest.approx(1.0)
+
+
+def test_top_query_entropy_handles_exact_zero_softmax_probabilities():
+    entropy = top_query_entropy(torch.tensor([[1000.0, -1000.0]]))
+    assert math.isfinite(entropy)
+    assert entropy == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize(("index", "severity"), [(0, False), (1, 4.0)])
+def test_score_triplet_requires_exact_non_boolean_integer_severities(index, severity):
+    config = ExperimentConfig(
+        class_count=2, query_count=3, persistence_dim=2, bank_capacity=5,
+    )
+    bank = normalize_bank(torch.tensor([
+        [1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3], [0.6, 0.4],
+    ]))
+    records = [
+        _record(0, [[0, 0], [2, 0], [5, 0]], [[1, 0], [0, 1], [1, 1]]),
+        _record(4, [[0, 0], [2, 0], [5, 0]], [[1, 0], [0, 1], [1, 1]]),
+        _record(5, [[0, 0], [2, 0], [5, 0]], [[1, 0], [0, 1], [1, 1]]),
+    ]
+    records[index]["severity"] = severity
+    with pytest.raises(ValueError, match="severities"):
+        score_triplet(records, bank, config)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("logits", torch.ones(3), "rank-two"),
+        ("persistence", torch.ones(3, 3), "persistence shape"),
+        ("logits", torch.full((3, 2), float("nan")), "finite"),
+    ],
+)
+def test_score_triplet_rejects_malformed_or_nonfinite_record_tensors(field, value, message):
+    config = ExperimentConfig(
+        class_count=2, query_count=3, persistence_dim=2, bank_capacity=5,
+    )
+    bank = normalize_bank(torch.tensor([
+        [1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3], [0.6, 0.4],
+    ]))
+    records = [
+        _record(0, [[0, 0], [2, 0], [5, 0]], [[1, 0], [0, 1], [1, 1]]),
+        _record(4, [[0, 0], [2, 0], [5, 0]], [[1, 0], [0, 1], [1, 1]]),
+        _record(5, [[0, 0], [2, 0], [5, 0]], [[1, 0], [0, 1], [1, 1]]),
+    ]
+    records[1][field] = value
+    with pytest.raises(ValueError, match=message):
+        score_triplet(records, bank, config)
+
+
+def test_score_triplet_rejects_empty_queries_after_union_padding():
+    config = ExperimentConfig(
+        class_count=2, query_count=3, persistence_dim=2, bank_capacity=5,
+    )
+    bank = normalize_bank(torch.tensor([
+        [1.0, 0.0], [0.9, 0.1], [0.8, 0.2], [0.7, 0.3], [0.6, 0.4],
+    ]))
+    records = [
+        _record(level, [[0, 0], [2, 0], [5, 0]], [[1, 0], [0, 1], [1, 1]], padded_ids=(0, 1, 2))
+        for level in (0, 4, 5)
+    ]
+    with pytest.raises(ValueError, match="no valid"):
+        score_triplet(records, bank, config)
+
+
+def test_score_triplet_rejects_zero_norm_normalized_bank_rows():
+    config = ExperimentConfig(
+        class_count=2, query_count=3, persistence_dim=2, bank_capacity=5,
+    )
+    bank = torch.tensor([
+        [1.0, 0.0], [0.0, 1.0], [0.0, 0.0], [0.7, 0.3], [0.6, 0.4],
+    ])
+    records = [
+        _record(level, [[0, 0], [2, 0], [5, 0]], [[1, 0], [0, 1], [1, 1]])
+        for level in (0, 4, 5)
+    ]
+    with pytest.raises(ValueError, match="zero norm"):
+        score_triplet(records, bank, config)

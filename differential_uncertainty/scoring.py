@@ -29,6 +29,8 @@ def normalize_bank(bank: Tensor) -> Tensor:
 def mean_five_cosine(queries: Tensor, normalized_bank: Tensor, chunk_size: int = 512) -> Tensor:
     _finite_matrix(queries, "queries")
     _finite_matrix(normalized_bank, "normalized_bank")
+    if queries.shape[0] == 0:
+        raise ValueError("queries must be nonempty")
     if queries.shape[1] != normalized_bank.shape[1]:
         raise ValueError("queries and bank feature dimensions must match")
     if normalized_bank.shape[0] < 5:
@@ -39,6 +41,9 @@ def mean_five_cosine(queries: Tensor, normalized_bank: Tensor, chunk_size: int =
     query_norms = queries.norm(dim=1)
     if bool((query_norms == 0).any()):
         raise ValueError("queries contain a zero norm row")
+    bank_norms = normalized_bank.detach().to(device="cpu", dtype=torch.float32).norm(dim=1)
+    if bool((bank_norms == 0).any()):
+        raise ValueError("normalized_bank contains a zero norm row")
     normalized_queries = queries / query_norms[:, None]
     best = torch.full((queries.shape[0], 5), float("inf"))
     for chunk in normalized_bank.detach().to(device="cpu", dtype=torch.float32).split(chunk_size):
@@ -55,7 +60,7 @@ def top_query_entropy(logits: Tensor) -> float:
     confidence = logits.float().sigmoid().amax(dim=1)
     selected = logits.float()[int(confidence.argmax())]
     probabilities = selected.softmax(dim=0)
-    entropy = -(probabilities * probabilities.log()).sum() / math.log(logits.shape[1])
+    entropy = -torch.xlogy(probabilities, probabilities).sum() / math.log(logits.shape[1])
     return float(entropy)
 
 
@@ -74,7 +79,8 @@ def _union_padded_ids(records: list[dict], query_count: int) -> Tensor:
 
 def score_triplet(records, normalized_bank: Tensor, config: ExperimentConfig = FIXED_CONFIG) -> list[dict]:
     records = list(records)
-    if len(records) != 3 or [record.get("severity") for record in records] != [0, 4, 5]:
+    severities = [record.get("severity") for record in records]
+    if len(records) != 3 or any(type(severity) is not int for severity in severities) or severities != [0, 4, 5]:
         raise ValueError("records must contain exact severities 0, 4, 5")
     image_ids = {record.get("image_id") for record in records}
     corruptions = {record.get("corruption") for record in records}
