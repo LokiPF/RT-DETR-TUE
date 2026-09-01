@@ -1,6 +1,7 @@
 import csv
 import copy
 import json
+from pathlib import Path
 
 import matplotlib.image as mpimg
 import matplotlib.pyplot as plt
@@ -46,6 +47,35 @@ def test_write_results_writes_exactly_the_five_required_files_and_csv_schemas(tm
     ]
     assert len(task_rows) == 39
     assert json.loads((output / "summary.json").read_text()) == evaluation
+
+
+def test_each_result_is_published_from_one_sibling_temporary_file(
+    tmp_path, monkeypatch
+):
+    rows, evaluation = _inputs()
+    output = tmp_path / "evidence"
+    replacements = []
+    original_replace = Path.replace
+
+    def record_replace(source, target):
+        replacements.append((source, Path(target)))
+        return original_replace(source, target)
+
+    monkeypatch.setattr(Path, "replace", record_replace)
+    write_results(output, rows, evaluation, FAMILIES)
+
+    expected = {
+        "corruption_auroc_bars.png", "per_image_scores.csv", "report.md",
+        "results.csv", "summary.json",
+    }
+    assert {target.name for _source, target in replacements} == expected
+    assert all(source.parent == target.parent == output for source, target in replacements)
+    chart_source = next(
+        source for source, target in replacements
+        if target.name == "corruption_auroc_bars.png"
+    )
+    assert chart_source.suffix == ".png"
+    assert {path.name for path in output.iterdir()} == expected
 
 
 def test_report_has_all_family_rows_real_chart_and_required_final_line(tmp_path):

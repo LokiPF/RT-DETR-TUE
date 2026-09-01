@@ -22,13 +22,6 @@ from .scoring import normalize_bank, score_triplet
 
 
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
-_REPORT_FILES = (
-    "per_image_scores.csv",
-    "results.csv",
-    "summary.json",
-    "report.md",
-    "corruption_auroc_bars.png",
-)
 
 
 def _positive_int(value, name: str) -> int:
@@ -123,8 +116,6 @@ def _run_config(
     checkpoint: Path,
     train_root: Path,
     val_root: Path,
-    train_images: list[Path],
-    val_images: list[Path],
     *,
     reference_count: int,
     evaluation_count: int,
@@ -139,8 +130,6 @@ def _run_config(
         "coco_val_images": str(val_root),
         "reference_count": reference_count,
         "evaluation_count": evaluation_count,
-        "reference_images": [path.name for path in train_images],
-        "evaluation_images": [path.name for path in val_images],
         "device": device,
         "batch_size": batch_size,
         "seed": seed,
@@ -211,10 +200,24 @@ def _build_bank(
     extractor,
     paths: list[Path],
     progress_path: Path,
+    bank_path: Path,
     config: ExperimentConfig,
     batch_size: int,
     seed: int,
 ) -> torch.Tensor:
+    if bank_path.exists():
+        bank = _load_torch(bank_path, "completed bank")
+        if not isinstance(bank, torch.Tensor) or tuple(bank.shape) != (
+            config.bank_capacity, config.persistence_dim
+        ):
+            raise ValueError("completed bank does not match fixed configuration")
+        try:
+            normalized = normalize_bank(bank)
+        except ValueError as error:
+            raise ValueError("completed bank is invalid") from error
+        progress_path.unlink(missing_ok=True)
+        return normalized
+
     next_image, reservoir = _bank_progress(progress_path, config, len(paths), seed)
     for start in range(next_image, len(paths), batch_size):
         batch_paths = paths[start : start + batch_size]
@@ -227,7 +230,8 @@ def _build_bank(
                 "reservoir": reservoir.state_dict(),
             })
     try:
-        return normalize_bank(reservoir.bank())
+        bank = reservoir.bank()
+        normalized = normalize_bank(bank)
     except ValueError as error:
         if reservoir.size < config.bank_capacity:
             raise ValueError(
@@ -235,6 +239,9 @@ def _build_bank(
                 f"need {config.bank_capacity}"
             ) from error
         raise
+    _atomic_torch(bank_path, bank)
+    progress_path.unlink(missing_ok=True)
+    return normalized
 
 
 def _evaluation_progress(path: Path, evaluation_count: int):
@@ -350,15 +357,6 @@ def _evaluate_images(
     return combined
 
 
-def _write_final_results(output: Path, rows: list[dict], evaluation: dict) -> None:
-    temporary = output / ".report-tmp"
-    temporary.mkdir(parents=True, exist_ok=True)
-    write_results(temporary, rows, evaluation, CORRUPTION_NAMES)
-    for name in _REPORT_FILES:
-        (temporary / name).replace(output / name)
-    temporary.rmdir()
-
-
 def run_coco_benchmark(
     checkpoint,
     coco_train_images,
@@ -395,7 +393,7 @@ def run_coco_benchmark(
     output.mkdir(parents=True, exist_ok=True)
     _seed_everything(seed)
     _ensure_run_config(output, _run_config(
-        checkpoint, train_root, val_root, train_images, val_images,
+        checkpoint, train_root, val_root,
         reference_count=reference_count, evaluation_count=evaluation_count,
         device=device, batch_size=batch_size, seed=seed, config=config,
     ))
@@ -406,8 +404,8 @@ def run_coco_benchmark(
         raise ValueError(f"invalid PyTorch device: {device}") from error
     with extractor_factory(checkpoint, runtime_device, config) as extractor:
         normalized_bank = _build_bank(
-            extractor, train_images, output / "bank_progress.pt", config,
-            batch_size, seed,
+            extractor, train_images, output / "bank_progress.pt",
+            output / "bank.pt", config, batch_size, seed,
         )
         score_rows = _evaluate_images(
             extractor, val_images, output, normalized_bank, config,
@@ -416,7 +414,7 @@ def run_coco_benchmark(
     evaluation = evaluate_scores(
         score_rows, CORRUPTION_NAMES, samples=config.bootstrap_samples, seed=seed
     )
-    _write_final_results(output, score_rows, evaluation)
+    write_results(output, score_rows, evaluation, CORRUPTION_NAMES)
     return output
 
 

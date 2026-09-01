@@ -9,6 +9,7 @@ from PIL import Image
 
 import differential_uncertainty.benchmark as benchmark
 from differential_uncertainty.config import ExperimentConfig
+from differential_uncertainty.scoring import normalize_bank
 
 
 SMALL_CONFIG = ExperimentConfig(
@@ -134,11 +135,24 @@ def test_missing_inputs_and_excess_counts_are_rejected(inputs, tmp_path, missing
 def test_run_config_mismatch_and_malformed_progress_are_rejected(inputs, tmp_path):
     output = tmp_path / "run"
     run(inputs, output)
+    assert set(json.loads((output / "run_config.json").read_text())) == {
+        "checkpoint", "coco_train_images", "coco_val_images",
+        "reference_count", "evaluation_count", "device", "batch_size", "seed",
+        "fixed_config", "corruptions",
+    }
     with pytest.raises(ValueError, match="run_config"):
         run(inputs, output, seed=8)
-    torch.save({"wrong": True}, output / "bank_progress.pt")
+
+    malformed = tmp_path / "malformed-bank"
+    FakeExtractor.calls = 0
+    FakeExtractor.fail_at = 2
+    with pytest.raises(RuntimeError, match="interrupted"):
+        run(inputs, malformed, batch_size=1)
+    FakeExtractor.fail_at = None
+    FakeExtractor.calls = 0
+    torch.save({"wrong": True}, malformed / "bank_progress.pt")
     with pytest.raises(ValueError, match="bank progress"):
-        run(inputs, output)
+        run(inputs, malformed, batch_size=1)
 
 
 def test_malformed_run_config_and_evaluation_progress_are_rejected(inputs, tmp_path):
@@ -166,21 +180,26 @@ def test_too_few_bank_rows_and_nonfinite_extraction_are_rejected(inputs, tmp_pat
 def test_interrupted_bank_resume_matches_uninterrupted(inputs, tmp_path):
     baseline = tmp_path / "baseline"
     run(inputs, baseline, batch_size=1)
-    baseline_state = torch.load(baseline / "bank_progress.pt", weights_only=False)
+    baseline_bank = torch.load(baseline / "bank.pt", weights_only=False)
+    assert normalize_bank(baseline_bank).shape == (5, 4)
+    assert not (baseline / "bank_progress.pt").exists()
     resumed = tmp_path / "resumed"
     FakeExtractor.calls = 0
     FakeExtractor.fail_at = 2
     with pytest.raises(RuntimeError, match="interrupted"):
         run(inputs, resumed, batch_size=1)
+    assert (resumed / "bank_progress.pt").is_file()
+    assert not (resumed / "bank.pt").exists()
     FakeExtractor.calls = 0
     FakeExtractor.fail_at = None
     run(inputs, resumed, batch_size=1)
-    resumed_state = torch.load(resumed / "bank_progress.pt", weights_only=False)
-    assert resumed_state["next_image"] == baseline_state["next_image"]
-    assert torch.equal(
-        resumed_state["reservoir"]["vectors"], baseline_state["reservoir"]["vectors"]
-    )
-    assert resumed_state["reservoir"]["rng"] == baseline_state["reservoir"]["rng"]
+    resumed_bank = torch.load(resumed / "bank.pt", weights_only=False)
+    assert torch.equal(resumed_bank, baseline_bank)
+    assert not (resumed / "bank_progress.pt").exists()
+
+    torch.save({"stale": True}, resumed / "bank_progress.pt")
+    run(inputs, resumed, batch_size=1)
+    assert not (resumed / "bank_progress.pt").exists()
 
 
 def test_stochastic_evaluation_resume_matches_score_files(inputs, tmp_path):

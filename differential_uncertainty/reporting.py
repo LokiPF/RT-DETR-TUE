@@ -194,18 +194,33 @@ def _write_chart(path: Path, tasks: list[dict], families: tuple[str, ...]) -> No
 
 
 def write_results(output: Path, score_rows: list[dict], evaluation: dict, families) -> None:
-    """Write the fixed corruption evidence files directly into ``output``."""
+    """Atomically publish the five fixed corruption evidence files."""
     output = Path(output)
     ordered_families = _ordered_families(families)
     scores = _ordered_scores(score_rows, ordered_families)
     checked_evaluation = _validated_evaluation(evaluation, ordered_families)
     output.mkdir(parents=True, exist_ok=True)
-    _write_csv(output / "per_image_scores.csv", _SCORE_COLUMNS, scores)
-    _write_csv(output / "results.csv", _TASK_COLUMNS, checked_evaluation["tasks"])
-    with (output / "summary.json").open("w", encoding="utf-8") as handle:
+
+    score_temporary = output / ".per_image_scores.tmp.csv"
+    _write_csv(score_temporary, _SCORE_COLUMNS, scores)
+    score_temporary.replace(output / "per_image_scores.csv")
+
+    results_temporary = output / ".results.tmp.csv"
+    _write_csv(results_temporary, _TASK_COLUMNS, checked_evaluation["tasks"])
+    results_temporary.replace(output / "results.csv")
+
+    summary_temporary = output / ".summary.tmp.json"
+    with summary_temporary.open("w", encoding="utf-8") as handle:
         json.dump(checked_evaluation, handle, indent=2, sort_keys=True, allow_nan=False)
         handle.write("\n")
-    (output / "report.md").write_text(
+    summary_temporary.replace(output / "summary.json")
+
+    report_temporary = output / ".report.tmp.md"
+    report_temporary.write_text(
         _render_report(checked_evaluation, ordered_families), encoding="utf-8"
     )
-    _write_chart(output / "corruption_auroc_bars.png", checked_evaluation["tasks"], ordered_families)
+    report_temporary.replace(output / "report.md")
+
+    chart_temporary = output / ".corruption_auroc_bars.tmp.png"
+    _write_chart(chart_temporary, checked_evaluation["tasks"], ordered_families)
+    chart_temporary.replace(output / "corruption_auroc_bars.png")
