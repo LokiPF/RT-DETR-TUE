@@ -3,7 +3,9 @@ import copy
 import json
 
 import matplotlib.image as mpimg
+import pytest
 
+from differential_uncertainty.corruptions import CORRUPTION_NAMES
 from differential_uncertainty.evaluation import evaluate_scores
 from differential_uncertainty.reporting import write_results
 from tests.differential_uncertainty.test_evaluation import FAMILIES, _rows
@@ -51,9 +53,11 @@ def test_report_has_all_family_rows_real_chart_and_required_final_line(tmp_path)
     write_results(output, rows, evaluation, FAMILIES)
 
     text = (output / "report.md").read_text()
-    assert "fingerprint" in text.lower()
-    assert "confidence" in text.lower()
-    assert "entropy" in text.lower()
+    assert "mean cosine distance to the five nearest bank vectors" in text
+    assert "confidence-weighted mean across the retained scene queries" in text
+    assert "one minus the maximum sigmoid confidence across retained queries" in text
+    assert "normalized Shannon entropy of the highest-confidence retained query" in text
+    assert "model confidence score" not in text.lower()
     assert "Levels 1 through 3 were not evaluated." in text
     assert all(f"| {family} |" in text for family in FAMILIES)
     assert text.rstrip().splitlines()[-1] == "![Per-corruption AUROC](corruption_auroc_bars.png)"
@@ -64,6 +68,31 @@ def test_report_has_all_family_rows_real_chart_and_required_final_line(tmp_path)
     assert chart.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     pixels = mpimg.imread(chart)
     assert pixels.shape[0] > 100 and pixels.shape[1] > 100
+
+
+@pytest.mark.parametrize("families", [
+    CORRUPTION_NAMES[:1],
+    (CORRUPTION_NAMES[1], CORRUPTION_NAMES[0], *CORRUPTION_NAMES[2:]),
+])
+def test_write_results_requires_the_exact_fixed_family_roster_in_order(tmp_path, families):
+    rows, evaluation = _inputs()
+    with pytest.raises(ValueError, match="fixed corruption roster"):
+        write_results(tmp_path / "evidence", rows, evaluation, families)
+
+
+def test_write_results_accepts_and_normalizes_integer_valued_real_scores(tmp_path):
+    rows, evaluation = _inputs()
+    for row in rows:
+        for method in ("fingerprint", "confidence", "entropy"):
+            row[method] = int(row[method])
+    output = tmp_path / "evidence"
+    write_results(output, rows, evaluation, FAMILIES)
+
+    with (output / "per_image_scores.csv").open(newline="") as handle:
+        reader = csv.reader(handle)
+        next(reader)
+        first_score = next(reader)
+    assert first_score[3:] == ["0.0", "0.0", "0.0"]
 
 
 def test_report_interprets_paired_intervals_honestly(tmp_path):

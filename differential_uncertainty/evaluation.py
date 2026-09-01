@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from numbers import Integral
+from numbers import Integral, Real
 
 import numpy as np
 from scipy.stats import rankdata
+
+from .corruptions import CORRUPTION_NAMES
 
 
 _METHODS = ("fingerprint", "confidence", "entropy")
@@ -39,19 +41,13 @@ def binary_auroc(clean, corrupted) -> float:
 
 
 def _validate_families(families) -> tuple[str, ...]:
-    if isinstance(families, str):
-        raise ValueError("families must be a non-empty sequence of unique strings")
     try:
         ordered = tuple(families)
     except TypeError as error:
-        raise ValueError("families must be a non-empty sequence of unique strings") from error
-    if (
-        not ordered
-        or len(set(ordered)) != len(ordered)
-        or any(not isinstance(family, str) or not family.strip() for family in ordered)
-    ):
-        raise ValueError("families must be a non-empty sequence of unique strings")
-    return ordered
+        raise ValueError("families must be the fixed corruption roster in approved order") from error
+    if ordered != CORRUPTION_NAMES:
+        raise ValueError("families must be the fixed corruption roster in approved order")
+    return CORRUPTION_NAMES
 
 
 def _validate_bootstrap_options(samples, seed) -> tuple[int, int]:
@@ -83,10 +79,10 @@ def _panel_arrays(rows, families) -> dict[str, np.ndarray]:
         severity = int(severity)
         for method in _METHODS:
             value = row[method]
-            if isinstance(value, bool) or not isinstance(value, (float, np.floating)):
-                raise ValueError(f"score row {method} must be a finite float")
+            if isinstance(value, bool) or not isinstance(value, Real):
+                raise ValueError(f"score row {method} must be a finite real number")
             if not np.isfinite(value):
-                raise ValueError(f"score row {method} must be a finite float")
+                raise ValueError(f"score row {method} must be a finite real number")
         image_rows = by_family[family].setdefault(image_id, {})
         if severity in image_rows:
             raise ValueError("duplicate family/image/severity score row")

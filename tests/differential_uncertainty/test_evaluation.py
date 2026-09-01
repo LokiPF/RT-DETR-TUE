@@ -2,15 +2,11 @@ import numpy as np
 import pytest
 
 import differential_uncertainty.evaluation as evaluation
+from differential_uncertainty.corruptions import CORRUPTION_NAMES
 from differential_uncertainty.evaluation import binary_auroc, evaluate_scores
 
 
-FAMILIES = (
-    "gaussian_blur", "gaussian_noise", "shot_noise", "impulse_noise",
-    "defocus_blur", "glass_blur", "motion_blur", "zoom_blur", "snow",
-    "frost", "fog", "brightness", "contrast", "elastic_transform",
-    "pixelate", "jpeg_compression", "speckle_noise", "spatter", "saturate",
-)
+FAMILIES = CORRUPTION_NAMES
 
 
 def _rows(families=FAMILIES, image_ids=("a", "b", "c")):
@@ -58,6 +54,24 @@ def test_evaluate_scores_returns_all_tasks_in_supplied_family_and_severity_order
     } for task in result["tasks"])
 
 
+@pytest.mark.parametrize("families", [
+    FAMILIES[:1],
+    (FAMILIES[1], FAMILIES[0], *FAMILIES[2:]),
+])
+def test_evaluate_scores_requires_the_exact_fixed_family_roster_in_order(families):
+    with pytest.raises(ValueError, match="fixed corruption roster"):
+        evaluate_scores(_rows(), families, samples=20, seed=7)
+
+
+def test_evaluate_scores_accepts_integer_valued_real_scores():
+    rows = _rows()
+    for row in rows:
+        for method in ("fingerprint", "confidence", "entropy"):
+            row[method] = int(row[method])
+
+    assert len(evaluate_scores(rows, FAMILIES, samples=10, seed=2)["tasks"]) == 38
+
+
 def test_evaluate_scores_orients_every_method_as_larger_means_more_corrupted():
     result = evaluate_scores(_rows(), FAMILIES, samples=10, seed=2)
     for task in result["tasks"]:
@@ -67,13 +81,13 @@ def test_evaluate_scores_orients_every_method_as_larger_means_more_corrupted():
 
 
 def test_aggregate_is_an_equal_weight_task_mean_not_a_pooled_score():
-    rows = _rows(("first", "second"), ("a", "b"))
+    rows = _rows(image_ids=("a", "b"))
     for row in rows:
-        if row["corruption"] == "second" and row["severity"] in (4, 5):
+        if row["corruption"] not in FAMILIES[:9] and row["severity"] in (4, 5):
             row["fingerprint"] = float(row["image_id"] == "b")
-    result = evaluate_scores(rows, ("first", "second"), samples=20, seed=3)
+    result = evaluate_scores(rows, FAMILIES, samples=20, seed=3)
 
-    assert result["aggregate"]["fingerprint"] == pytest.approx(0.75)
+    assert result["aggregate"]["fingerprint"] == pytest.approx(28 / 38)
 
 
 @pytest.mark.parametrize("mutate, message", [
@@ -82,37 +96,38 @@ def test_aggregate_is_an_equal_weight_task_mean_not_a_pooled_score():
     (lambda rows: rows[0].update({"unexpected": 1}), "exactly"),
     (lambda rows: rows[0].pop("entropy"), "exactly"),
     (lambda rows: rows[0].update({"severity": True}), "severity"),
-    (lambda rows: rows[0].update({"fingerprint": 1}), "fingerprint"),
+    (lambda rows: rows[0].update({"fingerprint": True}), "fingerprint"),
+    (lambda rows: rows[0].update({"fingerprint": "1"}), "fingerprint"),
 ])
 def test_evaluate_scores_validates_the_exact_row_contract(mutate, message):
-    rows = _rows(("first", "second"))
+    rows = _rows()
     mutate(rows)
     with pytest.raises(ValueError, match=message):
-        evaluate_scores(rows, ("first", "second"), samples=10, seed=0)
+        evaluate_scores(rows, FAMILIES, samples=10, seed=0)
 
 
 def test_evaluate_scores_requires_the_same_nonempty_image_roster_for_every_family():
-    rows = _rows(("first", "second"))
+    rows = _rows()
     for row in rows:
-        if row["corruption"] == "second" and row["image_id"] == "c":
+        if row["corruption"] == FAMILIES[1] and row["image_id"] == "c":
             row["image_id"] = "different"
     with pytest.raises(ValueError, match="same image roster"):
-        evaluate_scores(rows, ("first", "second"), samples=10, seed=0)
+        evaluate_scores(rows, FAMILIES, samples=10, seed=0)
 
 
 @pytest.mark.parametrize("samples, seed", [(True, 0), (2.0, 0), (1, True), (1, -1)])
 def test_evaluate_scores_requires_positive_integer_samples_and_nonnegative_integer_seed(samples, seed):
     with pytest.raises(ValueError):
-        evaluate_scores(_rows(("only",)), ("only",), samples=samples, seed=seed)
+        evaluate_scores(_rows(), FAMILIES, samples=samples, seed=seed)
 
 
 def test_paired_bootstrap_is_deterministic_and_comparison_point_matches_aggregates():
-    rows = _rows(("first", "second"), ("a", "b", "c", "d"))
+    rows = _rows(image_ids=("a", "b", "c", "d"))
     for row in rows:
         row["confidence"] = row["fingerprint"] - float(row["image_id"] in {"a", "b"})
         row["entropy"] = row["fingerprint"] - float(row["severity"] == 5)
-    first = evaluate_scores(rows, ("first", "second"), samples=101, seed=8)
-    second = evaluate_scores(list(reversed(rows)), ("first", "second"), samples=101, seed=8)
+    first = evaluate_scores(rows, FAMILIES, samples=101, seed=8)
+    second = evaluate_scores(list(reversed(rows)), FAMILIES, samples=101, seed=8)
 
     assert first == second
     assert first["comparisons"]["fingerprint_minus_confidence"]["point"] == pytest.approx(
@@ -124,7 +139,7 @@ def test_paired_bootstrap_is_deterministic_and_comparison_point_matches_aggregat
 
 
 def test_private_paired_draw_helper_uses_the_same_draw_for_both_methods():
-    panel = evaluation._panel_arrays(_rows(("first", "second")), ("first", "second"))
+    panel = evaluation._panel_arrays(_rows(), FAMILIES)
     draws = np.array([[0, 1, 1], [2, 0, 2]], dtype=int)
     differences = evaluation._paired_macro_differences(
         panel, draws, "fingerprint", "fingerprint"

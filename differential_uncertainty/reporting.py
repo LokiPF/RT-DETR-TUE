@@ -4,7 +4,7 @@ import csv
 import json
 import math
 from collections.abc import Mapping
-from numbers import Integral
+from numbers import Integral, Real
 from pathlib import Path
 
 import matplotlib
@@ -13,6 +13,8 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 
+from .corruptions import CORRUPTION_NAMES
+
 
 _METHODS = ("fingerprint", "confidence", "entropy")
 _SCORE_COLUMNS = ("image_id", "corruption", "severity", *_METHODS)
@@ -20,24 +22,18 @@ _TASK_COLUMNS = ("corruption", "severity", *(f"{method}_auroc" for method in _ME
 
 
 def _ordered_families(families) -> tuple[str, ...]:
-    if isinstance(families, str):
-        raise ValueError("families must be a non-empty sequence of unique strings")
     try:
         ordered = tuple(families)
     except TypeError as error:
-        raise ValueError("families must be a non-empty sequence of unique strings") from error
-    if (
-        not ordered
-        or len(set(ordered)) != len(ordered)
-        or any(not isinstance(family, str) or not family.strip() for family in ordered)
-    ):
-        raise ValueError("families must be a non-empty sequence of unique strings")
-    return ordered
+        raise ValueError("families must be the fixed corruption roster in approved order") from error
+    if ordered != CORRUPTION_NAMES:
+        raise ValueError("families must be the fixed corruption roster in approved order")
+    return CORRUPTION_NAMES
 
 
 def _finite_number(value, *, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (float, np.floating)) or not math.isfinite(value):
-        raise ValueError(f"{name} must be a finite float")
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite real number")
     return float(value)
 
 
@@ -53,9 +49,10 @@ def _ordered_scores(score_rows, families: tuple[str, ...]) -> list[dict]:
             raise ValueError("score row corruption must be requested")
         if isinstance(row["severity"], bool) or not isinstance(row["severity"], Integral):
             raise ValueError("score row severity must be an integer")
+        normalized = dict(row)
         for method in _METHODS:
-            _finite_number(row[method], name=f"score row {method}")
-        rows.append(dict(row))
+            normalized[method] = _finite_number(row[method], name=f"score row {method}")
+        rows.append(normalized)
     return sorted(rows, key=lambda row: (
         family_order[row["corruption"]], row["image_id"], int(row["severity"])
     ))
@@ -129,9 +126,9 @@ def _render_report(evaluation: dict, families: tuple[str, ...]) -> str:
     lines = [
         "# Fixed Corruption Evidence",
         "",
-        "Fingerprint is the model-derived differential fingerprint score. Higher values are treated as stronger evidence of corruption.",
-        "Confidence is the model confidence score. Higher values are treated as stronger evidence of corruption.",
-        "Entropy is the model prediction entropy score. Higher values are treated as stronger evidence of corruption.",
+        "Fingerprint is, for each retained query, the mean cosine distance to the five nearest bank vectors, then the confidence-weighted mean across the retained scene queries.",
+        "Confidence is one minus the maximum sigmoid confidence across retained queries.",
+        "Entropy is normalized Shannon entropy of the highest-confidence retained query.",
         "",
         "## Aggregate AUROC",
         "",
