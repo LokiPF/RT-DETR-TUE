@@ -28,6 +28,17 @@ def _prepare_compatibility() -> None:
 
         upstream.gaussian = compatible_gaussian
 
+    random_noise = getattr(getattr(upstream, "sk", None), "util", None)
+    random_noise = getattr(random_noise, "random_noise", None)
+    if random_noise is not None and not getattr(random_noise, "_fixed_legacy_rng", False):
+        def compatible_random_noise(image, mode="gaussian", rng=None, clip=True, **kwargs):
+            if rng is None:
+                rng = int(np.random.randint(0, 2**32))
+            return random_noise(image, mode=mode, rng=rng, clip=clip, **kwargs)
+
+        compatible_random_noise._fixed_legacy_rng = True
+        upstream.sk.util.random_noise = compatible_random_noise
+
 
 def apply_imagecorruption(image: Image.Image, name: str, severity: int) -> Image.Image:
     from imagecorruptions import corrupt

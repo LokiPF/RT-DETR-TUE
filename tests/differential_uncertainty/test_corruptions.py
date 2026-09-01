@@ -1,6 +1,7 @@
 import sys
 import types
 
+import numpy as np
 import pytest
 from PIL import Image, ImageFilter
 
@@ -51,3 +52,19 @@ def test_only_levels_four_and_five_are_accepted(level):
 def test_corruption_severity_must_be_an_exact_non_boolean_integer(level):
     with pytest.raises(ValueError, match="severity"):
         apply_corruption(Image.new("RGB", (5, 5)), "gaussian_blur", level)
+
+
+def test_real_impulse_noise_replays_exactly_from_numpy_legacy_state():
+    original = np.random.get_state()
+    image = Image.effect_noise((64, 64), 60).convert("RGB")
+    try:
+        np.random.seed(917)
+        saved = np.random.get_state()
+        first = apply_corruption(image, "impulse_noise", 4)
+        advanced = np.random.get_state()
+        np.random.set_state(saved)
+        second = apply_corruption(image, "impulse_noise", 4)
+        assert not np.array_equal(saved[1], advanced[1])
+        assert first.tobytes() == second.tobytes()
+    finally:
+        np.random.set_state(original)
