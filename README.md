@@ -1,48 +1,38 @@
 # Fixed COCO corruption benchmark
 
-This repository runs one inference-only experiment with a pretrained RT-DETRv2-R18
-checkpoint. It builds a fingerprint bank from clean COCO training images, then tests
-whether three image-level scores rank corrupted COCO validation images above their
-clean versions. Nothing is trained.
+This repository tests whether a pretrained RT-DETRv2-R18 can detect image corruption
+from its query representations. It builds a fingerprint bank from clean COCO training
+images and evaluates clean versus corrupted COCO validation images. Nothing is trained.
 
-The evaluation covers all 19 configured corruption families at severities 4 and 5:
-Gaussian blur, Gaussian noise, shot noise, impulse noise, defocus blur, glass blur,
-motion blur, zoom blur, snow, frost, fog, brightness, contrast, elastic transform,
-pixelate, JPEG compression, speckle noise, spatter, and saturate. Levels 1 through 3
-are not evaluated.
+The benchmark covers all 19 configured corruption families at severities 4 and 5.
+Levels 1 through 3 are not evaluated.
 
-## Method
+## Fixed scores
 
-The fixed fingerprint method is:
+The fingerprint score uses one fixed method:
 
-1. On the selected clean training images, keep non-padded detector queries whose
-   maximum sigmoid confidence is at least 0.5.
+1. Keep non-padded training queries with maximum sigmoid confidence of at least 0.5.
 2. Build a 2,000-row bank with seeded Algorithm R reservoir sampling.
-3. For each validation query, take the mean cosine distance to its five nearest bank
-   rows.
-4. Form the image fingerprint score as the confidence-weighted mean across the
-   non-padded scene queries.
+3. For each validation query, average its cosine distance to the five nearest bank rows.
+4. Take the confidence-weighted mean across the image's non-padded queries.
 
-The two fixed baselines are one minus the maximum sigmoid confidence and normalized
-Shannon entropy of the highest-confidence non-padded query.
+The two baselines are:
 
-## Install and inputs
+- confidence: one minus the maximum sigmoid confidence;
+- entropy: normalized Shannon entropy of the highest-confidence non-padded query.
 
-Use Python 3.10 or newer. Install a PyTorch build appropriate for your machine, then
-install the remaining dependencies:
+Larger values mean stronger evidence of corruption for all three scores.
+
+## Run the benchmark
+
+Use Python 3.10 or newer, install a PyTorch build for your machine, and then run:
 
 ```bash
 python -m pip install -r requirements.txt
 ```
 
-Provide a compatible pretrained RT-DETRv2-R18 checkpoint. The official RT-DETR
-project publishes the `rtdetrv2_r18vd_120e_coco_rerun_48.1.pth` COCO checkpoint.
-
-The image inputs are flat directories, normally COCO `train2017` and `val2017`.
-Images must be directly inside those directories. The command does not use COCO
-annotations or image manifests.
-
-## Run or resume
+Provide a compatible RT-DETRv2-R18 checkpoint and flat COCO `train2017` and
+`val2017` image directories. COCO annotations and manifests are not needed.
 
 ```bash
 python -m differential_uncertainty benchmark-coco \
@@ -57,34 +47,42 @@ python -m differential_uncertainty benchmark-coco \
   --seed 44
 ```
 
-The value 2,500 is an example, not a default. Both `--reference-count` and
-`--evaluation-count` are required, so choose them explicitly for each experiment.
-The optional controls default to `--device cuda:0`, `--batch-size 1`, and `--seed 44`.
+The value 2,500 is an example, not a default. Both image-count flags are required.
+Optional defaults are `--device cuda:0`, `--batch-size 1`, and `--seed 44`.
 
-Selection is repeatable for a given seed. To resume an interruption, run the same
-command with the same output directory. The working files are deliberately simple:
+Run the same command again to resume an interruption. The output directory keeps:
 
-- `run_config.json` records the small fixed run configuration.
-- `bank_progress.pt` holds partial reservoir state and is replaced by `bank.pt` when
-  bank construction finishes.
-- `scores/` contains one JSON score file per completed validation image.
-- `evaluation_progress.pt` records the next image and NumPy random state needed to
-  continue stochastic corruptions.
+- `run_config.json`: the fixed run configuration;
+- `bank_progress.pt`: partial bank state, replaced by `bank.pt` when complete;
+- `scores/`: one JSON file per completed validation image;
+- `evaluation_progress.pt`: the next image and NumPy state for stochastic corruptions.
 
-## Results
+## Outputs
 
-A completed run writes five final result files in the output directory:
+A completed run writes:
 
-- `per_image_scores.csv` contains clean, level-4, and level-5 scores.
-- `results.csv` contains every per-corruption AUROC at levels 4 and 5.
-- `summary.json` contains the same task results, aggregate values, and comparisons.
-- `corruption_auroc_bars.png` plots all per-corruption results.
-- `report.md` presents every corruption separately and ends with the bar chart.
+- `per_image_scores.csv`: clean, severity-4, and severity-5 image scores;
+- `results.csv`: AUROC for every corruption and severity;
+- `summary.json`: the 38 task results, aggregate scores, and paired comparisons;
+- `report.md`: the complete plain-language report;
+- `corruption_auroc_bars.png`: grouped per-corruption AUROC bars.
 
-The aggregate is the equal-weight mean across all 38 corruption-and-severity tasks.
-Paired whole-image bootstrap comparisons describe the fingerprint macro-AUROC
-difference from each baseline on this evaluation set. They are descriptive stability
-intervals, not population confidence intervals.
+The aggregate is the equal-weight mean across the 38 corruption-and-severity tasks.
+Paired whole-image bootstrap intervals compare the fingerprint with each baseline on
+the supplied evaluation set. They describe stability on that set, not population
+confidence. This benchmark measures corruption ranking, not detector accuracy or mAP.
 
-This benchmark detects and ranks image corruption. It does not evaluate detector box
-accuracy, mAP, or task performance.
+## Method-selection pilot
+
+The chart below is the earlier evidence used to choose the fixed method. That pilot
+used 1,000 COCO-val reference images and 250 evaluation images: 150 for method
+selection and 100 held out for validation. It predates the current COCO-train to
+COCO-val runner and is not the final 2,500-by-2,500 result.
+
+On the held-out pilot images, mean AUROC across the 38 strong-corruption tasks was
+0.822 for the fingerprint, 0.813 for confidence, and 0.822 for entropy. The paired
+intervals for fingerprint minus either baseline included zero, so the pilot did not
+establish that the fingerprint was better overall. The per-corruption chart shows
+where each score was stronger or weaker; an AUROC of 0.5 is chance-level ranking.
+
+![Method-selection pilot: per-corruption AUROC at severities 4 and 5](docs/assets/fingerprint-method-selection-pilot-auroc.png)
