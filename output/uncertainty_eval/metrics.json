@@ -1,0 +1,82 @@
+{
+  "matched_boxes": 3070,
+  "false_positives_at_score_threshold": 187248,
+  "missed_ground_truth_boxes": 81495,
+  "mean_iou_of_matches": 0.2713776161287663,
+  "gaussian_nll_mean_per_coordinate": 0.2286243106717617,
+  "rmse_normalized_cxcywh": {
+    "cx": 0.015169319096170626,
+    "cy": 0.01851617123587934,
+    "w": 0.038132499202277376,
+    "h": 0.028543098793999324
+  },
+  "mean_predicted_std_normalized_cxcywh": {
+    "cx": 0.007499429115199241,
+    "cy": 0.007863315921807649,
+    "w": 0.00820252500690345,
+    "h": 0.009848558674672232
+  },
+  "interval_coverage": {
+    "50": {
+      "coordinate_coverage": 0.36465798045602604,
+      "whole_box_coverage": 0.04657980456026058
+    },
+    "80": {
+      "coordinate_coverage": 0.5644136807817589,
+      "whole_box_coverage": 0.18273615635179152
+    },
+    "90": {
+      "coordinate_coverage": 0.6504071661237785,
+      "whole_box_coverage": 0.28631921824104234
+    },
+    "95": {
+      "coordinate_coverage": 0.7116449511400651,
+      "whole_box_coverage": 0.36384364820846904
+    }
+  },
+  "spearman_uncertainty_vs_one_minus_iou": 0.23099530540750246,
+  "aupr_error_iou_below_threshold": 0.9688891806071555,
+  "aupr_error_iou_threshold": 0.5,
+  "aurc_one_minus_iou": 0.6852970189917869,
+  "confidence_baseline": {
+    "uncertainty_definition": "1 - class score",
+    "aupr_error_iou_below_threshold": 0.9099337436515298,
+    "aurc_one_minus_iou": 0.7395398995591176
+  },
+  "aurc_references": {
+    "oracle": 0.5796855167833015,
+    "random_expected": 0.7286223838712336
+  },
+  "aurc_improvement_over_one_minus_score": 0.05424288056733073,
+  "selective_risk_at_coverage": {
+    "50%": 0.6965044244794205,
+    "80%": 0.7177037459335913,
+    "90%": 0.7225158504199335,
+    "100%": 0.7286223838712343
+  },
+  "notes": [
+    "Higher Spearman correlation and AUPR-error are better; lower NLL and AURC are better.",
+    "A positive AURC improvement means the probabilistic head ranks localization errors better than 1 - class score.",
+    "Coverage should be near its nominal level, while smaller predicted standard deviations are sharper.",
+    "Matched-box metrics evaluate localization uncertainty only; inspect false positives and misses separately."
+  ],
+  "configuration": {
+    "images_evaluated": 3836,
+    "score_threshold": 0.25,
+    "minimum_match_iou": 0.1,
+    "bad_iou": 0.5,
+    "uncertainty_score": "mean_std",
+    "label_mode": "category_id",
+    "input_size": [
+      640,
+      640
+    ],
+    "top_k": 300,
+    "config": "/home/philip/GuidedResearch/final/RT-DETR-TUE/configs/rtdetrv2/rtdetrv2_r18vd_120e_waymo.yml",
+    "checkpoint": "/home/philip/GuidedResearch/final/RT-DETR-TUE/output/rtdetrv2_r18vd_120e_waymo_prob_head/best.pth",
+    "logvar_clamp": [
+      -10.0,
+      4.0
+    ]
+  }
+}
