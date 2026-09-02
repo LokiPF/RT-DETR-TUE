@@ -1,25 +1,19 @@
-"""Copyright(c) 2023 lyuwenyu. All Rights Reserved.
-"""
+"""Copyright(c) 2023 lyuwenyu. All Rights Reserved."""
 
-import time
-import json
 import datetime
+import time
 from pathlib import Path
 
 import torch
 
-from ..misc import dist_utils, profiler_utils
-
+from ..misc import dist_utils
 from ._solver import BaseSolver
-from .tue_engine import evaluate, collect_persistence_one_epoch
 from .calibration_engine import collect_conformal_distances_one_epoch
+from .tue_engine import collect_persistence_one_epoch, evaluate
 from .tue_split import load_split, subset_dataloader
-
-from supervisely.nn.training import train_logger
 
 
 class CalibrationSolver(BaseSolver):
-
     def _create_frechet_mean(self, buckets):
         # Store means only for nonempty layer/class buckets.
         frechet_means = {}
@@ -53,7 +47,9 @@ class CalibrationSolver(BaseSolver):
         split_path = args.yaml_cfg.get("train_calibration_split_path")
         if split_path is not None:
             split = load_split(split_path)
-            data_loader = subset_dataloader(self.train_dataloader, split["frechet_indices"])
+            data_loader = subset_dataloader(
+                self.train_dataloader, split["frechet_indices"]
+            )
             print(
                 f"Fitting Fréchet means on the frechet partition "
                 f"({len(split['frechet_indices'])} images from {split_path})."
@@ -62,9 +58,9 @@ class CalibrationSolver(BaseSolver):
             data_loader.set_epoch(0)
 
         if (
-                dist_utils.is_dist_available_and_initialized()
-                and hasattr(data_loader, "sampler")
-                and hasattr(data_loader.sampler, "set_epoch")
+            dist_utils.is_dist_available_and_initialized()
+            and hasattr(data_loader, "sampler")
+            and hasattr(data_loader.sampler, "set_epoch")
         ):
             data_loader.sampler.set_epoch(0)
 
@@ -92,12 +88,10 @@ class CalibrationSolver(BaseSolver):
             decoder_layers=decoder_layers,
             class_ids=class_ids,
             print_freq=args.yaml_cfg.get("print_freq", 10),
-            data_fraction=1.0
+            data_fraction=1.0,
         )
 
-        frechet_means_score = self._create_frechet_mean(
-            buckets_score
-        )
+        frechet_means_score = self._create_frechet_mean(buckets_score)
 
         frechet_means_bbox = {
             bbox_layer_id: self._create_frechet_mean(bucket)
@@ -133,9 +127,7 @@ class CalibrationSolver(BaseSolver):
             print(f"Saved Fréchet means to {output_path}")
 
         elapsed = time.time() - start_time
-        elapsed_string = str(
-            datetime.timedelta(seconds=int(elapsed))
-        )
+        elapsed_string = str(datetime.timedelta(seconds=int(elapsed)))
 
         print(f"Persistence analysis time: {elapsed_string}")
 
@@ -284,27 +276,33 @@ class CalibrationSolver(BaseSolver):
             torch.save(conformal_state, output_path)
             print(f"Saved conformal distances to {output_path}")
 
-        elapsed_string = str(
-            datetime.timedelta(seconds=int(time.time() - start_time))
-        )
+        elapsed_string = str(datetime.timedelta(seconds=int(time.time() - start_time)))
         print(f"Conformal calibration time: {elapsed_string}")
 
         return conformal_state
 
-    def val(self, ):
+    def val(
+        self,
+    ):
         self.eval()
 
         module = self.ema.module if self.ema else self.model
-        test_stats, coco_evaluator = evaluate(module, self.criterion, self.postprocessor,
-                                              self.val_dataloader, self.evaluator, self.device)
+        test_stats, coco_evaluator = evaluate(
+            module,
+            self.criterion,
+            self.postprocessor,
+            self.val_dataloader,
+            self.evaluator,
+            self.device,
+        )
 
         if self.output_dir:
-            dist_utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")
-
-        return
+            dist_utils.save_on_master(
+                coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth"
+            )
 
     def _strip_state_dict(self, state_dict):
-        if not self.cfg.yaml_cfg['save_optimizer'] and "optimizer" in state_dict:
+        if not self.cfg.yaml_cfg["save_optimizer"] and "optimizer" in state_dict:
             state_dict.pop("optimizer")
-        if not self.cfg.yaml_cfg['save_ema'] and "ema" in state_dict:
+        if not self.cfg.yaml_cfg["save_ema"] and "ema" in state_dict:
             state_dict.pop("model")  # keep ema as a model
