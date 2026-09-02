@@ -26,6 +26,8 @@ class ClasSolver(BaseSolver):
         output_dir = Path(args.output_dir)
         output_dir.mkdir(exist_ok=True)
 
+        best_acc = 0.0
+
         start_time = time.time()
         start_epoch = self.last_epoch + 1
         for epoch in range(start_epoch, args.epoches):
@@ -44,6 +46,11 @@ class ClasSolver(BaseSolver):
             self.lr_scheduler.step()
             self.last_epoch += 1
 
+            module = self.ema.module if self.ema else self.model
+            test_stats = evaluate(
+                module, self.criterion, self.val_dataloader, self.device
+            )
+
             if output_dir:
                 checkpoint_paths = [output_dir / "checkpoint.pth"]
                 # extra checkpoint before LR drop and every 100 epochs
@@ -53,11 +60,12 @@ class ClasSolver(BaseSolver):
                     state = self.state_dict()
                     state["last_epoch"] = epoch
                     dist_utils.save_on_master(state, checkpoint_path)
-
-            module = self.ema.module if self.ema else self.model
-            test_stats = evaluate(
-                module, self.criterion, self.val_dataloader, self.device
-            )
+                if test_stats["acc"] > best_acc:
+                    checkpoint_paths = [output_dir / "best.pth"]
+                    state = self.state_dict()
+                    state["last_epoch"] = epoch
+                    dist_utils.save_on_master(state, checkpoint_path)
+                    best_acc = test_stats["acc"]
 
             log_stats = {
                 **{f"train_{k}": v for k, v in train_stats.items()},
