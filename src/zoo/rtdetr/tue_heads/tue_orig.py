@@ -11,9 +11,12 @@ __all__ = ["TUEOrig"]
 
 @register()
 class TUEOrig(TUEBase):
-    def __init__(self, frechet_means: str, tue_topk: int = 1):
+    def __init__(
+        self, frechet_means: str, tue_topk: int = 1, confidence_threshold: float = 0.0
+    ):
         super().__init__(frechet_means)
         self.tue_topk = tue_topk
+        self.confidence_threshold = confidence_threshold
 
     def forward(self, x: Tensor) -> dict[str, Tensor]:
 
@@ -26,7 +29,7 @@ class TUEOrig(TUEBase):
         output_device = logits.device
 
         confidence = logits.sigmoid().max(dim=-1).values
-        confidence_mask = confidence > 0
+        confidence_mask = confidence > self.confidence_threshold
 
         distances = self._calculate_distances_vectorized(
             score_captures,

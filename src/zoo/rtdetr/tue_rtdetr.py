@@ -28,11 +28,16 @@ class TUERTDETR(nn.Module):
         self.encoder = encoder
         self.tue_head = tue_head
 
-    def forward(self, x, targets=None):
+    def forward_detector(self, x, targets=None):
         x = self.backbone(x)
         x = self.encoder(x)
-        x = self.decoder(x, targets)
-        x = self.tue_head(x)
+        return self.decoder(x, targets)
+
+    def forward(self, x, targets=None):
+        x = self.forward_detector(x, targets)
+
+        if self.tue_head is not None:
+            x = self.tue_head(x)
 
         return x
 

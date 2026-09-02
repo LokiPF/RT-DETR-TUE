@@ -355,6 +355,155 @@ def _batched_prim(
     layer_inputs: Tensor,
 ) -> Tensor:
     """
+    Exact maximum spanning tree for the complete bipartite graph
+    induced by a score head.
+
+    weight_matrix: [C, H]
+    layer_inputs:  [K, H]
+    returns:       [K, H + C - 1]
+    """
+    if weight_matrix.ndim != 2:
+        raise ValueError("weight_matrix must have shape [C, H]")
+
+    if layer_inputs.ndim != 2:
+        raise ValueError("layer_inputs must have shape [K, H]")
+
+    device = layer_inputs.device
+
+    weight_matrix = weight_matrix.detach().to(
+        device=device,
+        dtype=torch.float32,
+    )
+    layer_inputs = layer_inputs.detach().to(
+        device=device,
+        dtype=torch.float32,
+    )
+
+    num_queries = layer_inputs.shape[0]
+    num_outputs, num_inputs = weight_matrix.shape
+
+    if layer_inputs.shape[1] != num_inputs:
+        raise ValueError("Input dimensions do not match")
+
+    if num_queries == 0:
+        return torch.empty(
+            (0, num_inputs + num_outputs - 1),
+            dtype=torch.float32,
+            device=device,
+        )
+
+    # [K, C, H]
+    edge_weights = torch.abs(layer_inputs[:, None, :] * weight_matrix[None, :, :])
+
+    # Each input vertex can safely take its strongest incident edge.
+    # [K, H]
+    input_tree_weights, input_owner = edge_weights.max(dim=1)
+
+    if num_outputs == 1:
+        return torch.sort(
+            input_tree_weights,
+            dim=1,
+            descending=True,
+        ).values
+
+    # directed[a, b] is the strongest edge from an input currently
+    # attached to output a into output b.
+    directed = []
+
+    for owner in range(num_outputs):
+        owner_mask = (input_owner == owner).unsqueeze(1)
+
+        directed.append(
+            edge_weights.masked_fill(
+                ~owner_mask,
+                -torch.inf,
+            ).amax(dim=-1)
+        )
+
+    # [K, C, C]
+    directed = torch.stack(directed, dim=1)
+
+    # Either endpoint may own the connecting input.
+    output_graph = torch.maximum(
+        directed,
+        directed.transpose(1, 2),
+    )
+
+    diagonal = torch.eye(
+        num_outputs,
+        dtype=torch.bool,
+        device=device,
+    ).unsqueeze(0)
+
+    output_graph = output_graph.masked_fill(
+        diagonal,
+        -torch.inf,
+    )
+
+    # Prim now runs only over C output vertices.
+    # With four classes, this is three iterations rather than 259.
+    selected = torch.zeros(
+        (num_queries, num_outputs),
+        dtype=torch.bool,
+        device=device,
+    )
+    selected[:, 0] = True
+
+    best = output_graph[:, 0, :]
+    bridge_weights = []
+
+    for _ in range(num_outputs - 1):
+        candidates = best.masked_fill(
+            selected,
+            -torch.inf,
+        )
+
+        selected_weight, selected_vertex = candidates.max(dim=1)
+        bridge_weights.append(selected_weight)
+
+        selected.scatter_(
+            1,
+            selected_vertex[:, None],
+            True,
+        )
+
+        new_weights = output_graph.gather(
+            1,
+            selected_vertex[:, None, None].expand(
+                -1,
+                1,
+                num_outputs,
+            ),
+        ).squeeze(1)
+
+        best = torch.maximum(best, new_weights)
+
+    bridge_weights = torch.stack(
+        bridge_weights,
+        dim=1,
+    )
+
+    mst_weights = torch.cat(
+        [
+            input_tree_weights,
+            bridge_weights,
+        ],
+        dim=1,
+    )
+
+    return torch.sort(
+        mst_weights,
+        dim=1,
+        descending=True,
+    ).values
+
+
+@torch.no_grad()
+def __batched_prim(
+    weight_matrix: Tensor,
+    layer_inputs: Tensor,
+) -> Tensor:
+    """
     Compute maximum-spanning-tree weights for multiple queries.
 
     Args:
