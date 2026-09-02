@@ -4,6 +4,7 @@ import copy
 import functools
 import math
 from collections import OrderedDict
+from collections.abc import Iterable
 
 import torch
 import torch.nn.functional as F
@@ -19,11 +20,19 @@ from .utils import (
     inverse_sigmoid,
 )
 
-__all__ = ["RTDETRTransformerv2"]
+__all__ = ["RTDETRTransformerv2TUE"]
 
 
 class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers, act="relu"):
+    def __init__(
+        self,
+        input_dim,
+        hidden_dim,
+        output_dim,
+        num_layers,
+        act="relu",
+        capture_layers: Iterable | int | None = None,
+    ):
         super().__init__()
         self.num_layers = num_layers
         h = [hidden_dim] * (num_layers - 1)
@@ -31,11 +40,27 @@ class MLP(nn.Module):
             nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim])
         )
         self.act = get_activation(act)
+        self.capture_layers = capture_layers if capture_layers is not None else []
+        if capture_layers == -1:
+            self.capture_layers = range(len(self.layers))
 
     def forward(self, x):
+        capture = dict()
+
         for i, layer in enumerate(self.layers):
-            x = self.act(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
+            layer_input = x
+            layer_output = layer(x)
+
+            if i in self.capture_layers or self.capture_layers == -1:
+                capture[i] = {
+                    "input": layer_input.detach(),
+                    "weight": layer.weight.detach(),
+                    "output": layer_output.detach(),
+                }
+
+            x = self.act(layer_output) if i < self.num_layers - 1 else layer_output
+
+        return (x, capture) if self.capture_layers else x
 
 
 class MSDeformableAttention(nn.Module):
@@ -282,7 +307,15 @@ class TransformerDecoderLayer(nn.Module):
 
 
 class TransformerDecoder(nn.Module):
-    def __init__(self, hidden_dim, decoder_layer, num_layers, eval_idx=-1):
+    def __init__(
+        self,
+        hidden_dim,
+        decoder_layer,
+        num_layers,
+        eval_idx=-1,
+        capture_layers: Iterable | int | None = None,
+        tue_task: Iterable | str | None = None,
+    ):
         super().__init__()
         self.layers = nn.ModuleList(
             [copy.deepcopy(decoder_layer) for _ in range(num_layers)]
@@ -290,6 +323,14 @@ class TransformerDecoder(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_layers = num_layers
         self.eval_idx = eval_idx if eval_idx >= 0 else num_layers + eval_idx
+
+        self.capture_layers = capture_layers if capture_layers is not None else []
+        if capture_layers == -1:
+            self.capture_layers = range(len(self.layers))
+
+        self.tue_task = tue_task if tue_task is not None else []
+        if type(tue_task) is str:
+            self.tue_task = [tue_task]
 
     def forward(
         self,
@@ -306,6 +347,7 @@ class TransformerDecoder(nn.Module):
         dec_out_bboxes = []
         dec_out_logits = []
         ref_points_detach = F.sigmoid(ref_points_unact)
+        capture = dict(score=dict(), bbox=dict())
 
         output = target
         for i, layer in enumerate(self.layers):
@@ -322,32 +364,49 @@ class TransformerDecoder(nn.Module):
                 query_pos_embed,
             )
 
-            inter_ref_bbox = F.sigmoid(
-                bbox_head[i](output) + inverse_sigmoid(ref_points_detach)
-            )
+            if i in self.capture_layers and "bbox" in self.tue_task:
+                bbox_delta, bbox_info = bbox_head[i](output)
+            else:
+                bbox_delta = bbox_head[i](output)
+                bbox_info = None
+
+            inter_ref_bbox = F.sigmoid(bbox_delta + inverse_sigmoid(ref_points_detach))
+
+            layer_logits = score_head[i](output)
+
+            if i in self.capture_layers and "score" in self.tue_task:
+                capture["score"][i] = {
+                    "input": output.detach(),
+                    "weight": score_head[i].weight.detach(),
+                    "output": layer_logits.detach(),
+                    "logits": layer_logits.detach(),
+                }
+
+            if "bbox" in self.tue_task:
+                capture["bbox"][i] = {**bbox_info, "logits": layer_logits.detach()}
 
             if self.training:
-                dec_out_logits.append(score_head[i](output))
+                dec_out_logits.append(layer_logits)
                 if i == 0:
                     dec_out_bboxes.append(inter_ref_bbox)
                 else:
                     dec_out_bboxes.append(
-                        F.sigmoid(bbox_head[i](output) + inverse_sigmoid(ref_points))
+                        F.sigmoid(bbox_delta + inverse_sigmoid(ref_points))
                     )
 
             elif i == self.eval_idx:
-                dec_out_logits.append(score_head[i](output))
+                dec_out_logits.append(layer_logits)
                 dec_out_bboxes.append(inter_ref_bbox)
                 break
 
             ref_points = inter_ref_bbox
             ref_points_detach = inter_ref_bbox.detach()
 
-        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits)
+        return torch.stack(dec_out_bboxes), torch.stack(dec_out_logits), capture
 
 
 @register()
-class RTDETRTransformerv2(nn.Module):
+class RTDETRTransformerv2TUE(nn.Module):
     __share__ = ["num_classes", "eval_spatial_size"]
 
     def __init__(
@@ -374,6 +433,9 @@ class RTDETRTransformerv2(nn.Module):
         aux_loss=True,
         cross_attn_method="default",
         query_select_method="default",
+        mlp_capture_layers: Iterable | int | None = None,
+        decoder_tue_task: Iterable | str | None = None,
+        decoder_capture_layers: Iterable | int | None = None,
     ):
         super().__init__()
         assert len(feat_channels) <= num_levels
@@ -413,7 +475,12 @@ class RTDETRTransformerv2(nn.Module):
             cross_attn_method=cross_attn_method,
         )
         self.decoder = TransformerDecoder(
-            hidden_dim, decoder_layer, num_layers, eval_idx
+            hidden_dim,
+            decoder_layer,
+            num_layers,
+            eval_idx,
+            decoder_capture_layers,
+            decoder_tue_task,
         )
 
         # denoising
@@ -462,7 +529,10 @@ class RTDETRTransformerv2(nn.Module):
             [nn.Linear(hidden_dim, num_classes) for _ in range(num_layers)]
         )
         self.dec_bbox_head = nn.ModuleList(
-            [MLP(hidden_dim, hidden_dim, 4, 3) for _ in range(num_layers)]
+            [
+                MLP(hidden_dim, hidden_dim, 4, 3, capture_layers=mlp_capture_layers)
+                for _ in range(num_layers)
+            ]
         )
 
         # init encoder output anchors and valid_mask
@@ -470,6 +540,8 @@ class RTDETRTransformerv2(nn.Module):
             anchors, valid_mask = self._generate_anchors()
             self.register_buffer("anchors", anchors)
             self.register_buffer("valid_mask", valid_mask)
+
+        self.tue_task = mlp_capture_layers or decoder_tue_task or decoder_capture_layers
 
         self._reset_parameters()
 
@@ -716,7 +788,7 @@ class RTDETRTransformerv2(nn.Module):
         )
 
         # decoder
-        out_bboxes, out_logits = self.decoder(
+        out_bboxes, out_logits, tue_info = self.decoder(
             init_ref_contents,
             init_ref_points_unact,
             memory,
@@ -736,6 +808,8 @@ class RTDETRTransformerv2(nn.Module):
             )
 
         out = {"pred_logits": out_logits[-1], "pred_boxes": out_bboxes[-1]}
+
+        out["tue_info"] = tue_info
 
         if self.training and self.aux_loss:
             out["aux_outputs"] = self._set_aux_loss(out_logits[:-1], out_bboxes[:-1])

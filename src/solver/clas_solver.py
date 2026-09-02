@@ -83,6 +83,8 @@ class ClasSolver(BaseSolver):
                     save_checkpoint(state, checkpoint_path)
                     best_acc = test_stats["acc"]
 
+            print(f"Best acc: {best_acc}")
+
             log_stats = {
                 **{f"train_{k}": v for k, v in train_stats.items()},
                 **{f"test_{k}": v for k, v in test_stats.items()},

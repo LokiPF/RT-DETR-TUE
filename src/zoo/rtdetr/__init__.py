@@ -18,4 +18,5 @@ from .rtdetrv2_decoder_clas import RTDETRTransformerv2Clas
 from .rtdetrv2_decoder_prob_bbox_head import RTDETRTransformerv2ProbHead
 
 # uncertaity estimation
+from .rtdetrv2_decoder_tue import RTDETRTransformerv2TUE
 from .tue_rtdetr import TUERTDETR

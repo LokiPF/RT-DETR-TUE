@@ -3,13 +3,14 @@
 import datetime
 import json
 import time
+from pathlib import Path
 
 import torch
 from supervisely.nn.training import train_logger
 
 from ..misc import dist_utils
 from ._solver import BaseSolver
-from .det_engine import evaluate, train_one_epoch
+from .det_engine import build_frechet_means, evaluate, train_one_epoch
 
 
 class DetSolver(BaseSolver):
@@ -20,10 +21,10 @@ class DetSolver(BaseSolver):
         self.train()
         args = self.cfg
 
-        # print("Freezing RT-DETR weights. Only training UncTemp head")
-        for name, param in self.model.named_parameters():
-            if "dec_bbox_logvar_head" not in name:
-                param.requires_grad = False
+        # # print("Freezing RT-DETR weights. Only training UncTemp head")
+        # for name, param in self.model.named_parameters():
+        #     if "dec_bbox_logvar_head" not in name:
+        #         param.requires_grad = False
 
         n_parameters = sum(
             [p.numel() for p in self.model.parameters() if p.requires_grad]
@@ -167,3 +168,39 @@ class DetSolver(BaseSolver):
         #     state_dict.pop("optimizer")
         # if not self.cfg.yaml_cfg['save_ema'] and "ema" in state_dict:
         #     state_dict.pop("model")  # keep ema as a model
+
+    def build_tue_frechet_means(self):
+        self.eval()
+
+        module = self.ema.module if self.ema else self.model
+
+        state = build_frechet_means(
+            model=module,
+            criterion=self.criterion,
+            data_loader=self.val_dataloader,
+            device=self.device,
+            min_confidence=getattr(
+                self.cfg,
+                "tue_calibration_confidence",
+                0.5,
+            ),
+        )
+
+        if dist_utils.is_main_process():
+            output_path = Path(
+                getattr(
+                    self.cfg,
+                    "frechet_means_output",
+                    self.output_dir / "frechet_means.pth",
+                )
+            )
+
+            output_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            torch.save(state, output_path)
+            print(f"Saved Fréchet means to {output_path}")
+            print("Counts per layer/class:")
+            print(state["counts"])

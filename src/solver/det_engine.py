@@ -17,6 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
+from ..misc.tue_utils import get_captured_persistence_diagrams
 from ..optim import ModelEMA, Warmup
 
 
@@ -197,3 +198,172 @@ def evaluate(
             stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
 
     return stats, coco_evaluator
+
+
+@torch.no_grad()
+def build_frechet_means(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    data_loader: Iterable,
+    device: torch.device,
+    min_confidence: float = 0.5,
+):
+    model.eval()
+    criterion.eval()
+
+    diagram_sums = None
+    diagram_counts = None
+    selected_layers = None
+
+    metric_logger = MetricLogger(delimiter="  ")
+
+    for samples, targets in metric_logger.log_every(
+        data_loader,
+        10,
+        "Fréchet calibration:",
+    ):
+        samples = samples.to(device)
+        targets = [
+            {key: value.to(device) for key, value in target.items()}
+            for target in targets
+        ]
+
+        if hasattr(model, "forward_detector"):
+            outputs = model.forward_detector(samples)
+        else:
+            outputs = model(samples)
+
+        score_captures = outputs["tue_info"]["score"]
+
+        if not score_captures:
+            raise RuntimeError("No score layers were captured")
+
+        if selected_layers is None:
+            selected_layers = sorted(score_captures)
+
+            first_capture = score_captures[selected_layers[0]]
+            num_classes, hidden_dim = first_capture["weight"].shape
+            diagram_size = num_classes + hidden_dim - 1
+            num_layers = max(selected_layers) + 1
+
+            diagram_sums = torch.zeros(
+                num_layers,
+                num_classes,
+                diagram_size,
+                dtype=torch.float64,
+                device="cpu",
+            )
+
+            diagram_counts = torch.zeros(
+                num_layers,
+                num_classes,
+                dtype=torch.long,
+                device="cpu",
+            )
+
+        matcher_outputs = {
+            "pred_logits": outputs["pred_logits"],
+            "pred_boxes": outputs["pred_boxes"],
+        }
+
+        matcher_result = criterion.matcher(
+            matcher_outputs,
+            targets,
+        )
+
+        matched_indices = matcher_result["indices"]
+
+        probabilities = outputs["pred_logits"].sigmoid()
+
+        query_indices = []
+        query_classes = []
+
+        for batch_id, (query_ids, target_ids) in enumerate(matched_indices):
+            query_ids = query_ids.to(device=device, dtype=torch.long)
+            target_ids = target_ids.to(device=device, dtype=torch.long)
+
+            target_classes = targets[batch_id]["labels"].index_select(
+                0,
+                target_ids,
+            )
+
+            matched_probabilities = probabilities[
+                batch_id,
+                query_ids,
+            ]
+
+            predicted_classes = matched_probabilities.argmax(dim=-1)
+
+            target_confidence = matched_probabilities.gather(
+                dim=1,
+                index=target_classes[:, None],
+            ).squeeze(1)
+
+            keep = (predicted_classes == target_classes) & (
+                target_confidence >= min_confidence
+            )
+
+            query_indices.append(query_ids[keep])
+            query_classes.append(target_classes[keep])
+
+        diagrams = get_captured_persistence_diagrams(
+            captures=score_captures,
+            query_indices=query_indices,
+            decoder_layer_indices=selected_layers,
+            # Usually processes the whole image batch in one Prim call.
+            chunk_size=512,
+        )
+
+        class_lookups = [
+            {
+                int(query_id): int(class_id)
+                for query_id, class_id in zip(
+                    batch_queries.detach().cpu().tolist(),
+                    batch_classes.detach().cpu().tolist(),
+                )
+            }
+            for batch_queries, batch_classes in zip(
+                query_indices,
+                query_classes,
+            )
+        ]
+
+        for layer_id, batch_diagrams in diagrams.items():
+            for batch_id, query_diagrams in enumerate(batch_diagrams):
+                for query_id, diagram in query_diagrams.items():
+                    class_id = class_lookups[batch_id][query_id]
+
+                    diagram_sums[layer_id, class_id].add_(diagram.to(torch.float64))
+                    diagram_counts[layer_id, class_id] += 1
+
+    if diagram_sums is None:
+        raise RuntimeError("The calibration dataloader was empty")
+
+    # Combine statistics from all distributed workers.
+    if dist_utils.is_dist_available_and_initialized():
+        sums_device = diagram_sums.to(device)
+        counts_device = diagram_counts.to(device)
+
+        torch.distributed.all_reduce(
+            sums_device,
+            op=torch.distributed.ReduceOp.SUM,
+        )
+        torch.distributed.all_reduce(
+            counts_device,
+            op=torch.distributed.ReduceOp.SUM,
+        )
+
+        diagram_sums = sums_device.cpu()
+        diagram_counts = counts_device.cpu()
+
+    means = (diagram_sums / diagram_counts.clamp_min(1).unsqueeze(-1)).to(torch.float32)
+
+    # Missing layer/class combinations remain explicitly invalid.
+    means[diagram_counts == 0] = float("nan")
+
+    return {
+        "means": means,
+        "counts": diagram_counts,
+        "selected_layers": selected_layers,
+        "min_confidence": min_confidence,
+    }
