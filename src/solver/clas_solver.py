@@ -2,12 +2,28 @@
 
 import datetime
 import json
+import os
 import time
 from pathlib import Path
 
 from ..misc import dist_utils
 from ._solver import BaseSolver
 from .clas_engine import evaluate, train_one_epoch
+
+
+def save_checkpoint(state, checkpoint_path):
+    temporary_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+
+    try:
+        dist_utils.save_on_master(state, temporary_path)
+
+        if dist_utils.is_main_process():
+            os.replace(temporary_path, checkpoint_path)
+
+    except Exception:
+        if dist_utils.is_main_process() and temporary_path.exists():
+            temporary_path.unlink()
+        raise
 
 
 class ClasSolver(BaseSolver):
@@ -26,7 +42,7 @@ class ClasSolver(BaseSolver):
         output_dir = Path(args.output_dir)
         output_dir.mkdir(exist_ok=True)
 
-        best_acc = 0.0
+        best_acc = -1.0
 
         start_time = time.time()
         start_epoch = self.last_epoch + 1
@@ -59,12 +75,12 @@ class ClasSolver(BaseSolver):
                 for checkpoint_path in checkpoint_paths:
                     state = self.state_dict()
                     state["last_epoch"] = epoch
-                    dist_utils.save_on_master(state, checkpoint_path)
+                    save_checkpoint(state, checkpoint_path)
                 if test_stats["acc"] > best_acc:
-                    checkpoint_paths = [output_dir / "best.pth"]
+                    checkpoint_path = output_dir / "best.pth"
                     state = self.state_dict()
                     state["last_epoch"] = epoch
-                    dist_utils.save_on_master(state, checkpoint_path)
+                    save_checkpoint(state, checkpoint_path)
                     best_acc = test_stats["acc"]
 
             log_stats = {
