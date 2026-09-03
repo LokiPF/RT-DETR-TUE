@@ -17,11 +17,11 @@ RTDETR:
 TUERTDETR:
   backbone: PResNet
   encoder: HybridEncoder
-  decoder: TUERTDETRTransformerv2
-  frechet_means: output/test_run/frechet_means.pth # output/rtdetrv2_r18vd_120e_coco_tue/frechet_means.pth
-  decoder_layers: null
-  tue_confidence_threshold: 0.5
-  tue_topk: 1
+  decoder: RTDETRTransformerv2TUE
+#   frechet_means: output/test_run/frechet_means.pth # output/rtdetrv2_r18vd_120e_coco_tue/frechet_means.pth
+#   decoder_layers: null
+#   tue_confidence_threshold: 0.5
+#   tue_topk: 1
 #  tue_normalization: none #robust_z
 #  tue_calibration: class_conformal
 
@@ -74,7 +74,7 @@ RTDETRTransformerv2:
   cross_attn_method: default # default, discrete
   query_select_method: default # default, agnostic 
 
-TUERTDETRTransformerv2:
+RTDETRTransformerv2TUE:
   feat_channels: [256, 256, 256]
   feat_strides: [8, 16, 32]
   hidden_dim: 256

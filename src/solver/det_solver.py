@@ -203,4 +203,3 @@ class DetSolver(BaseSolver):
             torch.save(state, output_path)
             print(f"Saved Fréchet means to {output_path}")
             print("Counts per layer/class:")
-            print(state["counts"])

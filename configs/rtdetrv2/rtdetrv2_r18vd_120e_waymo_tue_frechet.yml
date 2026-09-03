@@ -1,25 +1,32 @@
 __include__: [
-  '../dataset/coco_detection.yml',
+  '../dataset/waymo_detection.yml',
   '../runtime.yml',
   './include/dataloader.yml',
   './include/optimizer.yml',
   './include/rtdetrv2_r50vd.yml',
 ]
 
-task: tu_estimation
-model: TUERTDETR # uses default model for frechet mean generation as frechet means are not known yet 
+task: detection
+model: RTDETR # uses default model for frechet mean generation as frechet means are not known yet 
+
+RTDETR:
+  decoder: RTDETRTransformerv2TUE
 
 TUERTDETR:
-  decoder: RTDETRTransformerv2
-  frechet_means: output/rtdetrv2_r18vd_120e_coco_tue_frechet_generation/frechet_means.pth
-  tue_topk: 1
+  decoder: RTDETRTransformerv2TUE
+  tue_head: TUEOrig
 
-output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue_frechet_generation
+RTDETRTransformerv2TUE:
+  num_layers: 3
+  decoder_capture_layers: -1
+  decoder_tue_task: ["score", "bbox", "deformable_sampling_offsets", "attention_weights", "value_proj", "output_proj", "enc_output", "enc_score_head", "enc_bbox_head"]
 
-train_calibration_split_path: /home/philip/datasets/coco/annotations/instances_train_calibration_split.json
+TUEOrig:
+  frechet_means: output/rtdetrv2_r18vd_120e_coco_tue_frechet_tests/frechet_means.pth
+  tue_topk: 10
+  confidence_threshold: 0.0
 
-persistence_confidence_threshold: 0.5
-persistence_decoder_layers: null
+output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue_frechet_tests
 
 PResNet:
   depth: 18
@@ -32,21 +39,6 @@ HybridEncoder:
   in_channels: [128, 256, 512]
   hidden_dim: 256
   expansion: 0.5
-
-
-TUERTDETRTransformerv2:
-  num_layers: 3
-
-RTDETRTransformerv2:
-  num_layers: 3
-
-RTDETRCriterionv2:
-  losses: [vfl, boxes]
-  weight_dict:
-    loss_vfl: 1
-    loss_bbox: 5
-    loss_giou: 2
-
 
 epoches: 120 
 

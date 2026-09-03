@@ -6,6 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from .tue_dataclasses import DiagramStatistics, LayerCapture
+
 # The graph structure is identical for every query with the same dimensions.
 _EDGE_INDEX_CACHE: dict[tuple[int, int], Tensor] = {}
 
@@ -734,9 +736,126 @@ def get_persistence_diagram(
     ).values
 
 
+def run_detector(model, samples):
+    if hasattr(model, "forward_detector"):
+        return model.forward_detector(samples)
+    return model(samples)
+
+
+def initialize_statistics(
+    capture: LayerCapture,
+    num_classes: int,
+) -> DiagramStatistics:
+    if capture.weight.ndim != 2:
+        raise ValueError(f"Expected a matrix weight, got {capture.weight.shape}")
+
+    output_dim, input_dim = capture.weight.shape
+    diagram_size = output_dim + input_dim - 1
+
+    return DiagramStatistics(
+        sums=torch.zeros(
+            num_classes,
+            diagram_size,
+            dtype=torch.float64,
+            device="cpu",
+        ),
+        counts=torch.zeros(
+            num_classes,
+            dtype=torch.long,
+            device="cpu",
+        ),
+    )
+
+
+def select_confident_matches(
+    outputs,
+    targets,
+    matcher,
+    device,
+    min_confidence,
+):
+    matcher_result = matcher(
+        {
+            "pred_logits": outputs["pred_logits"],
+            "pred_boxes": outputs["pred_boxes"],
+        },
+        targets,
+    )
+
+    probabilities = outputs["pred_logits"].sigmoid()
+    query_indices = []
+    query_classes = []
+
+    for batch_id, (query_ids, target_ids) in enumerate(matcher_result["indices"]):
+        query_ids = query_ids.to(device=device, dtype=torch.long)
+        target_ids = target_ids.to(device=device, dtype=torch.long)
+
+        target_classes = targets[batch_id]["labels"].index_select(0, target_ids)
+        matched_probabilities = probabilities[batch_id, query_ids]
+
+        predicted_classes = matched_probabilities.argmax(dim=-1)
+        target_confidence = matched_probabilities.gather(
+            1, target_classes[:, None]
+        ).squeeze(1)
+
+        keep = (predicted_classes == target_classes) & (
+            target_confidence >= min_confidence
+        )
+
+        query_indices.append(query_ids[keep])
+        query_classes.append(target_classes[keep])
+
+    return query_indices, query_classes
+
+
+def accumulate_diagrams(
+    statistics_by_module,
+    captures,
+    query_indices,
+    query_classes,
+):
+    diagrams = get_captured_persistence_diagrams(
+        captures=captures,
+        query_indices=query_indices,
+        chunk_size=512,
+    )
+
+    class_lookups = [
+        dict(
+            zip(
+                queries.detach().cpu().tolist(),
+                classes.detach().cpu().tolist(),
+            )
+        )
+        for queries, classes in zip(
+            query_indices,
+            query_classes,
+        )
+    ]
+
+    for module_name, batch_diagrams in diagrams.items():
+        statistics = statistics_by_module[module_name]
+
+        for batch_id, query_diagrams in enumerate(batch_diagrams):
+            for query_id, diagram in query_diagrams.items():
+                class_id = class_lookups[batch_id][query_id]
+
+                statistics.sums[class_id].add_(
+                    diagram.to(dtype=torch.float64, device="cpu")
+                )
+                statistics.counts[class_id] += 1
+
+
+def compute_means(statistics):
+    means = (statistics.sums / statistics.counts.clamp_min(1).unsqueeze(-1)).float()
+
+    means[statistics.counts == 0] = float("nan")
+    return means
+
+
 @torch.no_grad()
 def get_captured_persistence_diagrams(
-    captures: dict[int, dict[str, Tensor]],
+    captures: LayerCapture,
     query_indices: list[Tensor],
     decoder_layer_indices: int | list[int] | None = None,
     chunk_size: int = 64,
@@ -750,8 +869,8 @@ def get_captured_persistence_diagrams(
 
     for layer_id in decoder_layer_indices:
         capture = captures[layer_id]
-        layer_inputs = capture["input"]
-        weight_matrix = capture["weight"]
+        layer_inputs = capture.input
+        weight_matrix = capture.weight
 
         batch_results = [{} for _ in range(layer_inputs.shape[0])]
 

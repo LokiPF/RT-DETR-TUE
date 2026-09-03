@@ -36,7 +36,7 @@ CLASS_MATCH = True
 SIZE = 640
 BATCH = 32
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-CONFIG_FILE = "output/auroc/exp4/exp4_config.yaml"
+CONFIG_FILE = "configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_tue_frechet.yml"
 COCO_STATS = [
     "AP",
     "AP50",
