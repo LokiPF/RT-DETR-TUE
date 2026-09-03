@@ -357,18 +357,25 @@ def _batched_prim(
     layer_inputs: Tensor,
 ) -> Tensor:
     """
-    Exact maximum spanning tree for the complete bipartite graph
-    induced by a score head.
+    Compute exact maximum-spanning-tree weights for complete bipartite
+    graphs induced by multiple query activations.
 
-    weight_matrix: [C, H]
-    layer_inputs:  [K, H]
-    returns:       [K, H + C - 1]
+    Args:
+        weight_matrix:
+            Linear-layer weights with shape [num_outputs, num_inputs].
+
+        layer_inputs:
+            Input activations with shape [num_queries, num_inputs].
+
+    Returns:
+        Sorted MST weights with shape:
+        [num_queries, num_inputs + num_outputs - 1].
     """
     if weight_matrix.ndim != 2:
-        raise ValueError("weight_matrix must have shape [C, H]")
+        raise ValueError("weight_matrix must have shape [num_outputs, num_inputs]")
 
     if layer_inputs.ndim != 2:
-        raise ValueError("layer_inputs must have shape [K, H]")
+        raise ValueError("layer_inputs must have shape [num_queries, num_inputs]")
 
     device = layer_inputs.device
 
@@ -383,78 +390,108 @@ def _batched_prim(
 
     num_queries = layer_inputs.shape[0]
     num_outputs, num_inputs = weight_matrix.shape
+    diagram_size = num_inputs + num_outputs - 1
 
     if layer_inputs.shape[1] != num_inputs:
-        raise ValueError("Input dimensions do not match")
+        raise ValueError(
+            f"Expected input dimension {num_inputs}, got {layer_inputs.shape[1]}"
+        )
 
     if num_queries == 0:
         return torch.empty(
-            (0, num_inputs + num_outputs - 1),
+            (0, diagram_size),
             dtype=torch.float32,
             device=device,
         )
 
-    # [K, C, H]
+    # Edge weights for the complete bipartite graph:
+    # [num_queries, num_outputs, num_inputs]
     edge_weights = torch.abs(layer_inputs[:, None, :] * weight_matrix[None, :, :])
 
-    # Each input vertex can safely take its strongest incident edge.
-    # [K, H]
-    input_tree_weights, input_owner = edge_weights.max(dim=1)
+    # The bipartite graph is symmetric. Use the smaller partition as
+    # the centre partition to minimize the later C x C graph.
+    if num_outputs <= num_inputs:
+        graph = edge_weights
+    else:
+        graph = edge_weights.transpose(1, 2)
 
-    if num_outputs == 1:
+    num_centres = graph.shape[1]
+    num_leaves = graph.shape[2]
+
+    # Attach every leaf to its strongest incident centre.
+    #
+    # leaf_tree_weights: [num_queries, num_leaves]
+    # leaf_owner:        [num_queries, num_leaves]
+    leaf_tree_weights, leaf_owner = graph.max(dim=1)
+
+    if num_centres == 1:
         return torch.sort(
-            input_tree_weights,
+            leaf_tree_weights,
             dim=1,
             descending=True,
         ).values
 
-    # directed[a, b] is the strongest edge from an input currently
-    # attached to output a into output b.
-    directed = []
+    # For each target centre and leaf, place its edge weight into the
+    # bucket belonging to that leaf's current owner.
+    #
+    # Before transpose:
+    #   [num_queries, target_centre, owner_centre]
+    directed_by_target = graph.new_full(
+        (
+            num_queries,
+            num_centres,
+            num_centres,
+        ),
+        -torch.inf,
+    )
 
-    for owner in range(num_outputs):
-        owner_mask = (input_owner == owner).unsqueeze(1)
+    owner_indices = leaf_owner[:, None, :].expand(
+        -1,
+        num_centres,
+        num_leaves,
+    )
 
-        directed.append(
-            edge_weights.masked_fill(
-                ~owner_mask,
-                -torch.inf,
-            ).amax(dim=-1)
-        )
+    directed_by_target.scatter_reduce_(
+        dim=2,
+        index=owner_indices,
+        src=graph,
+        reduce="amax",
+        include_self=True,
+    )
 
-    # [K, C, C]
-    directed = torch.stack(directed, dim=1)
+    # [num_queries, owner_centre, target_centre]
+    directed = directed_by_target.transpose(1, 2)
 
-    # Either endpoint may own the connecting input.
-    output_graph = torch.maximum(
+    # Either endpoint may own the leaf that supplies the strongest
+    # connection between two centre components.
+    centre_graph = torch.maximum(
         directed,
         directed.transpose(1, 2),
     )
 
     diagonal = torch.eye(
-        num_outputs,
+        num_centres,
         dtype=torch.bool,
         device=device,
     ).unsqueeze(0)
 
-    output_graph = output_graph.masked_fill(
+    centre_graph.masked_fill_(
         diagonal,
         -torch.inf,
     )
 
-    # Prim now runs only over C output vertices.
-    # With four classes, this is three iterations rather than 259.
+    # Run batched Prim over the reduced centre graph.
     selected = torch.zeros(
-        (num_queries, num_outputs),
+        (num_queries, num_centres),
         dtype=torch.bool,
         device=device,
     )
     selected[:, 0] = True
 
-    best = output_graph[:, 0, :]
+    best = centre_graph[:, 0, :]
     bridge_weights = []
 
-    for _ in range(num_outputs - 1):
+    for _ in range(num_centres - 1):
         candidates = best.masked_fill(
             selected,
             -torch.inf,
@@ -464,21 +501,24 @@ def _batched_prim(
         bridge_weights.append(selected_weight)
 
         selected.scatter_(
-            1,
-            selected_vertex[:, None],
-            True,
+            dim=1,
+            index=selected_vertex[:, None],
+            value=True,
         )
 
-        new_weights = output_graph.gather(
-            1,
-            selected_vertex[:, None, None].expand(
+        new_weights = centre_graph.gather(
+            dim=1,
+            index=selected_vertex[:, None, None].expand(
                 -1,
                 1,
-                num_outputs,
+                num_centres,
             ),
         ).squeeze(1)
 
-        best = torch.maximum(best, new_weights)
+        best = torch.maximum(
+            best,
+            new_weights,
+        )
 
     bridge_weights = torch.stack(
         bridge_weights,
@@ -487,11 +527,16 @@ def _batched_prim(
 
     mst_weights = torch.cat(
         [
-            input_tree_weights,
+            leaf_tree_weights,
             bridge_weights,
         ],
         dim=1,
     )
+
+    if mst_weights.shape[1] != diagram_size:
+        raise RuntimeError(
+            f"Expected diagram size {diagram_size}, got {mst_weights.shape[1]}"
+        )
 
     return torch.sort(
         mst_weights,
@@ -546,6 +591,49 @@ def __batched_prim(
 
     # [K, C, H]
     edge_weights = torch.abs(layer_inputs[:, None, :] * weight_matrix[None, :, :])
+
+    # The bipartite MST is symmetric. Keep the smaller partition
+    # as the output/centre partition to minimize the C x C graph.
+    if num_outputs > num_inputs:
+        edge_weights = edge_weights.transpose(1, 2)
+        num_outputs, num_inputs = num_inputs, num_outputs
+
+    # Attach each leaf vertex to its strongest centre.
+    # [K, H]
+    input_tree_weights, input_owner = edge_weights.max(dim=1)
+
+    if num_outputs == 1:
+        return torch.sort(
+            input_tree_weights,
+            dim=1,
+            descending=True,
+        ).values
+
+    # Construct all directed centre-to-centre connections in one
+    # scatter reduction instead of rescanning edge_weights C times.
+    #
+    # directed_by_target[k, target, owner]
+    directed_by_target = edge_weights.new_full(
+        (num_queries, num_outputs, num_outputs),
+        -torch.inf,
+    )
+
+    owner_indices = input_owner[:, None, :].expand(
+        -1,
+        num_outputs,
+        -1,
+    )
+
+    directed_by_target.scatter_reduce_(
+        dim=2,
+        index=owner_indices,
+        src=edge_weights,
+        reduce="amax",
+        include_self=True,
+    )
+
+    # directed[k, owner, target]
+    directed = directed_by_target.transpose(1, 2)
 
     selected_inputs = torch.zeros(
         (num_queries, num_inputs),
@@ -746,23 +834,21 @@ def initialize_statistics(
     capture: LayerCapture,
     num_classes: int,
 ) -> DiagramStatistics:
-    if capture.weight.ndim != 2:
-        raise ValueError(f"Expected a matrix weight, got {capture.weight.shape}")
-
     output_dim, input_dim = capture.weight.shape
     diagram_size = output_dim + input_dim - 1
+    device = capture.input.device
 
     return DiagramStatistics(
         sums=torch.zeros(
             num_classes,
             diagram_size,
             dtype=torch.float64,
-            device="cpu",
+            device=device,
         ),
         counts=torch.zeros(
             num_classes,
             dtype=torch.long,
-            device="cpu",
+            device=device,
         ),
     )
 
@@ -809,11 +895,11 @@ def select_confident_matches(
 
 
 def accumulate_diagrams(
-    statistics_by_module,
-    captures,
-    query_indices,
-    query_classes,
-):
+    statistics_by_module: dict[str, DiagramStatistics],
+    captures: dict[str, LayerCapture],
+    query_indices: list[torch.Tensor],
+    query_classes: list[torch.Tensor],
+) -> None:
     diagrams = get_captured_persistence_diagrams(
         captures=captures,
         query_indices=query_indices,
@@ -836,14 +922,42 @@ def accumulate_diagrams(
     for module_name, batch_diagrams in diagrams.items():
         statistics = statistics_by_module[module_name]
 
-        for batch_id, query_diagrams in enumerate(batch_diagrams):
-            for query_id, diagram in query_diagrams.items():
-                class_id = class_lookups[batch_id][query_id]
+        diagram_list = []
+        class_id_list = []
 
-                statistics.sums[class_id].add_(
-                    diagram.to(dtype=torch.float64, device="cpu")
-                )
-                statistics.counts[class_id] += 1
+        for batch_id, query_diagrams in enumerate(batch_diagrams):
+            class_lookup = class_lookups[batch_id]
+
+            for query_id, diagram in query_diagrams.items():
+                diagram_list.append(diagram)
+                class_id_list.append(class_lookup[query_id])
+
+        if not diagram_list:
+            continue
+
+        stacked_diagrams = torch.stack(diagram_list).to(
+            device=statistics.sums.device,
+            dtype=statistics.sums.dtype,
+        )
+
+        class_ids = torch.tensor(
+            class_id_list,
+            dtype=torch.long,
+            device=statistics.sums.device,
+        )
+
+        statistics.sums.index_add_(
+            0,
+            class_ids,
+            stacked_diagrams,
+        )
+
+        statistics.counts.add_(
+            torch.bincount(
+                class_ids,
+                minlength=statistics.counts.numel(),
+            )
+        )
 
 
 def compute_means(statistics):
@@ -855,22 +969,21 @@ def compute_means(statistics):
 
 @torch.no_grad()
 def get_captured_persistence_diagrams(
-    captures: LayerCapture,
+    captures: dict[str, LayerCapture],
     query_indices: list[Tensor],
-    decoder_layer_indices: int | list[int] | None = None,
+    module_names: Iterable[str] | None = None,
     chunk_size: int = 64,
-) -> dict[int, list[dict[int, Tensor]]]:
-    if decoder_layer_indices is None:
-        decoder_layer_indices = sorted(captures)
-    elif isinstance(decoder_layer_indices, int):
-        decoder_layer_indices = [decoder_layer_indices]
+) -> dict[str, list[dict[int, Tensor]]]:
+    if module_names is None:
+        module_names = captures.keys()
 
     results = {}
 
-    for layer_id in decoder_layer_indices:
-        capture = captures[layer_id]
+    for module_name in module_names:
+        capture = captures[module_name]
         layer_inputs = capture.input
         weight_matrix = capture.weight
+        module_chunk_size = 16 if capture.weight.numel() > 100_000 else chunk_size
 
         batch_results = [{} for _ in range(layer_inputs.shape[0])]
 
@@ -906,8 +1019,10 @@ def get_captured_persistence_diagrams(
             flat_diagrams = get_persistence_diagrams_batched(
                 weight_matrix=weight_matrix,
                 layer_inputs=flat_inputs,
-                chunk_size=chunk_size,
-            ).cpu()
+                chunk_size=module_chunk_size,
+            )
+
+            # Do not call .cpu()
 
             # This loop only reconstructs the output structure;
             # the expensive MST work is already batched.
@@ -918,7 +1033,7 @@ def get_captured_persistence_diagrams(
                 batch_id, query_id = location
                 batch_results[batch_id][query_id] = diagram
 
-        results[layer_id] = batch_results
+        results[module_name] = batch_results
 
     return results
 
