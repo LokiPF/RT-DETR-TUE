@@ -1,5 +1,5 @@
 __include__: [
-  '../dataset/waymo_detection.yml',
+  '../dataset/coco_detection.yml',
   '../runtime.yml',
   './include/dataloader.yml',
   './include/optimizer.yml',
@@ -7,7 +7,7 @@ __include__: [
 ]
 
 task: detection
-model: TUERTDETR # use default model for frechet mean generation as frechet means are not known yet
+model: TUERTDETR # uses default model for frechet mean generation as frechet means are not known yet
 
 RTDETR:
   decoder: RTDETRTransformerv2TUE
@@ -22,12 +22,12 @@ RTDETRTransformerv2TUE:
   decoder_tue_task: ["score"] #, "bbox", "deformable_sampling_offsets", "attention_weights", "value_proj", "output_proj", "enc_output", "enc_score_head", "enc_bbox_head"]
 
 TUEOrig:
-  frechet_means: output/rtdetrv2_r18vd_120e_waymo_tue_frechet_tests/frechet_means.pth
+  frechet_means: output/rtdetrv2_r18vd_120e_coco_tue_frechet_tests/frechet_means.pth
   num_top_queries: 10
   confidence_threshold: 0.3
-  num_classes: 4
+  num_classes: 80
 
-output_dir: ./output/rtdetrv2_r18vd_120e_waymo_tue_frechet_tests
+output_dir: ./output/rtdetrv2_r18vd_120e_coco_tue_frechet_tests
 
 PResNet:
   depth: 18

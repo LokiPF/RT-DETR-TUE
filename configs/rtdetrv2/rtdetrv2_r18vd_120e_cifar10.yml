@@ -11,9 +11,19 @@ eval_spatial_size: [32, 32]
 output_dir: ./output/rtdetrv2_r18vd_120e_cifar10
 task: classification
 criterion: CrossEntropyLoss
+model: TUERTDETR
 
 RTDETR: 
   decoder: RTDETRTransformerv2Clas
+
+TUERTDETR: 
+  decoder: RTDETRTransformerv2Clas
+  tue_head: TUEOrigClas
+
+TUEOrigClas:
+  frechet_means: output/rtdetrv2_r18vd_120e_cifar10/frechet_means.pth
+  tue_topk: 1
+  confidence_threshold: 0.5
 
 PResNet:
   depth: 18
