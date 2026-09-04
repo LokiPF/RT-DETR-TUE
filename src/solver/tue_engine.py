@@ -17,11 +17,12 @@ from torch import nn
 
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue
-from ..misc.tue_utils import (
-    LayerClassBuckets,
-    get_captured_persistence_diagrams,
-    hook_decoder_layers,
-)
+
+# from ..misc.tue_utils import (
+#     LayerClassBuckets,
+#     get_captured_persistence_diagrams,
+#     hook_decoder_layers,
+# )
 
 
 def _update_buckets(

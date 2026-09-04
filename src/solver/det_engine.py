@@ -17,13 +17,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
-from ..misc.tue_dataclasses import DiagramStatistics
+from ..misc.tue_dataclasses import FrechetAccumulator
 from ..misc.tue_utils import (
-    accumulate_diagrams,
-    compute_means,
-    initialize_statistics,
-    run_detector,
-    select_confident_matches,
+    build_frechet_mean,
 )
 from ..optim import ModelEMA, Warmup
 
@@ -225,6 +221,7 @@ def reduce_statistics(statistics, device):
 def build_frechet_means(
     model: torch.nn.Module,
     criterion: torch.nn.Module,
+    postprocessor,
     data_loader: Iterable,
     device: torch.device,
     min_confidence: float = 0.5,
@@ -232,9 +229,7 @@ def build_frechet_means(
     model.eval()
     criterion.eval()
 
-    statistics_by_module: dict[str, DiagramStatistics] = {}
-    saw_batch = False
-
+    acc = FrechetAccumulator()
     metric_logger = MetricLogger(delimiter="  ")
 
     for samples, targets in metric_logger.log_every(
@@ -242,60 +237,59 @@ def build_frechet_means(
         10,
         "Fréchet calibration:",
     ):
-        saw_batch = True
-
         samples = samples.to(device)
         targets = [
             {key: value.to(device) for key, value in target.items()}
             for target in targets
         ]
 
-        outputs = run_detector(model, samples)
+        outputs = model(samples)
 
-        query_indices, query_classes = select_confident_matches(
-            outputs=outputs,
-            targets=targets,
-            matcher=criterion.matcher,
-            device=device,
-            min_confidence=min_confidence,
+        captures = outputs["tue_info"]
+
+        orig_target_sizes = torch.stack(
+            [t["orig_size"] for t in targets],
+            dim=0,
         )
 
-        captures = outputs["tue_info"].data
+        results = postprocessor(outputs, orig_target_sizes)
 
-        if not captures:
-            continue
+        batch_indices = []
+        query_indices = []
+        class_indices = []
 
-        num_classes = outputs["pred_logits"].shape[-1]
+        for b, result in enumerate(results):
+            keep = result["scores"] >= min_confidence
 
-        for module_name, capture in captures.items():
-            if module_name not in statistics_by_module:
-                statistics_by_module[module_name] = initialize_statistics(
-                    capture=capture,
-                    num_classes=num_classes,
+            q = result["query_indices"][keep]
+            c = result["labels"][keep]
+
+            batch_indices.append(
+                torch.full(
+                    (q.numel(),),
+                    b,
+                    dtype=torch.long,
+                    device=q.device,
                 )
+            )
+            query_indices.append(q)
+            class_indices.append(c)
 
-        accumulate_diagrams(
-            statistics_by_module=statistics_by_module,
-            captures=captures,
-            query_indices=query_indices,
-            query_classes=query_classes,
-        )
+        if query_indices:
+            batch_indices = torch.cat(batch_indices)
+            query_indices = torch.cat(query_indices)
+            class_indices = torch.cat(class_indices)
 
-    if not saw_batch:
-        raise RuntimeError("The calibration dataloader was empty")
+            build_frechet_mean(
+                captures,
+                batch_indices,
+                query_indices,
+                class_indices,
+                acc,
+            )
 
-    if not statistics_by_module:
-        raise RuntimeError("No modules were captured")
-
-    frechet_means = {}
-
-    for module_name, statistics in statistics_by_module.items():
-        reduce_statistics(statistics, device)
-
-        frechet_means[module_name] = {
-            "means": compute_means(statistics),
-            "counts": statistics.counts,
-            "min_confidence": min_confidence,
-        }
-
-    return frechet_means
+    return {
+        "means": acc.means(),
+        "counts": acc.counts,
+        "min_confidence": min_confidence,
+    }

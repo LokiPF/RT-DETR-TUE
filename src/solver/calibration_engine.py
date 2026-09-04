@@ -7,16 +7,17 @@ import torch
 from torch import nn
 
 from ..misc import MetricLogger, SmoothedValue
-from ..misc.tue_utils import (
-    get_captured_persistence_diagrams,
-    hook_decoder_layers,
-)
+
+# from ..misc.tue_utils import (
+#     diagram_distance,
+#     get_captured_persistence_diagrams,
+#     hook_decoder_layers,
+# )
 
 CALIBRATION_POPULATIONS = ("correct", "predicted")
 
 
 class LayerClassDistances:
-
     def __init__(self, num_layers: int, num_classes: int):
         self.num_layers = num_layers
         self.num_classes = num_classes
@@ -91,8 +92,7 @@ def _collect_distances(
                     # No Frechet mean for this (layer, class); cannot calibrate.
                     continue
 
-                diagram_vector = diagram.detach().to(reference).flatten()
-                distance = torch.linalg.vector_norm(reference - diagram_vector)
+                distance = diagram_distance(diagram, reference)
                 distances.append(
                     layer_id=layer_id,
                     class_id=class_id,
@@ -127,7 +127,9 @@ def collect_conformal_distances_one_epoch(
         )
 
     allowed_class_ids = (
-        None if class_ids is None else frozenset(int(class_id) for class_id in class_ids)
+        None
+        if class_ids is None
+        else frozenset(int(class_id) for class_id in class_ids)
     )
     if allowed_class_ids is not None:
         invalid = sorted(
@@ -199,9 +201,7 @@ def collect_conformal_distances_one_epoch(
         "step": -1,
         "global_step": epoch * len(data_loader),
         "calibration_population": calibration_population,
-        "class_ids": (
-            None if allowed_class_ids is None else sorted(allowed_class_ids)
-        ),
+        "class_ids": (None if allowed_class_ids is None else sorted(allowed_class_ids)),
     }
 
     try:
@@ -239,7 +239,9 @@ def collect_conformal_distances_one_epoch(
             if calibration_population == "correct":
                 match_indices = matcher(outputs, targets)["indices"]
                 for batch_id, (query_idx, target_idx) in enumerate(match_indices):
-                    matched_labels[batch_id, query_idx] = targets[batch_id]["labels"][target_idx]
+                    matched_labels[batch_id, query_idx] = targets[batch_id]["labels"][
+                        target_idx
+                    ]
 
             query_indices = [
                 torch.where(confidence_mask[batch_id])[0]

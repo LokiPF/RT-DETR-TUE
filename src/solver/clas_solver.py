@@ -6,9 +6,11 @@ import os
 import time
 from pathlib import Path
 
+import torch
+
 from ..misc import dist_utils
 from ._solver import BaseSolver
-from .clas_engine import evaluate, train_one_epoch
+from .clas_engine import build_frechet_means, evaluate, train_one_epoch
 
 
 def save_checkpoint(state, checkpoint_path):
@@ -99,3 +101,38 @@ class ClasSolver(BaseSolver):
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
         print(f"Training time {total_time_str}")
+
+    def build_tue_frechet_means(self):
+        self.eval()
+
+        module = self.ema.module if self.ema else self.model
+
+        state = build_frechet_means(
+            model=module,
+            data_loader=self.val_dataloader,
+            device=self.device,
+            min_confidence=self.cfg.yaml_cfg.get(
+                "tue_calibration_confidence", 0.5
+            ),
+            chunk_size=self.cfg.yaml_cfg.get("tue_chunk_size"),
+            use_compile=self.cfg.yaml_cfg.get("tue_use_compile", False),
+        )
+
+        if dist_utils.is_main_process():
+            configured_output = self.cfg.yaml_cfg.get("frechet_means_output")
+            output_path = (
+                Path(configured_output)
+                if configured_output
+                else self.output_dir / "frechet_means.pth"
+            )
+
+            output_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            torch.save(state, output_path)
+            print(f"Saved Fréchet means to {output_path}")
+            print("Counts per layer/class:")
+            for module_name, module_state in state.items():
+                print(f"  {module_name}: {module_state['counts'].tolist()}")

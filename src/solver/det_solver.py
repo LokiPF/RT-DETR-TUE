@@ -184,6 +184,7 @@ class DetSolver(BaseSolver):
                 "tue_calibration_confidence",
                 0.5,
             ),
+            postprocessor=self.postprocessor,
         )
 
         if dist_utils.is_main_process():

@@ -100,3 +100,66 @@ class CaptureGroup:
 class DiagramStatistics:
     sums: torch.Tensor
     counts: torch.Tensor
+
+
+from dataclasses import dataclass, field
+
+import torch
+
+
+@dataclass
+class FrechetAccumulator:
+    sums: dict[int, dict[str, torch.Tensor]] = field(default_factory=dict)
+    counts: dict[int, int] = field(default_factory=dict)
+
+    def update(
+        self,
+        class_idx: int,
+        layer_name: str,
+        diagram: torch.Tensor,
+    ):
+        diagram = diagram.detach()
+
+        if class_idx not in self.sums:
+            self.sums[class_idx] = {}
+            self.counts[class_idx] = 0
+
+        if layer_name not in self.sums[class_idx]:
+            self.sums[class_idx][layer_name] = torch.zeros_like(diagram)
+
+        self.sums[class_idx][layer_name] += diagram
+
+    def update_batch(
+        self,
+        class_indices: torch.Tensor,
+        layer_name: str,
+        diagrams: torch.Tensor,
+    ):
+        for c in class_indices.unique():
+            mask = class_indices == c
+
+            total = diagrams[mask].sum(dim=0)
+            count = mask.sum()
+
+            c = int(c.item())
+
+            if c not in self.sums:
+                self.sums[c] = {}
+
+            if layer_name not in self.sums[c]:
+                self.sums[c][layer_name] = torch.zeros_like(total)
+
+            self.sums[c][layer_name] += total
+            self.counts[c] = self.counts.get(c, 0) + int(count.item())
+
+    def increment_class_count(self, class_idx: int, n: int = 1):
+        self.counts[class_idx] = self.counts.get(class_idx, 0) + n
+
+    def means(self):
+        return {
+            class_idx: {
+                layer_name: total / self.counts[class_idx]
+                for layer_name, total in layers.items()
+            }
+            for class_idx, layers in self.sums.items()
+        }
