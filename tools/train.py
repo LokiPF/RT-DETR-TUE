@@ -42,8 +42,10 @@ def main(
 
     if args.test_only:
         solver.val()
-    elif args.build_frechet_means:
+    elif args.build_task == "original":
         solver.build_tue_frechet_means()
+    elif args.build_task == "cluster":
+        solver.build_clustered_tue_frechet_means()
     else:
         solver.fit()
 
@@ -76,11 +78,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "-b",
-        "--build-frechet-means",
-        help="if flag is set, only the frechet means are built",
-        action="store_true",
-        default=False,
+        "-b", "--build-task", type=str, help="What type of Frechet mean to build"
     )
 
     # priority 1

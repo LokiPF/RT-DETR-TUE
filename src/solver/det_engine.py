@@ -11,6 +11,7 @@ from collections.abc import Iterable
 
 import torch
 import torch.amp
+from sklearn.cluster import KMeans
 from supervisely.nn.training import train_logger
 from torch.cuda.amp.grad_scaler import GradScaler
 from torch.utils.tensorboard import SummaryWriter
@@ -18,9 +19,7 @@ from torch.utils.tensorboard import SummaryWriter
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
 from ..misc.tue_dataclasses import FrechetAccumulator
-from ..misc.tue_utils import (
-    build_frechet_mean,
-)
+from ..misc.tue_utils import build_frechet_mean, collect_diagrams
 from ..optim import ModelEMA, Warmup
 
 
@@ -292,4 +291,176 @@ def build_frechet_means(
         "means": acc.means(),
         "counts": acc.counts,
         "min_confidence": min_confidence,
+    }
+
+
+@torch.no_grad()
+def collect_frechet_diagrams(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    postprocessor,
+    data_loader: Iterable,
+    device: torch.device,
+    min_confidence: float = 0.5,
+):
+    model.eval()
+    criterion.eval()
+
+    diagram_chunks = {}
+    class_chunks = []
+
+    metric_logger = MetricLogger(delimiter="  ")
+
+    for samples, targets in metric_logger.log_every(
+        data_loader,
+        10,
+        "Fréchet calibration:",
+    ):
+        samples = samples.to(device)
+        targets = [
+            {key: value.to(device) for key, value in target.items()}
+            for target in targets
+        ]
+
+        outputs = model(samples)
+
+        captures = outputs["tue_info"]
+
+        orig_target_sizes = torch.stack(
+            [t["orig_size"] for t in targets],
+            dim=0,
+        )
+
+        results = postprocessor(outputs, orig_target_sizes)
+
+        batch_indices = []
+        query_indices = []
+        class_indices = []
+
+        for b, result in enumerate(results):
+            keep = result["scores"] >= min_confidence
+
+            q = result["query_indices"][keep]
+            c = result["labels"][keep]
+
+            batch_indices.append(
+                torch.full(
+                    (q.numel(),),
+                    b,
+                    dtype=torch.long,
+                    device=q.device,
+                )
+            )
+            query_indices.append(q)
+            class_indices.append(c)
+
+        if query_indices:
+            batch_indices = torch.cat(batch_indices)
+            query_indices = torch.cat(query_indices)
+            class_indices = torch.cat(class_indices)
+
+            collect_diagrams(
+                captures,
+                batch_indices,
+                query_indices,
+                class_indices,
+                diagram_chunks,
+                class_chunks,
+            )
+
+    return {
+        "diagrams": {
+            layer_name: torch.cat(chunks, dim=0)
+            for layer_name, chunks in diagram_chunks.items()
+        },
+        "class_indices": (
+            torch.cat(class_chunks)
+            if class_chunks
+            else torch.empty(0, dtype=torch.long)
+        ),
+        "min_confidence": min_confidence,
+    }
+
+
+@torch.no_grad()
+def build_frechet_clusters(
+    state: dict,
+    n_clusters: int = 8,
+    init_size: int = 1000,
+    batch_size: int = 512,
+    random_state: int = 42,
+):
+    labels = state["class_indices"].detach().cpu().long()
+
+    means = {}
+    counts = {}
+
+    for class_id in labels.unique().tolist():
+        mask = labels == class_id
+
+        means[class_id] = {}
+        counts[class_id] = {}
+
+        for layer_name, diagrams in state["diagrams"].items():
+            X = (
+                diagrams.detach()
+                .to(
+                    device="cpu",
+                    dtype=torch.float32,
+                )[mask]
+                .contiguous()
+            )
+
+            n_samples, n_weights = X.shape
+            k = min(n_clusters, n_samples)
+
+            if not torch.isfinite(X).all():
+                raise ValueError(
+                    f"Non-finite diagrams: class={class_id}, layer={layer_name}"
+                )
+
+            if k == 1:
+                centers = X.mean(dim=0, keepdim=True)
+                cluster_counts = torch.tensor([n_samples])
+            else:
+                estimator = KMeans(
+                    n_clusters=k,
+                    init="k-means++",
+                    n_init=10,
+                    max_iter=3000,
+                    random_state=random_state,
+                )
+
+                estimator.fit(X.numpy())
+
+                assignments = torch.from_numpy(estimator.labels_).long()
+
+                cluster_counts = torch.bincount(
+                    assignments,
+                    minlength=k,
+                )
+
+                # Recompute exact means from final memberships.
+                # MiniBatchKMeans centers themselves are approximations.
+                sums = torch.zeros(
+                    (k, n_weights),
+                    dtype=X.dtype,
+                )
+                sums.index_add_(0, assignments, X)
+
+                # Drop any clusters with no assigned detections.
+                active = cluster_counts > 0
+                cluster_counts = cluster_counts[active]
+
+                centers = sums[active] / cluster_counts[:, None].to(X.dtype)
+
+            means[class_id][layer_name] = centers
+            counts[class_id][layer_name] = cluster_counts
+
+    return {
+        "means": means,
+        "counts": counts,
+        "min_confidence": state["min_confidence"],
+        "n_clusters_requested": n_clusters,
+        "distance": "W2",
     }

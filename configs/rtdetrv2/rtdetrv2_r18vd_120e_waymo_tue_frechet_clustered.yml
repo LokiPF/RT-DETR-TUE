@@ -14,20 +14,20 @@ RTDETR:
 
 TUERTDETR:
   decoder: RTDETRTransformerv2TUE
-  tue_head: TUEOrig
+  tue_head: TUEClusters
 
 RTDETRTransformerv2TUE:
   num_layers: 3
   decoder_capture_layers: -1
   decoder_tue_task: ["score"] #, "bbox", "deformable_sampling_offsets", "attention_weights", "value_proj", "output_proj", "enc_output", "enc_score_head", "enc_bbox_head"]
 
-TUEOrig:
-  frechet_means: output/rtdetrv2_r18vd_120e_waymo_tue_frechet_tests/frechet_means.pth
+TUEClusters:
+  frechet_means: output/rtdetrv2_r18vd_120e_waymo_tue_frechet_clustered_tests/frechet_means.pth
   num_top_queries: 10
-  confidence_threshold: 0.2
+  confidence_threshold: 0.5
   num_classes: 4
 
-output_dir: ./output/rtdetrv2_r18vd_120e_waymo_tue_frechet_tests
+output_dir: ./output/rtdetrv2_r18vd_120e_waymo_tue_frechet_clustered_tests
 
 PResNet:
   depth: 18
@@ -65,5 +65,5 @@ train_dataloader:
     scales: null
   total_batch_size: 16
 val_dataloader:
-  total_batch_size: 32
+  total_batch_size: 16
   shuffle: True

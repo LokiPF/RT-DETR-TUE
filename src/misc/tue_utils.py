@@ -160,17 +160,47 @@ def build_frechet_mean(
         )
 
 
+@torch.no_grad()
+def collect_diagrams(
+    captures: CaptureGroup,
+    batch_indices: torch.Tensor,
+    query_indices: torch.Tensor,
+    class_indices: torch.Tensor,
+    diagram_chunks: dict,
+    class_chunks: list,
+):
+    if query_indices.numel() == 0:
+        return
+
+    class_chunks.append(class_indices.detach().to(device="cpu", dtype=torch.long))
+
+    for layer_name, layer in captures.data.items():
+        W = layer.weight
+        X = layer.input[
+            batch_indices,
+            query_indices,
+        ]
+        diagrams = _build_mst(X, W)
+
+        diagram_chunks.setdefault(layer_name, []).append(
+            diagrams.detach().to(device="cpu", dtype=torch.float32)
+        )
+
+
 def topological_uncertainty_from_captures(
     captures: CaptureGroup,
     batch_idx: torch.Tensor,
     query_idx: torch.Tensor,
     class_idx: torch.Tensor,
     frechet_means: dict,
+    plot,
     distance_measure=diagram_distance_1d,
 ):
     tu = None
 
     for layer_name, layer in captures.data.items():
+        if "linear1" not in layer_name:
+            continue
         X = layer.input[batch_idx, query_idx]
         W = layer.weight
 
@@ -180,6 +210,62 @@ def topological_uncertainty_from_captures(
         ).to(device=diagram.device, dtype=diagram.dtype)
 
         distances = distance_measure(diagram, references)
+
+        if tu is None:
+            tu = torch.zeros_like(distances)
+
+        tu += distances
+
+        layer_plot = plot.setdefault(layer_name, {})
+
+        for cls in class_idx.unique():
+            mask = class_idx == cls
+            cls_key = int(cls)
+
+            layer_plot[cls_key] = distances[mask].detach().cpu()
+
+    tu /= len(captures.data)
+
+    return tu
+
+
+def clustered_topological_uncertainty_from_captures(
+    captures: CaptureGroup,
+    batch_idx: torch.Tensor,
+    query_idx: torch.Tensor,
+    class_idx: torch.Tensor,
+    frechet_means: dict,
+):
+    tu = None
+
+    for layer_name, layer in captures.data.items():
+        X = layer.input[batch_idx, query_idx]
+        W = layer.weight
+
+        diagram = _build_mst(X, W)
+
+        distances = torch.empty(
+            diagram.shape[0],
+            device=diagram.device,
+            dtype=torch.float32,
+        )
+
+        for class_id in class_idx.unique().tolist():
+            mask = class_idx == class_id
+
+            prototypes = frechet_means[class_id][layer_name].to(
+                device=diagram.device,
+                dtype=torch.float32,
+            )
+
+            # cdist gives Euclidean distance; dividing by sqrt(N)
+            # recovers your existing root-mean-square / W2 distance.
+            pairwise = torch.cdist(
+                diagram[mask].float(),
+                prototypes,
+            ) / (diagram.shape[1] ** 0.5)
+
+            distances[mask] = pairwise.max(dim=1).values
 
         if tu is None:
             tu = torch.zeros_like(distances)
