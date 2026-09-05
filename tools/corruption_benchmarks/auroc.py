@@ -11,11 +11,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT))
 
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from imagecorruptions import corrupt, get_corruption_names
 from sklearn.metrics import average_precision_score, roc_auc_score, roc_curve
+from tqdm import tqdm
 
 from src.core import YAMLConfig
 
@@ -24,36 +26,19 @@ from src.core import YAMLConfig
 # ---------------------------------------------------------------------
 
 
-def build_runtime(config: str, ckpt: str, batch_size: int):
-    """
-    Return:
-        model        : model with TUE enabled
-        data_loader  : ID evaluation loader
-
-    The model/postprocessing path is assumed to return one result per image:
-
-        [
-            {
-                "scores": Tensor[K],
-                "tu":     Tensor[K],
-                ...
-            },
-            ...
-        ]
-
-    Replace this function with your normal RT-DETR loading code.
-    """
+def build_runtime(config: str, ckpt: str):
     cfg = YAMLConfig(str(config))
+
     model = cfg.model
-    dataloader = cfg.val_dataloader
+    id_loader = cfg.val_dataloader
 
     checkpoint = torch.load(
-        ckpt, map_location="cuda" if torch.cuda.is_available() else "cpu"
+        ckpt,
+        map_location="cuda" if torch.cuda.is_available() else "cpu",
     )
-    # RT-DETR checkpoints commonly store weights under "ema" or "model"
+
     if "ema" in checkpoint:
         state_dict = checkpoint["ema"]
-        # Some checkpoints wrap EMA weights again
         if isinstance(state_dict, dict) and "module" in state_dict:
             state_dict = state_dict["module"]
     elif "model" in checkpoint:
@@ -62,8 +47,19 @@ def build_runtime(config: str, ckpt: str, batch_size: int):
         state_dict = checkpoint
 
     model.load_state_dict(state_dict, strict=True)
+    model.to("cuda" if torch.cuda.is_available() else "cpu")
 
-    return model, dataloader
+    return model, cfg, id_loader
+
+
+def build_corrupted_loader(config_path, image_dir, ann_file):
+    cfg = YAMLConfig(str(config_path))
+
+    # Override only the validation dataset source.
+    cfg.yaml_cfg["val_dataloader"]["dataset"]["img_folder"] = str(image_dir)
+    cfg.yaml_cfg["val_dataloader"]["dataset"]["ann_file"] = str(ann_file)
+
+    return cfg.val_dataloader
 
 
 # ---------------------------------------------------------------------
@@ -184,8 +180,10 @@ def corrupt_batch(images, corruption_name):
 @torch.no_grad()
 def collect_uncertainties(model, images):
     results = model(images)
+
     tue = []
     confidence_uncertainty = []
+    labels = []
 
     for result in results:
         if result["tu"].numel() == 0:
@@ -196,7 +194,10 @@ def collect_uncertainties(model, images):
         confidence_uncertainty.extend(
             (1.0 - result["scores"]).detach().float().cpu().tolist()
         )
-    return tue, confidence_uncertainty
+
+        labels.extend(result["labels"].detach().cpu().tolist())
+
+    return tue, confidence_uncertainty, labels
 
 
 # ---------------------------------------------------------------------
@@ -243,10 +244,9 @@ def plot_histogram(id_tue, ood_tue, name, output_dir):
 
 @torch.no_grad()
 def benchmark(args):
-    model, data_loader = build_runtime(
+    model, cfg, id_loader = build_runtime(
         args.config,
         args.ckpt,
-        args.batch,
     )
 
     device = next(model.parameters()).device
@@ -255,33 +255,89 @@ def benchmark(args):
     output_dir = Path("tue_ood_results")
     output_dir.mkdir(exist_ok=True)
 
-    corruptions = get_corruption_names()
+    corruptions = set(get_corruption_names())
+
+    corruptions -= set(["gaussian_noise", "shot_noise", "impulse_noise", "pixelate"])
+
+    corruptions = sorted(corruptions)
 
     print(
-        f"{'Corruption':<20}{'Method':<9}"
-        f"{'AUROC':>9}"
-        f"{'AUPR-O':>9}"
-        f"{'AUPR-I':>9}"
-        f"{'FPR95':>9}"
-        f"{'AURC':>9}"
-        f"{'E-AURC':>9}"
-        f"{'ID':>12}"
-        f"{'OOD':>9}"
+        f"{'Corruption':<20}{'Method':<9}{'Class':<8}"
+        f"{'AUROC':>9}{'AUPR-O':>9}{'AUPR-I':>9}"
+        f"{'FPR95':>9}{'AURC':>9}{'E-AURC':>9}"
+        f"{'ID':>10}{'OOD':>10}"
     )
 
+    def print_metrics_row(corruption, method, cls, metrics, n_id, n_ood):
+        metric_keys = (
+            "auroc",
+            "aupr_out",
+            "aupr_in",
+            "fpr95",
+            "aurc",
+            "eaurc",
+        )
+
+        metric_columns = "".join(f"{metrics[key]:>9.4f}" for key in metric_keys)
+
+        print(
+            f"{corruption:<20}{method:<9}{cls!s:<8}{metric_columns}{n_id:>10}{n_ood:>10}"
+        )
+
+    # ---------------------------------------------------------
+    # ID once
+    # ---------------------------------------------------------
+
+    id_tue = []
+    id_conf = []
+    id_tue_by_class = {}
+    id_conf_by_class = {}
+
+    seen = 0
+
+    for samples, _ in tqdm(id_loader, desc="ID Val Loader"):
+        if args.num is not None and seen >= args.num:
+            break
+
+        samples = samples.to(device)
+
+        if args.num is not None:
+            remaining = args.num - seen
+            samples = samples[:remaining]
+
+        seen += len(samples)
+
+        tue, conf, labels = collect_uncertainties(model, samples)
+
+        id_tue.extend(tue)
+        id_conf.extend(conf)
+
+        for value, cls in zip(tue, labels):
+            id_tue_by_class.setdefault(cls, []).append(value)
+
+        for value, cls in zip(conf, labels):
+            id_conf_by_class.setdefault(cls, []).append(value)
+
+    # ---------------------------------------------------------
+    # Pre-generated corrupted sets
+    # ---------------------------------------------------------
+
     for name in corruptions:
-        id_tue = []
-        id_conf = []
+        corruption_dir = Path(args.corrupted_root) / name
+        ood_loader = build_corrupted_loader(
+            args.config,
+            corruption_dir / "images",
+            corruption_dir / "annotations.json",
+        )
 
         ood_tue = []
         ood_conf = []
-
-        total_id = 0
-        total_ood = 0
+        ood_tue_by_class = {}
+        ood_conf_by_class = {}
 
         seen = 0
 
-        for samples, _ in data_loader:
+        for samples, _ in tqdm(ood_loader, desc=f"OOD Dataloader: {name}"):
             if args.num is not None and seen >= args.num:
                 break
 
@@ -293,25 +349,19 @@ def benchmark(args):
 
             seen += len(samples)
 
-            # ID
-            tue, conf = collect_uncertainties(model, samples)
-            id_tue.extend(tue)
-            id_conf.extend(conf)
-            total_id += len(tue)
-
-            # OOD: same images, severity-5 corruption
-            corrupted = corrupt_batch(
-                samples,
-                name,
-            ).to(device)
-
-            tue, conf = collect_uncertainties(
+            tue, conf, labels = collect_uncertainties(
                 model,
-                corrupted,
+                samples,
             )
+
             ood_tue.extend(tue)
             ood_conf.extend(conf)
-            total_ood += len(tue)
+
+            for value, cls in zip(tue, labels):
+                ood_tue_by_class.setdefault(cls, []).append(value)
+
+            for value, cls in zip(conf, labels):
+                ood_conf_by_class.setdefault(cls, []).append(value)
 
         if not ood_tue:
             print(f"{name:<20} skipped: no valid ood detections")
@@ -331,36 +381,65 @@ def benchmark(args):
             ood_conf,
         )
 
-        values = {
-            **{f"tue_{k}": v for k, v in tue_metrics.items()},
-            **{f"confidence_{k}": v for k, v in confidence_metrics.items()},
-            "valid_id": len(id_tue),
-            "total_id": total_id,
-            "valid_ood": len(ood_tue),
-            "total_ood": total_ood,
-        }
-
-        print(
-            f"{name:<20}{'TUE':<9}"
-            f"{values['tue_auroc']:>9.4f}"
-            f"{values['tue_aupr_out']:>9.4f}"
-            f"{values['tue_aupr_in']:>9.4f}"
-            f"{values['tue_fpr95']:>9.4f}"
-            f"{values['tue_aurc']:>9.4f}"
-            f"{values['tue_eaurc']:>9.4f}"
-            f"{values['valid_id']:>7}/{values['total_id']:<4}"
-            f"{values['valid_ood']:>4}/{values['total_ood']:<4}"
+        # Aggregate results.
+        print_metrics_row(
+            name,
+            "TUE",
+            "all",
+            tue_metrics,
+            len(id_tue),
+            len(ood_tue),
         )
 
-        print(
-            f"{'':<20}{'1-conf':<9}"
-            f"{values['confidence_auroc']:>9.4f}"
-            f"{values['confidence_aupr_out']:>9.4f}"
-            f"{values['confidence_aupr_in']:>9.4f}"
-            f"{values['confidence_fpr95']:>9.4f}"
-            f"{values['confidence_aurc']:>9.4f}"
-            f"{values['confidence_eaurc']:>9.4f}"
+        print_metrics_row(
+            "",
+            "1-conf",
+            "all",
+            confidence_metrics,
+            len(id_conf),
+            len(ood_conf),
         )
+
+        # Per-class TUE results.
+        shared_classes = id_tue_by_class.keys() & ood_tue_by_class.keys()
+
+        for cls in sorted(shared_classes):
+            class_id_scores_tue = id_tue_by_class[cls]
+            class_ood_scores_tue = ood_tue_by_class[cls]
+
+            class_id_scores_conf = id_conf_by_class[cls]
+            class_ood_scores_conf = ood_conf_by_class[cls]
+
+            n_id = len(class_id_scores_tue)
+            n_ood = len(class_ood_scores_tue)
+
+            class_metrics_tue = calculate_metrics(
+                class_id_scores_tue,
+                class_ood_scores_tue,
+            )
+
+            class_metrics_conf = calculate_metrics(
+                class_id_scores_conf,
+                class_ood_scores_conf,
+            )
+
+            print_metrics_row(
+                "",
+                "TUE",
+                cls,
+                class_metrics_tue,
+                n_id,
+                n_ood,
+            )
+
+            print_metrics_row(
+                "",
+                "CONF",
+                cls,
+                class_metrics_conf,
+                n_id,
+                n_ood,
+            )
 
         plot_histogram(
             id_tue,
@@ -377,6 +456,12 @@ def main():
     parser.add_argument("-r", "--ckpt", required=True)
     parser.add_argument("-n", "--num", type=int, default=None)
     parser.add_argument("-b", "--batch", type=int, default=32)
+    parser.add_argument(
+        "--corrupted-root",
+        default="dataset/waymo_corrupted",
+        type=Path,
+        help="Root containing one COCO dataset per corruption.",
+    )
 
     args = parser.parse_args()
 

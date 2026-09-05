@@ -7,3 +7,5 @@ scipy
 supervisely
 matplotlib
 scipy
+typing
+typing-extensions
