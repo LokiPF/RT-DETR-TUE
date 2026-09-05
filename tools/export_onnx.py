@@ -65,12 +65,12 @@ def main(args, ):
     )
 
     if args.check:
-        import onnx
-        onnx_model = onnx.load(args.output_file)
+        import os
+        import sys
         onnx.checker.check_model(onnx_model)
         print('Check export onnx model done...')
-
-    if args.simplify:
+        import torch
+        from torch import nn
         import onnx 
         import onnxsim
         dynamic = True 

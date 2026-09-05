@@ -1,0 +1,53 @@
+description: Hook before normalization layers (-> no longer normalized between [0,1]). Fréchet means are class agnostic. Per class histogram
+
+config: 
+  /home/philip/GuidedResearch/final/RT-DETR-TUE/output/auroc/exp6/configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_tue_frechet.yml
+checkpoint: pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth
+
+datasets:
+- dataset:
+    name: Train Sub Split of MS-COCO
+    imgs: ./dataset/coco/train2017
+    anns: ./dataset/coco/annotations/train_subsplit.json
+    ood: false
+- dataset:
+    name: Construction Split of COCO-O
+    imgs: ./dataset/ood_coco/construction/val2017
+    anns: ./dataset/ood_coco/construction/annotations/instances_val2017.json
+    ood: true
+- dataset:
+    name: Dusty Construction Split of COCO-O
+    imgs: ./dataset/ood_coco/dusty_construction/val2017
+    anns: 
+      ./dataset/ood_coco/dusty_construction/annotations/instances_val2017.json
+    ood: true
+# - dataset:
+#   name: Cartoon Split of COCO-O
+#   imgs: ./dataset/ood_coco/cartoon/val2017
+#   anns: ./dataset/ood_coco/cartoon/annotations/instances_val2017.json
+#   ood: true
+- dataset:
+    name: Handmake Split of COCO-O
+    imgs: ./dataset/ood_coco/handmake/val2017
+    anns: ./dataset/ood_coco/handmake/annotations/instances_val2017.json
+    ood: true
+- dataset:
+    name: Painting Split of COCO-O
+    imgs: ./dataset/ood_coco/painting/val2017
+    anns: ./dataset/ood_coco/painting/annotations/instances_val2017.json
+    ood: true
+- dataset:
+    name: Sketch Split of COCO-O
+    imgs: ./dataset/ood_coco/sketch/val2017
+    anns: ./dataset/ood_coco/sketch/annotations/instances_val2017.json
+    ood: true
+- dataset:
+    name: Tattoo Split of COCO-O
+    imgs: ./dataset/ood_coco/tattoo/val2017
+    anns: ./dataset/ood_coco/tattoo/annotations/instances_val2017.json
+    ood: true
+- dataset:
+    name: Weather Split of COCO-O
+    imgs: ./dataset/ood_coco/weather/val2017
+    anns: ./dataset/ood_coco/weather/annotations/instances_val2017.json
+    ood: true

@@ -5,39 +5,50 @@ https://github.com/facebookresearch/detr/blob/main/engine.py
 Copyright(c) 2023 lyuwenyu. All Rights Reserved.
 """
 
-import sys
 import math
-from typing import Iterable
+import sys
+from collections.abc import Iterable
 
 import torch
-import torch.amp 
-from torch.utils.tensorboard import SummaryWriter
+import torch.amp
+from sklearn.cluster import KMeans
+from supervisely.nn.training import train_logger
 from torch.cuda.amp.grad_scaler import GradScaler
+from torch.utils.tensorboard import SummaryWriter
 
-from ..optim import ModelEMA, Warmup
 from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
+from ..misc.tue_dataclasses import FrechetAccumulator
+from ..misc.tue_utils import build_frechet_mean, collect_diagrams
+from ..optim import ModelEMA, Warmup
 
-from supervisely.nn.training import train_logger
 
-
-def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
-                    data_loader: Iterable, optimizer: torch.optim.Optimizer,
-                    device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
+def train_one_epoch(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    data_loader: Iterable,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+    max_norm: float = 0,
+    **kwargs,
+):
     model.train()
     criterion.train()
     metric_logger = MetricLogger(delimiter="  ")
-    metric_logger.add_meter('lr', SmoothedValue(window_size=1, fmt='{value:.6f}'))
-    header = 'Epoch: [{}]'.format(epoch)
-    
-    print_freq = kwargs.get('print_freq', 10)
-    writer :SummaryWriter = kwargs.get('writer', None)
+    metric_logger.add_meter("lr", SmoothedValue(window_size=1, fmt="{value:.6f}"))
+    header = f"Epoch: [{epoch}]"
 
-    ema :ModelEMA = kwargs.get('ema', None)
-    scaler :GradScaler = kwargs.get('scaler', None)
-    lr_warmup_scheduler :Warmup = kwargs.get('lr_warmup_scheduler', None)
+    print_freq = kwargs.get("print_freq", 10)
+    writer: SummaryWriter = kwargs.get("writer", None)
 
-    for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
+    ema: ModelEMA = kwargs.get("ema", None)
+    scaler: GradScaler = kwargs.get("scaler", None)
+    lr_warmup_scheduler: Warmup = kwargs.get("lr_warmup_scheduler", None)
+
+    for i, (samples, targets) in enumerate(
+        metric_logger.log_every(data_loader, print_freq, header)
+    ):
         samples = samples.to(device)
         targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
         global_step = epoch * len(data_loader) + i
@@ -46,13 +57,13 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         if scaler is not None:
             with torch.autocast(device_type=str(device), cache_enabled=True):
                 outputs = model(samples, targets=targets)
-            
+
             with torch.autocast(device_type=str(device), enabled=False):
                 loss_dict = criterion(outputs, targets, **metas)
 
             loss = sum(loss_dict.values())
             scaler.scale(loss).backward()
-            
+
             if max_norm > 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
@@ -64,17 +75,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         else:
             outputs = model(samples, targets=targets)
             loss_dict = criterion(outputs, targets, **metas)
-            
-            loss : torch.Tensor = sum(loss_dict.values())
+
+            loss: torch.Tensor = sum(loss_dict.values())
             optimizer.zero_grad()
             loss.backward()
-            
+
             if max_norm > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
             optimizer.step()
-        
-        # ema 
+
+        # ema
         if ema is not None:
             ema.update(model)
 
@@ -85,7 +96,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         loss_value = sum(loss_dict_reduced.values())
 
         if not math.isfinite(loss_value):
-            print("Loss is {}, stopping training".format(loss_value))
+            print(f"Loss is {loss_value}, stopping training")
             print(loss_dict_reduced)
             sys.exit(1)
 
@@ -93,14 +104,14 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
 
         if writer and dist_utils.is_main_process():
-            writer.add_scalar('Loss/total', loss_value.item(), global_step)
+            writer.add_scalar("Loss/total", loss_value.item(), global_step)
             for j, pg in enumerate(optimizer.param_groups):
-                writer.add_scalar(f'Lr/pg_{j}', pg['lr'], global_step)
+                writer.add_scalar(f"Lr/pg_{j}", pg["lr"], global_step)
             for k, v in loss_dict_reduced.items():
-                writer.add_scalar(f'Loss/{k}', v.item(), global_step)
+                writer.add_scalar(f"Loss/{k}", v.item(), global_step)
 
         train_logger.step_finished()
-                
+
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -108,15 +119,22 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
 
 
 @torch.no_grad()
-def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, data_loader, coco_evaluator: CocoEvaluator, device):
+def evaluate(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    postprocessor,
+    data_loader,
+    coco_evaluator: CocoEvaluator,
+    device,
+):
     model.eval()
     criterion.eval()
     coco_evaluator.cleanup()
 
     metric_logger = MetricLogger(delimiter="  ")
     # metric_logger.add_meter('class_error', SmoothedValue(window_size=1, fmt='{value:.2f}'))
-    header = 'Test:'
-    
+    header = "Test:"
+
     # iou_types = tuple(k for k in ('segm', 'bbox') if k in postprocessor.keys())
     iou_types = coco_evaluator.iou_types
     # coco_evaluator = CocoEvaluator(base_ds, iou_types)
@@ -133,7 +151,7 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
         # TODO (lyuwenyu), fix dataset converted using `convert_to_coco_api`?
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         # orig_target_sizes = torch.tensor([[samples.shape[-1], samples.shape[-2]]], device=samples.device)
-        
+
         results = postprocessor(outputs, orig_target_sizes)
 
         # if 'segm' in postprocessor.keys():
@@ -143,17 +161,22 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
         # predictions carry 0-based label indices, while GT annotations use dataset
         # category ids (1-based for COCO-style json); remap unless the postprocessor
         # already did it (remap_mscoco_category=True)
-        label2category = getattr(data_loader.dataset, 'label2category', None)
-        if label2category is not None and not getattr(postprocessor, 'remap_mscoco_category', False):
+        label2category = getattr(data_loader.dataset, "label2category", None)
+        if label2category is not None and not getattr(
+            postprocessor, "remap_mscoco_category", False
+        ):
             for result in results:
-                labels = result['labels']
-                result['labels'] = torch.tensor(
+                labels = result["labels"]
+                result["labels"] = torch.tensor(
                     [label2category[int(x)] for x in labels.flatten()],
                     dtype=labels.dtype,
                     device=labels.device,
                 ).reshape(labels.shape)
 
-        res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+        res = {
+            target["image_id"].item(): output
+            for target, output in zip(targets, results)
+        }
         if coco_evaluator is not None:
             coco_evaluator.update(res)
 
@@ -171,12 +194,273 @@ def evaluate(model: torch.nn.Module, criterion: torch.nn.Module, postprocessor, 
     stats = {}
     # stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     if coco_evaluator is not None:
-        if 'bbox' in iou_types:
-            stats['coco_eval_bbox'] = coco_evaluator.coco_eval['bbox'].stats.tolist()
-        if 'segm' in iou_types:
-            stats['coco_eval_masks'] = coco_evaluator.coco_eval['segm'].stats.tolist()
-            
+        if "bbox" in iou_types:
+            stats["coco_eval_bbox"] = coco_evaluator.coco_eval["bbox"].stats.tolist()
+        if "segm" in iou_types:
+            stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
+
     return stats, coco_evaluator
 
 
+def reduce_statistics(statistics, device):
+    if not dist_utils.is_dist_available_and_initialized():
+        return
 
+    sums = statistics.sums.to(device)
+    counts = statistics.counts.to(device)
+
+    torch.distributed.all_reduce(sums)
+    torch.distributed.all_reduce(counts)
+
+    statistics.sums = sums.cpu()
+    statistics.counts = counts.cpu()
+
+
+@torch.no_grad()
+def build_frechet_means(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    postprocessor,
+    data_loader: Iterable,
+    device: torch.device,
+    min_confidence: float = 0.5,
+):
+    model.eval()
+    criterion.eval()
+
+    acc = FrechetAccumulator()
+    metric_logger = MetricLogger(delimiter="  ")
+
+    for samples, targets in metric_logger.log_every(
+        data_loader,
+        10,
+        "Fréchet calibration:",
+    ):
+        samples = samples.to(device)
+        targets = [
+            {key: value.to(device) for key, value in target.items()}
+            for target in targets
+        ]
+
+        outputs = model(samples)
+
+        captures = outputs["tue_info"]
+
+        orig_target_sizes = torch.stack(
+            [t["orig_size"] for t in targets],
+            dim=0,
+        )
+
+        results = postprocessor(outputs, orig_target_sizes)
+
+        batch_indices = []
+        query_indices = []
+        class_indices = []
+
+        for b, result in enumerate(results):
+            keep = result["scores"] >= min_confidence
+
+            q = result["query_indices"][keep]
+            c = result["labels"][keep]
+
+            batch_indices.append(
+                torch.full(
+                    (q.numel(),),
+                    b,
+                    dtype=torch.long,
+                    device=q.device,
+                )
+            )
+            query_indices.append(q)
+            class_indices.append(c)
+
+        if query_indices:
+            batch_indices = torch.cat(batch_indices)
+            query_indices = torch.cat(query_indices)
+            class_indices = torch.cat(class_indices)
+
+            build_frechet_mean(
+                captures,
+                batch_indices,
+                query_indices,
+                class_indices,
+                acc,
+            )
+
+    return {
+        "means": acc.means(),
+        "counts": acc.counts,
+        "min_confidence": min_confidence,
+    }
+
+
+@torch.no_grad()
+def collect_frechet_diagrams(
+    model: torch.nn.Module,
+    criterion: torch.nn.Module,
+    postprocessor,
+    data_loader: Iterable,
+    device: torch.device,
+    min_confidence: float = 0.5,
+):
+    model.eval()
+    criterion.eval()
+
+    diagram_chunks = {}
+    class_chunks = []
+
+    metric_logger = MetricLogger(delimiter="  ")
+
+    for samples, targets in metric_logger.log_every(
+        data_loader,
+        10,
+        "Fréchet calibration:",
+    ):
+        samples = samples.to(device)
+        targets = [
+            {key: value.to(device) for key, value in target.items()}
+            for target in targets
+        ]
+
+        outputs = model(samples)
+
+        captures = outputs["tue_info"]
+
+        orig_target_sizes = torch.stack(
+            [t["orig_size"] for t in targets],
+            dim=0,
+        )
+
+        results = postprocessor(outputs, orig_target_sizes)
+
+        batch_indices = []
+        query_indices = []
+        class_indices = []
+
+        for b, result in enumerate(results):
+            keep = result["scores"] >= min_confidence
+
+            q = result["query_indices"][keep]
+            c = result["labels"][keep]
+
+            batch_indices.append(
+                torch.full(
+                    (q.numel(),),
+                    b,
+                    dtype=torch.long,
+                    device=q.device,
+                )
+            )
+            query_indices.append(q)
+            class_indices.append(c)
+
+        if query_indices:
+            batch_indices = torch.cat(batch_indices)
+            query_indices = torch.cat(query_indices)
+            class_indices = torch.cat(class_indices)
+
+            collect_diagrams(
+                captures,
+                batch_indices,
+                query_indices,
+                class_indices,
+                diagram_chunks,
+                class_chunks,
+            )
+
+    return {
+        "diagrams": {
+            layer_name: torch.cat(chunks, dim=0)
+            for layer_name, chunks in diagram_chunks.items()
+        },
+        "class_indices": (
+            torch.cat(class_chunks)
+            if class_chunks
+            else torch.empty(0, dtype=torch.long)
+        ),
+        "min_confidence": min_confidence,
+    }
+
+
+@torch.no_grad()
+def build_frechet_clusters(
+    state: dict,
+    n_clusters: int = 8,
+    init_size: int = 1000,
+    batch_size: int = 512,
+    random_state: int = 42,
+):
+    labels = state["class_indices"].detach().cpu().long()
+
+    means = {}
+    counts = {}
+
+    for class_id in labels.unique().tolist():
+        mask = labels == class_id
+
+        means[class_id] = {}
+        counts[class_id] = {}
+
+        for layer_name, diagrams in state["diagrams"].items():
+            X = (
+                diagrams.detach()
+                .to(
+                    device="cpu",
+                    dtype=torch.float32,
+                )[mask]
+                .contiguous()
+            )
+
+            n_samples, n_weights = X.shape
+            k = min(n_clusters, n_samples)
+
+            if not torch.isfinite(X).all():
+                raise ValueError(
+                    f"Non-finite diagrams: class={class_id}, layer={layer_name}"
+                )
+
+            if k == 1:
+                centers = X.mean(dim=0, keepdim=True)
+                cluster_counts = torch.tensor([n_samples])
+            else:
+                estimator = KMeans(
+                    n_clusters=k,
+                    init="k-means++",
+                    n_init=10,
+                    max_iter=3000,
+                    random_state=random_state,
+                )
+
+                estimator.fit(X.numpy())
+
+                assignments = torch.from_numpy(estimator.labels_).long()
+
+                cluster_counts = torch.bincount(
+                    assignments,
+                    minlength=k,
+                )
+
+                # Recompute exact means from final memberships.
+                # MiniBatchKMeans centers themselves are approximations.
+                sums = torch.zeros(
+                    (k, n_weights),
+                    dtype=X.dtype,
+                )
+                sums.index_add_(0, assignments, X)
+
+                # Drop any clusters with no assigned detections.
+                active = cluster_counts > 0
+                cluster_counts = cluster_counts[active]
+
+                centers = sums[active] / cluster_counts[:, None].to(X.dtype)
+
+            means[class_id][layer_name] = centers
+            counts[class_id][layer_name] = cluster_counts
+
+    return {
+        "means": means,
+        "counts": counts,
+        "min_confidence": state["min_confidence"],
+        "n_clusters_requested": n_clusters,
+        "distance": "W2",
+    }

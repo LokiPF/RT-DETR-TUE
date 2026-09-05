@@ -1,0 +1,105 @@
+__include__: [
+  '../dataset/cifar10_detection.yml',
+  '../runtime.yml',
+  # './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/rtdetrv2_r50vd.yml',
+]
+
+eval_spatial_size: [32, 32]
+
+output_dir: ./output/rtdetrv2_r18vd_120e_cifar10
+task: classification
+criterion: CrossEntropyLoss
+model: TUERTDETR
+
+RTDETR: 
+  decoder: RTDETRTransformerv2Clas
+
+TUERTDETR: 
+  decoder: RTDETRTransformerv2Clas
+  tue_head: TUEOrigClas
+
+TUEOrigClas:
+  frechet_means: output/rtdetrv2_r18vd_120e_cifar10/frechet_means.pth
+  tue_topk: 1
+  confidence_threshold: 0.5
+
+PResNet:
+  depth: 18
+  freeze_at: -1
+  freeze_norm: False
+  pretrained: True
+
+
+HybridEncoder:
+  in_channels: [128, 256, 512]
+  hidden_dim: 256
+  expansion: 0.5
+
+
+RTDETRTransformerv2Clas:
+  feat_channels: [256, 256, 256]
+  feat_strides: [8, 16, 32]
+  hidden_dim: 256
+  num_levels: 3
+
+  num_queries: 21
+
+  learn_query_content: False
+
+  eval_idx: -1
+
+  # NEW
+  num_points: [4, 4, 4] # [3,3,3] [2,2,2]
+  cross_attn_method: default # default, discrete
+  query_select_method: default # default, agnostic 
+  num_layers: 3
+  aux_loss: False
+
+epoches: 23
+
+optimizer:
+  type: AdamW
+  params:
+    -
+      params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+optimizer:
+  type: AdamW
+  params: 
+    # Pretrained backbone, excluding normalization
+    - params: '^(?=.*backbone)(?!.*(?:norm|bn)).*$'
+      lr: 0.00001
+
+    # Backbone normalization
+    - params: '^(?=.*backbone)(?=.*(?:norm|bn)).*$'
+      lr: 0.00001
+      weight_decay: 0.
+
+    # Encoder/decoder normalization
+    - params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn)).*$'
+      lr: 0.0001
+      weight_decay: 0.
+
+  lr: 0.001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+
+lr_scheduler:
+  type: MultiStepLR
+  milestones: [1000]
+  gamma: 0.1
+
+
+lr_warmup_scheduler:
+  type: LinearWarmup
+  warmup_duration: 10
+
+train_dataloader: 
+  total_batch_size: 128
+
+val_dataloader:
+  total_batch_size: 128

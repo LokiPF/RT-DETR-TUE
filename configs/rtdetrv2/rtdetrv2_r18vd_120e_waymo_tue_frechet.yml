@@ -1,0 +1,69 @@
+__include__: [
+  '../dataset/waymo_detection.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/rtdetrv2_r50vd.yml',
+]
+
+task: detection
+model: TUERTDETR # use default model for frechet mean generation as frechet means are not known yet
+
+RTDETR:
+  decoder: RTDETRTransformerv2TUE
+
+TUERTDETR:
+  decoder: RTDETRTransformerv2TUE
+  tue_head: TUEOrig
+
+RTDETRTransformerv2TUE:
+  num_layers: 3
+  decoder_capture_layers: -1
+  decoder_tue_task: ["score"] #, "bbox", "deformable_sampling_offsets", "attention_weights", "value_proj", "output_proj", "enc_output", "enc_score_head", "enc_bbox_head"]
+
+TUEOrig:
+  frechet_means: output/rtdetrv2_r18vd_120e_waymo_tue_frechet_tests/frechet_means.pth
+  num_top_queries: 10
+  confidence_threshold: 0.2
+  num_classes: 4
+
+output_dir: ./output/rtdetrv2_r18vd_120e_waymo_tue_frechet_tests
+
+PResNet:
+  depth: 18
+  freeze_at: -1
+  freeze_norm: False
+  pretrained: True
+
+
+HybridEncoder:
+  in_channels: [128, 256, 512]
+  hidden_dim: 256
+  expansion: 0.5
+
+epoches: 120 
+
+optimizer:
+  type: AdamW
+  params:
+    - 
+      params: '^(?=.*(?:norm|bn)).*$'
+      weight_decay: 0.
+
+
+train_dataloader:
+  dataset:
+    transforms:
+      ops:
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: float32, scale: True}
+        - {type: ConvertBoxes, fmt: cxcywh, normalize: True}
+      policy:
+        name: default
+  collate_fn:
+    scales: null
+  total_batch_size: 16
+val_dataloader:
+  total_batch_size: 32
+  shuffle: True

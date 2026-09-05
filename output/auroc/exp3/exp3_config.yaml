@@ -1,0 +1,51 @@
+description: "AUROC COCO-O Weather vs MS-COCO on TUE-RTDETR where 3NN (weighted) classes are taken per layer. I.e. not the class predicted in the final layer for a query."
+
+config: "configs/rtdetrv2/rtdetrv2_r18vd_120e_coco_tue_frechet.yml"
+checkpoint: "pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth"
+
+datasets:
+  - dataset:
+      name: "Validation Split of MS-COCO"
+      imgs: "/home/philip/datasets/coco/val2017"
+      anns: "/home/philip/datasets/coco/annotations/instances_val2017.json"
+      ood: false
+  - dataset:
+      name: "Cartoon Split of COCO-O"
+      imgs: "/home/philip/datasets/ood_coco/cartoon/val2017"
+      anns: "/home/philip/datasets/ood_coco/cartoon/annotations/instances_val2017.json"
+      ood: true
+  - dataset:
+      name: "Construction Split of COCO-O"
+      imgs: "/home/philip/datasets/ood_coco/construction/val2017"
+      anns: "/home/philip/datasets/ood_coco/construction/annotations/instances_val2017.json"
+      ood: true
+  - dataset:
+      name: "Dusty Construction Split of COCO-O"
+      imgs: "/home/philip/datasets/ood_coco/dusty_construction/val2017"
+      anns: "/home/philip/datasets/ood_coco/dusty_construction/annotations/instances_val2017.json"
+      ood: true
+  - dataset:
+      name: "Handmake Split of COCO-O"
+      imgs: "/home/philip/datasets/ood_coco/handmake/val2017"
+      anns: "/home/philip/datasets/ood_coco/handmake/annotations/instances_val2017.json"
+      ood: true
+  - dataset:
+      name: "Painting Split of COCO-O"
+      imgs: "/home/philip/datasets/ood_coco/painting/val2017"
+      anns: "/home/philip/datasets/ood_coco/painting/annotations/instances_val2017.json"
+      ood: true
+  - dataset:
+      name: "Sketch Split of COCO-O"
+      imgs: "/home/philip/datasets/ood_coco/sketch/val2017"
+      anns: "/home/philip/datasets/ood_coco/sketch/annotations/instances_val2017.json"
+      ood: true
+  - dataset:
+      name: "Tattoo Split of COCO-O"
+      imgs: "/home/philip/datasets/ood_coco/tattoo/val2017"
+      anns: "/home/philip/datasets/ood_coco/tattoo/annotations/instances_val2017.json"
+      ood: true
+  - dataset:
+      name: "Weather Split of COCO-O"
+      imgs: "/home/philip/datasets/ood_coco/weather/val2017"
+      anns: "/home/philip/datasets/ood_coco/weather/annotations/instances_val2017.json"
+      ood: true
