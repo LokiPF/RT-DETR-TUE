@@ -8,8 +8,22 @@ import differential_uncertainty.cli as cli
 def _benchmark_parser():
     parser = cli.build_parser()
     command = next(action for action in parser._actions if getattr(action, "choices", None))
-    assert set(command.choices) == {"benchmark-coco"}
+    assert set(command.choices) == {"benchmark-coco", "baselines-coco"}
     return command.choices["benchmark-coco"]
+
+
+def test_cli_forwards_baselines_settings(monkeypatch, tmp_path):
+    import differential_uncertainty.baselines.pipeline as pipeline
+    received = {}
+    monkeypatch.setattr(pipeline, "run_phase", lambda phase, settings: received.update(phase=phase, settings=settings))
+    argv = ["baselines-coco", "--phase", "test", "--output", str(tmp_path / "out"),
+            "--checkpoint", "ckpt.pth", "--coco-train-images", "train", "--coco-val-images", "val",
+            "--coco-annotations", "ann.json", "--discopatch-root", "dcp", "--limit", "20", "--workers", "0"]
+    assert cli.main(argv) == 0
+    settings = received["settings"]
+    assert received["phase"] == "test"
+    assert (settings.limit, settings.workers, settings.epochs, settings.batch_size) == (20, 0, 65, 32)
+    assert str(settings.annotations) == "ann.json" and str(settings.discopatch_root) == "dcp"
 
 
 def test_cli_exposes_only_the_fixed_benchmark_contract():
