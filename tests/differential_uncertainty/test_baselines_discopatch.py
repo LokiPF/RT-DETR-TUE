@@ -1,0 +1,47 @@
+import numpy as np
+import pytest
+import torch
+from PIL import Image
+
+from differential_uncertainty.baselines import discopatch as dp
+
+pytestmark = pytest.mark.skipif(not dp.DEFAULT_ROOT.exists(), reason="DisCoPatch repository not available")
+
+
+def test_crop_positions_are_seeded_by_image_and_stay_inside_the_256_square():
+    first, again, other = dp.crop_positions("a.jpg", 64), dp.crop_positions("a.jpg", 64), dp.crop_positions("b.jpg", 64)
+    assert first.shape == (64, 2) and np.array_equal(first, again) and not np.array_equal(first, other)
+    assert first.min() >= 0 and first.max() < 192
+
+
+def test_coco_patch_dataset_returns_normalised_64px_patches_from_grayscale_too(tmp_path):
+    path = tmp_path / "x.jpg"
+    Image.new("L", (320, 200), 255).save(path)
+    patches, label = dp.CocoPatchDataset([path], patches=5)[0]
+    assert patches.shape == (5, 3, 64, 64) and label == 0
+    assert patches.max().item() == pytest.approx(1.0, abs=1e-2)
+
+
+def test_scorer_normalises_each_image_separately(tmp_path):
+    module = dp.import_discopatch(tmp_path, dp.DEFAULT_ROOT)
+    torch.save(module.Discriminator(64, 3, [4, 8], 1e-4, 2).state_dict(), tmp_path / "disc.pt")
+    scorer = dp.DisCoPatchScorer(tmp_path / "disc.pt", tmp_path, "cpu", patches=8, hidden_dims=[4, 8])
+    rng = np.random.default_rng(0)
+    a, b = (rng.integers(0, 256, (120, 160, 3), dtype=np.uint8) for _ in range(2))
+    together, alone = scorer.score([a, b], "img.jpg"), scorer.score([a], "img.jpg")
+    assert together.shape == (2,) and together[0] == pytest.approx(alone[0], abs=1e-6)
+    assert np.all((together >= 0) & (together <= 1))
+    assert not any(isinstance(layer, torch.nn.BatchNorm2d) for layer in scorer.discriminator.modules())
+
+
+def test_training_wrapper_runs_one_tiny_epoch_and_writes_the_discriminator(tmp_path):
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"{index}.jpg"
+        Image.new("RGB", (300, 260), (index * 100, 50, 200)).save(path)
+        paths.append(path)
+    checkpoint = dp.train_discopatch(
+        paths, tmp_path / "models", epochs=1, num_workers=0, seed=0,
+        overrides={"hidden_dims": [4, 8], "latent_dim": 8, "batch_size": 2, "patches": 2},
+    )
+    assert checkpoint.exists() and checkpoint.name == "Discriminator_coco.pt"
