@@ -2539,6 +2539,12 @@ stop the process and ask the user whether to lower `--epochs`. The epoch budget 
 `discopatch/training.json`, not in `run_config.json`, so a lower budget does not invalidate the other
 phases. The phase refuses to start if `Discriminator_coco.pt` already exists.
 
+Numerics (deviation, decided at run time): the README batch needs about 55 GB in fp32, and the
+authors used a 94 GB H100. On the 32 GB RTX 5090, training recomputes activations during backward,
+which gives the same arithmetic. It also runs the conv trunks under bf16 autocast, with the heads, the
+loss and the figures in fp32. This keeps every README hyperparameter, including the batch, and peaks at
+21.7 GB. `discopatch/training.json` records it, and the results doc lists it as a deviation.
+
 Crash recovery: the official loop saves no optimiser state, so training cannot be resumed. If it dies,
 either restart it from scratch with the same command, or, if a restart does not fit the schedule, copy
 the latest `discopatch/DisCoPatch/Discriminator_coco_<epoch>_group.pt` to `Discriminator_coco.pt`.
