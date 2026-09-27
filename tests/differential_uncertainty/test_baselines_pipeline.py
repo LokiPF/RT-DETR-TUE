@@ -157,7 +157,9 @@ def test_a_lower_epoch_budget_does_not_invalidate_finished_phases(tmp_path, fake
     monkeypatch.setattr(pipeline, "train_discopatch", lambda *a, **k: None)
     pipeline.run_phase("test", _settings(tmp_path))
     pipeline.run_phase("train-discopatch", _settings(tmp_path, epochs=30))
-    assert json.loads((tmp_path / "out" / "discopatch" / "training.json").read_text())["epochs"] == 30
+    training = json.loads((tmp_path / "out" / "discopatch" / "training.json").read_text())
+    assert training["epochs"] == 30
+    assert training["numerics"] == pipeline.discopatch.TRAINING_NUMERICS
 
 
 def test_discopatch_scores_stay_tied_to_one_checkpoint(tmp_path, fakes, monkeypatch):

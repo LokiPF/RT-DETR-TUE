@@ -18,7 +18,7 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from ..extraction import prepare_image
-from . import protocol
+from . import discopatch, protocol
 from .coco_quality import CocoGroundTruth, coco_map, coco_results
 from .detector import DetectorTap
 from .discopatch import DisCoPatchScorer, train_discopatch
@@ -263,7 +263,8 @@ def phase_train_discopatch(settings: Settings) -> None:
     # The official loop saves no optimiser state, so a finished discriminator is never retrained over.
     if _discopatch_checkpoint(settings).exists():
         raise ValueError(f"{_discopatch_checkpoint(settings)} already exists; remove it to train again")
-    _atomic_json(settings.output / "discopatch" / "training.json", {"epochs": settings.epochs, "seed": settings.seed})
+    _atomic_json(settings.output / "discopatch" / "training.json",
+                 {"epochs": settings.epochs, "seed": settings.seed, "numerics": discopatch.TRAINING_NUMERICS})
     train_discopatch(protocol.list_images(settings.train_images), settings.output / "discopatch",
                      epochs=settings.epochs, num_workers=settings.workers, seed=settings.seed,
                      root=settings.discopatch_root)

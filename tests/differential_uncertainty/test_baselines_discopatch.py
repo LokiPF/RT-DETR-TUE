@@ -45,3 +45,62 @@ def test_training_wrapper_runs_one_tiny_epoch_and_writes_the_discriminator(tmp_p
         overrides={"hidden_dims": [4, 8], "latent_dim": 8, "batch_size": 2, "patches": 2},
     )
     assert checkpoint.exists() and checkpoint.name == "Discriminator_coco.pt"
+
+
+def _tiny_model(tmp_path):
+    from argparse import Namespace
+    module = dp.import_discopatch(tmp_path, dp.DEFAULT_ROOT)
+    args = Namespace(**{**dp.TRAIN_ARGS, "hidden_dims": [4, 8], "latent_dim": 8, "batch_size": 2, "patches": 2,
+                        "n_epochs": 1})
+    return module.DisCoPatch(input_shape=64, input_channels=3, args=args)
+
+
+def _generator_gradients(model, x):
+    model.zero_grad()
+    torch.manual_seed(1)
+    recon, mu, logvar = model.vae(x)
+    gen = model.vae.decode(torch.randn(x.size(0), model.vae.latent_dim))
+    loss = (model.discriminator(recon).mean() + model.discriminator(gen).mean()
+            + model.vae.loss_function(recon, x, mu, logvar))
+    loss.backward()
+    return {name: p.grad.clone() for name, p in model.named_parameters() if p.grad is not None}
+
+
+def test_recomputing_activations_leaves_the_gradients_unchanged(tmp_path):
+    import copy
+    torch.manual_seed(0)
+    model = _tiny_model(tmp_path)
+    recomputed = copy.deepcopy(model)
+    dp.recompute_activations(recomputed)
+    x = torch.randn(6, 3, 64, 64)
+    expected, actual = _generator_gradients(model, x), _generator_gradients(recomputed, x)
+    assert expected.keys() == actual.keys() and len(expected) > 10
+    for name in expected:
+        assert torch.allclose(expected[name], actual[name], rtol=1e-5, atol=1e-7), name
+    assert recomputed.state_dict().keys() == model.state_dict().keys()
+
+
+def test_mixed_precision_keeps_the_discriminator_head_in_fp32_and_restores_the_loss(tmp_path):
+    model = _tiny_model(tmp_path)
+    original = torch.nn.BCELoss
+    x = torch.randn(4, 3, 64, 64)
+    with dp.mixed_precision(model):
+        output = model.discriminator(x)
+        loss = torch.nn.BCELoss()(output, torch.ones_like(output))
+    assert output.dtype == torch.float32 and torch.isfinite(loss)
+    assert torch.nn.BCELoss is original
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the autocast BCELoss ban is CUDA-only")
+def test_training_wrapper_runs_under_cuda_mixed_precision(tmp_path):
+    paths = []
+    for index in range(2):
+        path = tmp_path / f"{index}.jpg"
+        Image.new("RGB", (300, 260), (index * 100, 50, 200)).save(path)
+        paths.append(path)
+    checkpoint = dp.train_discopatch(
+        paths, tmp_path / "models", epochs=1, num_workers=0, seed=0,
+        overrides={"hidden_dims": [4, 8], "latent_dim": 8, "batch_size": 2, "patches": 2},
+    )
+    state = torch.load(checkpoint, map_location="cpu")
+    assert all(value.dtype == torch.float32 for value in state.values() if value.is_floating_point())

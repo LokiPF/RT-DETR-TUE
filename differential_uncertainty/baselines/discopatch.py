@@ -7,12 +7,14 @@ import sys
 import types
 import zlib
 from argparse import Namespace
+from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
 import torch
 from PIL import Image
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
@@ -67,6 +69,78 @@ class CocoPatchDataset(Dataset):
         return torch.stack([image[:, x:x + PATCH, y:y + PATCH] for x, y in corners]), 0
 
 
+TRAINING_NUMERICS = {  # how the README batch is made to fit a 32 GB GPU (see recompute_activations, mixed_precision)
+    "precision": "bf16 autocast; discriminator Linear+Sigmoid, VAE fc_mu/fc_logvar, BCE loss and figures in fp32",
+    "activation_recomputation": True,
+}
+
+
+def _recompute_blocks(sequential: nn.Sequential) -> None:
+    def forward(self, x):
+        for layer in self:
+            if isinstance(layer, nn.Sequential) and torch.is_grad_enabled():
+                x = checkpoint(layer, x, use_reentrant=False)
+            else:
+                x = layer(x)
+        return x
+    sequential.forward = types.MethodType(forward, sequential)
+
+
+def _recompute_whole(module: nn.Module) -> None:
+    original = module.forward
+    module.forward = lambda x: checkpoint(original, x, use_reentrant=False) if torch.is_grad_enabled() else original(x)
+
+
+def recompute_activations(model) -> None:
+    """Recompute conv-block activations during backward instead of storing them.
+
+    Same arithmetic, far less memory: the README batch (67 images x 48 patches) otherwise needs about
+    55 GB. The discriminator's BatchNorm keeps no running statistics; the VAE's are updated twice per
+    step, but the VAE never runs in eval mode during training and is not used for scoring.
+    """
+    _recompute_blocks(model.discriminator.encoder)
+    _recompute_blocks(model.vae.encoder)
+    _recompute_blocks(model.vae.decoder)
+    _recompute_whole(model.vae.final_layer)
+
+
+def _in_fp32(function, device_type):
+    def run(*args, **kwargs):
+        with torch.autocast(device_type, enabled=False):
+            return function(*(a.float() if torch.is_tensor(a) else a for a in args), **kwargs)
+    return run
+
+
+class _Fp32BCELoss(nn.BCELoss):
+    def forward(self, input, target):
+        with torch.autocast(input.device.type, enabled=False):
+            return super().forward(input.float(), target.float())
+
+
+@contextmanager
+def mixed_precision(model):
+    """bf16 autocast for the conv trunks; heads, sigmoid, loss and figures stay in fp32.
+
+    A bf16 sigmoid rounds to exactly 1.0 above a logit of about 6, which would change the adversarial
+    gradients, so the discriminator's last Linear + Sigmoid and the VAE's latent heads run in fp32.
+    The official loop builds torch.nn.BCELoss, which CUDA autocast refuses; it is swapped for an fp32
+    copy while the context is open.
+    """
+    device_type = model.device.type
+    for layer in (model.discriminator.encoder[-2], model.discriminator.encoder[-1],
+                  model.vae.fc_mu, model.vae.fc_logvar):
+        layer.forward = _in_fp32(layer.forward, device_type)
+    for name in ("create_grid", "create_validation_grid"):
+        setattr(model, name, _in_fp32(getattr(model, name), device_type))
+    original = torch.nn.BCELoss
+    torch.nn.BCELoss = _Fp32BCELoss
+    try:
+        with torch.autocast(model.device.type, dtype=torch.bfloat16):
+            yield
+    finally:
+        torch.nn.BCELoss = original
+
+
 def train_discopatch(paths, models_dir, *, epochs, num_workers, seed, overrides=None, root=DEFAULT_ROOT) -> Path:
     module = import_discopatch(models_dir, root)
     torch.manual_seed(seed)
@@ -76,7 +150,9 @@ def train_discopatch(paths, models_dir, *, epochs, num_workers, seed, overrides=
                         shuffle=True, pin_memory=True, num_workers=num_workers,
                         persistent_workers=num_workers > 0)
     model = module.DisCoPatch(input_shape=IMAGE_SIDE // 4, input_channels=3, args=args)
-    model.train_model(loader, loader)
+    recompute_activations(model)
+    with mixed_precision(model):
+        model.train_model(loader, loader)
     return Path(models_dir) / "DisCoPatch" / "Discriminator_coco.pt"
 
 
