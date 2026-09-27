@@ -121,3 +121,13 @@ def test_build_report_end_to_end_on_a_tiny_fixture(tmp_path, monkeypatch):
     for name in ("separation", "aggregates", "harm", "aurc_pools", "conditions", "intervals", "differences", "knn_k"):
         assert (results / f"{name}.csv").exists(), name
     assert "ContrastiveConf" in (results / "report.md").read_text()
+    header = (results / "conditions.csv").read_text().splitlines()[0].split(",")
+    assert "images_undefined_lrp" in header
+
+
+def test_differences_cover_every_separation_metric_for_both_family_groups():
+    numbers = report.headline_numbers(_scores(), np.random.default_rng(6).uniform(0, 1, (30, 96)))
+    for metric in report.SEPARATION:
+        for group in ("common", "extra"):
+            key = f"saod_top3 - knn:{metric}_{group}"
+            assert numbers[key] == pytest.approx(numbers[f"saod_top3:{metric}_{group}"] - numbers[f"knn:{metric}_{group}"])

@@ -123,3 +123,62 @@ def test_worker_pool_returns_every_image_in_order_with_identical_corruptions(tmp
     assert [name for name, _ in pooled] == [p.name for p in paths]
     for (_, expected), (_, actual) in zip(in_process, pooled):
         assert [pipeline.protocol.digest(a) for a in actual] == [pipeline.protocol.digest(a) for a in expected]
+
+
+def _fake_scorer(monkeypatch, score):
+    class FakeScorer:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def score(self, arrays, _image_id):
+            return score(arrays)
+
+    monkeypatch.setattr(pipeline, "DisCoPatchScorer", FakeScorer)
+
+
+def _write_discriminator(settings, content=b"x"):
+    checkpoint = settings.output / "discopatch" / "DisCoPatch" / "Discriminator_coco.pt"
+    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint.write_bytes(content)
+    return checkpoint
+
+
+def test_training_refuses_to_overwrite_a_finished_discriminator(tmp_path, monkeypatch):
+    settings = _settings(tmp_path)
+    calls = []
+    monkeypatch.setattr(pipeline, "train_discopatch", lambda *a, **k: calls.append(k))
+    _write_discriminator(settings)
+    with pytest.raises(ValueError, match="already exists"):
+        pipeline.run_phase("train-discopatch", settings)
+    assert calls == []
+
+
+def test_a_lower_epoch_budget_does_not_invalidate_finished_phases(tmp_path, fakes, monkeypatch):
+    monkeypatch.setattr(pipeline, "train_discopatch", lambda *a, **k: None)
+    pipeline.run_phase("test", _settings(tmp_path))
+    pipeline.run_phase("train-discopatch", _settings(tmp_path, epochs=30))
+    assert json.loads((tmp_path / "out" / "discopatch" / "training.json").read_text())["epochs"] == 30
+
+
+def test_discopatch_scores_stay_tied_to_one_checkpoint(tmp_path, fakes, monkeypatch):
+    import hashlib
+    settings = _settings(tmp_path)
+    pipeline.run_phase("test", settings)
+    checkpoint = _write_discriminator(settings, b"first")
+    _fake_scorer(monkeypatch, lambda arrays: np.array([a.mean() / 255.0 for a in arrays]))
+    pipeline.run_phase("discopatch-scores", settings)
+    recorded = json.loads((settings.output / "test_dcp" / "checkpoint.json").read_text())
+    assert recorded["sha1"] == hashlib.sha1(b"first").hexdigest()
+    checkpoint.write_bytes(b"second")
+    with pytest.raises(ValueError, match="checkpoint"):
+        pipeline.run_phase("discopatch-scores", settings)
+
+
+def test_discopatch_scores_refuse_non_finite_values(tmp_path, fakes, monkeypatch):
+    settings = _settings(tmp_path)
+    pipeline.run_phase("test", settings)
+    _write_discriminator(settings)
+    _fake_scorer(monkeypatch, lambda arrays: np.full(len(arrays), np.nan))
+    with pytest.raises(ValueError, match="non-finite"):
+        pipeline.run_phase("discopatch-scores", settings)
+    assert not list((settings.output / "test_dcp").glob("*.npz"))

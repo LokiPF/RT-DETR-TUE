@@ -21,8 +21,8 @@ KNN_K = 100
 KNN_KS = (1, 10, 50, 100, 200)
 SEPARATION = ("auroc", "aupr", "fpr95")
 BOOTSTRAP_SAMPLES = 1000
-DIFFERENCE_METRICS = ("auroc_common", "auroc_extra", "aupr_common", "fpr95_common",
-                      "rho_within", "rho_condition_lrp", "aurc_all")
+DIFFERENCE_METRICS = ("auroc_common", "auroc_extra", "aupr_common", "aupr_extra", "fpr95_common",
+                      "fpr95_extra", "rho_within", "rho_condition_lrp", "aurc_all")
 SEVERITY = np.array([s for _, s in protocol.CONDITIONS])
 CORRUPTED = np.arange(1, len(protocol.CONDITIONS))
 COMMON = np.array([c for c, (f, _) in enumerate(protocol.CONDITIONS) if f in protocol.COMMON_FAMILIES])
@@ -284,7 +284,7 @@ def build_report(settings) -> None:
     interval_rows = [{"quantity": key, "point": point[key], "low": ranges[key][0], "high": ranges[key][1]}
                      for key in point]
     conditions = [{"family": f, "severity": s, "map": float(condition_map[c]),
-                   "mean_lrp": float(_nanmean_columns(lrp)[c]),
+                   "mean_lrp": float(_nanmean_columns(lrp)[c]), "images_undefined_lrp": int(np.isnan(lrp[:, c]).sum()),
                    **{f"mean_{m}": float(v[:, c].mean()) for m, v in scores.items()}}
                   for c, (f, s) in enumerate(protocol.CONDITIONS)]
     knn_k = [{"k": k, "mean_auroc_common": float(metrics.condition_aurocs(

@@ -1,6 +1,7 @@
 """Resumable phases that compute the four baseline scores on the fixed COCO protocol."""
 from __future__ import annotations
 
+import hashlib
 import json
 import multiprocessing
 import subprocess
@@ -56,7 +57,7 @@ class Settings:
             "checkpoint": str(self.checkpoint), "train_images": str(self.train_images),
             "val_images": str(self.val_images), "annotations": str(self.annotations),
             "discopatch_root": str(self.discopatch_root), "limit": self.limit, "seed": self.seed,
-            "epochs": self.epochs, "folds": protocol.FOLDS, "top_k": TOP_K, "knn_k": KNN_K,
+            "folds": protocol.FOLDS, "top_k": TOP_K, "knn_k": KNN_K,
             "knn_k_max": KNN_K_MAX, "theta": THETA,
             "conditions": [list(c) for c in protocol.CONDITIONS],
         }
@@ -259,6 +260,10 @@ def phase_test(settings: Settings) -> None:
 
 
 def phase_train_discopatch(settings: Settings) -> None:
+    # The official loop saves no optimiser state, so a finished discriminator is never retrained over.
+    if _discopatch_checkpoint(settings).exists():
+        raise ValueError(f"{_discopatch_checkpoint(settings)} already exists; remove it to train again")
+    _atomic_json(settings.output / "discopatch" / "training.json", {"epochs": settings.epochs, "seed": settings.seed})
     train_discopatch(protocol.list_images(settings.train_images), settings.output / "discopatch",
                      epochs=settings.epochs, num_workers=settings.workers, seed=settings.seed,
                      root=settings.discopatch_root)
@@ -272,9 +277,15 @@ def phase_discopatch_scores(settings: Settings) -> None:
     checkpoint = _discopatch_checkpoint(settings)
     if not checkpoint.exists():
         raise ValueError(f"train DisCoPatch first: {checkpoint} is missing")
+    folder = settings.output / "test_dcp"
+    record = {"checkpoint": str(checkpoint), "sha1": hashlib.sha1(checkpoint.read_bytes()).hexdigest()}
+    if (folder / "checkpoint.json").exists():
+        if json.loads((folder / "checkpoint.json").read_text()) != record:
+            raise ValueError(f"the discriminator checkpoint changed since {folder / 'checkpoint.json'} was written")
+    else:
+        _atomic_json(folder / "checkpoint.json", record)
     scorer = DisCoPatchScorer(checkpoint, settings.output / "discopatch", settings.device,
                               root=settings.discopatch_root)
-    folder = settings.output / "test_dcp"
     pending = [p for p in evaluation(settings) if not _valid_existing(folder / f"{p.stem}.npz", ("dcp",))]
     missing = [p.name for p in pending if not (settings.output / "test" / f"{p.stem}.npz").exists()]
     if missing:
@@ -285,7 +296,10 @@ def phase_discopatch_scores(settings: Settings) -> None:
         stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
         if list(stored) != [protocol.digest(a) for a in arrays]:
             raise ValueError(f"corruptions differ from the detector pass for {name}")
-        _atomic_npz(folder / f"{stem}.npz", dcp=scorer.score(arrays, name))
+        dcp = scorer.score(arrays, name)
+        if not np.isfinite(dcp).all():
+            raise ValueError(f"DisCoPatch returned non-finite scores for {name}")
+        _atomic_npz(folder / f"{stem}.npz", dcp=dcp)
         if done % 25 == 0:
             _progress("discopatch", done, len(pending), started)
 

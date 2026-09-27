@@ -112,7 +112,7 @@ following:
   - COCO val annotations: `/home/yuchen/YuchenZ/Datasets/coco/annotations/instances_val2017.json`
 - DisCoPatch repo: `/home/yuchen/YuchenZ/UE/DisCoPatch` (commit `ec36b8529cef6c994a70237ca59cc0c8902d9aae`).
   Do not edit it; patch its module globals from our adapter instead.
-- Outputs go under `runs/coco-baselines/`. `runs/` is already in `.gitignore`. Result tables that are
+- Outputs go under the main checkout's `runs/coco-baselines/` (Task 9 uses an absolute path). `runs/` is already in `.gitignore`. Result tables that are
   kept go to `docs/results/coco-baselines/`.
 - Do not change the existing benchmark path (`benchmark.py`, `scoring.py`, `corruptions/__init__.py`).
   The new protocol lives in `baselines/protocol.py`.
@@ -2496,12 +2496,14 @@ git commit -m "feat: add baseline report tables and intervals"
 - Consumes: the CLI `baselines-coco` from Task 7.
 - Produces: the numbers, plus a plain-language results doc.
 
-Shared shell setup for every step:
+Shared shell setup for every step. The code runs from the worktree, where Tasks 1–8 are committed.
+The outputs go to the main checkout's ignored `runs/` folder, so removing the worktree after the merge
+does not delete them:
 
 ```bash
-cd /home/yuchen/YuchenZ/UE/philip_sa
+cd /home/yuchen/YuchenZ/UE/philip_sa/.worktrees/coco-baselines
 PY=/home/yuchen/miniconda3/envs/UE/bin/python
-OUT=runs/coco-baselines
+OUT=/home/yuchen/YuchenZ/UE/philip_sa/runs/coco-baselines
 DATA="--checkpoint /home/yuchen/YuchenZ/UE/RT-DETRv2-UE/pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth \
   --coco-train-images /home/yuchen/YuchenZ/Datasets/coco/train2017 \
   --coco-val-images /home/yuchen/YuchenZ/Datasets/coco/val2017 \
@@ -2533,31 +2535,38 @@ echo $! > $OUT/logs/train-discopatch.pid
 ```
 After the first epoch finishes, the `Loss:` progress bar in the log shows the epoch time. The
 projection is epoch time × 65, and the expectation is about 20–35 h. If the projection is above 36 h,
-stop the process and ask the user whether to lower `--epochs`.
+stop the process and ask the user whether to lower `--epochs`. The epoch budget is recorded in
+`discopatch/training.json`, not in `run_config.json`, so a lower budget does not invalidate the other
+phases. The phase refuses to start if `Discriminator_coco.pt` already exists.
+
+Crash recovery: the official loop saves no optimiser state, so training cannot be resumed. If it dies,
+either restart it from scratch with the same command, or, if a restart does not fit the schedule, copy
+the latest `discopatch/DisCoPatch/Discriminator_coco_<epoch>_group.pt` to `Discriminator_coco.pt`.
+Record that choice in the results doc as a deviation, with the epoch reached.
 
 - [ ] **Step 3: Build the kNN bank (about 10–20 min; can run during training)**
 
 Run: `$PY -m differential_uncertainty baselines-coco --phase bank --workers 6 $ARGS 2>&1 | tee $OUT/logs/bank.log`
-Expected: `runs/coco-baselines/bank/knn_bank.npy` with shape (118287, 512). Check with:
+Expected: `$OUT/bank/knn_bank.npy` with shape (118287, 512). Check with:
 `$PY -c "import numpy as np; print(np.load('$OUT/bank/knn_bank.npy', mmap_mode='r').shape)"`.
 
 - [ ] **Step 4: Smoke run on 20 images with the real detector (about 10 min)**
 
 Run:
 ```bash
-SMOKE=runs/coco-baselines-smoke
+SMOKE=/home/yuchen/YuchenZ/UE/philip_sa/runs/coco-baselines-smoke
 mkdir -p $SMOKE/bank && cp $OUT/bank/knn_bank.npy $OUT/bank/bank_names.json $SMOKE/bank/
 $PY -m differential_uncertainty baselines-coco --phase test --limit 20 --workers 9 --output $SMOKE $DATA
 $PY -m differential_uncertainty baselines-coco --phase report --limit 20 --output $SMOKE $DATA
 ```
-Expected: `runs/coco-baselines-smoke/results/report.md` with finite AUROC and AUPR values for the
+Expected: `$SMOKE/results/report.md` with finite AUROC and AUPR values for the
 detector-based baselines, and λ values from the grid. These numbers are not reported; the step only
 checks the plumbing.
 
 - [ ] **Step 5: Full test pass for the detector-based baselines (about 2–3 h, sharing the CPU with training)**
 
 Run: `$PY -m differential_uncertainty baselines-coco --phase test --workers 9 $ARGS 2>&1 | tee $OUT/logs/test.log`
-Expected: 5,000 files in `runs/coco-baselines/test/`. If it is interrupted, rerun the same command; it
+Expected: 5,000 files in `$OUT/test/`. If it is interrupted, rerun the same command; it
 resumes.
 
 - [ ] **Step 6: DisCoPatch scores, after training finishes (about 2 h)**
@@ -2565,12 +2574,13 @@ resumes.
 Wait until `$OUT/discopatch/DisCoPatch/Discriminator_coco.pt` exists and the training process has
 exited. Then run:
 `$PY -m differential_uncertainty baselines-coco --phase discopatch-scores --workers 14 $ARGS 2>&1 | tee $OUT/logs/discopatch-scores.log`
-Expected: 5,000 files in `test_dcp/`, and no "corruptions differ" error.
+Expected: 5,000 files in `test_dcp/`, plus `test_dcp/checkpoint.json` with the discriminator's sha1,
+and no "corruptions differ", "checkpoint changed" or "non-finite" error.
 
 - [ ] **Step 7: Runtime (about 5 min, with nothing else running on the GPU)**
 
 Run: `$PY -m differential_uncertainty baselines-coco --phase timing $ARGS 2>&1 | tee $OUT/logs/timing.log`
-Expected: `runs/coco-baselines/timing.json` with `detector_ms`, `detector_plus_saod_ms`,
+Expected: `$OUT/timing.json` with `detector_ms`, `detector_plus_saod_ms`,
 `detector_plus_contrastive_ms`, `detector_plus_knn_ms` and `discopatch_ms`. DisCoPatch runs on its own,
 without the detector, so it has no `detector_plus` entry.
 
@@ -2582,14 +2592,14 @@ The time goes on three things:
 - 96 COCO evaluations over 5,000 images: about 1–1.5 h;
 - 1,000 bootstrap draws at about 4 s each: about 1 h.
 
-Expected in `runs/coco-baselines/results/`:
+Expected in `$OUT/results/`:
 - all the tables and `report.md`;
 - in `summary.json`, a `clean_map` close to the sanity AP, and `lambda_per_fold` with five values;
 - the report stating whether λ agreed across folds.
 
 - [ ] **Step 9: Publish the numbers in docs**
 
-Copy every CSV and `summary.json` from `runs/coco-baselines/results/` to `docs/results/coco-baselines/`.
+Copy every CSV and `summary.json` from `$OUT/results/` to `docs/results/coco-baselines/`.
 Then write `docs/coco-baseline-numbers.md` in plain language:
 - **Setup and fixed choices:** 5,000 images, 5 folds, λ per fold, the LRP threshold, k.
 - **Separation:** the mean AUROC, AUPR and FPR95 tables for the 15 common and the 4 extra families by
