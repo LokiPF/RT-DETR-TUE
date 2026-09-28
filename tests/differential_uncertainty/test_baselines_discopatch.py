@@ -34,6 +34,21 @@ def test_scorer_normalises_each_image_separately(tmp_path):
     assert not any(isinstance(layer, torch.nn.BatchNorm2d) for layer in scorer.discriminator.modules())
 
 
+def test_scores_keep_their_order_when_every_patch_output_is_tiny(tmp_path):
+    module = dp.import_discopatch(tmp_path, dp.DEFAULT_ROOT)
+    torch.save(module.Discriminator(64, 3, [4, 8], 1e-4, 2).state_dict(), tmp_path / "disc.pt")
+    scorer = dp.DisCoPatchScorer(tmp_path / "disc.pt", tmp_path, "cpu", patches=8, hidden_dims=[4, 8])
+
+    class Tiny(torch.nn.Module):  # float32 patch outputs of 1e-9 (first image) and 1e-10 (second)
+        def forward(self, x):
+            return torch.tensor([1e-9] * 8 + [1e-10] * 8, dtype=torch.float32).view(-1, 1)
+
+    scorer.discriminator = Tiny()
+    image = np.zeros((64, 64, 3), dtype=np.uint8)
+    first, second = scorer.score([image, image], "img.jpg")
+    assert first < second < 1.0
+
+
 def test_training_wrapper_runs_one_tiny_epoch_and_writes_the_discriminator(tmp_path):
     paths = []
     for index in range(2):

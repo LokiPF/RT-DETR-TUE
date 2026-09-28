@@ -198,5 +198,6 @@ class DisCoPatchScorer:
                 image = _TRANSFORM(Image.fromarray(array).convert("RGB"))
                 patches.extend(image[:, x:x + PATCH, y:y + PATCH] for x, y in corners)
             output = self.discriminator(torch.stack(patches).to(self.device))
-            values.append(1.0 - output.view(-1, self.patches).mean(dim=1).cpu().numpy())
+            # float64: patch outputs near 1e-9 would otherwise round 1 - mean to exactly 1.0 and tie
+            values.append(1.0 - output.view(-1, self.patches).double().mean(dim=1).cpu().numpy())
         return np.concatenate(values)
