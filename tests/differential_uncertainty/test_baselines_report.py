@@ -1,3 +1,4 @@
+import csv
 import json
 
 import numpy as np
@@ -67,7 +68,8 @@ def test_write_outputs_creates_csv_json_and_markdown(tmp_path):
     assert "ContrastiveConf" in text and "DisCoPatch" in text and "AUPR" in text
 
 
-def test_build_report_end_to_end_on_a_tiny_fixture(tmp_path, monkeypatch):
+def _tiny_run(tmp_path, monkeypatch):
+    """15 fixture images through the test phase with a fake detector; returns the settings."""
     import torch
     from PIL import Image
     from differential_uncertainty.baselines import pipeline
@@ -112,17 +114,55 @@ def test_build_report_end_to_end_on_a_tiny_fixture(tmp_path, monkeypatch):
                                  val_images=val, annotations=tmp_path / "ann.json", discopatch_root=tmp_path,
                                  limit=15, workers=0, device="cpu")
     pipeline.run_phase("test", settings)
+    return settings
+
+
+def test_build_report_end_to_end_on_a_tiny_fixture(tmp_path, monkeypatch):
+    from differential_uncertainty.baselines import pipeline
+    settings = _tiny_run(tmp_path, monkeypatch)
     pipeline.run_phase("report", settings)
 
     results = settings.output / "results"
     summary = json.loads((results / "summary.json").read_text())
     assert summary["images"] == 15 and len(summary["lambda_per_fold"]) == 5
-    assert summary["discopatch_included"] is False
+    assert summary["discopatch_included"] is False and summary["activation_monitors_included"] is False
     for name in ("separation", "aggregates", "harm", "aurc_pools", "conditions", "intervals", "differences", "knn_k"):
         assert (results / f"{name}.csv").exists(), name
     assert "ContrastiveConf" in (results / "report.md").read_text()
     header = (results / "conditions.csv").read_text().splitlines()[0].split(",")
     assert "images_undefined_lrp" in header
+
+
+def test_build_report_includes_the_activation_monitors_when_scored(tmp_path, monkeypatch):
+    from differential_uncertainty.baselines import pipeline
+    settings = _tiny_run(tmp_path, monkeypatch)
+    folder = settings.output / "test_activation"
+    folder.mkdir()
+    rng = np.random.default_rng(8)
+    for path in sorted((settings.output / "test").glob("*.npz")):
+        np.savez(folder / path.name, hashemi_decoder=rng.uniform(0, 1, 96), hashemi_encoder=rng.uniform(0, 1, 96),
+                 cdf_backbone=rng.uniform(0, 50, 96))
+    pipeline.run_phase("report", settings)
+
+    results = settings.output / "results"
+    summary = json.loads((results / "summary.json").read_text())
+    assert summary["activation_monitors_included"] is True
+    assert summary["hashemi_k"] == 2.0 and summary["cdf_bins"] == 1000
+    with (results / "harm.csv").open() as handle:
+        methods = {row["method"] for row in csv.DictReader(handle)}
+    assert {"hashemi", "hashemi_enc", "cdf"} <= methods
+    text = (results / "report.md").read_text()
+    assert "Hashemi et al., decoder queries" in text and "Activation CDFs (Becker et al., ICPR 2026)" in text
+
+
+def test_method_scores_add_the_activation_monitors_only_when_given():
+    test = {"saod_top3": np.zeros((2, 96)), "saod_min": np.zeros((2, 96)), "conf_pos": np.ones((2, 96)),
+            "conf_neg": np.zeros((2, 96)), "knn": np.zeros((2, 96, 200))}
+    activation = {"hashemi_decoder": np.full((2, 96), 0.1), "hashemi_encoder": np.full((2, 96), 0.2),
+                  "cdf_backbone": np.full((2, 96), 3.0)}
+    scores = report.method_scores(test, None, np.ones(2), activation=activation)
+    assert (scores["hashemi"][0, 0], scores["hashemi_enc"][0, 0], scores["cdf"][0, 0]) == (0.1, 0.2, 3.0)
+    assert "hashemi" not in report.method_scores(test, None, np.ones(2))
 
 
 def test_differences_cover_every_separation_metric_for_both_family_groups():

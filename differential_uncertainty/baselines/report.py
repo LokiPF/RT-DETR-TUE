@@ -10,13 +10,19 @@ from pathlib import Path
 
 import numpy as np
 
+from .activation_cdf import BINS as CDF_BINS
+from .hashemi import K as HASHEMI_K
 from . import metrics, protocol
 from .coco_quality import (CocoGroundTruth, coco_map, coco_results, image_lrp, per_image_ap,
                            select_lrp_threshold)
 
-METHODS = ("saod_top3", "saod_min", "contrastive", "knn", "discopatch")
+METHODS = ("saod_top3", "saod_min", "contrastive", "knn", "discopatch", "hashemi", "hashemi_enc", "cdf")
 LABELS = {"saod_top3": "SAOD, mean of top 3", "saod_min": "SAOD, min (1 − max confidence)",
-          "contrastive": "ContrastiveConf", "knn": "kNN (k = 100)", "discopatch": "DisCoPatch"}
+          "contrastive": "ContrastiveConf", "knn": "kNN (k = 100)", "discopatch": "DisCoPatch",
+          "hashemi": "Hashemi et al., decoder queries",
+          "hashemi_enc": "Hashemi et al., encoder maps (sensitivity)",
+          "cdf": "Activation CDFs (Becker et al., ICPR 2026)"}
+ACTIVATION_ARRAYS = ("hashemi_decoder", "hashemi_encoder", "cdf_backbone")
 KNN_K = 100
 KNN_KS = (1, 10, 50, 100, 200)
 SEPARATION = ("auroc", "aupr", "fpr95")
@@ -30,12 +36,16 @@ EXTRA = np.array([c for c, (f, _) in enumerate(protocol.CONDITIONS) if f in prot
 TEST_ARRAYS = ("saod_min", "saod_top3", "conf_pos", "conf_neg", "knn", "det_scores", "det_labels", "det_boxes")
 
 
-def method_scores(test: dict, dcp, per_image_lambda, k: int = KNN_K) -> dict:
+def method_scores(test: dict, dcp, per_image_lambda, k: int = KNN_K, activation=None) -> dict:
     scores = {"saod_top3": test["saod_top3"], "saod_min": test["saod_min"],
               "contrastive": -(test["conf_pos"] - np.asarray(per_image_lambda)[:, None] * test["conf_neg"]),
               "knn": test["knn"][:, :, k - 1]}
     if dcp is not None:
         scores["discopatch"] = dcp
+    if activation is not None:
+        scores["hashemi"] = activation["hashemi_decoder"]
+        scores["hashemi_enc"] = activation["hashemi_encoder"]
+        scores["cdf"] = activation["cdf_backbone"]
     return scores
 
 
@@ -243,6 +253,8 @@ def build_report(settings) -> None:
     test = _stack(settings.output / "test", names, TEST_ARRAYS)
     dcp_folder = settings.output / "test_dcp"
     dcp = _stack(dcp_folder, names, ("dcp",))["dcp"] if dcp_folder.exists() else None
+    activation_folder = settings.output / "test_activation"
+    activation = _stack(activation_folder, names, ACTIVATION_ARRAYS) if activation_folder.exists() else None
 
     gt = CocoGroundTruth(settings.annotations)
     ids = [gt.image_id(n) for n in names]
@@ -252,7 +264,7 @@ def build_report(settings) -> None:
     clean_pos, clean_neg = test["conf_pos"][:, 0], test["conf_neg"][:, 0]
     per_image_lambda, per_fold = metrics.cross_fit_lambda(clean_pos, clean_neg, ap, folds)
     consistent = len(set(per_fold.values())) == 1
-    ordered = {m: v for m, v in method_scores(test, dcp, per_image_lambda).items()}
+    ordered = {m: v for m, v in method_scores(test, dcp, per_image_lambda, activation=activation).items()}
     scores = {m: ordered[m] for m in METHODS if m in ordered}
 
     threshold = select_lrp_threshold(clean_records, gt)
@@ -300,6 +312,7 @@ def build_report(settings) -> None:
         "lrp_threshold": threshold, "images_with_undefined_clean_lrp": int(np.isnan(lrp[:, 0]).sum()),
         "clean_map": float(condition_map[0]), "knn_k": KNN_K, "theta": 0.3,
         "bootstrap_samples": BOOTSTRAP_SAMPLES, "discopatch_included": dcp is not None,
+        "activation_monitors_included": activation is not None, "hashemi_k": HASHEMI_K, "cdf_bins": CDF_BINS,
     }
     write_outputs(settings.output / "results", {
         "separation": separation, "aggregates": aggregate_rows(separation), "harm": harm,
