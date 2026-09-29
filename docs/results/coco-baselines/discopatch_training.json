@@ -1,0 +1,8 @@
+{
+  "epochs": 65,
+  "numerics": {
+    "activation_recomputation": true,
+    "precision": "bf16 autocast; discriminator Linear+Sigmoid, VAE fc_mu/fc_logvar, BCE loss and figures in fp32"
+  },
+  "seed": 44
+}

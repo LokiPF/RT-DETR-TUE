@@ -1,0 +1,6 @@
+part,ms
+detector_ms,5.879339994862676
+detector_plus_contrastive_ms,6.14427647087723
+detector_plus_knn_ms,6.783529999665916
+detector_plus_saod_ms,7.143163500586525
+discopatch_ms,2.444993471726775

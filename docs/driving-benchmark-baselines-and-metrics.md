@@ -3,6 +3,8 @@
 *Decision record, 27 September 2026. The sources and reasoning are in
 [literature-review-image-corruption-detection.md](literature-review-image-corruption-detection.md).*
 
+COCO numbers: see [coco-baseline-numbers.md](coco-baseline-numbers.md).
+
 ## What the monitor must do
 
 The monitor is built into a frozen object detector and needs no training. It warns when the input

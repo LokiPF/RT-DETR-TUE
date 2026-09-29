@@ -1,0 +1,20 @@
+{
+  "bootstrap_samples": 1000,
+  "clean_map": 0.4790545764060369,
+  "discopatch_included": true,
+  "folds": 5,
+  "images": 5000,
+  "images_with_ap": 4952,
+  "images_with_undefined_clean_lrp": 32,
+  "knn_k": 100,
+  "lambda_folds_agree": false,
+  "lambda_per_fold": {
+    "0": 7.0,
+    "1": 8.0,
+    "2": 7.0,
+    "3": 7.0,
+    "4": 7.0
+  },
+  "lrp_threshold": 0.55,
+  "theta": 0.3
+}
