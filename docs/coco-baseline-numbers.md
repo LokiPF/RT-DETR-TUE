@@ -1,29 +1,47 @@
 # COCO baseline numbers
 
-These are the numbers for the four baselines we compare against on COCO: SAOD, ContrastiveConf, kNN
-and DisCoPatch. Our own method is not in this document. The plan is
-`docs/superpowers/plans/2026-09-27-coco-baseline-numbers.md`, and the baseline choices are in
+These are the numbers for the six baselines we compare against on COCO:
+- SAOD, ContrastiveConf, kNN and DisCoPatch;
+- two monitors on the detector's own activations, added on 29 September 2026: the runtime monitor of
+  Hashemi et al. (FM 2023), and our reproduction of the activation-distribution monitor of Becker et al.
+  (ICPR 2026).
+
+Our own method is not in this document. The plans are
+`docs/superpowers/plans/2026-09-27-coco-baseline-numbers.md` and
+`docs/superpowers/plans/2026-09-29-hashemi-baseline.md`. The baseline choices are in
 `docs/driving-benchmark-baselines-and-metrics.md`. Every table here comes from the files in
 `docs/results/coco-baselines/`.
 
 ## The short version
 
-- **DisCoPatch is best at telling a degraded image from a clean one.** Its mean AUROC is 0.764 on the
-  15 common corruption families and 0.751 on the 4 extra ones, and it has the lowest FPR95 (0.567). It
-  is almost perfect on the three common noise families (AUROC 0.97–1.00 at severities 3 and 5) and the
-  best on snow, frost and fog.
-- **But DisCoPatch does not tell us when the detector is hurt.** Within one corruption condition,
-  images whose DisCoPatch score rises more lose slightly *less* detection quality (ρ = −0.051). Its
-  risk–coverage curve is the worst of the five (AURC 0.665, against 0.698 for a random order). It is
-  also weak on JPEG compression (AUROC 0.59 at severity 5) and pixelation (0.75), which destroy the
-  detector (mAP 0.108 and 0.037 at severity 5).
-- **SAOD's min score is the strongest detector-based baseline.** Mean AUROC is 0.731 (common) and 0.664
+- **The activation CDFs (ICPR 2026, reproduced) are best at telling a degraded image from a clean
+  one.**
+  - Mean AUROC is 0.821 on the 15 common corruption families and 0.807 on the 4 extra ones, with the
+    lowest FPR95 (0.413).
+  - They win 15 of the 19 families at severity 5, with AUROC 0.96–1.00 on noise, most blurs, contrast and
+    pixelation.
+  - DisCoPatch is second (0.764 and 0.751). Both read low-level image statistics.
+- **Neither of them tells us when the detector is hurt.**
+  - Within one corruption condition, images whose DisCoPatch score rises more lose slightly *less*
+    detection quality (ρ = −0.051). The activation CDFs are barely better (ρ = 0.080).
+  - Their risk–coverage curves are the worst of the headline methods: AURC 0.665 and 0.658, against
+    0.698 for a random order.
+  - DisCoPatch is also weak on JPEG compression (AUROC 0.59 at severity 5) and pixelation (0.75), which
+    destroy the detector (mAP 0.108 and 0.037 at severity 5).
+- **Hashemi et al.'s monitor points the wrong way on this detector.**
+  - Mean AUROC is 0.428 (common) and 0.437 (extra), below chance.
+  - Its intervals are well calibrated: 4.5% of neurons fall outside μ ± 2σ on clean images, close to
+    the 4.6% a Gaussian gives. But degraded images give *less* extreme decoder activations, so fewer
+    neurons leave their interval.
+  - We report it with the paper's orientation, fixed in advance.
+  - Within a condition, it still follows the harm a little (ρ = 0.099, rising to 0.19 at severity 5).
+- **SAOD's min score is the strongest baseline built on the detector's outputs.** Mean AUROC is 0.731 (common) and 0.664
   (extra). Across the 95 conditions, its mean score follows the detector's mAP almost perfectly
   (ρ = −0.98).
 - **No baseline predicts per-image harm well.** The best within-condition correlation between the
   change in score and the change in detection error is 0.257 (SAOD min), then 0.230 (ContrastiveConf).
   ContrastiveConf has the best risk–coverage curve (AURC 0.540; the best possible is 0.449).
-- **Every monitor is cheap.** The detector takes 5.9 ms per image, and each score adds 0.3–1.3 ms on
+- **Every monitor is cheap.** The detector takes 5.9 ms per image, and each score adds 0.2–1.2 ms on
   top. DisCoPatch runs on its own in 2.4 ms.
 
 So "is this image degraded?" and "will the detector fail on this image?" are different questions, and
@@ -38,9 +56,9 @@ the existing baselines each answer only part of one of them.
 | Test images | all 5,000 COCO val2017 images, shuffled with seed 44, in 5 folds of 1,000 |
 | Corruptions | all 19 `imagecorruptions` families × severities 1–5 = 95 conditions, plus clean; one seeded draw per image and condition |
 | Family groups | 15 common families (COCO-C) and 4 extra ones (speckle noise, Gaussian blur, spatter, saturate), reported separately |
-| Training data for kNN and DisCoPatch | all 118,287 COCO train2017 images, clean |
+| Training data for kNN, DisCoPatch and both activation monitors | all 118,287 COCO train2017 images, clean |
 
-The four baselines, all scored so that higher means "more likely degraded":
+The six baselines, all scored so that higher means "more likely degraded":
 
 | Baseline | Score | Fixed choices |
 | --- | --- | --- |
@@ -48,6 +66,8 @@ The four baselines, all scored so that higher means "more likely degraded":
 | ContrastiveConf (Park et al., TPAMI 2026, `uq-detr`) | −(Conf⁺ − λ·Conf⁻) | θ = 0.3; λ cross-fitted: for each fold, fitted on the other 4 folds' clean images against per-image AP. λ per fold = 7, 8, 7, 7, 7 |
 | kNN (Sun et al., ICML 2022) | distance to the 100th nearest train image, on L2-normalised 512-d backbone features (ResNet-18 layer 4, global average pooled) | k = 100, fixed in advance (see the k check below) |
 | DisCoPatch (ICCV 2025, official code) | 1 − mean discriminator output over 64 random 64-px patches of a 256² resize, normalised per image | README hyperparameters, 65 COCO epochs, one training run |
+| Hashemi et al. (FM 2023), reimplemented | share of the last decoder layer's 300 × 256 neurons outside μ ± 2σ, with μ and σ per neuron from the clean train images and classes ignored | k = 2; population σ. A sensitivity row uses the hybrid encoder's three output maps instead |
+| Activation CDFs (Becker et al., ICPR 2026), reproduced | per channel of backbone stages C1–C5 (1,024 channels), the EMD between the image's activation CDF and the training CDF, summed within each stage. Each stage's sum is z-scored with mean and spread from 5,000 clean train images, and the five z-scores are added | 1,000 bins; ranges = training min/max ± 20% of the span. A sensitivity row adds the raw EMDs of all channels |
 
 Detection harm uses per-image LRP. The confidence threshold is 0.55, chosen once for the optimal
 average LRP on clean images, and detections that are at least 50% inside a crowd box are ignored. In
@@ -74,7 +94,11 @@ per fold.
 | SAOD, min | 0.608 | 0.665 | 0.733 | 0.799 | 0.848 | 0.731 [0.727, 0.734] | 0.717 [0.711, 0.723] | 0.714 [0.707, 0.722] |
 | ContrastiveConf | 0.527 | 0.545 | 0.569 | 0.595 | 0.605 | 0.568 [0.562, 0.574] | 0.532 [0.527, 0.539] | 0.869 [0.864, 0.875] |
 | kNN (k = 100) | 0.546 | 0.559 | 0.590 | 0.625 | 0.650 | 0.594 [0.590, 0.598] | 0.561 [0.557, 0.565] | 0.847 [0.842, 0.852] |
-| **DisCoPatch** | **0.678** | **0.733** | **0.777** | **0.805** | 0.825 | **0.764** [0.760, 0.767] | **0.729** [0.724, 0.734] | **0.567** [0.558, 0.576] |
+| DisCoPatch | 0.678 | 0.733 | 0.777 | 0.805 | 0.825 | 0.764 [0.760, 0.767] | 0.729 [0.724, 0.734] | 0.567 [0.558, 0.576] |
+| Hashemi et al., decoder | 0.443 | 0.425 | 0.421 | 0.422 | 0.430 | 0.428 [0.424, 0.432] | 0.445 [0.443, 0.448] | 0.959 [0.955, 0.962] |
+| *Hashemi et al., encoder (sensitivity)* | 0.425 | 0.386 | 0.352 | 0.306 | 0.262 | 0.346 [0.343, 0.349] | 0.413 [0.412, 0.415] | 0.974 [0.972, 0.975] |
+| Activation CDFs (ICPR 2026) | **0.707** | **0.781** | **0.836** | **0.877** | **0.901** | **0.821 [0.817, 0.824]** | **0.775 [0.770, 0.781]** | **0.413 [0.407, 0.420]** |
+| *Activation CDFs, plain sum (sensitivity)* | 0.644 | 0.721 | 0.791 | 0.848 | 0.881 | 0.777 [0.773, 0.781] | 0.734 [0.729, 0.740] | 0.512 [0.505, 0.519] |
 
 ### 4 extra families
 
@@ -84,43 +108,52 @@ per fold.
 | SAOD, min | 0.543 | 0.607 | 0.660 | 0.720 | 0.787 | 0.664 [0.660, 0.667] | 0.652 [0.646, 0.657] | 0.811 [0.804, 0.817] |
 | ContrastiveConf | 0.507 | 0.531 | 0.548 | 0.582 | 0.600 | 0.554 [0.550, 0.558] | 0.530 [0.527, 0.535] | 0.895 [0.890, 0.899] |
 | kNN (k = 100) | 0.518 | 0.587 | 0.605 | 0.673 | 0.725 | 0.622 [0.619, 0.625] | 0.590 [0.587, 0.594] | 0.802 [0.796, 0.807] |
-| **DisCoPatch** | **0.633** | **0.755** | **0.756** | **0.787** | **0.824** | **0.751** [0.747, 0.755] | **0.717** [0.712, 0.723] | **0.580** [0.572, 0.588] |
+| DisCoPatch | **0.633** | 0.755 | 0.756 | 0.787 | 0.824 | 0.751 [0.747, 0.755] | 0.717 [0.712, 0.723] | 0.580 [0.572, 0.588] |
+| Hashemi et al., decoder | 0.471 | 0.443 | 0.416 | 0.432 | 0.426 | 0.437 [0.434, 0.441] | 0.451 [0.449, 0.453] | 0.954 [0.951, 0.957] |
+| *Hashemi et al., encoder (sensitivity)* | 0.446 | 0.429 | 0.382 | 0.399 | 0.349 | 0.401 [0.398, 0.404] | 0.442 [0.441, 0.444] | 0.958 [0.955, 0.960] |
+| Activation CDFs (ICPR 2026) | 0.610 | **0.762** | **0.834** | **0.896** | **0.935** | **0.807 [0.804, 0.811]** | **0.770 [0.765, 0.775]** | **0.429 [0.423, 0.434]** |
+| *Activation CDFs, plain sum (sensitivity)* | 0.563 | 0.684 | 0.774 | 0.848 | 0.901 | 0.754 [0.751, 0.758] | 0.717 [0.712, 0.722] | 0.537 [0.531, 0.544] |
 
-At severity 5 on the common families, SAOD min (0.848) and DisCoPatch (0.825) are close. DisCoPatch's
-lead comes from the mild severities.
+Bold is the best of the seven headline methods; the two sensitivity rows are in italics. The activation
+CDFs lead at every severity except the mildest extra-family one, where DisCoPatch is ahead (0.633 vs
+0.610). Z-scoring the stages adds 0.044 AUROC over the plain channel sum.
 
 ### Per family: AUROC at severity 3 / severity 5
 
 Bold is the best method at severity 5. `*` marks the extra families.
 
-| Family | SAOD top-3 | SAOD min | ContrastiveConf | kNN | DisCoPatch |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| gaussian noise | 0.69 / 0.90 | 0.75 / 0.95 | 0.62 / 0.70 | 0.48 / 0.58 | **0.99 / 1.00** |
-| shot noise | 0.67 / 0.86 | 0.74 / 0.93 | 0.60 / 0.69 | 0.49 / 0.62 | **0.97 / 0.99** |
-| impulse noise | 0.70 / 0.89 | 0.76 / 0.95 | 0.61 / 0.71 | 0.55 / 0.58 | **0.99 / 1.00** |
-| defocus blur | 0.73 / 0.85 | **0.80 / 0.92** | 0.58 / 0.64 | 0.65 / 0.73 | 0.80 / 0.85 |
-| glass blur | 0.84 / 0.89 | **0.90 / 0.95** | 0.56 / 0.58 | 0.58 / 0.63 | 0.88 / 0.94 |
-| motion blur | 0.71 / 0.85 | **0.78 / 0.91** | 0.59 / 0.68 | 0.66 / 0.73 | 0.74 / 0.83 |
-| zoom blur | 0.82 / 0.87 | **0.88 / 0.92** | 0.62 / 0.63 | 0.59 / 0.57 | 0.82 / 0.85 |
-| snow | 0.67 / 0.73 | 0.73 / 0.80 | 0.63 / 0.62 | 0.73 / 0.66 | **0.84 / 0.84** |
-| frost | 0.66 / 0.69 | 0.71 / 0.75 | 0.55 / 0.57 | 0.55 / 0.56 | **0.83 / 0.87** |
-| fog | 0.54 / 0.57 | 0.55 / 0.58 | 0.49 / 0.50 | 0.45 / 0.52 | **0.72 / 0.84** |
-| brightness | 0.52 / 0.56 | **0.53 / 0.58** | 0.52 / 0.53 | 0.50 / 0.55 | 0.50 / 0.52 |
-| contrast | 0.57 / 0.78 | **0.58 / 0.85** | 0.50 / 0.59 | 0.46 / 0.41 | 0.61 / 0.78 |
-| elastic transform | 0.64 / 0.72 | 0.68 / 0.74 | 0.50 / 0.48 | **0.73 / 0.85** | 0.68 / 0.72 |
-| pixelate | 0.81 / 0.95 | **0.85 / 0.97** | 0.56 / 0.49 | 0.69 / 0.83 | 0.64 / 0.75 |
-| jpeg compression | 0.67 / 0.86 | 0.74 / 0.92 | 0.60 / 0.66 | **0.76 / 0.93** | 0.65 / 0.59 |
-| speckle noise * | 0.64 / 0.74 | 0.69 / 0.81 | 0.57 / 0.61 | 0.49 / 0.56 | **0.94 / 0.97** |
-| gaussian blur * | 0.71 / 0.88 | **0.78 / 0.94** | 0.56 / 0.65 | 0.64 / 0.77 | 0.80 / 0.87 |
-| spatter * | 0.62 / 0.74 | 0.66 / 0.81 | 0.55 / 0.60 | **0.77 / 0.93** | 0.81 / 0.89 |
-| saturate * | 0.51 / 0.57 | 0.51 / 0.59 | 0.51 / 0.53 | **0.52 / 0.64** | 0.47 / 0.56 |
+| Family | SAOD top-3 | SAOD min | ContrastiveConf | kNN | DisCoPatch | Hashemi (dec.) | Act. CDFs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| gaussian noise | 0.69 / 0.90 | 0.75 / 0.95 | 0.62 / 0.70 | 0.48 / 0.58 | 0.99 / 1.00 | 0.39 / 0.48 | **0.99 / 1.00** |
+| shot noise | 0.67 / 0.86 | 0.74 / 0.93 | 0.60 / 0.69 | 0.49 / 0.62 | 0.97 / 0.99 | 0.39 / 0.45 | **0.99 / 1.00** |
+| impulse noise | 0.70 / 0.89 | 0.76 / 0.95 | 0.61 / 0.71 | 0.55 / 0.58 | 0.99 / 1.00 | 0.40 / 0.50 | **0.99 / 1.00** |
+| defocus blur | 0.73 / 0.85 | 0.80 / 0.92 | 0.58 / 0.64 | 0.65 / 0.73 | 0.80 / 0.85 | 0.33 / 0.37 | **0.94 / 0.98** |
+| glass blur | 0.84 / 0.89 | 0.90 / 0.95 | 0.56 / 0.58 | 0.58 / 0.63 | 0.88 / 0.94 | 0.37 / 0.35 | **0.90 / 0.96** |
+| motion blur | 0.71 / 0.85 | 0.78 / 0.91 | 0.59 / 0.68 | 0.66 / 0.73 | 0.74 / 0.83 | 0.38 / 0.42 | **0.89 / 0.96** |
+| zoom blur | 0.82 / 0.87 | **0.88 / 0.92** | 0.62 / 0.63 | 0.59 / 0.57 | 0.82 / 0.85 | 0.43 / 0.44 | 0.81 / 0.83 |
+| snow | 0.67 / 0.73 | 0.73 / 0.80 | 0.63 / 0.62 | 0.73 / 0.66 | 0.84 / 0.84 | 0.46 / 0.45 | **0.91 / 0.93** |
+| frost | 0.66 / 0.69 | 0.71 / 0.75 | 0.55 / 0.57 | 0.55 / 0.56 | **0.83 / 0.87** | 0.41 / 0.40 | 0.73 / 0.78 |
+| fog | 0.54 / 0.57 | 0.55 / 0.58 | 0.49 / 0.50 | 0.45 / 0.52 | **0.72 / 0.84** | 0.46 / 0.43 | 0.73 / 0.75 |
+| brightness | 0.52 / 0.56 | 0.53 / 0.58 | 0.52 / 0.53 | 0.50 / 0.55 | 0.50 / 0.52 | 0.50 / 0.49 | **0.59 / 0.70** |
+| contrast | 0.57 / 0.78 | 0.58 / 0.85 | 0.50 / 0.59 | 0.46 / 0.41 | 0.61 / 0.78 | 0.44 / 0.33 | **0.85 / 0.99** |
+| elastic transform | 0.64 / 0.72 | 0.68 / 0.74 | 0.50 / 0.48 | **0.73 / 0.85** | 0.68 / 0.72 | 0.51 / 0.58 | 0.61 / 0.72 |
+| pixelate | 0.81 / 0.95 | 0.85 / 0.97 | 0.56 / 0.49 | 0.69 / 0.83 | 0.64 / 0.75 | 0.43 / 0.28 | **0.81 / 0.97** |
+| jpeg compression | 0.67 / 0.86 | 0.74 / 0.92 | 0.60 / 0.66 | 0.76 / 0.93 | 0.65 / 0.59 | 0.42 / 0.48 | **0.79 / 0.94** |
+| speckle noise * | 0.64 / 0.74 | 0.69 / 0.81 | 0.57 / 0.61 | 0.49 / 0.56 | 0.94 / 0.97 | 0.40 / 0.39 | **0.96 / 0.99** |
+| gaussian blur * | 0.71 / 0.88 | 0.78 / 0.94 | 0.56 / 0.65 | 0.64 / 0.77 | 0.80 / 0.87 | 0.33 / 0.39 | **0.94 / 0.99** |
+| spatter * | 0.62 / 0.74 | 0.66 / 0.81 | 0.55 / 0.60 | 0.77 / 0.93 | 0.81 / 0.89 | 0.44 / 0.47 | **0.87 / 0.98** |
+| saturate * | 0.51 / 0.57 | 0.51 / 0.59 | 0.51 / 0.53 | 0.52 / 0.64 | 0.47 / 0.56 | 0.50 / 0.47 | **0.56 / 0.78** |
 
 What stands out:
 
-- DisCoPatch wins on noise and weather.
-- SAOD min wins on blur, contrast and pixelation, because it sees what the detector sees.
-- kNN wins on JPEG, elastic transform and spatter.
-- Brightness, fog and saturate are hard for everyone. They are also mild for the detector: at
+- The activation CDFs win 15 of the 19 families, including noise, blur, contrast, pixelation and
+  JPEG. The others:
+  - DisCoPatch keeps frost and fog;
+  - SAOD min keeps zoom blur;
+  - kNN keeps elastic transform.
+- Hashemi et al. is below 0.5 in almost every family. Only elastic transform goes above it (0.51 /
+  0.58), and brightness and saturate sit at chance.
+- Brightness, fog and saturate are the hardest for everyone. They are also mild for the detector: at
   severity 5, mAP only falls from 0.479 to 0.39–0.42 (`conditions.csv`).
 
 ## Harm: does the score follow detection quality?
@@ -130,10 +163,14 @@ This is the part that matters for a monitor.
 | Method | ρ(score, mAP), 96 conditions | ρ(score, LRP), 96 conditions | **ρ(Δscore, ΔLRP), within condition** | AURC, all (oracle 0.449) |
 | --- | ---: | ---: | ---: | ---: |
 | SAOD, top-3 | −0.986 | 0.988 [0.986, 0.989] | 0.175 [0.162, 0.187] | 0.638 [0.631, 0.645] |
-| SAOD, min | −0.981 | 0.983 [0.981, 0.985] | **0.257** [0.246, 0.268] | 0.560 [0.552, 0.568] |
-| ContrastiveConf | −0.729 | 0.744 [0.688, 0.787] | 0.230 [0.216, 0.243] | **0.540** [0.532, 0.549] |
+| SAOD, min | −0.981 | 0.983 [0.981, 0.985] | **0.257 [0.246, 0.268]** | 0.560 [0.552, 0.568] |
+| ContrastiveConf | −0.729 | 0.744 [0.688, 0.787] | 0.230 [0.216, 0.243] | **0.540 [0.532, 0.549]** |
 | kNN (k = 100) | −0.534 | 0.542 [0.522, 0.554] | 0.061 [0.049, 0.072] | 0.638 [0.631, 0.645] |
 | DisCoPatch | −0.636 | 0.640 [0.628, 0.653] | −0.051 [−0.066, −0.034] | 0.665 [0.658, 0.672] |
+| Hashemi et al., decoder | 0.455 | −0.438 [−0.475, −0.409] | 0.099 [0.086, 0.112] | 0.626 [0.618, 0.634] |
+| *Hashemi et al., encoder (sensitivity)* | 0.723 | −0.706 [−0.717, −0.698] | 0.020 [0.008, 0.032] | 0.703 [0.696, 0.710] |
+| Activation CDFs (ICPR 2026) | −0.682 | 0.692 [0.682, 0.698] | 0.080 [0.066, 0.093] | 0.658 [0.652, 0.665] |
+| *Activation CDFs, plain sum (sensitivity)* | −0.762 | 0.774 [0.763, 0.780] | 0.110 [0.096, 0.124] | 0.656 [0.649, 0.662] |
 
 How to read the columns:
 
@@ -148,6 +185,14 @@ How to read the columns:
   coverage levels. Lower is better. The oracle rejects by the true LRP (0.449). A random order gives
   about 0.698.
 
+The two activation monitors behave in opposite ways:
+- **Activation CDFs.** They rank the corruption conditions roughly like the detector does (ρ with LRP
+  = 0.692). Within a condition they barely follow the harm (ρ = 0.080).
+- **Hashemi et al.** Between conditions it is anti-aligned: its mean score *rises* with mAP (ρ =
+  +0.455), because stronger corruption gives fewer extreme activations. Within a condition, the images
+  whose share rises most are still somewhat more often the ones the detector fails on. That gives it
+  a better AURC (0.626) than kNN, DisCoPatch or the activation CDFs.
+
 Within-condition ρ at each severity:
 
 | Method | sev 1 | sev 2 | sev 3 | sev 4 | sev 5 |
@@ -155,23 +200,27 @@ Within-condition ρ at each severity:
 | SAOD, top-3 | 0.109 | 0.181 | 0.212 | 0.208 | 0.165 |
 | SAOD, min | 0.152 | 0.226 | 0.284 | 0.318 | 0.308 |
 | ContrastiveConf | 0.102 | 0.157 | 0.231 | 0.297 | 0.364 |
-| kNN | 0.036 | 0.045 | 0.068 | 0.076 | 0.077 |
+| kNN (k = 100) | 0.036 | 0.045 | 0.068 | 0.076 | 0.077 |
 | DisCoPatch | −0.011 | −0.027 | −0.050 | −0.074 | −0.091 |
+| Hashemi et al., decoder | 0.020 | 0.036 | 0.095 | 0.153 | 0.190 |
+| *Hashemi et al., encoder (sensitivity)* | −0.013 | −0.022 | 0.006 | 0.040 | 0.090 |
+| Activation CDFs (ICPR 2026) | 0.042 | 0.068 | 0.096 | 0.102 | 0.090 |
+| *Activation CDFs, plain sum (sensitivity)* | 0.053 | 0.089 | 0.129 | 0.144 | 0.132 |
 
 AURC per severity pool. Each pool is the clean images plus that severity's 19 conditions. Bold is the
 best method:
 
-| Pool | SAOD top-3 | SAOD min | ContrastiveConf | kNN | DisCoPatch | oracle |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| all conditions | 0.638 | 0.560 | **0.540** | 0.638 | 0.665 | 0.449 |
-| severity 1 | 0.581 | 0.490 | **0.430** | 0.545 | 0.596 | 0.352 |
-| severity 2 | 0.609 | 0.521 | **0.472** | 0.584 | 0.627 | 0.389 |
-| severity 3 | 0.639 | 0.558 | **0.531** | 0.634 | 0.661 | 0.441 |
-| severity 4 | 0.674 | 0.603 | **0.600** | 0.689 | 0.703 | 0.503 |
-| severity 5 | 0.709 | **0.651** | 0.668 | 0.745 | 0.749 | 0.569 |
+| Pool | SAOD top-3 | SAOD min | ContrastiveConf | kNN | DisCoPatch | Hashemi (dec.) | Act. CDFs | oracle |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| all conditions | 0.638 | 0.560 | **0.540** | 0.638 | 0.665 | 0.626 | 0.658 | 0.449 |
+| severity 1 | 0.581 | 0.490 | **0.430** | 0.545 | 0.596 | 0.505 | 0.603 | 0.352 |
+| severity 2 | 0.609 | 0.521 | **0.472** | 0.584 | 0.627 | 0.554 | 0.631 | 0.389 |
+| severity 3 | 0.639 | 0.558 | **0.531** | 0.634 | 0.661 | 0.614 | 0.666 | 0.441 |
+| severity 4 | 0.674 | 0.603 | **0.600** | 0.689 | 0.703 | 0.681 | 0.699 | 0.503 |
+| severity 5 | 0.709 | **0.651** | 0.668 | 0.745 | 0.749 | 0.741 | 0.733 | 0.569 |
 
 The family pools are in `aurc_pools.csv`. ContrastiveConf is best in 16 of the 19, and SAOD min wins
-the other three: glass blur, zoom blur and pixelate.
+the other three: glass blur, zoom blur and pixelate. Neither activation monitor wins a pool.
 
 SAOD top-3 and kNN have the same AURC over all conditions (0.638) only by coincidence. The family pools
 tell them apart, for example on fog (0.558 vs 0.511).
@@ -191,6 +240,12 @@ AUPR and FPR95 for both family groups, is in `differences.csv`.
 | DisCoPatch − ContrastiveConf | 0.195 [0.188, 0.203] | −0.281 [−0.303, −0.257] | 0.125 [0.118, 0.131] |
 | DisCoPatch − kNN | 0.170 [0.164, 0.175] | −0.111 [−0.132, −0.091] | 0.027 [0.021, 0.033] |
 | SAOD top-3 − kNN | 0.092 [0.086, 0.098] | 0.115 [0.095, 0.132] | 0.000 [−0.006, 0.006] |
+| Act. CDFs − DisCoPatch | 0.057 [0.052, 0.062] | 0.131 [0.110, 0.152] | −0.007 [−0.011, −0.003] |
+| Act. CDFs − SAOD min | 0.090 [0.085, 0.095] | −0.178 [−0.193, −0.162] | 0.098 [0.094, 0.103] |
+| Act. CDFs − ContrastiveConf | 0.252 [0.246, 0.260] | −0.151 [−0.168, −0.130] | 0.118 [0.112, 0.124] |
+| Act. CDFs − Act. CDFs, plain sum | 0.044 [0.042, 0.045] | −0.030 [−0.035, −0.024] | 0.003 [0.002, 0.004] |
+| SAOD min − Hashemi (dec.) | 0.303 [0.297, 0.308] | 0.159 [0.143, 0.174] | −0.066 [−0.071, −0.061] |
+| kNN − Hashemi (dec.) | 0.166 [0.160, 0.172] | −0.038 [−0.057, −0.020] | 0.012 [0.007, 0.017] |
 
 With 5,000 images the intervals are narrow. Every difference in the table excludes zero except the
 SAOD top-3 vs kNN AURC.
@@ -212,14 +267,20 @@ images, with nothing else on the GPU. Preprocessing is included.
 
 | Part | ms per image |
 | --- | ---: |
-| Detector alone | 5.88 |
-| Detector + ContrastiveConf | 6.14 |
-| Detector + kNN (search over 118k train features) | 6.78 |
+| Detector alone | 5.89 |
+| Detector + ContrastiveConf | 6.13 |
+| Detector + Hashemi et al. (decoder) | 6.20 |
+| Detector + activation CDFs (backbone) | 6.60 |
+| Detector + kNN (search over 118k train features) | 6.81 |
 | Detector + SAOD | 7.14 |
-| DisCoPatch, standalone | 2.44 |
+| DisCoPatch, standalone | 2.45 |
 
 SAOD comes out slower than kNN because of how we implemented it, not because of the method. Our SAOD
 post-processing runs a full numpy sort of all 300 × 80 (query, class) scores on the CPU.
+
+Both activation-monitor timings go through a tap that captures every hidden layer (decoder, encoder,
+C1–C5) and checks each for finite values. That biases the Hashemi figure slightly upwards, because
+Hashemi needs only the decoder.
 
 ## Deviations from the plan
 
@@ -243,6 +304,35 @@ post-processing runs a full numpy sort of all 300 × 80 (query, class) scores on
 3. **Extra outputs.** These were not in the plan's first version:
    - pairwise differences for AUPR and FPR95 on the extra families;
    - the number of images with undefined LRP for every condition, not only clean.
+4. **Hashemi et al., adapted to RT-DETRv2** (no code was released; reimplemented from the paper):
+   - **Monitored layer:** the last decoder layer's query embeddings, the last hidden layer before the
+     class and box heads. The paper used PolyYOLO's last batch-norm or leaky-ReLU layer. The encoder
+     output maps are a sensitivity row.
+   - **Fitting:** μ and σ come from all 118,287 train images, not 500, as population values.
+   - **Score:** the raw share of neurons outside the interval, not the conformal p-value. The p-value is
+     a decreasing function of the share, so every threshold-free metric is the same.
+   - **Orientation:** kept as in the paper (more neurons outside = more degraded), although it turned
+     out below chance here.
+5. **Activation CDFs (Becker et al., ICPR 2026), reproduced** (no code was released):
+   - **Layers:** stages C1–C5 of RT-DETRv2-R18's ResNet-18 backbone, the analogue of their Faster R-CNN
+     "CDFs backbone" variant.
+   - **Margin:** their "20% margin" is read as 20% of the training span on each side.
+   - **Reference:** the training images get a plain 640² resize. The paper collected references "with
+     the same data and augmentation settings" as training.
+   - **Combining stages:** the EMD is in units of each channel's range. The first version of the plan
+     summed all 1,024 channels, and the final code review showed that C5's 512 content-driven channels
+     then dominate. The headline score therefore z-scores each stage's sum with clean train statistics
+     before adding, which we read as their "z-score normalization". The plain sum is the sensitivity
+     row.
+   - **Severities:** the standard 1–5, not their 10-level extension.
+   - **Comparison with their numbers, in words only:**
+     - Their RT-DETR-l "CDFs backbone" reached AUROC 76.4 / 86.4 at *their* severities 3 / 5, pooled
+       over the 19 corruptions.
+     - Ours reaches a mean AUROC of 0.836 / 0.908 over all 19 families at the standard severities 3 /
+       5, and the plain sum 0.788 / 0.885.
+     - Their severity scale, their detector (RT-DETR-l with an HGNet backbone) and their pooling
+       differ, so the numbers are not directly comparable.
+   - `cdf_fit.json`, `cdf_zstats.json` and `activation_fits.json` record the fits.
 
 ## Limitations to state in the paper
 
@@ -262,7 +352,10 @@ post-processing runs a full numpy sort of all 300 × 80 (query, class) scores on
   threshold-free AUROC, AUPR and FPR95 are used instead.
 - The between-condition ρ with mAP has no interval, because mAP is a single number per condition.
 - Separation and harm are measured on the same 5,000 images. Nothing is tuned on them except
-  ContrastiveConf's cross-fitted λ.
+  ContrastiveConf's cross-fitted λ. The activation CDFs' z-statistics come from train images.
+- Both activation monitors are reimplementations; no code was released for either. Their per-stage
+  and per-map scores are stored (`cdf_stages`, `hashemi_encoder_maps` in the per-image files), so other
+  combinations can be checked without a new GPU pass.
 
 ## Files
 
@@ -276,7 +369,8 @@ Everything in `docs/results/coco-baselines/`:
 - `intervals.csv` and `differences.csv` hold the bootstrap intervals.
 - `knn_k.csv`, `timing.csv` and `timing.json` hold the k check and the runtimes.
 - Provenance: `summary.json`, `run_config.json`, `environment.json`, `sanity.json`,
-  `discopatch_training.json` and `discopatch_checkpoint.json`.
+  `discopatch_training.json`, `discopatch_checkpoint.json`, `hashemi_fit.json`, `cdf_fit.json`,
+  `cdf_zstats.json` and `activation_fits.json` (the sha1 of both fits used for scoring).
 - `report.md` is the generated report.
 
 The per-image scores (about 1.5 GB) stay in `runs/coco-baselines/` in the main checkout. That folder

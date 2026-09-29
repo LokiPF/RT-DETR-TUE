@@ -1,0 +1,11 @@
+{
+  "images": 118287,
+  "k": 2.0,
+  "layers": [
+    "decoder",
+    "encoder_s8",
+    "encoder_s16",
+    "encoder_s32"
+  ],
+  "std": "population (ddof=0)"
+}

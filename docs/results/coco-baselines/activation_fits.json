@@ -1,0 +1,16 @@
+{
+  "cdf-fit": {
+    "path": "/home/yuchen/YuchenZ/UE/philip_sa/runs/coco-baselines/cdf/reference.npz",
+    "sha1": "4ffac954a2f0f7d71b8837aaee3574557ccf027c"
+  },
+  "cdf-zstats": {
+    "path": "/home/yuchen/YuchenZ/UE/philip_sa/runs/coco-baselines/cdf/zstats.json",
+    "sha1": "fad1555833329bbdc41db2f57f113993521ec67a"
+  },
+  "cdf_bins": 1000,
+  "hashemi-fit": {
+    "path": "/home/yuchen/YuchenZ/UE/philip_sa/runs/coco-baselines/hashemi/intervals.npz",
+    "sha1": "d12b64ddef43211767136522412ad3c55b2c91fa"
+  },
+  "hashemi_k": 2.0
+}
