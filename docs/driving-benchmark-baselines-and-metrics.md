@@ -47,6 +47,7 @@ aggregation is held fixed."*
 | Detector outputs | **SAOD image-level uncertainty** (Oksuz et al., CVPR 2023), 1 − confidence with *min* and *top-3 mean* aggregation | one score per image by definition | **Nothing is fitted.** Its scores are used directly; we report no thresholded metric. | [fiveai/saod](https://github.com/fiveai/saod) | Our old "1 − max confidence" baseline is SAOD's *min* variant, so cite it as SAOD. Entropy only in SAOD's own form, or not at all. |
 | Detector outputs | **ContrastiveConf** (Park et al., IEEE TPAMI 2026) | one score per image, designed for DETR | **Clean only, but labelled.** Nothing is trained. The split is the fixed threshold θ = 0.3; λ is cross-fitted on labelled clean evaluation images (5 folds; each fold's λ comes from the other four). | [azizanlab/uq-detr](https://github.com/azizanlab/uq-detr), `pip install uq-detr`, MIT | The paper already uses Cityscapes and Foggy Cityscapes (see "Open items"). |
 | Detector features | **kNN** (Sun et al., ICML 2022) on **one pooled image-level feature** from the same frozen detector | one distance per image | **Clean only, no labels.** A bank of clean Cityscapes train images. | [deeplearning-wisc/knn-ood](https://github.com/deeplearning-wisc/knn-ood) | Uses the same clean bank images as ours. Choose and fix the pooled layer before running. |
+| Detector features | **Gaussian neuron-interval runtime monitor** (Hashemi, Křetínský, Rieder & Schmidt, FM 2023). *Added 29 September 2026 as the fifth baseline.* | one score per image: the share of monitored neurons outside μ ± kσ, with k = 2. Their conformal p-value is a decreasing function of this score, so it changes none of our threshold-free metrics. | **Clean only, no labels.** μ and σ per neuron come from clean train images, ignoring classes. The calibration set only sets a threshold, which we do not use. | none found; the method is fully described on one page, so we reimplement it | The only published monitor with exactly our assumptions: frozen detector, clean data only, image-level, class-agnostic. It comes from the runtime-verification community. The monitored layer for RT-DETRv2 is still to be fixed (see "Open items"). Paper: arXiv 2212.07773. |
 | External image quality | **ARNIQA quality score** (Agnolucci et al., WACV 2024) | one score per image | **Corrupted, in its authors' training.** The encoder was trained on synthetically distorted images, and the `kadid10k` regressor on human ratings of synthetically distorted images. We train nothing. | [miccunifi/ARNIQA](https://github.com/miccunifi/ARNIQA); `pyiqa` (`arniqa`) | |
 | External image quality | **ARNIQA embedding + clean prototype**, following Becker et al. (2026) | one cosine distance per image | **Corrupted, in its authors' training** (same encoder). We add only a clean prototype from Cityscapes train images. | ARNIQA repo (`return_embedding`) | The prototype is the mean embedding of the same clean Cityscapes train images. Becker et al. have no code, but the protocol is fully described. |
 | External image quality | **QualiCLIP** or **CLIP-IQA** score (pick one) | one score per image | **QualiCLIP: corrupted**; its authors fine-tuned CLIP on synthetically degraded images. **CLIP-IQA (zero-shot): neither**; plain CLIP with text prompts, no distortion training. (CLIP-IQA+ adds prompts learned from human ratings of real-world distorted photos.) We train nothing. | `pyiqa` (`qualiclip`, `clipiqa`); [miccunifi/QualiCLIP](https://github.com/miccunifi/QualiCLIP); [IceClear/CLIP-IQA](https://github.com/IceClear/CLIP-IQA) | |
@@ -71,7 +72,7 @@ favours them. DisCoPatch is the only baseline we train ourselves, on clean image
 | Mahalanobis (Lee et al., 2018) | Per query: ablation. On a pooled feature it would be a possible extra baseline, but its code was not checked. |
 | DA-CLIP | Has no "clean" class, so a clean-vs-degraded score would be our invention. |
 | LIQE distortion head | "1 − p(others)" would be our invention. Its quality score could be used, but was not chosen. |
-| Becker et al. (2026) | No code. Discussed as the closest concurrent work. |
+| Becker et al. (2026, arXiv preprint, "degradation manifolds") | No code, and it trains a monitoring branch on damaged images. Discussed as close concurrent work. Their ICPR 2026 paper is a separate, training-free method; it is a candidate below. |
 | Rahman / Yatbaz / Keser & Knoll (LFA) runtime monitors | No public code found for Rahman; not checked for Yatbaz and Keser & Knoll. A reimplemented "Rahman-style" supervised predictor is still an open decision (see below). |
 | Foundation-model density (Keser et al., BMVC 2025) | No public code, and it relies on an external foundation model (CLIP, DINOv2 or Grounding DINO). **Related work:** the closest new work, with the same Cityscapes → Foggy Cityscapes / ACDC setting, but segmentation only. |
 | MA-CLIP (Liao et al., AAAI 2026) | Relies on an external pretrained model, CLIP (RN50 image and text encoders by default; RN101, ViT-B/32 and ViT-L/14 also supported). **Related work:** the newest zero-shot image-quality model; it needs no training data. |
@@ -85,6 +86,7 @@ are related work only.
 
 | Baseline | Native output | Data needed: corrupted, or clean only? | Code | Notes |
 | --- | --- | --- | --- | --- |
+| **Activation-distribution monitor** (Becker, Bayer, Hübner & Arens, "Operational Readiness for Object Detection", ICPR 2026). *Recommended; awaiting decision.* | one score per image: the Earth Mover's distance between each channel's activation CDF and a training-set reference CDF, summed over channels and layers | **Clean only, no labels.** Reference CDFs come from clean train images through the frozen detector. | none found; fully described (1,000 bins per channel; ranges from the training minimum and maximum plus a 20% margin) | The closest *published* work, in our exact setting: a frozen detector (RT-DETR-l among others), clean COCO, COCO-C, AUROC. Reviewers will expect it. Their best variant reads the backbone layers. On the same pass as Hashemi et al. it adds little cost. Literature review, Section 12. |
 | MaRS (Di Salvo et al., arXiv 2026) | one score per image | **Clean only, no labels.** | [francescodisalvo05/mars](https://github.com/francescodisalvo05/mars), Apache-2.0 | Relies on an external foundation model (ViT or DINOv3). Never tested on corruptions. |
 | Cumulative Consensus Score (Manoharan et al., arXiv 2025) | one score per image | **Neither.** Box consistency under test-time augmentation. | not found | The only new score built on detector outputs, but it has no code, was never tested under degradation, and needs about 9 extra forward passes. |
 
@@ -148,6 +150,18 @@ LRP is available in `uq-detr` (`uq_detr.lrp()`).
 3. **Same images, corruptions and seeds** for every method.
 
 ## Open items
+
+- **Hashemi et al. on RT-DETRv2: which layer to monitor.** *Decided 29 September 2026: option A.*
+  They monitor all neurons of the last hidden layer before the output (PolyYOLO's last batch-norm or
+  leaky-ReLU layer), and cite earlier work that last layers work best. The two RT-DETRv2 analogues:
+  - **A (the baseline): the last decoder layer's query embeddings** (300 queries × 256 channels),
+    right before the class and box heads. This is the literal "last hidden layer". The queries are
+    ordered by encoder score, so neuron (j, c) is channel c of the j-th proposal.
+  - **B (sensitivity check only): the hybrid encoder's output maps** (256 channels at strides 8, 16
+    and 32 for a 640 × 640 input). This is the last *spatial* layer, closest to PolyYOLO's feature
+    map.
+
+  μ and σ are fitted on all clean COCO train images, as for the other baselines.
 
 - **External-model rule.** Decide whether "relies on an external pretrained model" also rules out
   ARNIQA and QualiCLIP/CLIP-IQA. Both are external pretrained models, and CLIP-IQA and QualiCLIP use

@@ -4,7 +4,7 @@
 checked against its arXiv, proceedings, or publisher page. Datasets and metrics were read from each
 paper's experiments section unless a note says otherwise. Section 10 explains how the search was
 done and what it may have missed. Section 6 on image-quality assessment and Section 11 on 2025–2026 work were added
-later.*
+later. Section 12, a second search on image degradation with object detectors, was added on 29 September 2026.*
 
 The question behind this search: **who else uses a trained object detector's outputs or internal
 features to decide whether an input image is corrupted or shifted, and which datasets and metrics
@@ -26,6 +26,14 @@ COCO val images at severities 4 and 5.
 
   With RT-DETR-l they reach 95.6 AUROC at severity 4 and 97.1 at severity 5. Their confidence
   baseline, taken from a probabilistic RetinaNet, reaches 69.7 and 77.7.
+- **A second paper by the same group is now the closest *published* work** (Section 12). Becker, Bayer,
+  Hübner and Arens, "Operational Readiness for Object Detection" (ICPR 2026):
+  - Frozen detectors, including RT-DETR-l, and clean COCO train images only.
+  - An image-level score: per-channel activation distributions compared with a training reference.
+  - AUROC for clean versus corrupted COCO val (19 corruptions, 10 severities).
+
+  Like every paper we found, it measures only whether the score separates corrupted from clean
+  images. It does not check whether the score follows the harm to the detector.
 - **Two other detector papers make image-level decisions but ask a different question.** SAOD (Oksuz
   et al., CVPR 2023) wants the detector to *accept* mildly corrupted images and reject only images
   that contain no known objects. Park et al. (TPAMI 2026) build an image-level reliability score from
@@ -257,16 +265,34 @@ SUN.
 
 ### Papers that, like us, treat corrupted images as the thing to flag
 
-- **Lee & AlRegib (ICIP 2020).**
-  - CIFAR-10 versus CIFAR-10-C, plus CURE-TSR traffic signs.
-  - AUROC for each corruption at each of levels 1–5.
-  - Their detector is trained on examples of the corruptions, unlike ours.
-- **Lee et al. (IEEE Access 2023).**
-  - All 19 CIFAR-10-C families at levels 1–5, reported per corruption and level.
-  - They report detection accuracy because AUROC was nearly saturated.
-- **Viviers et al. (ECCV 2024 Workshops).**
-  - Generative models flag CIFAR-10-C (19 families × 5 levels) and ImageNet200-C (15 × 5).
-  - Metrics: AUROC and FPR95 per severity, with per-corruption tables in the supplement.
+- **Lee & AlRegib (ICIP 2020).** Re-read on 29 September 2026.
+  - **Data:** CIFAR-10 versus CIFAR-10-C, and CURE-TSR traffic signs. Only **8 of the 19** CIFAR-10-C
+    types are reported, chosen to match CURE-TSR (noise, lens blur, Gaussian blur, dirty lens,
+    exposure, snow, haze, decolour), at levels 1–5.
+  - **Metric:** AUROC for each type at each level, with no averages. Their OOD experiments also report
+    detection accuracy and AUPR.
+  - **Training:** the classifier sees only clean images. The detector is a 2-layer network on gradient
+    features, trained on clean *and* corrupted test images (40/40/20 split). So it sees the
+    corruptions, unlike ours.
+- **Lee et al. (IEEE Access 2023).** Re-read on 29 September 2026.
+  - **Data:** all 19 CIFAR-10-C families at levels 1–5 (95 cases), plus CURE-TSR (12 × 5).
+  - **Metric:** *detection accuracy* per corruption and level, and averaged per corruption. This is the
+    best accuracy over all thresholds, max_δ {0.5·P_in(q ≤ δ) + 0.5·P_out(q > δ)}; for their own
+    detector δ is fixed at 0.5.
+  - **Why not AUROC:** AUROC was "highly saturated", and their significance test (a corrected
+    repeated k-fold cross-validation paired t-test, k = 5, r = 2, p = 0.05) needs predictions.
+  - **Training:** the same kind of detector, trained on clean and corrupted examples, with 5-fold
+    cross-validation repeated with 2 seeds.
+- **Viviers et al. (ECCV 2024 Workshops).** Re-read on 29 September 2026.
+  - **Models:** generative models (VAEs, normalizing flows, diffusion), trained only on clean
+    training images.
+  - **Data:** CIFAR-10-C (19 families × 5 levels = 95 test sets) and ImageNet200-C (15 × 5 = 75),
+    each against its clean 10k test set, following OpenOOD.
+  - **Metrics:** AUROC and FPR95 per condition. The main table gives the mean AUROC over all corruptions
+    at each severity, plus an overall mean AUROC and FPR95. Per-corruption tables are in the
+    supplement.
+  - They argue that only the overall performance matters, because the type of degradation cannot be
+    predicted. This is the closest reporting template to ours.
 - **Tian et al. (2021 preprint; short version at a NeurIPS 2021 workshop).**
   - CIFAR-10/100-C, 15 families × 5 levels. Metrics: AUROC, TNR at 95% TPR.
   - Includes entropy-based baselines.
@@ -573,6 +599,12 @@ provides two things: baselines that need no detector, and ideas for damage-aware
 
 "Not found" means these searches did not turn it up. It does not prove the work does not exist.
 
+*Update, 29 September 2026 (Section 12):*
+- A training-free, image-level corruption score from a frozen detector now exists: Becker et al.,
+  ICPR 2026. It uses activation distributions of backbone layers, not decoder queries, and no
+  nearest-neighbour bank. So the second bullet above still holds for queries.
+- That paper reports AUROC per severity, pooled over corruptions, but not per corruption.
+
 ## 10. How this search was done, and its limits
 
 - **Method.** Four parallel search strands:
@@ -683,7 +715,225 @@ cite it with care.
 ### What still seems open
 
 We found no 2025–2026 work that builds a training-free, clean-only, image-level monitor from a DETR's
-own queries or features, evaluates it on weather or corruption, and releases code.
+own queries or features, evaluates it on weather or corruption, and releases code. (The ICPR 2026
+paper in Section 12 comes closest: it has everything except a DETR-query signal and released code.)
+
+## 12. Image degradation with object detectors: a second search
+
+*Added 29 September 2026.* The question was narrower than in Sections 2–11: **which papers detect or
+quantify the degradation of the input image, with or for an object detector, excluding mAP or
+accuracy prediction?** It ran as three parallel searches:
+- image-level monitors built on detectors;
+- driving-camera degradation and camera health;
+- detectors that estimate their own input's degradation, and runtime monitors tested on corrupted
+  images.
+
+The two papers marked "read in full" were read end to end. The rest were checked against a fetched
+page and read at abstract and experiments level, unless a note says otherwise.
+
+### The short version
+
+- **One new paper is the closest published work:** Becker, Bayer, Hübner and Arens, "Operational
+  Readiness for Object Detection" (ICPR 2026). It comes from the same group as the Becker et al. 2026
+  preprint (Section 2), but uses a different method.
+- **Everything else falls into one of three groups:**
+  - degradation classifiers trained on labelled degraded images (soiling, weather, glare), often
+    sharing the detector's backbone;
+  - a small monitor on a frozen detector with a very small evaluation (Hashemi et al., FM 2023);
+  - degradation signals measured over sequences, not single images (Hildebrand et al., 2023).
+- **None of them checks, image by image, whether the score follows the harm to the detector.** The
+  ICPR 2026 paper says so directly: "Because dense error labeling under shift is impractical, we use
+  ID vs. OOD separability as a proxy." Our per-image LRP makes exactly that measurement.
+
+### Operational Readiness for Object Detection (Becker et al., ICPR 2026), read in full
+
+- **Question.** An image-level score for "is the input inside the detector's operating range?". No
+  unsafe or corrupted samples are used to build the monitor; the paper cites Guérin et al. (AAAI
+  2023) for this setting.
+- **Method (activation distributions).** For chosen layers of a frozen detector:
+  - Build a histogram of each channel's activations. There are 1,000 bins, and each channel's range
+    is its training minimum and maximum plus a 20% margin.
+  - Turn each histogram into a cumulative distribution function (CDF).
+  - Compare the image's CDFs with CDFs aggregated over the whole training set, using the Earth
+    Mover's distance. Sum over channels and layers.
+
+  The idea comes from Visual DNA (Ramtoula et al., CVPR 2023, cited there; not checked by us).
+- **Baselines:**
+  - RealNVP normalizing flows on globally average-pooled features from several layers, either one
+    flow for all layers or one per layer.
+  - SAOD-style top-3 aggregation of detection uncertainties from a probabilistic Faster R-CNN
+    (variance networks trained with the energy score). The scores are confidence, classification
+    entropy, and the trace, determinant and entropy of the box distribution.
+- **Data:**
+  - Reference: COCO train. In-distribution: clean COCO val.
+  - Shifted: COCO val under the 19 Hendrycks corruptions at **10 severity levels** ("extending the
+    standard five by intensifying parameters"). The paper does not say whether its levels 3 and 5
+    equal the standard levels 3 and 5.
+- **Detectors:**
+  - Faster R-CNN R50, read at backbone stages C1–C5 and at the ROI head.
+  - RT-DETR-l, YOLOv9-m, YOLOv10-m and YOLOv11, read at early convolutions and FPN stages.
+- **Metrics.** AUROC for clean versus corrupted at severities 3, 5, 8 and 10, pooled over the
+  corruptions, as mean ± std over 3 runs, after z-score normalization. mAP is used only to show that
+  the corruptions hurt the detector. There is no per-family table, no FPR95 or AUPR, no harm
+  measure, and no code.
+- **Results (AUROC at severities 3 / 5 / 8 / 10):**
+
+  | Method | 3 | 5 | 8 | 10 |
+  | --- | ---: | ---: | ---: | ---: |
+  | Faster R-CNN, CDFs of all backbone layers | 68.0 | 80.3 | 86.8 | 87.4 |
+  | Faster R-CNN, low layers C1–C3 only | 71.9 | 79.5 | 84.6 | 86.7 |
+  | Best normalizing flow | 61.8 | 76.5 | 77.1 | 79.3 |
+  | Top-3 classification entropy | 62.8 | 77.6 | 81.2 | 81.7 |
+  | Top-3 confidence | 58.8 | 72.6 | 75.6 | 78.3 |
+  | RT-DETR-l, CDFs of backbone layers | 76.4 | 86.4 | 91.4 | 92.8 |
+
+  Adding head layers never helps, and the low-level layers carry most of the signal.
+- **What it means for us:**
+  - It is the closest published competitor and uses our setting: a frozen detector including RT-DETR,
+    clean COCO only, COCO-C, AUROC. Reviewers will expect a comparison. The method is fully
+    described and simple to reimplement on RT-DETRv2.
+  - Its separation-only evaluation is exactly the gap our harm columns (within-condition ρ, AURC)
+    fill.
+  - Its finding that low-level backbone activations carry most of the shift signal matches
+    Full-Spectrum OOD (Section 4) and Bianco et al. (Section 6). That matters for a method built on
+    decoder queries, which are high-level.
+
+### Hashemi, Křetínský, Rieder and Schmidt (FM 2023), read in full
+
+- **Method.**
+  - A frozen PolyYOLO (YOLOv3-based) trained on Cityscapes.
+  - One layer is monitored: the last batch-norm layer or the last leaky-ReLU layer before the
+    output. For each of its neurons they compute the mean μ and standard deviation σ over 500 clean
+    training images, ignoring classes.
+  - The score is the share of the layer's neurons that fall outside μ ± kσ, with k ≈ 2.
+  - Inductive conformal anomaly detection turns the score into a p-value against 100 clean
+    calibration images. An image is flagged below 5%.
+- **Data.**
+  - 100 Cityscapes test images with Gaussian noise (variance 0.02, 0.04, 0.06), impulse noise (0.03,
+    0.06) and FGSM attacks.
+  - KITTI and A2D2 serve as other-dataset shift.
+- **Metric: images flagged out of 100.**
+  - 3–6 clean images.
+  - 7–9 at noise variance 0.02, 91–92 at 0.04, and all 100 at 0.06 and for impulse noise.
+  - Every KITTI and A2D2 image.
+
+  There is no AUROC and no code.
+- **A hint towards harm alignment.** They note that the variance-0.02 noise that fools the monitor "is
+  not as critical as large objects are still detected", but they do not measure this.
+- **What it means for us.** It is the only published monitor with exactly our assumptions: frozen
+  detector, clean data only, one score per image, no classes. It also comes from the
+  runtime-verification community. It is now our fifth baseline (see the decision record). Our metrics
+  are threshold-free, so the conformal step does not change any result: the p-value is a
+  decreasing step function of the score.
+
+### Other work on the detector side
+
+- **Hildebrand, Brown, Brown and Waslander (IEEE Access 2023).**
+  - A probabilistic Faster R-CNN (camera and LiDAR), tested under Waymo rain and night, simulated
+    fog, lens spatter and pixel dropout, and CADC snow.
+  - Kernel densities of box uncertainties, fitted on normal data, label each detection as a likely
+    true or false positive.
+  - The ratio of predicted false to true positives, averaged over a sequence, rises as AP falls: 2.1×
+    in rain with an obscured lens, and 1.4× in fog with −19% AP.
+  - This is measured over sequences, not single images, and there is no clean-vs-degraded AUROC.
+- **Yoo, Lee, Chung, Kim and Kwak (CVPR 2024).**
+  - Test-time adaptation of Faster R-CNN, from COCO to COCO-C and SHIFT.
+  - A "when to adapt" trigger, the KL divergence between Gaussians fitted to training features and to
+    running test features, peaks at every domain change.
+  - It works on streams and is never scored as a detector.
+- **Khandal and Vidyarthi (COMSNETS 2022 workshop).** Confidence of YOLOv3, Faster R-CNN and SSD under
+  noise, blur, fog, glare and snow. Exploratory; there is no monitor.
+- **Yuhas and Easwaran (ITSC 2023).**
+  - A separate β-VAE flags heavy rain in CARLA.
+  - The in-distribution limit, 10% rain, is set where YOLOv7-tiny starts to degrade.
+  - Code is public.
+
+### Degradation estimated next to a detector, using degradation labels
+
+- **Soiling.**
+  - SoilingNet (Uřičář et al., ITSC 2019) and TiledSoilingNet (Das et al., ITSC 2020), both on
+    WoodScape, put soiling heads on the encoder they share with a YOLOv2 detector. TiledSoilingNet
+    trains its head on the *frozen* encoder.
+  - Both are supervised on 76k–106k real soiled frames and scored by accuracy or per-class RMSE.
+    Neither measures the effect on detection.
+- **Soiling severity (Yang, Duan, Li and Zhang, *Sensors* 2026).**
+  - Tile-level soiling classes, plus an image-level severity score smoothed over time.
+  - A pedestrian detector's detection rate falls steadily with severity, from 88.7% at level 1 to
+    56.9% at level 3.
+  - Supervised on WoodScape plus synthetic sequences. It reports Spearman 0.79 and MAE.
+- **Weather and light classifiers inside detectors, with the estimate evaluated.**
+  - DTRDNet (Huang et al., *Sensors* 2024): clean, haze, rain or snow, read from the YOLOX encoder;
+    99% precision.
+  - AW-MoE (preprint 2026): a weather router for 3D detection, about 99% accurate.
+  - Illumination-aware Faster R-CNN (Li et al., *Pattern Recognition* 2019): day/night gating for
+    RGB-thermal pedestrian detection.
+- **Weather and light used only internally**, with only mAP reported: IA-YOLO, GDIP, RDMNet, MTW-DETR
+  and similar.
+- **Reliability maps inside multi-sensor 3D detectors:** RAF (Park, Jeong and Yoon, ECCV 2026) and
+  Seeing Through Fog (Bijelic et al., CVPR 2020).
+
+### Driving-camera degradation without a detector
+
+These papers classify the condition, but none links its output to a detector's accuracy:
+- soiling: SoildNet, and "Let's Get Dirty" (WACV 2021);
+- lens dirt and raindrops: Einecke et al., ITSC 2014;
+- overexposure: ITSC 2018;
+- weather and light level: Dhananjaya et al., ITSC 2021;
+- fog visibility: Hautière et al., 2006;
+- sun glare: a NeurIPS 2021 ML4AD workshop paper, IV 2021 and IV 2026.
+
+The two IV glare papers were read at abstract level only. Beránek et al. report data leakage and
+annotation errors in WoodScape's soiling set and release cleaned splits, which matters if WoodScape
+is used.
+
+### Borderline: the label is detector failure
+
+- **Sezgin et al. (IV 2023).** A weather-chamber monitor built from image sharpness, brightness and
+  contrast, labelled by YOLOv5 confidence and IoU. A useful IV precedent.
+- **Dario et al. (arXiv 2026, vision-based aircraft landing).** Corruption-aware runtime monitors on
+  YOLOv5, with 5 corruptions × 3 severities. The ground truth is detector failure (IoU < 0.7). Code
+  is public.
+
+### Resources worth borrowing
+
+- **Degradation taxonomy.** Becker, Weiss, Hübner and Arens (arXiv 2026), "A causally grounded
+  taxonomy for image degradation robustness evaluation". Severity is quantified by PSNR, SSIM and
+  LPIPS.
+- **DRIVE-C** (Aher, arXiv 2026). 12 degradations × 5 severities, as 600 driving clips aligned
+  pixel-for-pixel with clean versions.
+- **ImageNet-ES** (Baek et al., CVPR 2024). Real covariate shifts from sensor and environment
+  settings; existing OOD detectors fail on them.
+- **TCSR-Monitor** (Pham et al., arXiv 2026, surgical segmentation). Explicitly tests whether a
+  monitor predicts failure rather than merely detecting corruption. That is the distinction between
+  our separation and harm columns.
+
+### Judging a monitor by the failures it catches
+
+- **Guérin, Delmas, Ferreira and Guiochet (AAAI 2023), "Out-of-distribution detection is not all you
+  need".**
+  - Runtime monitors should be judged by how well they discard incorrect predictions, not by OOD
+    detection. They call this "out-of-model-scope detection".
+  - Classifiers only. The ICPR 2026 paper above adopts their setting but falls back to ID-vs-OOD
+    separability.
+- **Geifman, Uziel and El-Yaniv (ICLR 2019).**
+  - Introduce AURC, the area under the risk–coverage curve of a selective classifier.
+  - Our AURC applies it to detection, with per-image LRP as the risk.
+
+### What this search did not find, and its limits
+
+- **Not found:** a paper combining all of the following.
+  - A frozen modern (DETR-family) detector trained on clean data only.
+  - An image-level score with AUROC over the full corruption suite.
+  - A per-image check that the score follows the harm to the detector.
+
+  The ICPR 2026 paper has everything except the last.
+- **Not found either:** a follow-up to Hashemi et al. on detection with more corruptions or with AUROC.
+  Their RV 2024 follow-up uses classification; a 2025 one uses segmentation.
+- **Limits:**
+  - Semantic Scholar rate-limited almost every request, and the arXiv API throttled phrase queries.
+  - MDPI, ScienceDirect, Springer, Wiley and IEEE Xplore pages were often blocked.
+  - Read at title or metadata level only: Reddy Mure et al. (IV 2026), Yoneda et al. (IV 2021) and
+    Johansen et al. (*Applied Sciences* 2023).
 
 ## References
 
@@ -691,16 +941,24 @@ Surnames only; links point to the page used for checking.
 
 - Agnolucci, Galteri, Bertini (2025). Quality-aware image-text alignment for opinion-unaware image quality assessment (QualiCLIP). *arXiv preprint*. https://arxiv.org/abs/2403.11176
 - Agnolucci, Galteri, Bertini, Del Bimbo (2024). ARNIQA: Learning distortion manifold for image quality assessment. *WACV*. https://arxiv.org/abs/2310.14918 (code: https://github.com/miccunifi/ARNIQA)
+- Aher (2026). DRIVE-C: A controlled corruption dataset for autonomous driving. *arXiv preprint*. https://arxiv.org/abs/2605.09774
 - Aher (2026). Safety-critical camera reliability monitoring for ADAS via degradation-aware uncertainty pattern analysis. *arXiv preprint*. https://arxiv.org/abs/2605.05439
 - Arnal, Hensel, Carrière, Lacombe, Kurihara, Ike, Chazal (2024). MAGDiff: Covariate data set shift detection via activation graphs of neural networks. *TMLR*. https://arxiv.org/abs/2305.13271
+- Baek, Park, Kim, Kim (2024). Unexplored faces of robustness and out-of-distribution: Covariate shifts in environment and sensor domains (ImageNet-ES). *CVPR*. https://arxiv.org/abs/2404.15882
+- Becker, Bayer, Hübner, Arens (2026). Operational readiness for object detection. *ICPR 2026*, LNCS 16814, pp. 121–135 (Springer, 2027). https://doi.org/10.1007/978-3-032-31654-7_9 (read in full)
+- Becker, Weiss, Hübner, Arens (2026). A causally grounded taxonomy for image degradation robustness evaluation. *arXiv preprint*. https://arxiv.org/abs/2605.15906
 - Becker, Weiss, Hübner, Arens (2026). Self-aware object detection via degradation manifolds. *arXiv preprint*. https://arxiv.org/abs/2602.18394
 - Beemelmanns, Nekrasov, Vilceanu, et al. (2026). Query2Uncertainty: Robust uncertainty quantification and calibration for 3D object detection under distribution shift. *CVPR*. https://arxiv.org/abs/2605.05328
 - Beniwal, Mantini, Shah (2022). Image quality assessment using deep features for object detection. *VISAPP*. https://www.scitepress.org/Papers/2022/109170/109170.pdf
+- Beránek, Diviš, Gruber (2025). Soiling detection for advanced driver assistance systems. *arXiv preprint* (reported as ICMV 2024; venue not checked). https://arxiv.org/abs/2511.09740
 - Bhuyan (2026). Tippett-minimum fusion of representation-space diffusion models for multi-encoder out-of-distribution detection. *arXiv preprint*. https://arxiv.org/abs/2605.20502
 - Bianco, Celona, Napoletano (2021). Disentangling image distortions in deep feature space. *Pattern Recognition Letters*, 148. https://arxiv.org/abs/2002.11409
 - Caetano, Viviers, Zavala-Mondragón, et al. (2025). DisCoPatch: Taming adversarially-driven batch statistics for improved out-of-distribution detection. *ICCV*. https://arxiv.org/abs/2501.08005 (code: https://github.com/caetas/DisCoPatch)
 - Chen, Mo (2022). IQA-PyTorch: PyTorch toolbox for image quality assessment (`pyiqa`). *Software*. https://github.com/chaofengc/IQA-PyTorch
 - Chen, Mo, Hou, et al. (2024). TOPIQ: A top-down approach from semantics to distortions for image quality assessment. *IEEE TIP*, 33. https://arxiv.org/abs/2308.03060
+- Dario, Chenevier, Delmas, Guérin, Guiochet (2026). Unifying runtime monitoring approaches for safety-critical machine learning: Application to vision-based landing. *arXiv preprint* (reported as ICPR 2026). https://arxiv.org/abs/2604.26411
+- Das, Křížek, Sistu, et al. (2020). TiledSoilingNet: Tile-level soiling detection on automotive surround-view cameras using coverage metric. *IEEE ITSC*. https://arxiv.org/abs/2007.00801
+- Dhananjaya, Kumar, Yogamani (2021). Weather and light level classification for autonomous driving: Dataset, baseline and active learning. *IEEE ITSC*. https://arxiv.org/abs/2104.14042
 - Di Salvo, Doerrich, Ledig (2026). MaRS: Robust out-of-distribution detection via Mahalanobis residual scoring. *arXiv preprint* (MICCAI 2026 according to the code repository). https://arxiv.org/abs/2606.22649 (code: https://github.com/francescodisalvo05/mars)
 - Dremin, Kozhemyakov, Molodetskikh, et al. (2024). Machine vision-aware quality metrics for compressed image and video assessment. *arXiv preprint*. https://arxiv.org/abs/2411.06776
 - Du, Gozum, Ming, Li (2022). SIREN: Shaping representations for detecting out-of-distribution objects. *NeurIPS*. https://proceedings.neurips.cc/paper_files/paper/2022/hash/804dbf8d3b8eee1ef875c6857efc64eb-Abstract-Conference.html
@@ -708,18 +966,24 @@ Surnames only; links point to the page used for checking.
 - Feng, Harakeh, Waslander, Dietmayer. A review and comparative study on probabilistic object detection in autonomous driving. *IEEE T-ITS*. https://arxiv.org/abs/2011.10671
 - Ferreira, Arlat, Guiochet, Waeselynck (2021). Benchmarking safety monitors for image classifiers with machine learning. *IEEE PRDC*. https://arxiv.org/abs/2110.01232
 - Gebhart, Schrater (2017). Adversary detection in neural networks via persistent homology. *arXiv preprint*. https://arxiv.org/abs/1711.10056
+- Geifman, Uziel, El-Yaniv (2019). Bias-reduced uncertainty estimation for deep neural classifiers (introduces AURC). *ICLR*. https://openreview.net/forum?id=SJfb5jCqKm
 - Girrbach, Christensen, Winther, Akata, Koepke (2023). Addressing caveats of neural persistence with deep graph persistence. *TMLR*. https://arxiv.org/abs/2307.10865
 - Goibert, Ricatte, Dohmatob (2022). An adversarial robustness perspective on the topology of neural networks. *NeurIPS ML Safety Workshop*. https://arxiv.org/abs/2211.02675
+- Guérin, Delmas, Ferreira, Guiochet (2023). Out-of-distribution detection is not all you need. *AAAI*, 37(12), 14829–14837. https://arxiv.org/abs/2211.16158
 - Hall, Dayoub, Skinner, et al. (2020). Probabilistic object detection: Definition and evaluation. *WACV*. https://arxiv.org/abs/1811.10800
 - Harakeh, Waslander (2021). Estimating and evaluating regression predictive uncertainty in deep object detectors. *ICLR*. https://arxiv.org/abs/2101.05036
+- Hashemi, Křetínský, Rieder, Schmidt (2023). Runtime monitoring for out-of-distribution detection in object detection neural networks. *FM 2023*, LNCS. https://arxiv.org/abs/2212.07773 (read in full)
 - Hendrycks, Dietterich (2019). Benchmarking neural network robustness to common corruptions and perturbations. *ICLR*. https://arxiv.org/abs/1903.12261
 - Hendrycks, Gimpel (2017). A baseline for detecting misclassified and out-of-distribution examples in neural networks. *ICLR*. https://arxiv.org/abs/1610.02136
 - Heng, Soh (2025). Detecting covariate shifts with vision-language foundation models. *ICLR 2025 Workshop on Foundation Models in the Wild*. https://mlanthology.org/iclrw/2025/heng2025iclrw-detecting/
+- Hildebrand, Brown, Brown, Waslander (2023). Assessing distribution shift in probabilistic object detection under adverse weather. *IEEE Access*, 11. https://doi.org/10.1109/ACCESS.2023.3270447
+- Huang, Wang, Teng, He, Chen (2024). Degradation type-aware image restoration for effective object detection in adverse weather (DTRDNet). *Sensors*, 24. https://pmc.ncbi.nlm.nih.gov/articles/PMC11478636/
 - Jaeger, Lüth, Klein, Bungert (2023). A call to reflect on evaluation practices for failure detection in image classification. *ICLR*. https://arxiv.org/abs/2211.15259
 - Ke, Wang, Wang, Milanfar, Yang (2021). MUSIQ: Multi-scale image quality transformer. *ICCV*. (CVF open access)
 - Kees, Hoemann, Köster, Hallerbach (2026). Image quality dependent degradation for AI systems. *arXiv preprint*. https://arxiv.org/abs/2607.25736
 - Keser, Knoll (2026). LFA: Layer feature attention for run-time introspection of 2D object detectors in automated driving. *arXiv preprint*. https://arxiv.org/abs/2606.00372
 - Keser, Orhan, Amini-Naieni, Schwalbe, Knoll, Rottmann (2025). Benchmarking vision foundation models for input monitoring in autonomous driving. *BMVC*. https://arxiv.org/abs/2501.08083
+- Khandal, Vidyarthi (2022). Exploring credibility scoring metrics of perception systems for autonomous driving. *COMSNETS 2022 workshop*. https://arxiv.org/abs/2112.11643
 - Kuzucu, Oksuz, Sadeghi, Dokania (2024). On calibration of object detectors: Pitfalls, evaluation and baselines. *ECCV*. https://arxiv.org/abs/2405.20459
 - Lacombe, Ike, Carrière, Chazal, Glisse, Umeda (2021). Topological uncertainty: Monitoring trained neural networks through persistence of activation graphs. *IJCAI*. https://arxiv.org/abs/2105.04404
 - Lee, AlRegib (2020). Gradients as a measure of uncertainty in neural networks. *IEEE ICIP*. https://arxiv.org/abs/2008.08030
@@ -740,7 +1004,9 @@ Surnames only; links point to the page used for checking.
 - Munir, Khan, Sarfraz, Ali (2022). Towards improving calibration in object detection under domain shift. *NeurIPS*. https://arxiv.org/abs/2209.07601
 - Oksuz, Joy, Dokania (2023). Towards building self-aware object detectors via reliable uncertainty quantification and calibration. *CVPR*. https://arxiv.org/abs/2307.00934
 - Ovadia, Fertig, Ren, et al. (2019). Can you trust your model's uncertainty? Evaluating predictive uncertainty under dataset shift. *NeurIPS*. https://arxiv.org/abs/1906.02530
+- Park, Jeong, Yoon (2026). RAF: Reliability-aware fusion of camera, LiDAR, and 4D RADAR for robust 3D object detection in adverse weather. *ECCV*. https://arxiv.org/abs/2607.04587
 - Park, Sobolewski, Azizan (2026). Uncertainty quantification in detection transformers: Object-level calibration and image-level reliability. *IEEE TPAMI*. https://arxiv.org/abs/2412.01782
+- Pham, Cao, Huynh, et al. (2026). Beyond uncertainty: Generalizable failure monitoring for surgical segmentation under acquisition degradation (TCSR-Monitor). *arXiv preprint*. https://arxiv.org/abs/2608.16748
 - Pollano, Chaudhuri, Simmons (2024). Detecting out-of-distribution text using topological features of transformer-based language models. *IJCAI 2024 AISafety Workshop (CEUR-WS Vol-3856)*. https://arxiv.org/abs/2311.13102
 - Qutub, Paulitsch, Scholl, et al. (2024). Situation monitor: Diversity-driven zero-shot out-of-distribution detection using budding ensemble architecture for object detection. *CVPR Workshops (SAIAD)*. https://arxiv.org/abs/2406.03188
 - Rabanser, Günnemann, Lipton (2019). Failing loudly: An empirical study of methods for detecting dataset shift. *NeurIPS*. https://arxiv.org/abs/1810.11953
@@ -749,9 +1015,11 @@ Surnames only; links point to the page used for checking.
 - Ramesh, Wang, Islam (2025). HiRQA: Hierarchical ranking and quality alignment for opinion-unaware image quality assessment. *Machine Vision and Applications* (accepted). https://arxiv.org/abs/2508.15130
 - Rieck, Togninalli, Bock, et al. (2019). Neural persistence: A complexity measure for deep neural networks using algebraic topology. *ICLR*. https://arxiv.org/abs/1812.09764
 - Saha, Mishra, Bovik (2023). Re-IQA: Unsupervised learning for image quality assessment in the wild. *CVPR*. https://arxiv.org/abs/2304.00451
+- Sezgin, Vriesman, Steinhauser, Lugner, Brandmeier (2023). Safe autonomous driving in adverse weather: Sensor evaluation and performance monitoring. *IEEE IV*. https://arxiv.org/abs/2305.01336
 - Su, Yan, Zhu, et al. (2020). Blindly assess image quality in the wild guided by a self-adaptive hyper network (HyperIQA). *CVPR*. (code: https://github.com/SSL92/hyperIQA)
 - Sun, Ming, Zhu, Li (2022). Out-of-distribution detection with deep nearest neighbors. *ICML*. https://arxiv.org/abs/2204.06507
 - Tian, Hsu, Shen, Jin, Kira (2021). Exploring covariate and concept shift for detection and calibration of out-of-distribution data. *arXiv preprint* (short version at NeurIPS 2021 DistShift Workshop). https://arxiv.org/abs/2110.15231
+- Uřičář, Křížek, Sistu, Yogamani (2019). SoilingNet: Soiling detection on automotive surround-view cameras. *IEEE ITSC*. https://arxiv.org/abs/1905.01492
 - Venkataramanan, Facktor, Gupta, Bovik (2022). Assessing the impact of image quality on object-detection algorithms. *IS&T Electronic Imaging*. https://doi.org/10.2352/EI.2022.34.9.IQSP-334
 - Viviers, Valiuddin, Caetano, et al. (2024). Can your generative model detect out-of-distribution covariate shift? *ECCV 2024 Workshops*. https://arxiv.org/abs/2409.03043
 - Wang, Chan, Loy (2023). Exploring CLIP for assessing the look and feel of images (CLIP-IQA). *AAAI*. https://arxiv.org/abs/2207.12396
@@ -760,6 +1028,7 @@ Surnames only; links point to the page used for checking.
 - Wilson, Fischer, Dayoub, Miller, Sünderhauf (2023). SAFE: Sensitivity-aware features for out-of-distribution object detection. *ICCV*. https://arxiv.org/abs/2208.13930
 - Wu, He, Cheng, Huang, Bensalem (2025). Revisiting out-of-distribution detection in real-time object detection: From benchmark pitfalls to a new mitigation paradigm. *IEEE TPAMI* (accepted). https://arxiv.org/abs/2503.07330
 - Wu, Zhang, Zhang, et al. (2024). Q-Align: Teaching LMMs for visual scoring via discrete text-defined levels. *ICML*. https://arxiv.org/abs/2312.17090
+- Yang, Duan, Li, Zhang (2026). A static-to-temporal framework for interpretable camera lens soiling severity estimation in autonomous driving. *Sensors*, 26(11), 3533. https://doi.org/10.3390/s26113533
 - Yang, Popović, Wiederer, et al. (2026). GroupEnsemble: Efficient uncertainty estimation for DETR-based object detection. *arXiv preprint*. https://arxiv.org/abs/2603.01847
 - Yang, Wang, Chen, Dai, Zheng (2024). Bounding box stability against feature dropout reflects detector generalization across environments. *ICLR*. https://arxiv.org/abs/2403.13803
 - Yang, Wu, Shi, et al. (2022). MANIQA: Multi-dimension attention network for no-reference image quality assessment. *CVPR Workshops*. https://arxiv.org/abs/2204.08958
@@ -769,6 +1038,8 @@ Surnames only; links point to the page used for checking.
 - Yatbaz, Dianati, Woodman (2024). Introspection of DNN-based perception functions in automated driving systems: State-of-the-art and open research challenges. *IEEE T-ITS*, 25(2). https://wrap.warwick.ac.uk/id/eprint/179419/
 - Yeh, Yang (2025). Uncertainty of network topology with applications to out-of-distribution detection. *arXiv preprint*. https://arxiv.org/abs/2511.18813
 - Yoo, Kwon, Hwang, Lee (2025). Automated model evaluation for object detection via prediction consistency and reliability. *ICCV*. https://arxiv.org/abs/2508.12082
+- Yoo, Lee, Chung, Kim, Kwak (2024). What, how, and when should object detectors update in continually changing test domains? *CVPR*. https://arxiv.org/abs/2312.08875
+- Yuhas, Easwaran (2023). Co-design of out-of-distribution detectors for autonomous emergency braking systems. *IEEE ITSC*. https://arxiv.org/abs/2307.13419
 - Zhang, Ma, Yan, Deng, Wang (2020). Blind image quality assessment using a deep bilinear convolutional neural network (DBCNN). *IEEE TCSVT*, 30. https://arxiv.org/abs/1907.02665
 - Zhang, Yang, Wang, et al. (2024). OpenOOD v1.5: Enhanced benchmark for out-of-distribution detection. *DMLR*. https://arxiv.org/abs/2306.09301
 - Zhang, Zhai, Wei, Yang, Ma (2023). Blind image quality assessment via vision-language correspondence: A multitask learning perspective (LIQE). *CVPR*. https://arxiv.org/abs/2303.14968
@@ -779,6 +1050,10 @@ Surnames only; links point to the page used for checking.
 
 If new-class OOD (unknown objects) is out of scope and only image degradation matters, these are
 the papers to read, roughly in order.
+
+*Update, 29 September 2026:* read Becker, Bayer, Hübner and Arens, "Operational Readiness for Object
+Detection" (ICPR 2026) first. It is the closest published work. Then read Hashemi et al. (FM 2023),
+now our fifth baseline. Both are summarised in Section 12.
 
 1. Becker et al. 2026, "Self-Aware Object Detection via Degradation Manifolds" (preprint, arXiv 2602.18394). This is the closest paper.
    - The task is purely degradation. Positives are corrupted COCO val images at severities 1–5 against clean ones, scored with AUROC, and there are no unknown objects.
