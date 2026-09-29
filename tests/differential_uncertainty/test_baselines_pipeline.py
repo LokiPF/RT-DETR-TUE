@@ -184,3 +184,112 @@ def test_discopatch_scores_refuse_non_finite_values(tmp_path, fakes, monkeypatch
     with pytest.raises(ValueError, match="non-finite"):
         pipeline.run_phase("discopatch-scores", settings)
     assert not list((settings.output / "test_dcp").glob("*.npz"))
+
+
+class HiddenFakeTap(FakeTap):
+    """FakeTap plus the hidden-layer interface; every activation shifts with image brightness."""
+    hidden_calls = 0
+
+    def prepare(self, arrays):
+        return torch.stack([torch.from_numpy(np.ascontiguousarray(a)).permute(2, 0, 1).float() / 255.0
+                            for a in arrays])
+
+    def forward(self, batch):
+        return self.run([(b.permute(1, 2, 0).numpy() * 255).astype(np.uint8) for b in batch])
+
+    def forward_hidden(self, batch):
+        HiddenFakeTap.hidden_calls += 1
+        n = batch.shape[0]
+        level = batch.float().mean(dim=(1, 2, 3))
+        generator = torch.Generator().manual_seed(0)
+
+        def maps(channels, sizes):
+            return [level.view(n, 1, 1, 1).expand(n, channels, s, s).clone()
+                    + torch.randn(channels, s, s, generator=generator) for s in sizes]
+
+        return {"decoder": torch.randn(300, 256, generator=generator) + 4.0 * level.view(n, 1, 1),
+                "encoder": maps(8, (4, 2, 1)), "backbone": maps(3, (4, 4, 2, 2, 1))}
+
+
+def _train_images(tmp_path, count=3):
+    folder = tmp_path / "train"
+    folder.mkdir(exist_ok=True)
+    rng = np.random.default_rng(3)
+    for index in range(count):
+        Image.fromarray(rng.integers(0, 256, (40, 50, 3), dtype=np.uint8)).save(folder / f"{index:04d}.jpg")
+    return folder
+
+
+@pytest.fixture
+def hidden_fakes(monkeypatch):
+    HiddenFakeTap.calls = HiddenFakeTap.hidden_calls = 0
+    monkeypatch.setattr(pipeline, "DetectorTap", HiddenFakeTap)
+    monkeypatch.setattr(pipeline, "_load_bank", lambda _s, _d: torch.nn.functional.normalize(torch.randn(256, 512), dim=1))
+
+
+def test_hashemi_fit_stores_intervals_for_every_monitored_layer_once(tmp_path, hidden_fakes):
+    settings = _settings(tmp_path, train_images=_train_images(tmp_path))
+    pipeline.run_phase("hashemi-fit", settings)
+    with np.load(settings.output / "hashemi" / "intervals.npz") as data:
+        assert data["decoder_mean"].shape == (300, 256) and data["encoder_s8_std"].shape == (8, 4, 4)
+        assert data["encoder_s32_mean"].shape == (8, 1, 1) and int(data["images"]) == 3
+    fit = json.loads((settings.output / "hashemi" / "fit.json").read_text())
+    assert fit["k"] == 2.0 and fit["images"] == 3
+    calls = HiddenFakeTap.hidden_calls
+    pipeline.run_phase("hashemi-fit", settings)
+    assert HiddenFakeTap.hidden_calls == calls
+
+
+def test_cdf_fit_stores_ranges_and_reference_cdfs_for_the_five_stages_once(tmp_path, hidden_fakes):
+    settings = _settings(tmp_path, train_images=_train_images(tmp_path))
+    pipeline.run_phase("cdf-fit", settings)
+    with np.load(settings.output / "cdf" / "reference.npz") as data:
+        assert data["C1_cdf"].shape == (3, 1000) and data["C5_low"].shape == (3,)
+        assert np.allclose(data["C3_cdf"][:, -1], 1.0) and int(data["images"]) == 3
+    assert json.loads((settings.output / "cdf" / "fit.json").read_text())["bins"] == 1000
+    assert HiddenFakeTap.hidden_calls == 2   # one ranges pass and one histogram pass over the single batch
+    pipeline.run_phase("cdf-fit", settings)
+    assert HiddenFakeTap.hidden_calls == 2
+
+
+def test_activation_scores_cover_every_variant_and_stay_tied_to_their_fits(tmp_path, hidden_fakes):
+    settings = _settings(tmp_path, train_images=_train_images(tmp_path))
+    pipeline.run_phase("test", settings)
+    pipeline.run_phase("hashemi-fit", settings)
+    with pytest.raises(ValueError, match="cdf-fit"):
+        pipeline.run_phase("activation-scores", settings)
+    pipeline.run_phase("cdf-fit", settings)
+    pipeline.run_phase("activation-scores", settings)
+    files = sorted((settings.output / "test_activation").glob("*.npz"))
+    assert len(files) == 2
+    with np.load(files[0]) as data:
+        assert all(data[key].shape == (96,) for key in pipeline.ACTIVATION_KEYS)
+        assert np.all((data["hashemi_decoder"] >= 0) & (data["hashemi_decoder"] <= 1))
+        assert np.all(data["cdf_backbone"] >= 0)
+    reference = settings.output / "cdf" / "reference.npz"
+    reference.write_bytes(reference.read_bytes() + b"x")
+    with pytest.raises(ValueError, match="changed since"):
+        pipeline.run_phase("activation-scores", settings)
+
+
+def test_activation_scores_detect_changed_corruptions(tmp_path, hidden_fakes):
+    settings = _settings(tmp_path, train_images=_train_images(tmp_path))
+    pipeline.run_phase("test", settings)
+    pipeline.run_phase("hashemi-fit", settings)
+    pipeline.run_phase("cdf-fit", settings)
+    victim = sorted((settings.output / "test").glob("*.npz"))[0]
+    data = dict(np.load(victim))
+    data["digests"] = np.array(["0" * 16] * 96)
+    np.savez(victim, **data)
+    with pytest.raises(ValueError, match="corruptions differ"):
+        pipeline.run_phase("activation-scores", settings)
+
+
+def test_timing_reports_both_activation_monitors_once_they_are_fitted(tmp_path, hidden_fakes):
+    settings = _settings(tmp_path, train_images=_train_images(tmp_path))
+    pipeline.run_phase("hashemi-fit", settings)
+    pipeline.run_phase("cdf-fit", settings)
+    pipeline.run_phase("timing", settings)
+    timing = json.loads((settings.output / "timing.json").read_text())
+    assert {"detector_ms", "detector_plus_hashemi_ms", "detector_plus_cdf_ms"} <= set(timing)
+    assert "discopatch_ms" not in timing

@@ -41,7 +41,8 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument("--seed", default=44, type=nonnegative_int)
     baselines = commands.add_parser("baselines-coco")
     baselines.add_argument("--phase", required=True,
-                           choices=["sanity", "bank", "test", "train-discopatch", "discopatch-scores", "timing", "report"])
+                           choices=["sanity", "bank", "test", "train-discopatch", "discopatch-scores",
+                                    "hashemi-fit", "cdf-fit", "activation-scores", "timing", "report"])
     baselines.add_argument("--output", required=True)
     baselines.add_argument("--checkpoint", required=True)
     baselines.add_argument("--coco-train-images", required=True)

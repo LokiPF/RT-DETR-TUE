@@ -89,3 +89,15 @@ def test_cli_prints_plain_runtime_errors(monkeypatch, capsys):
     assert code == 2
     assert captured.out == ""
     assert captured.err == "error: bad input\n"
+
+
+def test_cli_accepts_the_activation_monitor_phases(monkeypatch, tmp_path):
+    import differential_uncertainty.baselines.pipeline as pipeline
+    seen = []
+    monkeypatch.setattr(pipeline, "run_phase", lambda phase, settings: seen.append(phase))
+    base = ["--output", str(tmp_path / "out"), "--checkpoint", "c.pth", "--coco-train-images", "train",
+            "--coco-val-images", "val", "--coco-annotations", "ann.json", "--discopatch-root", "dcp"]
+    phases = ("hashemi-fit", "cdf-fit", "activation-scores")
+    for phase in phases:
+        assert cli.main(["baselines-coco", "--phase", phase, *base]) == 0
+    assert tuple(seen) == phases

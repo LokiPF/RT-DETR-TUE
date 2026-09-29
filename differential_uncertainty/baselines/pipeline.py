@@ -1,4 +1,4 @@
-"""Resumable phases that compute the four baseline scores on the fixed COCO protocol."""
+"""Resumable phases that compute the baseline scores on the fixed COCO protocol."""
 from __future__ import annotations
 
 import hashlib
@@ -19,9 +19,16 @@ from torch.utils.data import DataLoader, Dataset
 
 from ..extraction import prepare_image
 from . import discopatch, protocol
+from .activation_cdf import BINS as CDF_BINS
+from .activation_cdf import MARGIN as CDF_MARGIN
+from .activation_cdf import STAGES as CDF_STAGES
+from .activation_cdf import CdfMonitor, ChannelRanges, ReferenceHistograms
 from .coco_quality import CocoGroundTruth, coco_map, coco_results
 from .detector import DetectorTap
 from .discopatch import DisCoPatchScorer, train_discopatch
+from .hashemi import K as HASHEMI_K
+from .hashemi import LAYERS as HASHEMI_LAYERS
+from .hashemi import HashemiMonitor, NeuronStats, save_intervals
 from .scores import (contrastive_parts, knn_distances, normalize_rows, query_detections,
                      saod_uncertainty, top_detections)
 
@@ -33,6 +40,7 @@ TIMING_IMAGES = 100
 TIMING_WARMUP = 10
 TEST_KEYS = ("saod_min", "saod_top3", "conf_pos", "conf_neg", "knn",
              "det_scores", "det_labels", "det_boxes", "digests", "size")
+ACTIVATION_KEYS = ("hashemi_decoder", "hashemi_encoder", "cdf_backbone")
 _PACKAGES = ("torch", "torchvision", "numpy", "scipy", "scikit-image", "scikit-learn",
              "imagecorruptions", "uq-detr", "pycocotools", "Pillow")
 
@@ -305,6 +313,120 @@ def phase_discopatch_scores(settings: Settings) -> None:
             _progress("discopatch", done, len(pending), started)
 
 
+def _hashemi_intervals(settings: Settings) -> Path:
+    return settings.output / "hashemi" / "intervals.npz"
+
+
+def _cdf_reference(settings: Settings) -> Path:
+    return settings.output / "cdf" / "reference.npz"
+
+
+def _train_loader(settings: Settings, paths) -> DataLoader:
+    return DataLoader(_Prepared(paths), batch_size=settings.batch_size,
+                      num_workers=settings.workers, pin_memory=True)
+
+
+def phase_hashemi_fit(settings: Settings) -> None:
+    """Per-neuron mean and standard deviation over every clean COCO train image (Hashemi et al., Sec. 3.1)."""
+    path = _hashemi_intervals(settings)
+    if path.exists():
+        return
+    paths = protocol.list_images(settings.train_images)
+    stats = {name: NeuronStats() for name in HASHEMI_LAYERS}
+    started = time.time()
+    with DetectorTap(settings.checkpoint, settings.device, hidden=True) as tap:
+        for index, batch in enumerate(_train_loader(settings, paths)):
+            hidden = tap.forward_hidden(batch)
+            if len(hidden["encoder"]) != len(HASHEMI_LAYERS) - 1:
+                raise ValueError(f"expected the encoder's three output maps, got {len(hidden['encoder'])}")
+            stats["decoder"].update(hidden["decoder"])
+            for name, values in zip(HASHEMI_LAYERS[1:], hidden["encoder"]):
+                stats[name].update(values)
+            if index % 200 == 0:
+                _progress("hashemi-fit", min((index + 1) * settings.batch_size, len(paths)), len(paths), started)
+    save_intervals(path, stats, images=len(paths))
+    _atomic_json(path.with_name("fit.json"), {"images": len(paths), "k": HASHEMI_K,
+                                              "std": "population (ddof=0)", "layers": list(HASHEMI_LAYERS)})
+
+
+def phase_cdf_fit(settings: Settings) -> None:
+    """Per-channel ranges, then training histograms of backbone stages C1-C5 (Becker et al., ICPR 2026)."""
+    path = _cdf_reference(settings)
+    if path.exists():
+        return
+    paths = protocol.list_images(settings.train_images)
+    ranges = {stage: ChannelRanges() for stage in CDF_STAGES}
+    with DetectorTap(settings.checkpoint, settings.device, hidden=True) as tap:
+        started = time.time()
+        for index, batch in enumerate(_train_loader(settings, paths)):
+            stages = tap.forward_hidden(batch)["backbone"]
+            if len(stages) != len(CDF_STAGES):
+                raise ValueError(f"expected the five backbone stages, got {len(stages)}")
+            for stage, values in zip(CDF_STAGES, stages):
+                ranges[stage].update(values)
+            if index % 200 == 0:
+                _progress("cdf-fit ranges", min((index + 1) * settings.batch_size, len(paths)), len(paths), started)
+        reference = ReferenceHistograms({s: r.result() for s, r in ranges.items()}, settings.device)
+        started = time.time()
+        for index, batch in enumerate(_train_loader(settings, paths)):
+            reference.update(tap.forward_hidden(batch)["backbone"])
+            if index % 200 == 0:
+                _progress("cdf-fit histograms", min((index + 1) * settings.batch_size, len(paths)), len(paths), started)
+    reference.save(path, images=len(paths))
+    _atomic_json(path.with_name("fit.json"), {"images": len(paths), "bins": CDF_BINS, "margin": CDF_MARGIN,
+                                              "stages": list(CDF_STAGES), "passes": 2})
+
+
+def _activation_scores(tap, hashemi_monitor, cdf_monitor, arrays, batch_size) -> dict:
+    parts = {key: [] for key in ACTIVATION_KEYS}
+    for start in range(0, len(arrays), batch_size):
+        hidden = tap.forward_hidden(tap.prepare(arrays[start:start + batch_size]))
+        decoder_share, encoder_share = hashemi_monitor.scores(hidden["decoder"], hidden["encoder"])
+        parts["hashemi_decoder"].append(decoder_share)
+        parts["hashemi_encoder"].append(encoder_share)
+        parts["cdf_backbone"].append(cdf_monitor.scores(hidden["backbone"]))
+    return {key: np.concatenate(values) for key, values in parts.items()}
+
+
+def phase_activation_scores(settings: Settings) -> None:
+    """Both activation monitors in one pass over every evaluation image and condition."""
+    fits = {"hashemi": _hashemi_intervals(settings), "cdf": _cdf_reference(settings)}
+    missing = [name for name, path in fits.items() if not path.exists()]
+    if missing:
+        raise ValueError("run the " + " and ".join(f"{name}-fit" for name in missing) + " phase first")
+    folder = settings.output / "test_activation"
+    record = {name: {"path": str(path), "sha1": hashlib.sha1(path.read_bytes()).hexdigest()}
+              for name, path in fits.items()}
+    record.update(hashemi_k=HASHEMI_K, cdf_bins=CDF_BINS)
+    marker = folder / "fits.json"
+    if marker.exists():
+        if json.loads(marker.read_text()) != record:
+            raise ValueError(f"the fitted intervals or reference changed since {marker} was written")
+    else:
+        _atomic_json(marker, record)
+    pending = [p for p in evaluation(settings) if not _valid_existing(folder / f"{p.stem}.npz", ACTIVATION_KEYS)]
+    absent = [p.name for p in pending if not (settings.output / "test" / f"{p.stem}.npz").exists()]
+    if absent:
+        raise ValueError(f"run the test phase first: {len(absent)} detector results are missing, e.g. {absent[0]}")
+    if not pending:
+        return
+    hashemi_monitor = HashemiMonitor(fits["hashemi"], settings.device)
+    cdf_monitor = CdfMonitor(fits["cdf"], settings.device)
+    started = time.time()
+    with DetectorTap(settings.checkpoint, settings.device, hidden=True) as tap:
+        for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
+            stem = Path(name).stem
+            stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
+            if list(stored) != [protocol.digest(a) for a in arrays]:
+                raise ValueError(f"corruptions differ from the detector pass for {name}")
+            values = _activation_scores(tap, hashemi_monitor, cdf_monitor, arrays, settings.batch_size)
+            if not all(np.isfinite(v).all() for v in values.values()):
+                raise ValueError(f"an activation monitor returned non-finite scores for {name}")
+            _atomic_npz(folder / f"{stem}.npz", **values)
+            if done % 25 == 0:
+                _progress("activation", done, len(pending), started)
+
+
 def phase_timing(settings: Settings) -> None:
     """Median ms per image at batch 1 on a warm GPU, preprocessing included."""
     images = [_open(p) for p in evaluation(settings)[:TIMING_IMAGES]]
@@ -350,6 +472,24 @@ def phase_timing(settings: Settings) -> None:
         scorer = DisCoPatchScorer(checkpoint, settings.output / "discopatch", settings.device,
                                   root=settings.discopatch_root)
         result["discopatch_ms"] = timed(lambda array: scorer.score([array], "timing.jpg"))
+    intervals, reference = _hashemi_intervals(settings), _cdf_reference(settings)
+    if intervals.exists() or reference.exists():
+        # a separate tap, so the hidden-layer hooks never touch the other timings
+        with DetectorTap(settings.checkpoint, settings.device, hidden=True) as hidden_tap:
+            if intervals.exists():
+                hashemi_monitor = HashemiMonitor(intervals, settings.device)
+
+                def hashemi_score(array):
+                    hashemi_monitor.decoder_share(hidden_tap.forward_hidden(hidden_tap.prepare([array]))["decoder"])
+
+                result["detector_plus_hashemi_ms"] = timed(hashemi_score)
+            if reference.exists():
+                cdf_monitor = CdfMonitor(reference, settings.device)
+
+                def cdf_score(array):
+                    cdf_monitor.scores(hidden_tap.forward_hidden(hidden_tap.prepare([array]))["backbone"])
+
+                result["detector_plus_cdf_ms"] = timed(cdf_score)
     _atomic_json(settings.output / "timing.json", result)
     print(f"[timing] {result}", flush=True)
 
@@ -362,6 +502,7 @@ def phase_report(settings: Settings) -> None:
 PHASES = {
     "sanity": phase_sanity, "bank": phase_bank, "test": phase_test,
     "train-discopatch": phase_train_discopatch, "discopatch-scores": phase_discopatch_scores,
+    "hashemi-fit": phase_hashemi_fit, "cdf-fit": phase_cdf_fit, "activation-scores": phase_activation_scores,
     "timing": phase_timing, "report": phase_report,
 }
 
