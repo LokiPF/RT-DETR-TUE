@@ -45,7 +45,7 @@
   - **Histograms:** 1,000 bins per channel. The range is the training minimum and maximum, widened by 20% of their span on each side. A channel that was constant in training gets span 1. Values outside the range fall into the edge bins.
   - **Reference:** the histogram of every training image and position, summed, as a CDF.
   - **Distance:** the Earth Mover's distance between the image's per-channel CDF and the reference CDF, in units of the channel's range (the mean |ΔCDF| over bins).
-  - **Score:** the sum over all 1,024 channels. There is no z-scoring, because z-scoring leaves a single score's AUROC unchanged.
+  - **Score (amended after the final review, finding I1):** each stage's channel sum of EMDs is z-scored with mean and spread from 5,000 seeded clean *train* images (phase `cdf-zstats`), and the five z-scores are added (`cdf`, the headline). This is the paper's "z-score normalization" applied per layer. The plain sum over all 1,024 channels is kept as a sensitivity row (`cdf_sum`), because without z-scoring C5's 512 channels dominate it. Per-stage sums (`cdf_stages`, 96 × 5) and per-map Hashemi encoder shares (`hashemi_encoder_maps`, 96 × 3) are stored too.
 - **The ICPR numbers cannot be reproduced exactly:**
   - their 10-level severity extension is not specified;
   - their detectors (Faster R-CNN R50, RT-DETR-l with HGNet) differ from ours.
@@ -1370,7 +1370,7 @@ Send `explore` a message via `SendMessage`: about 4 h at roughly 8 GB for the fi
 
 - [ ] **Step 3: Fit both monitors (about 5–10 min each)**
 
-Run `bash .superpowers/sdd/2026-09-29-hashemi-baseline/launch.sh hashemi-fit 6` and wait for the process to exit. Then do the same with `cdf-fit`.
+Run `bash .superpowers/sdd/2026-09-29-hashemi-baseline/launch.sh hashemi-fit 6` and wait for the process to exit. Then do the same with `cdf-fit`, and then with `cdf-zstats` (about 1 min; 5,000 seeded clean train images). `cdf/zstats.json` must hold five positive `std` values.
 Check with:
 
 ```bash
@@ -1448,7 +1448,7 @@ Then edit `docs/coco-baseline-numbers.md`. Take every number from the new `repor
 - **Setup, baseline table:**
   - a row "Hashemi et al. (FM 2023)": score = share of the last decoder layer's 300 × 256 neurons outside μ ± 2σ, fitted on 118,287 clean train images; mention the encoder-map sensitivity row;
   - a row "Activation CDFs (Becker et al., ICPR 2026), reproduced": score = sum over the 1,024 channels of backbone stages C1–C5 of the EMD between the image's activation CDF and the training CDF; 1,000 bins; ranges ±20%.
-- **Separation tables (common and extra):** three rows from `report.md`.
+- **Separation tables (common and extra):** four rows from `report.md`: both Hashemi variants, the activation CDFs, and the plain-sum CDF sensitivity row.
 - **Per-family table:** two columns, "Hashemi (dec.)" and "Act. CDFs", with AUROC at severity 3 / 5 from `separation.csv` (methods `hashemi` and `cdf`). Update the bold best-at-severity-5 marks.
 - **Harm table, per-severity ρ table and AURC severity-pool table:** rows or columns for all three, from `harm.csv` and `aurc_pools.csv`.
 - **Differences table:** add "Act. CDFs − DisCoPatch", "Act. CDFs − SAOD min", "Hashemi (dec.) − SAOD min" and "Hashemi (dec.) − kNN", from `differences.csv`.

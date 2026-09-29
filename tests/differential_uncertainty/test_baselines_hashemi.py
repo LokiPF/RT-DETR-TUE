@@ -75,3 +75,16 @@ def test_monitor_pools_encoder_neurons_and_needs_all_three_maps(tmp_path):
     assert share[0] == pytest.approx(64 / 84)
     with pytest.raises(ValueError, match="three"):
         monitor.scores(decoder, encoder[:2])
+
+
+def test_encoder_shares_per_map_weight_back_to_the_pooled_share(tmp_path):
+    rng = np.random.default_rng(4)
+    path, shapes = _fitted(tmp_path, rng)
+    monitor = hashemi.HashemiMonitor(path, "cpu")
+    encoder = [torch.from_numpy(rng.normal(size=(2, *shapes[n]))).float() for n in hashemi.LAYERS[1:]]
+    encoder[1] += 5.0                                    # every stride-16 neuron is far outside
+    per_map = monitor.encoder_shares(encoder)
+    _, pooled = monitor.scores(torch.zeros(2, *shapes["decoder"]), encoder)
+    sizes = np.array([64, 16, 4])
+    assert per_map.shape == (2, 3) and np.allclose(per_map[:, 1], 1.0)
+    assert np.allclose((per_map * sizes).sum(axis=1) / sizes.sum(), pooled)

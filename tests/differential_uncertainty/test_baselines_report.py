@@ -141,7 +141,8 @@ def test_build_report_includes_the_activation_monitors_when_scored(tmp_path, mon
     rng = np.random.default_rng(8)
     for path in sorted((settings.output / "test").glob("*.npz")):
         np.savez(folder / path.name, hashemi_decoder=rng.uniform(0, 1, 96), hashemi_encoder=rng.uniform(0, 1, 96),
-                 cdf_backbone=rng.uniform(0, 50, 96))
+                 hashemi_encoder_maps=rng.uniform(0, 1, (96, 3)), cdf_backbone=rng.uniform(0, 50, 96),
+                 cdf_backbone_z=rng.normal(0, 3, 96), cdf_stages=rng.uniform(0, 10, (96, 5)))
     pipeline.run_phase("report", settings)
 
     results = settings.output / "results"
@@ -150,7 +151,7 @@ def test_build_report_includes_the_activation_monitors_when_scored(tmp_path, mon
     assert summary["hashemi_k"] == 2.0 and summary["cdf_bins"] == 1000
     with (results / "harm.csv").open() as handle:
         methods = {row["method"] for row in csv.DictReader(handle)}
-    assert {"hashemi", "hashemi_enc", "cdf"} <= methods
+    assert {"hashemi", "hashemi_enc", "cdf", "cdf_sum"} <= methods
     text = (results / "report.md").read_text()
     assert "Hashemi et al., decoder queries" in text and "Activation CDFs (Becker et al., ICPR 2026)" in text
 
@@ -159,9 +160,10 @@ def test_method_scores_add_the_activation_monitors_only_when_given():
     test = {"saod_top3": np.zeros((2, 96)), "saod_min": np.zeros((2, 96)), "conf_pos": np.ones((2, 96)),
             "conf_neg": np.zeros((2, 96)), "knn": np.zeros((2, 96, 200))}
     activation = {"hashemi_decoder": np.full((2, 96), 0.1), "hashemi_encoder": np.full((2, 96), 0.2),
-                  "cdf_backbone": np.full((2, 96), 3.0)}
+                  "cdf_backbone": np.full((2, 96), 3.0), "cdf_backbone_z": np.full((2, 96), -1.5)}
     scores = report.method_scores(test, None, np.ones(2), activation=activation)
-    assert (scores["hashemi"][0, 0], scores["hashemi_enc"][0, 0], scores["cdf"][0, 0]) == (0.1, 0.2, 3.0)
+    assert (scores["hashemi"][0, 0], scores["hashemi_enc"][0, 0]) == (0.1, 0.2)
+    assert (scores["cdf"][0, 0], scores["cdf_sum"][0, 0]) == (-1.5, 3.0)
     assert "hashemi" not in report.method_scores(test, None, np.ones(2))
 
 

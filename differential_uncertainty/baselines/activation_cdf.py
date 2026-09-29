@@ -3,9 +3,10 @@
 Each channel of each monitored layer is summarised, per image, by a histogram of its activations over all
 spatial positions. The histogram has 1,000 bins on a fixed per-channel range: the training minimum and
 maximum, widened by 20% of their span. It becomes a CDF and is compared with the same channel's CDF pooled
-over all training images, using the Earth Mover's distance in units of the channel's range. The image score
-is the sum over all channels and layers. Their final z-scoring is left out: it does not change a single
-score's AUROC.
+over all training images, using the Earth Mover's distance in units of the channel's range. Two image scores
+are kept: the plain sum over all channels and layers, and the sum over layers of each layer's channel sum
+z-scored with clean-image statistics (their "z-score normalization"). Without the z-scoring, the 512
+channels of C5 dominate the plain sum.
 """
 from __future__ import annotations
 
@@ -104,12 +105,30 @@ class CdfMonitor:
             self.high = {s: torch.from_numpy(data[f"{s}_high"]).float().to(device) for s in STAGES}
             self.cdf = {s: torch.from_numpy(data[f"{s}_cdf"]).float().to(device) for s in STAGES}
 
-    def scores(self, stages) -> np.ndarray:
+    def stage_scores(self, stages) -> np.ndarray:
+        """Per image and stage, the sum over the stage's channels of the EMD to the reference: (n, 5)."""
         if len(stages) != len(STAGES):
             raise ValueError(f"expected the five backbone stages, got {len(stages)}")
-        total = None
+        parts = []
         for stage, values in zip(STAGES, stages):
             counts = channel_histograms(values, self.low[stage], self.high[stage], self.bins)
-            part = emd_to_reference(counts, self.cdf[stage]).double()
-            total = part if total is None else total + part
-        return total.cpu().numpy()
+            parts.append(emd_to_reference(counts, self.cdf[stage]).double())
+        return torch.stack(parts, dim=1).cpu().numpy()
+
+    def scores(self, stages) -> np.ndarray:
+        """The plain sum over all channels of all stages."""
+        return self.stage_scores(stages).sum(axis=1)
+
+
+def stage_zstats(stage_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and population standard deviation of each stage's score over clean images."""
+    stage_scores = np.asarray(stage_scores, dtype=np.float64)
+    mean, std = stage_scores.mean(axis=0), stage_scores.std(axis=0)
+    if not np.all(std > 0):
+        raise ValueError("every stage needs a positive spread over the clean images")
+    return mean, std
+
+
+def zscored_sum(stage_scores: np.ndarray, mean, std) -> np.ndarray:
+    """Sum over stages of each stage's score standardised with clean-image statistics."""
+    return ((np.asarray(stage_scores, dtype=np.float64) - np.asarray(mean)) / np.asarray(std)).sum(axis=1)

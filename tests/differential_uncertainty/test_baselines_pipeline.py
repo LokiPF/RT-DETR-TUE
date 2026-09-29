@@ -259,13 +259,19 @@ def test_activation_scores_cover_every_variant_and_stay_tied_to_their_fits(tmp_p
     with pytest.raises(ValueError, match="cdf-fit"):
         pipeline.run_phase("activation-scores", settings)
     pipeline.run_phase("cdf-fit", settings)
+    with pytest.raises(ValueError, match="cdf-zstats"):
+        pipeline.run_phase("activation-scores", settings)
+    pipeline.run_phase("cdf-zstats", settings)
     pipeline.run_phase("activation-scores", settings)
     files = sorted((settings.output / "test_activation").glob("*.npz"))
     assert len(files) == 2
     with np.load(files[0]) as data:
-        assert all(data[key].shape == (96,) for key in pipeline.ACTIVATION_KEYS)
+        assert set(data.files) == set(pipeline.ACTIVATION_KEYS)
+        assert all(data[key].shape == (96,) for key in ("hashemi_decoder", "hashemi_encoder", "cdf_backbone", "cdf_backbone_z"))
+        assert data["hashemi_encoder_maps"].shape == (96, 3) and data["cdf_stages"].shape == (96, 5)
         assert np.all((data["hashemi_decoder"] >= 0) & (data["hashemi_decoder"] <= 1))
         assert np.all(data["cdf_backbone"] >= 0)
+        assert np.allclose(data["cdf_stages"].sum(axis=1), data["cdf_backbone"])
     reference = settings.output / "cdf" / "reference.npz"
     reference.write_bytes(reference.read_bytes() + b"x")
     with pytest.raises(ValueError, match="changed since"):
@@ -277,6 +283,7 @@ def test_activation_scores_detect_changed_corruptions(tmp_path, hidden_fakes):
     pipeline.run_phase("test", settings)
     pipeline.run_phase("hashemi-fit", settings)
     pipeline.run_phase("cdf-fit", settings)
+    pipeline.run_phase("cdf-zstats", settings)
     victim = sorted((settings.output / "test").glob("*.npz"))[0]
     data = dict(np.load(victim))
     data["digests"] = np.array(["0" * 16] * 96)
@@ -293,3 +300,17 @@ def test_timing_reports_both_activation_monitors_once_they_are_fitted(tmp_path, 
     timing = json.loads((settings.output / "timing.json").read_text())
     assert {"detector_ms", "detector_plus_hashemi_ms", "detector_plus_cdf_ms"} <= set(timing)
     assert "discopatch_ms" not in timing
+
+
+def test_cdf_zstats_standardise_each_stage_on_clean_train_images_once(tmp_path, hidden_fakes):
+    settings = _settings(tmp_path, train_images=_train_images(tmp_path))
+    with pytest.raises(ValueError, match="cdf-fit"):
+        pipeline.run_phase("cdf-zstats", settings)
+    pipeline.run_phase("cdf-fit", settings)
+    pipeline.run_phase("cdf-zstats", settings)
+    stats = json.loads((settings.output / "cdf" / "zstats.json").read_text())
+    assert stats["images"] == 3 and len(stats["mean"]) == 5 and len(stats["std"]) == 5
+    assert all(s > 0 for s in stats["std"])
+    calls = HiddenFakeTap.hidden_calls
+    pipeline.run_phase("cdf-zstats", settings)
+    assert HiddenFakeTap.hidden_calls == calls

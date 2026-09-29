@@ -79,6 +79,16 @@ class HashemiMonitor:
         mean, std = self.stats["decoder"]
         return (outside_counts(decoder, mean, std, self.k).double() / mean.numel()).cpu().numpy()
 
+    def encoder_shares(self, encoder) -> np.ndarray:
+        """Share of neurons outside their interval, per image and encoder map: (n, 3)."""
+        if len(encoder) != len(LAYERS) - 1:
+            raise ValueError(f"expected the encoder's three output maps, got {len(encoder)}")
+        shares = []
+        for name, values in zip(LAYERS[1:], encoder):
+            mean, std = self.stats[name]
+            shares.append(outside_counts(values, mean, std, self.k).double() / mean.numel())
+        return torch.stack(shares, dim=1).cpu().numpy()
+
     def scores(self, decoder: torch.Tensor, encoder) -> tuple[np.ndarray, np.ndarray]:
         """(decoder share, encoder share) per image; the encoder share pools all three maps' neurons."""
         if len(encoder) != len(LAYERS) - 1:

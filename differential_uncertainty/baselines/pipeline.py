@@ -22,7 +22,7 @@ from . import discopatch, protocol
 from .activation_cdf import BINS as CDF_BINS
 from .activation_cdf import MARGIN as CDF_MARGIN
 from .activation_cdf import STAGES as CDF_STAGES
-from .activation_cdf import CdfMonitor, ChannelRanges, ReferenceHistograms
+from .activation_cdf import CdfMonitor, ChannelRanges, ReferenceHistograms, stage_zstats, zscored_sum
 from .coco_quality import CocoGroundTruth, coco_map, coco_results
 from .detector import DetectorTap
 from .discopatch import DisCoPatchScorer, train_discopatch
@@ -40,7 +40,9 @@ TIMING_IMAGES = 100
 TIMING_WARMUP = 10
 TEST_KEYS = ("saod_min", "saod_top3", "conf_pos", "conf_neg", "knn",
              "det_scores", "det_labels", "det_boxes", "digests", "size")
-ACTIVATION_KEYS = ("hashemi_decoder", "hashemi_encoder", "cdf_backbone")
+ACTIVATION_KEYS = ("hashemi_decoder", "hashemi_encoder", "hashemi_encoder_maps",
+                   "cdf_backbone", "cdf_backbone_z", "cdf_stages")
+CDF_ZSTAT_IMAGES = 5000  # seeded sample of clean train images for the per-stage z-statistics
 _PACKAGES = ("torch", "torchvision", "numpy", "scipy", "scikit-image", "scikit-learn",
              "imagecorruptions", "uq-detr", "pycocotools", "Pillow")
 
@@ -321,6 +323,10 @@ def _cdf_reference(settings: Settings) -> Path:
     return settings.output / "cdf" / "reference.npz"
 
 
+def _cdf_zstats(settings: Settings) -> Path:
+    return settings.output / "cdf" / "zstats.json"
+
+
 def _train_loader(settings: Settings, paths) -> DataLoader:
     return DataLoader(_Prepared(paths), batch_size=settings.batch_size,
                       num_workers=settings.workers, pin_memory=True)
@@ -377,23 +383,50 @@ def phase_cdf_fit(settings: Settings) -> None:
                                               "stages": list(CDF_STAGES), "passes": 2})
 
 
-def _activation_scores(tap, hashemi_monitor, cdf_monitor, arrays, batch_size) -> dict:
+def phase_cdf_zstats(settings: Settings) -> None:
+    """Mean and spread of each stage's EMD over a seeded sample of clean train images (for the z-scored sum)."""
+    path = _cdf_zstats(settings)
+    if path.exists():
+        return
+    reference = _cdf_reference(settings)
+    if not reference.exists():
+        raise ValueError(f"run the cdf-fit phase first: {reference} is missing")
+    paths = protocol.list_images(settings.train_images)
+    chosen = np.sort(np.random.default_rng(settings.seed).choice(len(paths), size=min(CDF_ZSTAT_IMAGES, len(paths)),
+                                                                replace=False))
+    monitor = CdfMonitor(reference, settings.device)
+    values = []
+    with DetectorTap(settings.checkpoint, settings.device, hidden=True) as tap:
+        for batch in _train_loader(settings, [paths[i] for i in chosen]):
+            values.append(monitor.stage_scores(tap.forward_hidden(batch)["backbone"]))
+    mean, std = stage_zstats(np.concatenate(values))
+    _atomic_json(path, {"images": len(chosen), "seed": settings.seed, "stages": list(CDF_STAGES),
+                        "mean": mean.tolist(), "std": std.tolist(),
+                        "reference_sha1": hashlib.sha1(reference.read_bytes()).hexdigest()})
+
+
+def _activation_scores(tap, hashemi_monitor, cdf_monitor, zstats, arrays, batch_size) -> dict:
     parts = {key: [] for key in ACTIVATION_KEYS}
     for start in range(0, len(arrays), batch_size):
         hidden = tap.forward_hidden(tap.prepare(arrays[start:start + batch_size]))
         decoder_share, encoder_share = hashemi_monitor.scores(hidden["decoder"], hidden["encoder"])
+        stage_scores = cdf_monitor.stage_scores(hidden["backbone"])
         parts["hashemi_decoder"].append(decoder_share)
         parts["hashemi_encoder"].append(encoder_share)
-        parts["cdf_backbone"].append(cdf_monitor.scores(hidden["backbone"]))
+        parts["hashemi_encoder_maps"].append(hashemi_monitor.encoder_shares(hidden["encoder"]))
+        parts["cdf_backbone"].append(stage_scores.sum(axis=1))
+        parts["cdf_backbone_z"].append(zscored_sum(stage_scores, zstats["mean"], zstats["std"]))
+        parts["cdf_stages"].append(stage_scores)
     return {key: np.concatenate(values) for key, values in parts.items()}
 
 
 def phase_activation_scores(settings: Settings) -> None:
     """Both activation monitors in one pass over every evaluation image and condition."""
-    fits = {"hashemi": _hashemi_intervals(settings), "cdf": _cdf_reference(settings)}
-    missing = [name for name, path in fits.items() if not path.exists()]
+    fits = {"hashemi-fit": _hashemi_intervals(settings), "cdf-fit": _cdf_reference(settings),
+            "cdf-zstats": _cdf_zstats(settings)}
+    missing = [phase for phase, path in fits.items() if not path.exists()]
     if missing:
-        raise ValueError("run the " + " and ".join(f"{name}-fit" for name in missing) + " phase first")
+        raise ValueError("run the " + " and ".join(missing) + " phase first")
     folder = settings.output / "test_activation"
     record = {name: {"path": str(path), "sha1": hashlib.sha1(path.read_bytes()).hexdigest()}
               for name, path in fits.items()}
@@ -410,8 +443,9 @@ def phase_activation_scores(settings: Settings) -> None:
         raise ValueError(f"run the test phase first: {len(absent)} detector results are missing, e.g. {absent[0]}")
     if not pending:
         return
-    hashemi_monitor = HashemiMonitor(fits["hashemi"], settings.device)
-    cdf_monitor = CdfMonitor(fits["cdf"], settings.device)
+    hashemi_monitor = HashemiMonitor(fits["hashemi-fit"], settings.device)
+    cdf_monitor = CdfMonitor(fits["cdf-fit"], settings.device)
+    zstats = json.loads(fits["cdf-zstats"].read_text())
     started = time.time()
     with DetectorTap(settings.checkpoint, settings.device, hidden=True) as tap:
         for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
@@ -419,7 +453,7 @@ def phase_activation_scores(settings: Settings) -> None:
             stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
             if list(stored) != [protocol.digest(a) for a in arrays]:
                 raise ValueError(f"corruptions differ from the detector pass for {name}")
-            values = _activation_scores(tap, hashemi_monitor, cdf_monitor, arrays, settings.batch_size)
+            values = _activation_scores(tap, hashemi_monitor, cdf_monitor, zstats, arrays, settings.batch_size)
             if not all(np.isfinite(v).all() for v in values.values()):
                 raise ValueError(f"an activation monitor returned non-finite scores for {name}")
             _atomic_npz(folder / f"{stem}.npz", **values)
@@ -502,7 +536,8 @@ def phase_report(settings: Settings) -> None:
 PHASES = {
     "sanity": phase_sanity, "bank": phase_bank, "test": phase_test,
     "train-discopatch": phase_train_discopatch, "discopatch-scores": phase_discopatch_scores,
-    "hashemi-fit": phase_hashemi_fit, "cdf-fit": phase_cdf_fit, "activation-scores": phase_activation_scores,
+    "hashemi-fit": phase_hashemi_fit, "cdf-fit": phase_cdf_fit, "cdf-zstats": phase_cdf_zstats,
+    "activation-scores": phase_activation_scores,
     "timing": phase_timing, "report": phase_report,
 }
 

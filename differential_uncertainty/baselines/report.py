@@ -16,13 +16,14 @@ from . import metrics, protocol
 from .coco_quality import (CocoGroundTruth, coco_map, coco_results, image_lrp, per_image_ap,
                            select_lrp_threshold)
 
-METHODS = ("saod_top3", "saod_min", "contrastive", "knn", "discopatch", "hashemi", "hashemi_enc", "cdf")
+METHODS = ("saod_top3", "saod_min", "contrastive", "knn", "discopatch", "hashemi", "hashemi_enc", "cdf", "cdf_sum")
 LABELS = {"saod_top3": "SAOD, mean of top 3", "saod_min": "SAOD, min (1 − max confidence)",
           "contrastive": "ContrastiveConf", "knn": "kNN (k = 100)", "discopatch": "DisCoPatch",
           "hashemi": "Hashemi et al., decoder queries",
           "hashemi_enc": "Hashemi et al., encoder maps (sensitivity)",
-          "cdf": "Activation CDFs (Becker et al., ICPR 2026)"}
-ACTIVATION_ARRAYS = ("hashemi_decoder", "hashemi_encoder", "cdf_backbone")
+          "cdf": "Activation CDFs (Becker et al., ICPR 2026)",
+          "cdf_sum": "Activation CDFs, plain channel sum (sensitivity)"}
+ACTIVATION_ARRAYS = ("hashemi_decoder", "hashemi_encoder", "cdf_backbone_z", "cdf_backbone")
 KNN_K = 100
 KNN_KS = (1, 10, 50, 100, 200)
 SEPARATION = ("auroc", "aupr", "fpr95")
@@ -45,7 +46,8 @@ def method_scores(test: dict, dcp, per_image_lambda, k: int = KNN_K, activation=
     if activation is not None:
         scores["hashemi"] = activation["hashemi_decoder"]
         scores["hashemi_enc"] = activation["hashemi_encoder"]
-        scores["cdf"] = activation["cdf_backbone"]
+        scores["cdf"] = activation["cdf_backbone_z"]
+        scores["cdf_sum"] = activation["cdf_backbone"]
     return scores
 
 
