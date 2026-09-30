@@ -173,3 +173,12 @@ def test_differences_cover_every_separation_metric_for_both_family_groups():
         for group in ("common", "extra"):
             key = f"saod_top3 - knn:{metric}_{group}"
             assert numbers[key] == pytest.approx(numbers[f"saod_top3:{metric}_{group}"] - numbers[f"knn:{metric}_{group}"])
+
+
+def test_write_outputs_takes_other_methods_labels_and_title(tmp_path):
+    scores = {"mine": np.random.default_rng(0).normal(size=(6, len(protocol.CONDITIONS)))}
+    rows = report.separation_rows(scores, protocol.assign_folds(6))
+    report.write_outputs(tmp_path, {"separation": rows, "aggregates": report.aggregate_rows(rows)}, {"x": 1},
+                         methods=("mine",), labels={"mine": "My method"}, title="# Pilot")
+    text = (tmp_path / "report.md").read_text()
+    assert text.startswith("# Pilot") and "My method" in text

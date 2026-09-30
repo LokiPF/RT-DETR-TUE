@@ -176,11 +176,11 @@ def _with_ci(intervals: dict, key: str) -> str:
     return "–" if row is None else f"{_fmt(row['point'])} [{_fmt(row['low'])}, {_fmt(row['high'])}]"
 
 
-def _markdown(tables: dict, summary: dict) -> str:
+def _markdown(tables: dict, summary: dict, methods=METHODS, labels=LABELS, title="# COCO baseline numbers") -> str:
     intervals = {r["quantity"]: r for r in tables.get("intervals", []) + tables.get("differences", [])}
     aggregates = tables.get("aggregates", [])
-    present = [m for m in METHODS if any(r["method"] == m for r in aggregates)]
-    lines = ["# COCO baseline numbers", "",
+    present = [m for m in methods if any(r["method"] == m for r in aggregates)]
+    lines = [title, "",
              "All scores are oriented so that higher means more likely degraded. AUROC and AUPR: higher is "
              "better (chance 0.5). FPR95: lower is better. Brackets are 95% paired bootstrap intervals over "
              "images.", ""]
@@ -191,7 +191,7 @@ def _markdown(tables: dict, summary: dict) -> str:
         for method in present:
             cells = {r["severity"]: r for r in aggregates if r["method"] == method and r["group"] == group}
             by_severity = " | ".join(_fmt(cells[s]["auroc"]) if s in cells else "–" for s in protocol.SEVERITIES)
-            lines.append(f"| {LABELS[method]} | {by_severity} | "
+            lines.append(f"| {labels[method]} | {by_severity} | "
                          f"{_with_ci(intervals, f'{method}:auroc_{group}') if intervals else _fmt(cells['all']['auroc'])} | "
                          f"{_with_ci(intervals, f'{method}:aupr_{group}') if intervals else _fmt(cells['all']['aupr'])} | "
                          f"{_with_ci(intervals, f'{method}:fpr95_{group}') if intervals else _fmt(cells['all']['fpr95'])} |")
@@ -205,7 +205,7 @@ def _markdown(tables: dict, summary: dict) -> str:
         for row in harm:
             m = row["method"]
             pool = pools.get((m, "all"), {})
-            lines.append(f"| {LABELS[m]} | {_fmt(row['rho_condition_map'])} | "
+            lines.append(f"| {labels[m]} | {_fmt(row['rho_condition_map'])} | "
                          f"{_with_ci(intervals, f'{m}:rho_condition_lrp')} | {_with_ci(intervals, f'{m}:rho_within')} | "
                          f"{_with_ci(intervals, f'{m}:aurc_all')} ({_fmt(pool.get('aurc_oracle'))}) |")
         lines.append("")
@@ -226,14 +226,15 @@ def _markdown(tables: dict, summary: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_outputs(folder, tables: dict, summary: dict) -> None:
+def write_outputs(folder, tables: dict, summary: dict, methods=METHODS, labels=LABELS,
+                  title="# COCO baseline numbers") -> None:
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     for name, rows in tables.items():
         if rows:
             _write_csv(folder / f"{name}.csv", rows)
     (folder / "summary.json").write_text(json.dumps(summary, indent=2, sort_keys=True, default=str) + "\n")
-    (folder / "report.md").write_text(_markdown(tables, summary))
+    (folder / "report.md").write_text(_markdown(tables, summary, methods, labels, title))
 
 
 def _stack(folder: Path, names, keys) -> dict:

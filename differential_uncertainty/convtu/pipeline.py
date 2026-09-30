@@ -290,5 +290,10 @@ def phase_scores(settings: Settings) -> None:
                 _progress("convtu-scores", done, len(pending), started)
 
 
+def phase_report(settings: Settings) -> None:
+    from .report import build_pilot_report
+    build_pilot_report(settings, [p.name for p in pilot_images(settings)])
+
+
 PHASES = {"convtu-calibrate": phase_calibrate, "convtu-bank": phase_bank, "convtu-zstats": phase_zstats,
-          "convtu-scores": phase_scores}
+          "convtu-scores": phase_scores, "convtu-report": phase_report}
