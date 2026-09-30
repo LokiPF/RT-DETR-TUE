@@ -8,14 +8,17 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 
 from ..baselines import protocol
-from ..baselines.activation_cdf import stage_zstats
-from ..baselines.pipeline import Settings, _atomic_json, _atomic_npz, _progress, _train_loader
-from ..extraction import load_frozen_detector
+from ..baselines.activation_cdf import stage_zstats, zscored_sum
+from ..baselines.pipeline import (TEST_KEYS, Settings, _atomic_json, _atomic_npz, _load_npz, _progress,
+                                  _train_loader, _valid_existing, _variant_stream, evaluation)
+from ..extraction import load_frozen_detector, prepare_image
 from .features import KNN_NEIGHBOURS, REPRESENTATIONS, knn_scores, layer_features, layer_specs
 from .graph import EDGE_CAP, FRACTION, conv_top_merges, heaviest_weight
 from .tap import LAYER_NAMES, ConvInputs
@@ -25,6 +28,9 @@ BANK_IMAGES = 2000
 ZSTAT_IMAGES = 500
 CUT_MARGIN = 0.5    # each layer's cut: half the smallest K-th value over the calibration images
 START_MULTIPLE = 8  # calibration starts each image at its (8 K)-th heaviest edge
+PILOT_IMAGES = 200  # the first images of the seed-44 evaluation order, all 96 conditions
+IMAGE_SIZE = (640, 640)
+SCORE_KEYS = (*REPRESENTATIONS, *(f"{rep}_layers" for rep in REPRESENTATIONS), "tau_k", "read", "rounds")
 
 
 def _folder(settings: Settings):
@@ -222,4 +228,67 @@ def phase_zstats(settings: Settings) -> None:
                         "neighbours": KNN_NEIGHBOURS, "stats": stats, "bank_sha1": _sha1(bank_path(settings))})
 
 
-PHASES = {"convtu-calibrate": phase_calibrate, "convtu-bank": phase_bank, "convtu-zstats": phase_zstats}
+def pilot_images(settings: Settings) -> list:
+    return evaluation(settings)[:PILOT_IMAGES]
+
+
+def image_scores(taps, arrays, bank, zstats, cuts, batch_size) -> dict:
+    """Every condition of one image: per-layer kNN distances, their z-scored sums and the diagnostics."""
+    rows, specs = [], None
+    for start in range(0, len(arrays), batch_size):
+        batch = torch.stack([prepare_image(Image.fromarray(a), IMAGE_SIZE) for a in arrays[start:start + batch_size]])
+        inputs = taps(batch.to(taps.kernels[0].device))
+        specs = specs or layer_specs(inputs, taps.kernels)
+        rows += features_of(inputs, taps.kernels, specs, cuts)
+    out = {}
+    for rep, values in layer_scores(rows, bank, specs).items():
+        stats = zstats["stats"][rep]
+        out[f"{rep}_layers"] = values
+        out[rep] = zscored_sum(values, stats["mean"], stats["std"])
+    for key in ("tau_k", "read", "rounds"):
+        out[key] = np.array([[row[f"{key}_{spec.name}"] for spec in specs] for row in rows])
+    if not all(np.isfinite(value).all() for value in out.values()):
+        raise ValueError("conv-TU produced non-finite scores")
+    return out
+
+
+def phase_scores(settings: Settings) -> None:
+    """The fingerprint and its three controls for every condition of the pilot images."""
+    fits = {"convtu-calibrate": calibration_path(settings), "convtu-bank": bank_path(settings),
+            "convtu-zstats": zstats_path(settings)}
+    missing = [phase for phase, path in fits.items() if not path.exists()]
+    if missing:
+        raise ValueError("run the " + " and ".join(missing) + " phase first")
+    folder = settings.output / "test_convtu"
+    record = {phase: {"path": str(path), "sha1": _sha1(path)} for phase, path in fits.items()}
+    marker = folder / "fits.json"
+    if marker.exists():
+        if json.loads(marker.read_text()) != record:
+            raise ValueError(f"the calibration, bank or z-statistics changed since {marker} was written")
+    else:
+        _atomic_json(marker, record)
+    pending = [p for p in pilot_images(settings) if not _valid_existing(folder / f"{p.stem}.npz", SCORE_KEYS)]
+    absent = [p.name for p in pending if not (settings.output / "test" / f"{p.stem}.npz").exists()]
+    if absent:
+        raise ValueError(f"run the test phase first: {len(absent)} detector results are missing, e.g. {absent[0]}")
+    if not pending:
+        return
+    cuts = _cuts(settings)
+    bank = load_bank(settings, settings.device)
+    zstats = json.loads(fits["convtu-zstats"].read_text())
+    if zstats["bank_sha1"] != _sha1(bank_path(settings)):
+        raise ValueError("the bank changed since the z-statistics were computed")
+    started = time.time()
+    with _conv_inputs(settings) as taps:
+        for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
+            stem = Path(name).stem
+            stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
+            if list(stored) != [protocol.digest(a) for a in arrays]:
+                raise ValueError(f"corruptions differ from the detector pass for {name}")
+            _atomic_npz(folder / f"{stem}.npz", **image_scores(taps, arrays, bank, zstats, cuts, settings.batch_size))
+            if done % 5 == 0:
+                _progress("convtu-scores", done, len(pending), started)
+
+
+PHASES = {"convtu-calibrate": phase_calibrate, "convtu-bank": phase_bank, "convtu-zstats": phase_zstats,
+          "convtu-scores": phase_scores}

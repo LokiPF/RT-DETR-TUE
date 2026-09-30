@@ -72,3 +72,57 @@ def test_zstats_refuse_a_bank_from_another_calibration(small):
     path.write_text(json.dumps(record))
     with pytest.raises(ValueError, match="calibration changed"):
         baselines.run_phase("convtu-zstats", small)
+
+
+import torch
+
+from convtu_fakes import FakeTap
+
+
+@pytest.fixture
+def detector(monkeypatch):
+    monkeypatch.setattr(baselines, "DetectorTap", FakeTap)
+    monkeypatch.setattr(baselines, "_load_bank",
+                        lambda _s, _d: torch.nn.functional.normalize(torch.randn(256, 512), dim=1))
+
+
+def _pilot(settings):
+    for phase in ("test", "convtu-calibrate", "convtu-bank", "convtu-zstats", "convtu-scores"):
+        baselines.run_phase(phase, settings)
+
+
+def test_scores_phase_writes_every_condition_and_resumes(small, detector, monkeypatch):
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)
+    _pilot(small)
+    files = sorted((small.output / "test_convtu").glob("*.npz"))
+    assert len(files) == 2
+    with np.load(files[0]) as scores:
+        assert scores["mst"].shape == (96,) and scores["mst_layers"].shape == (96, 4)
+        assert scores["tau_k"].shape == (96, 4) and np.isfinite(scores["acts"]).all()
+    stamp = files[0].stat().st_mtime_ns
+    baselines.run_phase("convtu-scores", small)
+    assert files[0].stat().st_mtime_ns == stamp
+
+
+def test_scores_phase_detects_changed_corruptions(small, detector, monkeypatch):
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)
+    _pilot(small)
+    stem = sorted((small.output / "test_convtu").glob("*.npz"))[0].stem
+    (small.output / "test_convtu" / f"{stem}.npz").unlink()
+    stored = dict(np.load(small.output / "test" / f"{stem}.npz"))
+    stored["digests"] = stored["digests"].copy()
+    stored["digests"][5] = "0" * 16
+    np.savez(small.output / "test" / f"{stem}.npz", **stored)
+    with pytest.raises(ValueError, match="corruptions differ"):
+        baselines.run_phase("convtu-scores", small)
+
+
+def test_scores_phase_refuses_changed_fits(small, detector, monkeypatch):
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)
+    _pilot(small)
+    path = convtu.zstats_path(small)
+    record = json.loads(path.read_text())
+    record["images"] += 1
+    path.write_text(json.dumps(record))
+    with pytest.raises(ValueError, match="changed since"):
+        baselines.run_phase("convtu-scores", small)

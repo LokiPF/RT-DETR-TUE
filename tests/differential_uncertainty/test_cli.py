@@ -109,7 +109,7 @@ def test_cli_accepts_the_convtu_phases(monkeypatch, tmp_path):
     monkeypatch.setattr(pipeline, "run_phase", lambda phase, settings: seen.append(phase))
     base = ["--output", str(tmp_path / "out"), "--checkpoint", "c.pth", "--coco-train-images", "train",
             "--coco-val-images", "val", "--coco-annotations", "ann.json", "--discopatch-root", "dcp"]
-    phases = ("convtu-calibrate", "convtu-bank", "convtu-zstats")
+    phases = ("convtu-calibrate", "convtu-bank", "convtu-zstats", "convtu-scores")
     for phase in phases:
         assert cli.main(["baselines-coco", "--phase", phase, *base]) == 0
     assert tuple(seen) == phases

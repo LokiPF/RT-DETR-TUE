@@ -542,7 +542,7 @@ PHASES = {
 }
 
 
-CONVTU_PHASES = ("convtu-calibrate", "convtu-bank", "convtu-zstats")
+CONVTU_PHASES = ("convtu-calibrate", "convtu-bank", "convtu-zstats", "convtu-scores")
 
 
 def _convtu_phase(name: str):
