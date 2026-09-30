@@ -65,7 +65,7 @@
    - Pinned by `test_scores_phase_detects_changed_corruptions` (Task 6).
 5. **A crash in the middle of the scoring phase.** Other sessions can take GPU memory at any time.
    - Expected: finished images are kept, and a rerun continues with the rest.
-   - Pinned by `test_scores_phase_writes_every_condition_and_resumes` (Task 6). `peak_gpu_gib` in the calibration output feeds the Task 8 gate.
+   - Pinned by `test_scores_phase_writes_every_condition_and_resumes` (Task 6). `peak_gpu_reserved_gib` in the calibration output feeds the Task 8 gate.
 
 ---
 
@@ -945,7 +945,7 @@ git commit -m "feat: conv-TU fingerprint, its three controls and an unnormalized
   - `_cuts(settings) -> dict[str, float]`, `_conv_inputs(settings) -> ConvInputs`: tests replace the latter
   - `PHASES` with `convtu-calibrate`, `convtu-bank`, `convtu-zstats`
 - Output formats:
-  - `convtu/calibration.json`: `{"images", "seed", "fraction", "cut_margin", "edge_cap", "peak_gpu_gib", "layers": {"s1": {"conv", "input_shape", "nodes", "k", "cut", "tau_k", "tau_k_cv", "edges_read", "edges_gathered_at_cut", "rounds_at_cut_max", "ms_per_image"}, …}}`. The quantile entries are `{"min", "p50", "p90", "p99", "max"}`.
+  - `convtu/calibration.json`: `{"images", "seed", "fraction", "cut_margin", "edge_cap", "peak_gpu_allocated_gib", "peak_gpu_reserved_gib", "layers": {"s1": {"conv", "input_shape", "nodes", "k", "cut", "tau_k", "tau_k_cv", "edges_read", "edges_gathered_at_cut", "rounds_at_cut_max", "ms_per_image"}, …}}`. The quantile entries are `{"min", "p50", "p90", "p99", "max"}`.
   - `convtu/bank.npz`: `calibration_sha1` plus `f"{rep}_{s}"` arrays of shape `(2000, k)`; `means_*` are `(2000, C)`.
   - `convtu/zstats.json`: `{"images", "layers", "neighbours", "stats": {rep: {"mean": [4], "std": [4]}}, "bank_sha1"}`.
 
@@ -1816,7 +1816,7 @@ OUT=/home/yuchen/YuchenZ/UE/philip_sa/runs/coco-baselines
 mkdir -p "$OUT/logs"
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 setsid nohup /home/yuchen/miniconda3/envs/UE/bin/python -m differential_uncertainty baselines-coco \
-  --phase "$PHASE" --workers "$WORKERS" --output "$OUT" \
+  --phase "$PHASE" --workers "$WORKERS" --batch-size 8 --output "$OUT" \
   --checkpoint /home/yuchen/YuchenZ/UE/RT-DETRv2-UE/pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth \
   --coco-train-images /home/yuchen/YuchenZ/Datasets/coco/train2017 \
   --coco-val-images /home/yuchen/YuchenZ/Datasets/coco/val2017 \
@@ -1833,7 +1833,7 @@ Expected: `runs/coco-baselines/convtu/calibration.json` exists, and `logs/convtu
 - [ ] **Step 3: Check the calibration gate**
 
 Read `convtu/calibration.json`. All four must hold:
-- (a) `peak_gpu_gib` ≤ 4.5. The scoring phase adds the bank, about 1.5 GB, on top of this peak.
+- (a) `peak_gpu_reserved_gib` ≤ 3.5. The scoring phase adds the bank, about 1.5 GB. Every GPU phase also caps its allocator at `GPU_MEMORY_CAP_GIB` = 5.5 GiB, and the CUDA context adds about 0.5 GiB, so the pilot stays near 6 GiB even at its worst. (Changed after the final review, finding I1: the allocated peak alone undercounts what the other sessions see.)
 - (b) `rounds_at_cut_max` ≤ 2 in every layer;
 - (c) `edges_gathered_at_cut.max` ≤ 32,000,000 in every layer;
 - (d) the projected scoring time is at most 4 h. The projection is 1.5 × 19,200 × Σ over layers of `ms_per_image.p50` / 3.6e6 hours; the factor 1.5 covers the backbone pass and the kNN, which `ms_per_image` leaves out.

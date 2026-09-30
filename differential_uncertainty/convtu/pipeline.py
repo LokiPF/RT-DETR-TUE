@@ -28,6 +28,7 @@ BANK_IMAGES = 2000
 ZSTAT_IMAGES = 500
 CUT_MARGIN = 0.5    # each layer's cut: half the smallest K-th value over the calibration images
 START_MULTIPLE = 8  # calibration starts each image at its (8 K)-th heaviest edge
+GPU_MEMORY_CAP_GIB = 5.5  # the pilot's allocator limit on the shared GPU; the CUDA context adds about 0.5 GiB
 PILOT_IMAGES = 200  # the first images of the seed-44 evaluation order, all 96 conditions
 IMAGE_SIZE = (640, 640)
 SCORE_KEYS = (*REPRESENTATIONS, *(f"{rep}_layers" for rep in REPRESENTATIONS), "tau_k", "read", "rounds")
@@ -78,6 +79,23 @@ def _sync(device) -> None:
         torch.cuda.synchronize()
 
 
+def _cap_gpu_memory(device) -> None:
+    """Make the pilot run out of memory itself before it squeezes the other sessions on the shared GPU."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        return
+    total = torch.cuda.get_device_properties(device).total_memory
+    torch.cuda.set_per_process_memory_fraction(min(1.0, GPU_MEMORY_CAP_GIB * 2**30 / total), device)
+
+
+def _gpu_memory_record(device) -> dict:
+    """Peak allocated and peak reserved memory; the reserved peak is what the other sessions see."""
+    if torch.device(device).type != "cuda":
+        return {"peak_gpu_allocated_gib": None, "peak_gpu_reserved_gib": None}
+    return {"peak_gpu_allocated_gib": torch.cuda.max_memory_allocated() / 2**30,
+            "peak_gpu_reserved_gib": torch.cuda.max_memory_reserved() / 2**30}
+
+
 def _quantiles(values) -> dict:
     values = np.asarray(values, dtype=np.float64)
     return {"min": float(values.min()), "p50": float(np.median(values)), "p90": float(np.quantile(values, 0.9)),
@@ -97,6 +115,7 @@ def phase_calibrate(settings: Settings) -> None:
     path = calibration_path(settings)
     if path.exists():
         return
+    _cap_gpu_memory(settings.device)
     on_gpu = torch.device(settings.device).type == "cuda"
     tau, read, specs = [], [], None
     with _conv_inputs(settings) as taps:
@@ -145,8 +164,7 @@ def phase_calibrate(settings: Settings) -> None:
         }
     _atomic_json(path, {"images": int(tau.shape[0]), "seed": settings.seed, "fraction": FRACTION,
                         "cut_margin": CUT_MARGIN, "edge_cap": EDGE_CAP,
-                        "peak_gpu_gib": torch.cuda.max_memory_allocated() / 2**30 if on_gpu else None,
-                        "layers": layers})
+                        **_gpu_memory_record(settings.device), "layers": layers})
 
 
 def _cuts(settings: Settings) -> dict:
@@ -175,6 +193,7 @@ def phase_bank(settings: Settings) -> None:
     if path.exists():
         return
     cuts = _cuts(settings)
+    _cap_gpu_memory(settings.device)
     rows, specs, started = [], None, time.time()
     with _conv_inputs(settings) as taps:
         for batch in _clean_batches(settings, "bank"):
@@ -213,6 +232,7 @@ def phase_zstats(settings: Settings) -> None:
     if path.exists():
         return
     cuts = _cuts(settings)
+    _cap_gpu_memory(settings.device)
     bank = load_bank(settings, settings.device)
     rows, specs = [], None
     with _conv_inputs(settings) as taps:
@@ -274,6 +294,7 @@ def phase_scores(settings: Settings) -> None:
     if not pending:
         return
     cuts = _cuts(settings)
+    _cap_gpu_memory(settings.device)
     bank = load_bank(settings, settings.device)
     zstats = json.loads(fits["convtu-zstats"].read_text())
     if zstats["bank_sha1"] != _sha1(bank_path(settings)):

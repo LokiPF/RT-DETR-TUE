@@ -126,3 +126,32 @@ def test_scores_phase_refuses_changed_fits(small, detector, monkeypatch):
     path.write_text(json.dumps(record))
     with pytest.raises(ValueError, match="changed since"):
         baselines.run_phase("convtu-scores", small)
+
+
+def test_gpu_memory_record_reports_allocated_and_reserved_peaks(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "max_memory_allocated", lambda device=None: 3 * 2**30)
+    monkeypatch.setattr(torch.cuda, "max_memory_reserved", lambda device=None: 4 * 2**30)
+    assert convtu._gpu_memory_record("cuda:0") == {"peak_gpu_allocated_gib": 3.0, "peak_gpu_reserved_gib": 4.0}
+    assert convtu._gpu_memory_record("cpu") == {"peak_gpu_allocated_gib": None, "peak_gpu_reserved_gib": None}
+
+
+def test_gpu_cap_limits_the_process_to_its_share_of_the_card(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda device: type("Properties", (), {"total_memory": 32 * 2**30})())
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction",
+                        lambda fraction, device=None: calls.append((fraction, device)))
+    convtu._cap_gpu_memory("cuda:0")
+    assert calls == [(convtu.GPU_MEMORY_CAP_GIB / 32, torch.device("cuda:0"))]
+    convtu._cap_gpu_memory("cpu")
+    assert len(calls) == 1
+
+
+def test_every_gpu_phase_caps_its_memory_first(small, detector, monkeypatch):
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)
+    capped = []
+    monkeypatch.setattr(convtu, "_cap_gpu_memory", lambda device: capped.append(device))
+    _pilot(small)
+    assert capped == ["cpu"] * 4
+    calibration = json.loads(convtu.calibration_path(small).read_text())
+    assert calibration["peak_gpu_reserved_gib"] is None and "peak_gpu_gib" not in calibration
