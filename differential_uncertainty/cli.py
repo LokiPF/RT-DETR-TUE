@@ -42,7 +42,8 @@ def build_parser() -> argparse.ArgumentParser:
     baselines = commands.add_parser("baselines-coco")
     baselines.add_argument("--phase", required=True,
                            choices=["sanity", "bank", "test", "train-discopatch", "discopatch-scores",
-                                    "hashemi-fit", "cdf-fit", "cdf-zstats", "activation-scores", "timing", "report"])
+                                    "hashemi-fit", "cdf-fit", "cdf-zstats", "activation-scores", "timing", "report",
+                                    "convtu-calibrate", "convtu-bank", "convtu-zstats"])
     baselines.add_argument("--output", required=True)
     baselines.add_argument("--checkpoint", required=True)
     baselines.add_argument("--coco-train-images", required=True)

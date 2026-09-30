@@ -101,3 +101,15 @@ def test_cli_accepts_the_activation_monitor_phases(monkeypatch, tmp_path):
     for phase in phases:
         assert cli.main(["baselines-coco", "--phase", phase, *base]) == 0
     assert tuple(seen) == phases
+
+
+def test_cli_accepts_the_convtu_phases(monkeypatch, tmp_path):
+    import differential_uncertainty.baselines.pipeline as pipeline
+    seen = []
+    monkeypatch.setattr(pipeline, "run_phase", lambda phase, settings: seen.append(phase))
+    base = ["--output", str(tmp_path / "out"), "--checkpoint", "c.pth", "--coco-train-images", "train",
+            "--coco-val-images", "val", "--coco-annotations", "ann.json", "--discopatch-root", "dcp"]
+    phases = ("convtu-calibrate", "convtu-bank", "convtu-zstats")
+    for phase in phases:
+        assert cli.main(["baselines-coco", "--phase", phase, *base]) == 0
+    assert tuple(seen) == phases

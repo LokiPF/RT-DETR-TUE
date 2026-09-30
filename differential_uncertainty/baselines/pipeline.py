@@ -542,6 +542,19 @@ PHASES = {
 }
 
 
+CONVTU_PHASES = ("convtu-calibrate", "convtu-bank", "convtu-zstats")
+
+
+def _convtu_phase(name: str):
+    def run(settings: Settings) -> None:
+        from ..convtu import pipeline as convtu  # imported late: convtu.pipeline imports this module
+        convtu.PHASES[name](settings)
+    return run
+
+
+PHASES.update({name: _convtu_phase(name) for name in CONVTU_PHASES})
+
+
 def run_phase(phase: str, settings: Settings) -> None:
     if phase not in PHASES:
         raise ValueError(f"unknown phase {phase!r}; choose from {sorted(PHASES)}")
