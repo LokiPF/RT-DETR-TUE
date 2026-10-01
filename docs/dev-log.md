@@ -63,8 +63,13 @@ Both are judged against the 50 clean bank images nearest in standardised stage-4
 - Positions 1970–4999 (about 3,030 images) are unread by anyone, so they are the clean confirmation set for these rows.
 - The pre-registered decision on the level row is unaffected, because its rule was fixed beforehand. It will also be reported on 1970–4999.
 
-**Open decisions (user):**
-- the headline row and its rule, before 1970–4999 are read. The proposal is M1 primary on 1970–4999 with AC as the ablation; the alternative is panelist A's frozen rule;
+**Decided (user, 19:30, before 1970–4999 were read).**
+- **The headline:** M1, the two-axis score.
+- **The images:** all 5,000 val images, so that it is comparable with the baselines.
+- **The check:** the 3,030 untouched images. The rule is in the plan's amendment 2. AC is the ablation.
+- **The clean bank stays COCO train only:** 2,000 images, plus 500 for the z-statistics, the same source as the baselines' references.
+
+**Still open (user):**
 - the downloads of Foggy Cityscapes and ACDC;
 - the framing, "corruptions flatten or shift the early channels".
 

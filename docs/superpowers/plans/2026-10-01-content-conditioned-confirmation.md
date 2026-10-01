@@ -22,6 +22,23 @@ The pass also stores each channel's top-1% mean (`top_s1..s4`, from `channel_sta
 - **What it does not change:** the decision below, which concerns the means score only. Any result for C's statistic is reported separately, as a second candidate whose choices were fixed on the 200 screen images.
 - **Cost:** no extra pass, about 1.8 GB more on disk.
 
+## Amendment 2 (19:30, before positions 1970 and later were read): the headline
+
+The user chose the two-axis score as the paper's headline. It is the "flatten or shift" row of the dev log, 2026-10-01 (night). It is evaluated on all 5,000 images, so that it stays comparable with the six baselines.
+
+- **Headline row** (`conditioned.two_axis_scores`): the larger of two arms, each re-z-scored on the z-statistics images.
+  - The flatter arm averages −(peak share − neighbours' peak share)/sd over the channels of s1–s3.
+  - The level arm is the level score below.
+  - The bank, key, k = 50 and stages are the same as below.
+  - The peak share alone (`conditioned.peak_share_scores`) is the ablation row.
+- **Images:**
+  - all 5,000 images, for the headline;
+  - positions 1970–4999, as the check: 3,030 images that nobody read while the method was designed. The roundtable read positions 200–1969 of the running pass.
+- **Headline rule** (`confirmation.headline_decision`): confirmed when, on both image sets, every 95% interval of these differences excludes 0:
+  - two-axis minus the activation CDFs, on AUROC common and on AUROC extra;
+  - two-axis minus the level score, on AUROC common.
+- **The level score's pre-registered rule below is unchanged.** It is still reported on the 4,800 held-out images.
+
 ## Pre-registered method (exactly the screen)
 
 1. **Key.** Stage-4 channel means, each channel standardised with the bank's mean and population spread; Euclidean distance; the k = 50 nearest bank images.

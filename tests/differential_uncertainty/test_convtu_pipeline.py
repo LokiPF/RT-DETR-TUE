@@ -272,14 +272,18 @@ def test_conditioned_report_writes_every_row_and_checks_the_screen_images(small,
     monkeypatch.setattr(conditioned, "NEIGHBOURS", 3)
     monkeypatch.setattr(confirmation, "BOOTSTRAP_SAMPLES", 20)
     monkeypatch.setattr(confirmation, "SCREEN_AUROC", None)  # the fake backbone cannot reproduce the real screen
+    monkeypatch.setattr(confirmation, "UNTOUCHED_START", 1)
     for phase in ("test", "convtu-channels", "convtu-means", "convtu-conditioned-report"):
         baselines.run_phase(phase, small)
     folder = small.output / confirmation.FOLDER
     summary = json.loads((folder / "summary.json").read_text())
     assert (summary["images"], summary["screen_images"], summary["held_out_images"]) == (2, 1, 1)
+    assert summary["untouched_images"] == 1 and set(summary["headline"]) == {"all", "untouched", "held_out", "screen"}
     assert summary["decision"] == confirmation.decision(summary["intervals"]["held_out"])
-    assert set(summary["headline"]["held_out"]) == {"conditioned", "global_s123", "ch_means_knn", "ch_means_own",
-                                                    "saod_min", "knn"}  # no CDF or DisCoPatch scores in this run
+    assert summary["headline_decision"] == "unavailable: the two-axis or the activation-CDF scores are missing"
+    assert set(summary["headline"]["all"]) == {"two_axis", "peak_share", "conditioned", "global_s123", "ch_means_knn",
+                                               "ch_means_own", "saod_min", "knn"}  # no CDF or DisCoPatch in this run
+    assert "two_axis - conditioned:auroc_common" in summary["intervals"]["untouched"]
     assert "conditioned - global_s123:auroc_common" in summary["intervals"]["held_out"]
     assert all(value == 0 for value in summary["reproduction_max_relative"].values())
     assert "Held-out images" in (folder / "report.md").read_text() and (folder / "separation.csv").exists()
