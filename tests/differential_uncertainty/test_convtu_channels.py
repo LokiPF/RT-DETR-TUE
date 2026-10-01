@@ -78,3 +78,20 @@ def test_own_comparison_matches_the_per_dimension_formula():
     mean, std = channels.fit_own_average(bank["top_s2"])
     np.testing.assert_allclose(per_layer["ch_top_own"][1, :, 1],
                                channels.own_average_scores(test["top_s2"][1], mean, std))
+
+
+def test_floored_dimensions_are_counted_and_can_be_left_out():
+    bank, zstats, test = _clean_and_test(np.random.default_rng(2))
+    for clean in (bank, zstats):
+        clean["top_s1"][:, 0] = 0.0       # a dimension dead on every clean image
+    test["top_s1"][:, :, 0] = 0.0
+    lit = {key: value.copy() for key, value in test.items()}
+    lit["top_s1"][1, :, 0] = 50.0         # ... that a corruption lights up
+    counts = channels.floored_counts(bank, ("s1", "s2"))
+    assert counts["top_s1"] == 1 and counts["top_s2"] == 0 and counts["means_s1"] == 0
+    _, kept = channels.channel_method_scores(bank, zstats, lit, ("s1", "s2"))
+    _, dropped = channels.channel_method_scores(bank, zstats, lit, ("s1", "s2"), drop_floored=True)
+    _, quiet = channels.channel_method_scores(bank, zstats, test, ("s1", "s2"), drop_floored=True)
+    # kept, the floored dimension dominates the layer score; left out, it cannot move it at all
+    assert (kept["ch_top_own"][1, :, 0] > quiet["ch_top_own"][1, :, 0] + 10).all()
+    np.testing.assert_allclose(dropped["ch_top_own"][1, :, 0], quiet["ch_top_own"][1, :, 0])

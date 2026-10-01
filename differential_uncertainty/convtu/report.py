@@ -46,7 +46,7 @@ def _depth_markdown(rows: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_pilot_report(settings, names, extra=None, extra_layers=None, extra_labels=None,
+def build_pilot_report(settings, names, extra=None, extra_layers=None, extra_labels=None, extra_summary=None,
                        folder_name="results_convtu", title="# Conv TU pilot") -> None:
     names = list(names)
     folds = protocol.assign_folds(len(names))
@@ -102,7 +102,7 @@ def build_pilot_report(settings, names, extra=None, extra_layers=None, extra_lab
                "contrastive_lambda": "stored per-fold values of the full run, not refitted per bootstrap draw",
                "bootstrap_samples": BOOTSTRAP_SAMPLES, "clean_map_of_these_images": float(condition_map[0]),
                "fraction": calibration["fraction"], "cut_margin": calibration["cut_margin"],
-               "calibration": calibration["layers"]}
+               "calibration": calibration["layers"], **(extra_summary or {})}
     folder = settings.output / folder_name
     report.write_outputs(folder, {
         "separation": separation, "aggregates": report.aggregate_rows(separation), "harm": harm,

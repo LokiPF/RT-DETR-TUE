@@ -65,3 +65,31 @@ def test_channels_report_adds_eight_rows(tmp_path, monkeypatch):
     assert "Channel means vs own training average" in text and "Conv TU: top 1% of the diagram" in text
     assert len((results / "depth.csv").read_text().splitlines()) == 1 + 16 + 32
     assert "ch_means_own:auroc_common" in (results / "intervals.csv").read_text()
+
+
+def test_channels_report_counts_floored_dimensions_and_adds_rows_without_them(tmp_path, monkeypatch):
+    settings = _fake_pilot(tmp_path, monkeypatch)
+    rng = np.random.default_rng(2)
+    widths = {f"{statistic}_s{stage}": (48 if statistic == "grid" else 3)
+              for statistic in channels.STATISTICS for stage in range(1, 5)}
+    bank = {k: rng.normal(size=(30, w)) for k, w in widths.items()}
+    zstats = {k: rng.normal(size=(10, w)) for k, w in widths.items()}
+    bank["p99_s4"][:, 0] = 0.0  # one dimension dead on every clean image
+    zstats["p99_s4"][:, 0] = 0.0
+    np.savez(convtu.channels_bank_path(settings), **bank)
+    np.savez(convtu.channels_zstats_path(settings), **zstats)
+    folder = settings.output / convtu.CHANNELS_FOLDER
+    folder.mkdir()
+    for path in convtu.pilot_images(settings):
+        np.savez(folder / f"{Path(path.name).stem}.npz",
+                 **{k: rng.normal(size=(96, w)) + np.linspace(0, 3, 96)[:, None] for k, w in widths.items()})
+
+    baselines.run_phase("convtu-channels-report", settings)
+
+    results = settings.output / "results_convtu_channels"
+    summary = json.loads((results / "summary.json").read_text())
+    assert summary["channel_floored_dimensions"]["p99_s4"] == 1 and summary["channel_floored_dimensions"]["top_s4"] == 0
+    assert summary["channel_std_floor"] == channels.STD_FLOOR
+    intervals = (results / "intervals.csv").read_text()
+    assert "ch_p99_own_live:auroc_common" in intervals and "ch_top_own_live" not in intervals
+    assert "floored dimensions left out" in (results / "report.md").read_text()

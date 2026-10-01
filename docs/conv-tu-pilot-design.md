@@ -89,7 +89,7 @@ The question (user): "if we compare each channel with the own training average, 
    - **grid:** each channel's mean on a 4 × 4 grid, from adaptive average pooling (16·C values).
 2. **Two comparisons for each statistic:**
    - **kNN,** as in the pilot: the mean Euclidean distance to the 5 nearest of the 2,000 bank images.
-   - **Own training average:** per layer, the mean over dimensions of |v − μ| / σ. μ and σ (population) are computed per dimension over the same 2,000 bank images. σ is floored at 1% of the median of the layer's positive σ, so that channels that are dead on clean images cannot dominate.
+   - **Own training average:** per layer, the mean over dimensions of |v − μ| / σ. μ and σ (population) are computed per dimension over the same 2,000 bank images. σ is floored at 1% of the median of the layer's positive σ. The floor keeps the term of a channel that is dead on clean images finite, but such a term can still dominate the layer score. So the report counts the floored dimensions per statistic and layer, and whenever any exist it adds the same own-average row with them left out (final review, finding I1).
 3. **Combining layers.** Per-layer scores are z-scored with the pilot's 500 clean z-statistics images and summed over the four layers, as in the pilot.
 4. **Same images and report.** The pilot's bank, z-statistics images and 200 val images × 96 conditions, and the same report machinery. The kNN on channel means must reproduce the pilot's channel-means row, with AUROC within 0.001.
 5. **Out of scope:** the fixed heavy-edge list (dev-log variant 1).

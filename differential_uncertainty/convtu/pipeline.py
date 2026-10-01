@@ -399,7 +399,7 @@ def phase_channels_report(settings: Settings) -> None:
     """Score the stored channel statistics both ways and report them next to the pilot rows and the baselines."""
     from ..baselines import report as baseline_report
     from .channels import LABELS as CHANNEL_LABELS
-    from .channels import channel_method_scores
+    from .channels import STD_FLOOR, channel_method_scores, floored_counts, method_name
     from .report import build_pilot_report
     clean = (channels_bank_path(settings), channels_zstats_path(settings))
     if not all(path.exists() for path in clean):
@@ -408,8 +408,19 @@ def phase_channels_report(settings: Settings) -> None:
     with np.load(clean[0]) as bank, np.load(clean[1]) as zstats:
         bank, zstats = dict(bank), dict(zstats)
     test = baseline_report._stack(settings.output / CHANNELS_FOLDER, names, CHANNEL_KEYS)
-    summed, per_layer = channel_method_scores(bank, zstats, test, [f"s{stage}" for stage in range(1, 5)])
-    build_pilot_report(settings, names, extra=summed, extra_layers=per_layer, extra_labels=CHANNEL_LABELS,
+    layers = [f"s{stage}" for stage in range(1, 5)]
+    summed, per_layer = channel_method_scores(bank, zstats, test, layers)
+    counts = floored_counts(bank, layers)
+    labels = dict(CHANNEL_LABELS)
+    floored = [statistic for statistic in STATISTICS if any(counts[f"{statistic}_{layer}"] for layer in layers)]
+    if floored:
+        live, live_layers = channel_method_scores(bank, zstats, test, layers, drop_floored=True)
+        for statistic in floored:
+            name = method_name(statistic, "own")
+            summed[f"{name}_live"], per_layer[f"{name}_live"] = live[name], live_layers[name]
+            labels[f"{name}_live"] = f"{CHANNEL_LABELS[name]}, floored dimensions left out"
+    build_pilot_report(settings, names, extra=summed, extra_layers=per_layer, extra_labels=labels,
+                       extra_summary={"channel_floored_dimensions": counts, "channel_std_floor": STD_FLOOR},
                        folder_name="results_convtu_channels", title="# Conv TU pilot: channel statistics")
 
 

@@ -46,6 +46,21 @@ def fit_own_average(reference: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return mean, np.maximum(std, STD_FLOOR * float(np.median(positive)))
 
 
+def floored_mask(reference: np.ndarray) -> np.ndarray:
+    """True where a dimension's clean spread is below the floor, so fit_own_average floors it."""
+    std = np.asarray(reference, dtype=np.float64).std(axis=0)
+    positive = std[std > 0]
+    if positive.size == 0:
+        raise ValueError("the clean rows have no spread")
+    return std < STD_FLOOR * float(np.median(positive))
+
+
+def floored_counts(bank: dict, layers) -> dict:
+    """How many dimensions of each statistic and layer the floor touches."""
+    return {f"{statistic}_{layer}": int(floored_mask(bank[f"{statistic}_{layer}"]).sum())
+            for statistic in STATISTICS for layer in layers}
+
+
 def own_average_scores(values: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     """Mean over dimensions of |value - clean mean| / clean spread: one score per row."""
     return (np.abs(np.asarray(values, dtype=np.float64) - mean) / std).mean(axis=1)
@@ -71,12 +86,13 @@ def _float32(array) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32))
 
 
-def channel_method_scores(bank: dict, zstats: dict, test: dict, layers) -> tuple[dict, dict]:
+def channel_method_scores(bank: dict, zstats: dict, test: dict, layers, drop_floored: bool = False) -> tuple[dict, dict]:
     """Every statistic compared both ways: z-summed (images, conditions) scores and the per-layer ones.
 
     bank and zstats map f"{statistic}_{layer}" to clean (rows, dim) arrays; test maps it to
     (images, conditions, dim). Per-layer scores are z-scored with the z-statistics images and summed over
-    the layers, as in the pilot.
+    the layers, as in the pilot. With drop_floored, the own-average comparison leaves out the dimensions
+    whose clean spread the floor touches, so they cannot dominate it.
     """
     summed, per_layer = {}, {}
     for statistic in STATISTICS:
@@ -92,8 +108,9 @@ def channel_method_scores(bank: dict, zstats: dict, test: dict, layers) -> tuple
                     test_columns.append(knn_scores(_float32(flat), reference))
                 else:
                     mean, std = fit_own_average(bank[key])
-                    clean_columns.append(own_average_scores(zstats[key], mean, std))
-                    test_columns.append(own_average_scores(flat, mean, std))
+                    keep = ~floored_mask(bank[key]) if drop_floored else np.ones(dim, dtype=bool)
+                    clean_columns.append(own_average_scores(zstats[key][:, keep], mean[keep], std[keep]))
+                    test_columns.append(own_average_scores(flat[:, keep], mean[keep], std[keep]))
             mean, std = stage_zstats(np.stack(clean_columns, axis=1))
             values = np.stack(test_columns, axis=1)
             name = method_name(statistic, comparison)
