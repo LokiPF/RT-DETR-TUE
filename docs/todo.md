@@ -6,13 +6,13 @@ Open experiments for the corruption-detection paper. Newest additions go at the 
 
 ## Ablations requested by the user (1 October)
 
-- [ ] **Bank size: how many clean images the bank needs.**
-  - Score the two-axis row (and the level and peak-share rows) with banks of 100, 250, 500, 1,000 and 2,000 clean COCO-train images. Use several random subsets per size, and keep the 500 z-statistics images fixed and disjoint from the bank.
-  - Larger banks (5,000, 10,000, 20,000 images) need the channel means and top-1% means of more clean train images. That is a short GPU pass: one forward each, no corruptions.
-  - **Cost:** CPU only up to 2,000 images, once the 5,000-image pass is complete.
-- [ ] **k: how many of the most similar clean images to compare with.**
-  - Score with k = 1, 5, 10, 20, 50, 100, 200, 500, 1,000 and 2,000.
-  - With k equal to the bank size, the neighbours' mean becomes the mean of all clean images. So this curve also connects to the next ablation.
+- [ ] **Bank size: how many clean images the bank needs, up to 5,000** (user: "you can go for up to 5000").
+  - Score the two-axis row (and the level and peak-share rows) with banks of 100, 250, 500, 1,000, 2,000 and 5,000 clean COCO-train images.
+  - The smaller banks are random subsets of the 5,000-image bank, with several seeds per size. The 500 z-statistics images stay fixed and disjoint from every bank.
+  - **Cost:** the 5,000-image bank needs the channel means and top-1% means of 3,000 more clean train images. Draw them disjoint from the existing calibration, bank and z-statistics splits. That is a short GPU pass: one forward each, no corruptions. The rest is CPU, once the 5,000-image val pass is complete.
+- [ ] **k: how many of the most similar clean images to compare with.** Do this after the bank-size ablation, because its upper end depends on that result (user).
+  - Score with k = 1, 5, 10, 20, 50, 100, 200 and 500, then upwards to the size of the bank the first ablation favours: up to 5,000 if the 5,000-image bank wins.
+  - With k equal to the bank size, the neighbours' mean becomes the mean of all clean images, so the top of this curve meets the next ablation.
   - **Cost:** CPU only.
 - [ ] **No content matching: compare with the average of all clean images.**
   - Replace the 50 neighbours' mean with the mean over the whole bank, for the level, the peak share and the two-axis score.
