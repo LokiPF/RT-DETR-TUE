@@ -35,6 +35,7 @@ IMAGE_SIZE = (640, 640)
 SCORE_KEYS = (*REPRESENTATIONS, *(f"{rep}_layers" for rep in REPRESENTATIONS), "tau_k", "read", "rounds")
 CHANNELS_FOLDER = "test_convtu_channels"
 CHANNEL_KEYS = tuple(f"{statistic}_s{stage}" for statistic in STATISTICS for stage in range(1, 5))
+REPRODUCTION_RTOL = 1e-4  # the bank's channel means must equal the pilot bank's means this closely
 
 
 def _folder(settings: Settings):
@@ -347,6 +348,20 @@ def image_channel_statistics(taps, arrays, batch_size) -> dict:
     return out
 
 
+def _check_bank_matches_pilot(settings: Settings) -> None:
+    """The bank's channel means must reproduce the pilot's bank means: same images, same tensors, same order."""
+    pilot = bank_path(settings)
+    if not pilot.exists():
+        return
+    with np.load(pilot, allow_pickle=False) as reference, \
+            np.load(channels_bank_path(settings), allow_pickle=False) as bank:
+        for stage in range(1, 5):
+            key = f"means_s{stage}"
+            expected, got = reference[key], bank[key]
+            if got.shape != expected.shape or np.abs(got - expected).max() > REPRODUCTION_RTOL * np.abs(expected).max():
+                raise ValueError(f"the channel means of the bank differ from the pilot's bank ({key})")
+
+
 def phase_channels(settings: Settings) -> None:
     """Channel statistics of the pilot layers: the bank and z-statistics images, then every pilot variant."""
     folder = settings.output / CHANNELS_FOLDER
@@ -364,6 +379,7 @@ def phase_channels(settings: Settings) -> None:
             if not path.exists():
                 _atomic_npz(path, **_concatenated(
                     [_batch_channel_statistics(taps, batch) for batch in _clean_batches(settings, split)]))
+        _check_bank_matches_pilot(settings)
         for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
             stem = Path(name).stem
             stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]

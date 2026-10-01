@@ -195,3 +195,42 @@ def test_channels_phase_detects_changed_corruptions(small, detector, monkeypatch
     np.savez(small.output / "test" / f"{stem}.npz", **stored)
     with pytest.raises(ValueError, match="corruptions differ"):
         baselines.run_phase("convtu-channels", small)
+
+
+def test_channels_phase_refuses_a_bank_that_differs_from_the_pilot(small, detector, monkeypatch):
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)
+    for phase in ("test", "convtu-calibrate", "convtu-bank"):
+        baselines.run_phase(phase, small)
+    stored = dict(np.load(convtu.bank_path(small)))
+    stored["means_s2"] = stored["means_s2"] * 1.01
+    np.savez(convtu.bank_path(small), **stored)
+    with pytest.raises(ValueError, match="differ from the pilot's bank"):
+        baselines.run_phase("convtu-channels", small)
+
+
+def test_channel_statistics_reproduce_the_pilot_on_the_fake_backbone(small, detector, monkeypatch):
+    from differential_uncertainty.baselines import report as baseline_report
+    from differential_uncertainty.baselines.activation_cdf import stage_zstats
+    from differential_uncertainty.convtu import channels
+    from differential_uncertainty.convtu.features import knn_scores
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)
+    _pilot(small)
+    baselines.run_phase("convtu-channels", small)
+    layers = [f"s{stage}" for stage in range(1, 5)]
+    with np.load(convtu.bank_path(small)) as pilot_bank, np.load(convtu.channels_bank_path(small)) as bank:
+        for layer in layers:
+            np.testing.assert_allclose(bank[f"means_{layer}"], pilot_bank[f"means_{layer}"], rtol=1e-6)
+        bank = dict(bank)
+    with np.load(convtu.channels_zstats_path(small)) as zstats:
+        zstats = dict(zstats)
+    clean = np.stack([knn_scores(torch.from_numpy(zstats[f"means_{layer}"]), torch.from_numpy(bank[f"means_{layer}"]))
+                      for layer in layers], axis=1)
+    mean, std = stage_zstats(clean)
+    stored = json.loads(convtu.zstats_path(small).read_text())["stats"]["means"]
+    np.testing.assert_allclose(mean, stored["mean"], rtol=1e-6)
+    np.testing.assert_allclose(std, stored["std"], rtol=1e-6)
+    names = [p.name for p in convtu.pilot_images(small)]
+    test = baseline_report._stack(small.output / convtu.CHANNELS_FOLDER, names, convtu.CHANNEL_KEYS)
+    _, per_layer = channels.channel_method_scores(bank, zstats, test, layers)
+    pilot = baseline_report._stack(small.output / "test_convtu", names, ("means_layers",))["means_layers"]
+    np.testing.assert_allclose(per_layer["ch_means_knn"], pilot, rtol=1e-6)
