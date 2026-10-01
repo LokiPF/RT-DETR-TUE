@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, "/home/yuchen/YuchenZ/UE/philip_sa/.worktrees/convtu-pilot")
+sys.path.insert(0, "/home/yuchen/YuchenZ/UE/philip_sa")
 from differential_uncertainty.baselines import protocol  # noqa: E402
 from differential_uncertainty.baselines.activation_cdf import stage_zstats, zscored_sum  # noqa: E402
 from differential_uncertainty.convtu import conditioned, confirmation  # noqa: E402
