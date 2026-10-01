@@ -4,6 +4,20 @@ Run on 30 September 2026, following `docs/superpowers/plans/2026-09-30-conv-tu-p
 
 What was scored: the first 200 COCO val2017 images of the seed-44 order, each in all 96 conditions (19,200 variants). The layers were the four stride-1 3 × 3 convs `res_layers[s].blocks[1].branch2a.conv`, and the fingerprint was the exact top K = 1% of each conv graph's persistence diagram. The nine baseline rows are recomputed on the same 200 images.
 
+## How to read the tables
+
+↑ means higher is better and ↓ means lower is better. LRP is the detection error (localisation-recall-precision): 0 is perfect, and higher means worse detection.
+
+| Column | What it measures | Better | Reference values |
+|---|---|---|---|
+| AUROC common ↑ | How well the score tells a corrupted image from its clean version, averaged over the 75 conditions of the 15 common families | higher | 0.5 = chance, 1 = perfect |
+| AUROC extra ↑ | The same, over the 20 conditions of the 4 extra families | higher | 0.5 = chance, 1 = perfect |
+| ρ(Δscore, ΔLRP) within ↑ | Within one condition, images whose LRP rose more should get a larger score increase. Spearman correlation, averaged over the 95 conditions | higher | 0 = no relation, 1 = perfect |
+| ρ(score, LRP) conditions ↑ | Across the 95 conditions, conditions with a higher mean LRP should get a higher mean score | higher | 0 = no relation, 1 = perfect; below 0 = backwards |
+| AURC all ↓ | Area under the risk–coverage curve when images are set aside by score, with LRP as the risk: how much detection error is left among the images the score keeps | lower | an oracle that sets images aside by their true LRP sets the floor |
+
+In a difference (first row minus second), a positive Δ in a ↑ column means the first row is better. In the ↓ column (AURC), a negative Δ means the first row is better.
+
 ## Verdict
 
 At K = 1%, the pilot is negative. Neither criterion of the design note is met.
@@ -33,9 +47,9 @@ The top of the diagram behaves this way because at K = 1% the heaviest edges rar
 
 ## Separation and harm on the 200 images
 
-Higher AUROC is better (chance 0.5); higher ρ is better; lower AURC is better. Brackets are 95% paired bootstrap intervals over images (1,000 draws).
+↑ higher is better, ↓ lower is better (see "How to read the tables"). Brackets are 95% paired bootstrap intervals over images (1,000 draws).
 
-| Method | AUROC common | AUROC extra | ρ(Δscore, ΔLRP) within | ρ(score, LRP) conditions | AURC all |
+| Method | AUROC common ↑ | AUROC extra ↑ | ρ(Δscore, ΔLRP) within ↑ | ρ(score, LRP) conditions ↑ | AURC all ↓ |
 |---|---|---|---|---|---|
 | Conv TU: top 1% of the diagram | 0.661 [0.634, 0.687] | 0.615 [0.595, 0.633] | 0.100 [0.040, 0.160] | 0.582 [0.538, 0.616] | 0.667 [0.636, 0.698] |
 | Control: top 1% heaviest edges | 0.658 [0.631, 0.685] | 0.609 [0.588, 0.630] | 0.096 [0.035, 0.155] | 0.572 [0.527, 0.607] | 0.666 [0.634, 0.697] |
@@ -53,7 +67,9 @@ Higher AUROC is better (chance 0.5); higher ρ is better; lower AURC is better. 
 
 ## Differences that decide the pilot (fingerprint minus the other row)
 
-| Pair | Δ AUROC common | Δ AUROC extra | Δ ρ within | Δ AURC all |
+A positive Δ in a ↑ column, or a negative Δ in the ↓ column, means the fingerprint (the first row) is better.
+
+| Pair | Δ AUROC common ↑ | Δ AUROC extra ↑ | Δ ρ within ↑ | Δ AURC all ↓ |
 |---|---|---|---|---|
 | mst − edges | +0.003 [−0.004, +0.009] | +0.006 [−0.001, +0.013] | +0.004 [−0.011, +0.018] | +0.001 [−0.000, +0.003] |
 | mst − acts | −0.010 [−0.028, +0.007] | +0.012 [−0.006, +0.028] | +0.001 [−0.039, +0.042] | −0.004 [−0.012, +0.005] |
@@ -64,9 +80,9 @@ Higher AUROC is better (chance 0.5); higher ρ is better; lower AURC is better. 
 
 ## Depth: one layer at a time
 
-Each layer's own kNN distance, without the z-scored sum.
+Each layer's own kNN distance, without the z-scored sum. All three numbers in each cell are ↑ (higher is better).
 
-| Stage | mst AUROC common / extra / ρ within | edges | acts | means |
+| Stage | mst: AUROC common ↑ / AUROC extra ↑ / ρ within ↑ | edges (same three) | acts (same three) | means (same three) |
 |---|---|---|---|---|
 | 1 | 0.678 / 0.663 / 0.038 | 0.684 / 0.665 / 0.046 | 0.667 / 0.653 / −0.007 | 0.741 / 0.839 / 0.040 |
 | 2 | 0.658 / 0.662 / 0.070 | 0.667 / 0.666 / 0.070 | 0.663 / 0.670 / 0.090 | 0.824 / 0.859 / 0.047 |
@@ -103,7 +119,7 @@ The fingerprint's largest edge over the heaviest edges is at stage 4, the layer 
 - **Per-channel tails do not beat the plain means.** The top-1% mean and the 99th percentile both lose to the plain means under either comparison. The own-average comparison does rescue them, from about 0.64 to 0.75–0.77 AUROC on the common families.
 - **The 4 × 4 grid is worst.** It reaches 0.510 AUROC on the common families with kNN, which is chance, and 0.646 with the own average. Even coarse position brings back the content variation that the dev log predicted for COCO. A fixed-camera driving dataset is still untested.
 
-| Row | AUROC common | AUROC extra | ρ(Δscore, ΔLRP) within | ρ(score, LRP) conditions | AURC all |
+| Row | AUROC common ↑ | AUROC extra ↑ | ρ(Δscore, ΔLRP) within ↑ | ρ(score, LRP) conditions ↑ | AURC all ↓ |
 |---|---|---|---|---|---|
 | Channel means, kNN (= the pilot's control) | 0.798 [0.780, 0.816] | 0.847 [0.829, 0.864] | 0.074 [0.021, 0.123] | 0.500 [0.462, 0.527] | 0.649 [0.620, 0.679] |
 | Channel means vs own training average | 0.794 [0.777, 0.810] | 0.818 [0.803, 0.832] | 0.055 [0.003, 0.108] | 0.677 [0.645, 0.705] | 0.659 [0.630, 0.688] |
@@ -115,9 +131,9 @@ The fingerprint's largest edge over the heaviest edges is at stage 4, the layer 
 | 4 × 4-grid channel means vs own average | 0.646 [0.632, 0.660] | 0.774 [0.759, 0.789] | 0.071 [0.017, 0.122] | 0.530 [0.499, 0.570] | 0.660 [0.630, 0.689] |
 | Activation CDFs (Becker et al., ICPR 2026) | 0.825 [0.807, 0.845] | 0.808 [0.791, 0.824] | 0.021 [−0.036, 0.075] | 0.677 [0.649, 0.708] | 0.664 [0.635, 0.692] |
 
-Differences, first row minus second:
+Differences, first row minus second. A positive Δ in a ↑ column, or a negative Δ in the ↓ column, means the first row is better:
 
-| Pair | Δ AUROC common | Δ AUROC extra | Δ ρ within | Δ AURC all |
+| Pair | Δ AUROC common ↑ | Δ AUROC extra ↑ | Δ ρ within ↑ | Δ AURC all ↓ |
 |---|---|---|---|---|
 | means vs own average − means kNN | −0.005 [−0.021, +0.011] | −0.029 [−0.043, −0.016] | −0.019 [−0.073, +0.035] | +0.011 [+0.000, +0.023] |
 | top-1% vs own average − means vs own average | −0.028 [−0.051, −0.006] | −0.096 [−0.114, −0.079] | +0.049 [−0.018, +0.111] | +0.011 [+0.001, +0.021] |
