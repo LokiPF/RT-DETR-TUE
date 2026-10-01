@@ -15,6 +15,13 @@
 - **Same reference as the screen:** the pilot's 2,000-image clean bank and its 500 z-statistics images (`runs/coco-baselines/convtu/channels_bank.npz`, `channels_zstats.npz`). Nothing is refitted.
 - Tests run with `CUDA_VISIBLE_DEVICES=`.
 
+## Amendment (16:35, before the pass started)
+
+The pass also stores each channel's top-1% mean (`top_s1..s4`, from `channel_statistics`, so it is identical to the pilot's).
+- **Why:** roundtable panelist C asked for it. C's candidate applies the same conditioning to log(top-1% mean / mean). On the 200 screen images it reached 0.897 common / 0.859 extra, with the statistic picked among about 7 tried there.
+- **What it does not change:** the decision below, which concerns the means score only. Any result for C's statistic is reported separately, as a second candidate whose choices were fixed on the 200 screen images.
+- **Cost:** no extra pass, about 1.8 GB more on disk.
+
 ## Pre-registered method (exactly the screen)
 
 1. **Key.** Stage-4 channel means, each channel standardised with the bank's mean and population spread; Euclidean distance; the k = 50 nearest bank images.

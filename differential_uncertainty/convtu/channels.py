@@ -34,12 +34,12 @@ def channel_statistics(x: torch.Tensor) -> dict:
     return {key: value.cpu().numpy().astype(np.float32) for key, value in out.items()}
 
 
-@torch.inference_mode()
-def channel_means(x: torch.Tensor) -> dict:
-    """Only the means statistic of channel_statistics, computed the same way; small enough for 5,000 images."""
-    if x.ndim != 4:
-        raise ValueError("expected a batch of shape (N, C, H, W)")
-    return {"means": x.abs().float().mean(dim=(2, 3)).cpu().numpy().astype(np.float32)}
+def channel_means_and_top(x: torch.Tensor) -> dict:
+    """The means and top statistics of channel_statistics, taken from it so the values are identical.
+
+    The 4 x 4 grid is left out: for 5,000 images x 96 conditions it would need about 30 GB.
+    """
+    return {key: value for key, value in channel_statistics(x).items() if key in ("means", "top")}
 
 
 def fit_own_average(reference: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

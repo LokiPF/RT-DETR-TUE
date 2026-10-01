@@ -233,8 +233,9 @@ def test_means_phase_covers_every_evaluation_image_and_resumes(small, detector, 
     files = sorted((small.output / convtu.MEANS_FOLDER).glob("*.npz"))
     assert [f.stem for f in files] == sorted(p.stem for p in baselines.evaluation(small)) and len(files) == 2
     with np.load(files[0]) as stats:
-        assert set(stats.files) == set(convtu.MEANS_KEYS)
-        assert [stats[key].shape for key in convtu.MEANS_KEYS] == [(96, 2), (96, 3), (96, 4), (96, 5)]
+        assert set(stats.files) == set(convtu.MEANS_KEYS) == {f"{s}_s{l}" for s in ("means", "top") for l in range(1, 5)}
+        for statistic in ("means", "top"):
+            assert [stats[f"{statistic}_s{l}"].shape for l in range(1, 5)] == [(96, 2), (96, 3), (96, 4), (96, 5)]
         assert all(stats[key].dtype == np.float32 for key in convtu.MEANS_KEYS)
     stamp = files[0].stat().st_mtime_ns
     baselines.run_phase("convtu-means", small)

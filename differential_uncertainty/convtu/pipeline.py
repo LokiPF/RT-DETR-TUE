@@ -19,7 +19,7 @@ from ..baselines.activation_cdf import stage_zstats, zscored_sum
 from ..baselines.pipeline import (TEST_KEYS, Settings, _atomic_json, _atomic_npz, _load_npz, _progress,
                                   _train_loader, _valid_existing, _variant_stream, evaluation)
 from ..extraction import load_frozen_detector, prepare_image
-from .channels import STATISTICS, channel_means, channel_statistics
+from .channels import STATISTICS, channel_means_and_top, channel_statistics
 from .features import KNN_NEIGHBOURS, REPRESENTATIONS, knn_scores, layer_features, layer_specs
 from .graph import EDGE_CAP, FRACTION, conv_top_merges, heaviest_weight
 from .tap import LAYER_NAMES, ConvInputs
@@ -36,8 +36,8 @@ SCORE_KEYS = (*REPRESENTATIONS, *(f"{rep}_layers" for rep in REPRESENTATIONS), "
 CHANNELS_FOLDER = "test_convtu_channels"
 CHANNEL_KEYS = tuple(f"{statistic}_s{stage}" for statistic in STATISTICS for stage in range(1, 5))
 REPRODUCTION_RTOL = 1e-4  # the bank's channel means must equal the pilot bank's means this closely
-MEANS_FOLDER = "test_convtu_means"  # channel means of every evaluation image, for the 5,000-image confirmation
-MEANS_KEYS = tuple(f"means_s{stage}" for stage in range(1, 5))
+MEANS_FOLDER = "test_convtu_means"  # channel means (and top-1% means) of every evaluation image, 5,000-image run
+MEANS_KEYS = tuple(f"{statistic}_s{stage}" for statistic in ("means", "top") for stage in range(1, 5))
 MEANS_GPU_CAP_GIB = 1.5  # the backbone-only means pass needs well under 1 GiB
 
 
@@ -414,7 +414,7 @@ def phase_means(settings: Settings) -> None:
             if list(stored) != [protocol.digest(a) for a in arrays]:
                 raise ValueError(f"corruptions differ from the detector pass for {name}")
             _atomic_npz(folder / f"{stem}.npz",
-                        **image_channel_statistics(taps, arrays, settings.batch_size, channel_means))
+                        **image_channel_statistics(taps, arrays, settings.batch_size, channel_means_and_top))
             if done % 25 == 0:
                 _progress("convtu-means", done, len(pending), started)
 
