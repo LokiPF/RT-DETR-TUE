@@ -1,0 +1,78 @@
+# Content-conditioned reference: 5,000-image confirmation
+
+**Goal:** confirm on all 5,000 COCO val images the screen recorded in `docs/dev-log.md` (2026-10-01, evening): stages 1–3 channel means judged against the clean scenes nearest in stage-4 channel means. All choices are fixed below, before any held-out number exists.
+
+**Spec:** `docs/dev-log.md`, entry "The back of the detector as a content key". The user's goal is detecting corruption, so separation is the criterion; harm is not reported.
+
+**Authorization:** the user asked for this run on 1 October ("you probably can run the 5000 image confirmation") while the detection roundtable runs.
+
+## Global constraints
+
+- **GPU.** The card is shared. Explore's training peaks at 31.5 of 32.6 GB, so nothing may run beside it. The means pass runs only in explore's gaps, when explore uses 2.6 GiB: about 16:35–18:30, 22:00–23:50 and 03:25–05:30, and freely after about 05:30.
+  - Each part runs for at most 85 minutes (`timeout`).
+  - A watchdog stops the part at once if the card's total compute memory exceeds 6 GiB.
+  - Explore pings at the start of each gap. The pass caps itself at 1.5 GiB (`MEANS_GPU_CAP_GIB`).
+- **Same reference as the screen:** the pilot's 2,000-image clean bank and its 500 z-statistics images (`runs/coco-baselines/convtu/channels_bank.npz`, `channels_zstats.npz`). Nothing is refitted.
+- Tests run with `CUDA_VISIBLE_DEVICES=`.
+
+## Pre-registered method (exactly the screen)
+
+1. **Key.** Stage-4 channel means, each channel standardised with the bank's mean and population spread; Euclidean distance; the k = 50 nearest bank images.
+2. **Score each of stages s1, s2 and s3:**
+   - take the mean over channels of |v − μ_nb| / σ;
+   - μ_nb is the neighbours' mean;
+   - σ is the bank's per-channel population spread, floored as in `channels.fit_own_average` (no dimension was floored in the pilot).
+3. **Combine.** Z-score each stage with the 500 z-statistics images, scored the same way with neighbours from the bank, and add the three.
+
+## Rows reported
+
+- **The conditioned score:** the method above.
+- **Stages 1–3 vs the global clean average:** the same as the conditioned score, with μ_nb replaced by the bank's mean. This isolates the conditioning.
+- **Channel means, kNN:** the pilot's control, all 4 stages, mean Euclidean distance to the 5 nearest bank rows, z-scored with the z-statistics images and summed.
+- **Channel means vs own average, all 4 stages:** the follow-up's row.
+- **Baselines** from the stored 5,000-image scores:
+  - activation CDFs (headline, z-scored stages);
+  - DisCoPatch;
+  - SAOD min;
+  - kNN (k = 100);
+  - Hashemi et al. (decoder).
+
+## Evaluation
+
+- **Images:**
+  - **Primary:** the 4,800 images not used by the screen, positions 200–4,999 of the seed-44 order.
+  - **Also:** all 5,000 images, and the 200 screen images.
+  - **Reproduction check:** the screen images must reproduce the screen's 0.841 / 0.870 to within 0.003. Their stage means must equal the pilot's stored means to within 1e-4 relative, on the same GPU settings.
+- **Metrics:**
+  - mean AUROC over the 75 common and the 20 extra conditions;
+  - AUPR and FPR95;
+  - AUROC by severity, and by family at severities 3 and 5.
+- **Intervals:** 95% paired bootstrap over images, with 1,000 draws and seed 44.
+
+## Decision rule (on the 4,800 held-out images)
+
+- **Confirmed:** both of the following hold, each with a 95% interval excluding 0 on both AUROC common and AUROC extra:
+  - the conditioned score minus the activation CDFs is above 0;
+  - the conditioned score minus stages 1–3 vs the global average is above 0.
+- **Conditioning confirmed, not ahead of the CDFs:** only the second condition holds.
+- **Not confirmed:** the second condition fails on either group.
+
+## Tasks
+
+1. **The `convtu-means` phase** (done, `bff2bef`): `means_s1..s4` for the 96 conditions of every evaluation image. It is resumable per image and checked against the detector pass's corruption digests. The tests cover:
+   - coverage beyond the pilot images;
+   - resume;
+   - exact equality with the channel-statistics means;
+   - changed corruptions.
+2. **Run it in explore's gaps:** `run_means.sh` in the session scratchpad, with the 85-minute timeout and the 6 GiB watchdog.
+3. **`differential_uncertainty/convtu/conditioned.py`**, test first:
+   - `nearest_rows(queries, reference, k)` (exact, chunked);
+   - `conditioned_scores(test, bank, zstats, k)`;
+   - `global_scores(test, bank, zstats)`.
+
+   The tests cover:
+   - agreement with a brute-force neighbour search;
+   - a synthetic bank with two content clusters, where a clean image of the second cluster scores high against the global average but low against its neighbours;
+   - a shifted early stage scoring high either way.
+4. **The `convtu-conditioned-report` phase:** the rows, metrics, intervals, decision and reproduction checks above, written to `runs/coco-baselines/results_convtu_conditioned/`. Its test runs on the fake backbone.
+5. **Results:** `docs/conv-tu-conditioned-results.md` with the tables in `docs/results/conv-tu-conditioned/`, a dev-log line, then commit.

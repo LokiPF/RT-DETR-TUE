@@ -9,7 +9,7 @@ Dated observations and decisions that don't belong in a results document. Newest
 - `docs/driving-benchmark-baselines-and-metrics.md` still lists harm as goal (b).
 
 **Why plain channel means are not enough.**
-- **Already published.** Comparing each channel's mean with its training mean is Neural Mean Discrepancy (Dong et al., CVPR 2022), which takes the training means from the BatchNorm layers. This was verified during the paper-idea roundtable (`docs/roundtable-2026-10-01/record.md`).
+- **Already published.** Comparing activation means with the training means is Neural Mean Discrepancy (Dong et al., CVPR 2022, arXiv 2104.11408). It takes the training means from the BatchNorm layers as a "free lunch", and reports that the means of out-of-distribution inputs deviate more.
 - **On clean images, the early stages' channel means vary mostly with scene content.** A ridge map from the stage-4 means predicts 73%, 77% and 82% of that variation at stages 1, 2 and 3. That is held-out R² on the 500 clean z-statistics images, with the map fitted on the 2,000-image bank.
 - That content variation is what hides mild corruptions.
 
@@ -71,7 +71,9 @@ It keeps the three lessons of this log: the front, not the back, sees the corrup
   - the driving data.
 - **Literature:** check conditional and cross-layer references for OOD and corruption detection.
 
-**Scripts.** `content_conditioned.py` and `content_conditioned_bootstrap.py`, kept with the roundtable record in `docs/roundtable-2026-10-01/scripts/`. They read the tables stacked by `build_tables.py` in the same folder.
+**Code.** The screen ran from scratch scripts outside the repository. The 5,000-image confirmation reimplements the score in the package; its plan is `docs/superpowers/plans/2026-10-01-content-conditioned-confirmation.md`.
+
+**Note.** A first paper-idea roundtable, run the same afternoon, was briefed with harm as its primary metric. It answered the wrong question, and was discarded at the user's request. A second roundtable on detection only is running.
 
 ## 2026-10-01 (later): Own training average vs kNN on channel means
 
