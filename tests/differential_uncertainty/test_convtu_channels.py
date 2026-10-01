@@ -45,3 +45,36 @@ def test_own_average_scores_are_mean_absolute_z():
     mean, std = np.array([1.0, 2.0]), np.array([0.5, 4.0])
     values = np.array([[1.0, 2.0], [2.0, -2.0]])
     np.testing.assert_allclose(channels.own_average_scores(values, mean, std), [0.0, (2.0 + 1.0) / 2])
+
+
+def _clean_and_test(rng, layers=("s1", "s2"), dims=(3, 4)):
+    bank, zstats, test = {}, {}, {}
+    for statistic in channels.STATISTICS:
+        for layer, dim in zip(layers, dims):
+            width = 16 * dim if statistic == "grid" else dim
+            key = f"{statistic}_{layer}"
+            bank[key] = rng.normal(size=(40, width))
+            zstats[key] = rng.normal(size=(12, width))
+            test[key] = np.stack([zstats[key], zstats[key] + 10.0])  # (2 images, 12 conditions, width)
+    return bank, zstats, test
+
+
+def test_channel_method_scores_compare_every_statistic_both_ways():
+    bank, zstats, test = _clean_and_test(np.random.default_rng(0))
+    summed, per_layer = channels.channel_method_scores(bank, zstats, test, ("s1", "s2"))
+    expected = {channels.method_name(s, c) for s in channels.STATISTICS for c in channels.COMPARISONS}
+    assert set(summed) == set(per_layer) == expected and set(channels.LABELS) == expected
+    for name in expected:
+        assert summed[name].shape == (2, 12) and per_layer[name].shape == (2, 12, 2)
+        # image 0 is the z-statistics images themselves, so its layer z-scores average to 0
+        assert abs(summed[name][0].mean()) < 1e-9
+        # image 1 is shifted far from every clean row, so it scores higher everywhere
+        assert (summed[name][1] > summed[name][0].max()).all()
+
+
+def test_own_comparison_matches_the_per_dimension_formula():
+    bank, zstats, test = _clean_and_test(np.random.default_rng(1))
+    _, per_layer = channels.channel_method_scores(bank, zstats, test, ("s1", "s2"))
+    mean, std = channels.fit_own_average(bank["top_s2"])
+    np.testing.assert_allclose(per_layer["ch_top_own"][1, :, 1],
+                               channels.own_average_scores(test["top_s2"][1], mean, std))

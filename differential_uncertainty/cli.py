@@ -44,7 +44,8 @@ def build_parser() -> argparse.ArgumentParser:
                            choices=["sanity", "bank", "test", "train-discopatch", "discopatch-scores",
                                     "hashemi-fit", "cdf-fit", "cdf-zstats", "activation-scores", "timing", "report",
                                     "convtu-calibrate", "convtu-bank", "convtu-zstats", "convtu-scores",
-                                    "convtu-report", "convtu-channels"])
+                                    "convtu-report", "convtu-channels",
+                                    "convtu-channels-report"])
     baselines.add_argument("--output", required=True)
     baselines.add_argument("--checkpoint", required=True)
     baselines.add_argument("--coco-train-images", required=True)

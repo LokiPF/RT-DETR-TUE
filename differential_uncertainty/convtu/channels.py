@@ -10,6 +10,9 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from ..baselines.activation_cdf import stage_zstats, zscored_sum
+from .features import knn_scores
+
 STATISTICS = ("means", "top", "p99", "grid")
 COMPARISONS = ("knn", "own")
 TOP_FRACTION = 0.01
@@ -46,3 +49,54 @@ def fit_own_average(reference: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def own_average_scores(values: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
     """Mean over dimensions of |value - clean mean| / clean spread: one score per row."""
     return (np.abs(np.asarray(values, dtype=np.float64) - mean) / std).mean(axis=1)
+
+
+LABELS = {
+    "ch_means_knn": "Channel means, kNN (check: the pilot's control)",
+    "ch_means_own": "Channel means vs own training average",
+    "ch_top_knn": "Per-channel top-1% means, kNN",
+    "ch_top_own": "Per-channel top-1% means vs own training average",
+    "ch_p99_knn": "Per-channel 99th percentiles, kNN",
+    "ch_p99_own": "Per-channel 99th percentiles vs own training average",
+    "ch_grid_knn": "4 × 4-grid channel means, kNN",
+    "ch_grid_own": "4 × 4-grid channel means vs own training average",
+}
+
+
+def method_name(statistic: str, comparison: str) -> str:
+    return f"ch_{statistic}_{comparison}"
+
+
+def _float32(array) -> torch.Tensor:
+    return torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32))
+
+
+def channel_method_scores(bank: dict, zstats: dict, test: dict, layers) -> tuple[dict, dict]:
+    """Every statistic compared both ways: z-summed (images, conditions) scores and the per-layer ones.
+
+    bank and zstats map f"{statistic}_{layer}" to clean (rows, dim) arrays; test maps it to
+    (images, conditions, dim). Per-layer scores are z-scored with the z-statistics images and summed over
+    the layers, as in the pilot.
+    """
+    summed, per_layer = {}, {}
+    for statistic in STATISTICS:
+        for comparison in COMPARISONS:
+            clean_columns, test_columns = [], []
+            for layer in layers:
+                key = f"{statistic}_{layer}"
+                images, conditions, dim = test[key].shape
+                flat = test[key].reshape(images * conditions, dim)
+                if comparison == "knn":
+                    reference = _float32(bank[key])
+                    clean_columns.append(knn_scores(_float32(zstats[key]), reference))
+                    test_columns.append(knn_scores(_float32(flat), reference))
+                else:
+                    mean, std = fit_own_average(bank[key])
+                    clean_columns.append(own_average_scores(zstats[key], mean, std))
+                    test_columns.append(own_average_scores(flat, mean, std))
+            mean, std = stage_zstats(np.stack(clean_columns, axis=1))
+            values = np.stack(test_columns, axis=1)
+            name = method_name(statistic, comparison)
+            per_layer[name] = values.reshape(images, conditions, len(layers))
+            summed[name] = zscored_sum(values, mean, std).reshape(images, conditions)
+    return summed, per_layer

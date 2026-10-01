@@ -22,15 +22,14 @@ LABELS = {**report.LABELS,
 BOOTSTRAP_SAMPLES = 1000
 
 
-def depth_rows(conv: dict, lrp: np.ndarray) -> list[dict]:
-    """Per stage and representation: separation and harm tracking of that one layer's kNN distance."""
+def depth_rows(layer_scores: dict, lrp: np.ndarray) -> list[dict]:
+    """Per representation and stage: separation and harm tracking of that one layer's score."""
     delta_risk = lrp[:, report.CORRUPTED] - lrp[:, [0]]
     rows = []
-    for rep in REPRESENTATIONS:
-        values = conv[f"{rep}_layers"]
+    for name, values in layer_scores.items():
         for layer in range(values.shape[2]):
             v = values[:, :, layer]
-            rows.append({"representation": rep, "stage": layer + 1,
+            rows.append({"representation": name, "stage": layer + 1,
                          "auroc_common": float(metrics.condition_aurocs(v[:, 0], v[:, report.COMMON].T).mean()),
                          "auroc_extra": float(metrics.condition_aurocs(v[:, 0], v[:, report.EXTRA].T).mean()),
                          "rho_within": metrics.mean_within_condition_spearman(
@@ -47,7 +46,8 @@ def _depth_markdown(rows: list[dict]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def build_pilot_report(settings, names) -> None:
+def build_pilot_report(settings, names, extra=None, extra_layers=None, extra_labels=None,
+                       folder_name="results_convtu", title="# Conv TU pilot") -> None:
     names = list(names)
     folds = protocol.assign_folds(len(names))
     baseline = json.loads((settings.output / "results" / "summary.json").read_text())
@@ -63,7 +63,10 @@ def build_pilot_report(settings, names) -> None:
     per_fold_methods = () if baseline["lambda_folds_agree"] else ("contrastive",)
     ordered = report.method_scores(test, dcp, per_image_lambda, activation=activation)
     ordered.update({f"convtu_{rep}": conv[rep] for rep in REPRESENTATIONS})
-    scores = {m: ordered[m] for m in METHODS if m in ordered}
+    ordered.update(extra or {})
+    methods = METHODS + tuple(extra or {})
+    labels = {**LABELS, **(extra_labels or {})}
+    scores = {m: ordered[m] for m in methods if m in ordered}
 
     gt = CocoGroundTruth(settings.annotations)
     ids = [gt.image_id(n) for n in names]
@@ -90,7 +93,9 @@ def build_pilot_report(settings, names) -> None:
     ranges = metrics.bootstrap(statistic, len(names), samples=BOOTSTRAP_SAMPLES, seed=settings.seed)
     interval_rows = [{"quantity": key, "point": point[key], "low": ranges[key][0], "high": ranges[key][1]}
                      for key in point]
-    depth = depth_rows(conv, lrp)
+    layer_scores = {rep: conv[f"{rep}_layers"] for rep in REPRESENTATIONS}
+    layer_scores.update(extra_layers or {})
+    depth = depth_rows(layer_scores, lrp)
     calibration = json.loads((settings.output / "convtu" / "calibration.json").read_text())
     summary = {"images": len(names), "chosen_as": "first images of the seed-44 evaluation order",
                "lrp_threshold": threshold, "lambda_per_fold": baseline["lambda_per_fold"],
@@ -98,11 +103,11 @@ def build_pilot_report(settings, names) -> None:
                "bootstrap_samples": BOOTSTRAP_SAMPLES, "clean_map_of_these_images": float(condition_map[0]),
                "fraction": calibration["fraction"], "cut_margin": calibration["cut_margin"],
                "calibration": calibration["layers"]}
-    folder = settings.output / "results_convtu"
+    folder = settings.output / folder_name
     report.write_outputs(folder, {
         "separation": separation, "aggregates": report.aggregate_rows(separation), "harm": harm,
         "aurc_pools": pools, "intervals": [r for r in interval_rows if " - " not in r["quantity"]],
         "differences": [r for r in interval_rows if " - " in r["quantity"]], "depth": depth,
-    }, summary, methods=METHODS, labels=LABELS, title="# Conv TU pilot")
+    }, summary, methods=methods, labels=labels, title=title)
     with (folder / "report.md").open("a") as handle:
         handle.write("\n" + _depth_markdown(depth))

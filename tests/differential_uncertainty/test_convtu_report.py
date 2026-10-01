@@ -4,14 +4,16 @@ from pathlib import Path
 import numpy as np
 
 from differential_uncertainty.baselines import pipeline as baselines
+from differential_uncertainty.convtu import channels
 from differential_uncertainty.convtu import pipeline as convtu
 from differential_uncertainty.convtu import report as pilot
 from test_baselines_report import _tiny_run
 
 
-def test_pilot_report_puts_the_fingerprint_next_to_the_baselines(tmp_path, monkeypatch):
-    settings = _tiny_run(tmp_path, monkeypatch)   # 15 images through the fake test phase
-    baselines.run_phase("report", settings)       # the full report: stored LRP threshold and per-fold lambda
+def _fake_pilot(tmp_path, monkeypatch):
+    """The tiny run's full report, then fake conv-TU scores and a fake calibration for its 15 images."""
+    settings = _tiny_run(tmp_path, monkeypatch)
+    baselines.run_phase("report", settings)
     monkeypatch.setattr(convtu, "PILOT_IMAGES", 15)
     monkeypatch.setattr(pilot, "BOOTSTRAP_SAMPLES", 5)
     folder = settings.output / "test_convtu"
@@ -25,9 +27,12 @@ def test_pilot_report_puts_the_fingerprint_next_to_the_baselines(tmp_path, monke
     (settings.output / "convtu").mkdir()
     (settings.output / "convtu" / "calibration.json").write_text(json.dumps(
         {"fraction": 0.01, "cut_margin": 0.5, "layers": {"s1": {"k": 32768}}}))
+    return settings
 
+
+def test_pilot_report_puts_the_fingerprint_next_to_the_baselines(tmp_path, monkeypatch):
+    settings = _fake_pilot(tmp_path, monkeypatch)
     baselines.run_phase("convtu-report", settings)
-
     results = settings.output / "results_convtu"
     summary = json.loads((results / "summary.json").read_text())
     assert summary["images"] == 15 and summary["lrp_threshold"] == json.loads(
@@ -37,3 +42,26 @@ def test_pilot_report_puts_the_fingerprint_next_to_the_baselines(tmp_path, monke
     assert "Depth: one layer at a time" in text and "ContrastiveConf" in text
     assert len((results / "depth.csv").read_text().splitlines()) == 1 + 16
     assert "convtu_mst:auroc_common" in (results / "intervals.csv").read_text()
+
+
+def test_channels_report_adds_eight_rows(tmp_path, monkeypatch):
+    settings = _fake_pilot(tmp_path, monkeypatch)
+    rng = np.random.default_rng(1)
+    widths = {f"{statistic}_s{stage}": (48 if statistic == "grid" else 3)
+              for statistic in channels.STATISTICS for stage in range(1, 5)}
+    np.savez(convtu.channels_bank_path(settings), **{k: rng.normal(size=(30, w)) for k, w in widths.items()})
+    np.savez(convtu.channels_zstats_path(settings), **{k: rng.normal(size=(10, w)) for k, w in widths.items()})
+    folder = settings.output / convtu.CHANNELS_FOLDER
+    folder.mkdir()
+    for path in convtu.pilot_images(settings):
+        np.savez(folder / f"{Path(path.name).stem}.npz",
+                 **{k: rng.normal(size=(96, w)) + np.linspace(0, 3, 96)[:, None] for k, w in widths.items()})
+
+    baselines.run_phase("convtu-channels-report", settings)
+
+    results = settings.output / "results_convtu_channels"
+    text = (results / "report.md").read_text()
+    assert text.startswith("# Conv TU pilot: channel statistics")
+    assert "Channel means vs own training average" in text and "Conv TU: top 1% of the diagram" in text
+    assert len((results / "depth.csv").read_text().splitlines()) == 1 + 16 + 32
+    assert "ch_means_own:auroc_common" in (results / "intervals.csv").read_text()

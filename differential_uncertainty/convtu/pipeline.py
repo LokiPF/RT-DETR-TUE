@@ -379,5 +379,24 @@ def phase_report(settings: Settings) -> None:
     build_pilot_report(settings, [p.name for p in pilot_images(settings)])
 
 
+def phase_channels_report(settings: Settings) -> None:
+    """Score the stored channel statistics both ways and report them next to the pilot rows and the baselines."""
+    from ..baselines import report as baseline_report
+    from .channels import LABELS as CHANNEL_LABELS
+    from .channels import channel_method_scores
+    from .report import build_pilot_report
+    clean = (channels_bank_path(settings), channels_zstats_path(settings))
+    if not all(path.exists() for path in clean):
+        raise ValueError("run the convtu-channels phase first")
+    names = [p.name for p in pilot_images(settings)]
+    with np.load(clean[0]) as bank, np.load(clean[1]) as zstats:
+        bank, zstats = dict(bank), dict(zstats)
+    test = baseline_report._stack(settings.output / CHANNELS_FOLDER, names, CHANNEL_KEYS)
+    summed, per_layer = channel_method_scores(bank, zstats, test, [f"s{stage}" for stage in range(1, 5)])
+    build_pilot_report(settings, names, extra=summed, extra_layers=per_layer, extra_labels=CHANNEL_LABELS,
+                       folder_name="results_convtu_channels", title="# Conv TU pilot: channel statistics")
+
+
 PHASES = {"convtu-calibrate": phase_calibrate, "convtu-bank": phase_bank, "convtu-zstats": phase_zstats,
-          "convtu-scores": phase_scores, "convtu-report": phase_report, "convtu-channels": phase_channels}
+          "convtu-scores": phase_scores, "convtu-report": phase_report, "convtu-channels": phase_channels,
+          "convtu-channels-report": phase_channels_report}
