@@ -123,6 +123,14 @@ def _cell(point, interval=None) -> str:
     return f"{point:.3f}" + (f" [{interval['low']:.3f}, {interval['high']:.3f}]" if interval else "")
 
 
+def _signed(value: float) -> str:
+    return f"{value:+.3f}".replace("-", "−")
+
+
+def _difference_cell(point, interval) -> str:
+    return f"{_signed(point)} [{_signed(interval['low'])}, {_signed(interval['high'])}]"
+
+
 def _markdown(summary: dict) -> str:
     lines = ["# Content-conditioned reference: 5,000-image confirmation", "",
              f"**Decision (pre-registered rule, held-out images):** {summary['decision']}.", "",
@@ -144,9 +152,9 @@ def _markdown(summary: dict) -> str:
             lines += ["", "Differences, the conditioned row minus each other row (positive Δ: the conditioned row is better):",
                       "", "| Other row | Δ AUROC common ↑ | Δ AUROC extra ↑ |", "|---|---|---|"]
             for method in differences:
-                cells = [_cell(head["conditioned"][g] - head[method][g], intervals[f"conditioned - {method}:{g}"])
-                         for g in GROUPS]
-                lines.append(f"| {LABELS[method]} | {cells[0].replace('-', '−')} | {cells[1].replace('-', '−')} |")
+                cells = [_difference_cell(head["conditioned"][g] - head[method][g],
+                                          intervals[f"conditioned - {method}:{g}"]) for g in GROUPS]
+                lines.append(f"| {LABELS[method]} | {cells[0]} | {cells[1]} |")
         lines.append("")
     lines += ["## AUROC by severity (held-out images)", "", "| Row | Common, severities 1–5 ↑ | Extra, severities 1–5 ↑ |",
               "|---|---|---|"]
