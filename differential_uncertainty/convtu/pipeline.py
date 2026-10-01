@@ -419,6 +419,15 @@ def phase_means(settings: Settings) -> None:
                 _progress("convtu-means", done, len(pending), started)
 
 
+def phase_conditioned_report(settings: Settings) -> None:
+    """The 5,000-image confirmation of the content-conditioned reference, from the stored channel means."""
+    from .confirmation import build_confirmation_report
+    clean = (channels_bank_path(settings), channels_zstats_path(settings))
+    if not all(path.exists() for path in clean):
+        raise ValueError("run the convtu-channels phase first")
+    build_confirmation_report(settings)
+
+
 def phase_report(settings: Settings) -> None:
     from .report import build_pilot_report
     build_pilot_report(settings, [p.name for p in pilot_images(settings)])
@@ -455,4 +464,5 @@ def phase_channels_report(settings: Settings) -> None:
 
 PHASES = {"convtu-calibrate": phase_calibrate, "convtu-bank": phase_bank, "convtu-zstats": phase_zstats,
           "convtu-scores": phase_scores, "convtu-report": phase_report, "convtu-channels": phase_channels,
-          "convtu-channels-report": phase_channels_report, "convtu-means": phase_means}
+          "convtu-channels-report": phase_channels_report, "convtu-means": phase_means,
+          "convtu-conditioned-report": phase_conditioned_report}

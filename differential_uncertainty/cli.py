@@ -45,7 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
                                     "hashemi-fit", "cdf-fit", "cdf-zstats", "activation-scores", "timing", "report",
                                     "convtu-calibrate", "convtu-bank", "convtu-zstats", "convtu-scores",
                                     "convtu-report", "convtu-channels",
-                                    "convtu-channels-report", "convtu-means"])
+                                    "convtu-channels-report", "convtu-means",
+                                    "convtu-conditioned-report"])
     baselines.add_argument("--output", required=True)
     baselines.add_argument("--checkpoint", required=True)
     baselines.add_argument("--coco-train-images", required=True)

@@ -265,6 +265,31 @@ def test_means_phase_detects_changed_corruptions(small, detector, monkeypatch):
         baselines.run_phase("convtu-means", small)
 
 
+def test_conditioned_report_writes_every_row_and_checks_the_screen_images(small, detector, monkeypatch):
+    from differential_uncertainty.convtu import conditioned, confirmation
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 1)
+    monkeypatch.setattr(conditioned, "NEIGHBOURS", 3)
+    monkeypatch.setattr(confirmation, "BOOTSTRAP_SAMPLES", 20)
+    monkeypatch.setattr(confirmation, "SCREEN_AUROC", None)  # the fake backbone cannot reproduce the real screen
+    for phase in ("test", "convtu-channels", "convtu-means", "convtu-conditioned-report"):
+        baselines.run_phase(phase, small)
+    folder = small.output / confirmation.FOLDER
+    summary = json.loads((folder / "summary.json").read_text())
+    assert (summary["images"], summary["screen_images"], summary["held_out_images"]) == (2, 1, 1)
+    assert summary["decision"] == confirmation.decision(summary["intervals"]["held_out"])
+    assert set(summary["headline"]["held_out"]) == {"conditioned", "global_s123", "ch_means_knn", "ch_means_own",
+                                                    "saod_min", "knn"}  # no CDF or DisCoPatch scores in this run
+    assert "conditioned - global_s123:auroc_common" in summary["intervals"]["held_out"]
+    assert all(value == 0 for value in summary["reproduction_max_relative"].values())
+    assert "Held-out images" in (folder / "report.md").read_text() and (folder / "separation.csv").exists()
+    path = sorted((small.output / convtu.CHANNELS_FOLDER).glob("*.npz"))[0]
+    stored = dict(np.load(path))
+    stored["means_s2"] = stored["means_s2"] * 1.01
+    np.savez(path, **stored)
+    with pytest.raises(ValueError, match="differ from the pilot"):
+        baselines.run_phase("convtu-conditioned-report", small)
+
+
 def test_channel_statistics_reproduce_the_pilot_on_the_fake_backbone(small, detector, monkeypatch):
     from differential_uncertainty.baselines import report as baseline_report
     from differential_uncertainty.baselines.activation_cdf import stage_zstats

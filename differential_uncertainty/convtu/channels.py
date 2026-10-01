@@ -94,16 +94,17 @@ def _float32(array) -> torch.Tensor:
     return torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32))
 
 
-def channel_method_scores(bank: dict, zstats: dict, test: dict, layers, drop_floored: bool = False) -> tuple[dict, dict]:
-    """Every statistic compared both ways: z-summed (images, conditions) scores and the per-layer ones.
+def channel_method_scores(bank: dict, zstats: dict, test: dict, layers, drop_floored: bool = False,
+                          statistics=STATISTICS) -> tuple[dict, dict]:
+    """Each statistic compared both ways: z-summed (images, conditions) scores and the per-layer ones.
 
     bank and zstats map f"{statistic}_{layer}" to clean (rows, dim) arrays; test maps it to
     (images, conditions, dim). Per-layer scores are z-scored with the z-statistics images and summed over
     the layers, as in the pilot. With drop_floored, the own-average comparison leaves out the dimensions
-    whose clean spread the floor touches, so they cannot dominate it.
+    whose clean spread the floor touches, so they cannot dominate it. statistics picks which ones to score.
     """
     summed, per_layer = {}, {}
-    for statistic in STATISTICS:
+    for statistic in statistics:
         for comparison in COMPARISONS:
             clean_columns, test_columns = [], []
             for layer in layers:

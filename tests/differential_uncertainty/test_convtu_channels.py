@@ -72,6 +72,17 @@ def test_channel_method_scores_compare_every_statistic_both_ways():
         assert (summed[name][1] > summed[name][0].max()).all()
 
 
+def test_channel_method_scores_can_score_only_the_means():
+    bank, zstats, test = _clean_and_test(np.random.default_rng(3))
+    full, full_layers = channels.channel_method_scores(bank, zstats, test, ("s1", "s2"))
+    only = {key: value for key, value in test.items() if key.startswith("means_")}
+    summed, per_layer = channels.channel_method_scores(bank, zstats, only, ("s1", "s2"), statistics=("means",))
+    assert set(summed) == set(per_layer) == {"ch_means_knn", "ch_means_own"}
+    for name in summed:
+        np.testing.assert_array_equal(summed[name], full[name])
+        np.testing.assert_array_equal(per_layer[name], full_layers[name])
+
+
 def test_own_comparison_matches_the_per_dimension_formula():
     bank, zstats, test = _clean_and_test(np.random.default_rng(1))
     _, per_layer = channels.channel_method_scores(bank, zstats, test, ("s1", "s2"))
