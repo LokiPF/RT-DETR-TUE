@@ -2,6 +2,79 @@
 
 Dated observations and decisions that don't belong in a results document. Newest first.
 
+## 2026-10-01 (night): Corruptions flatten or shift the early channels
+
+**Source.** The detection-only roundtable proposed this; all five panelists gave it their first vote. The record is in `docs/roundtable-2026-10-01-detection/`. I re-implemented the two leading rows from their written spec (`verify_panel_rows.py` in that folder) and reproduced the panel's point estimates exactly.
+
+**Two numbers per channel, at stages 1–3:**
+- **Level** m: the channel's mean |activation| over all positions, as in the previous entry.
+- **Peak share** π = log(t + 1e-6) − log(m + 1e-6), where t is the mean of the channel's strongest 1% of positions. A high π means the pattern appears in a few places, strongly. A low π means the responses are flat across the image.
+
+Both are judged against the 50 clean bank images nearest in standardised stage-4 channel means, the content key of the previous entry.
+
+**The two leading rows:**
+- **AC, the shape row** (frozen in round 1):
+  - per stage, take the mean over channels of |π − mean_N π| / sd_bank(π);
+  - z-score each stage with the 500 z-statistics images;
+  - sum over stages 1–3.
+- **M1, the two-axis row** (frozen in round 2): the larger of two arms, each re-z-scored on the z-statistics images.
+  - The signed "flatter" arm is the mean over channels of −(π − mean_N π)/sd.
+  - The level arm is the previous entry's score.
+
+**The panel's account of why it works** (after the confrontation; measured on the screen or the clean bank):
+- **Structure removal lowers the peaks.** Fog, contrast and the blurs lower a channel's strongest responses much more than its mean. At severity 1, an s1 channel's log ceiling drops 4–14 times more than its log level (fog: −0.280 vs −0.061). 77–84% of s1 channels flatten, against 52–53% under noise.
+- **The flattening is shared across channels.** The direction in which all channels move together holds 12% of the clean variation, but 40–59% of the shift under fog, contrast and the blurs. A signed average over channels adds it up.
+- **Noise, snow and spatter add responses instead.** They mainly move the level.
+- **Content still matters for the peak share.** The stage-4 key predicts 60–69% of its clean variation (69–77% for the level), so the similar-scene reference still helps.
+
+**Numbers** on positions 1059–1969 (911 images, read only after both rows were frozen):
+
+| Row | AUROC common ↑ | AUROC extra ↑ | Severity 1, common ↑ |
+|---|---|---|---|
+| M1 (two axes) | **0.922** | 0.861 | **0.869** |
+| AC (peak share) | 0.901 | 0.862 | 0.818 |
+| Level vs similar scenes (previous entry) | 0.842 | **0.868** | 0.763 |
+| Activation CDFs (Becker et al., ICPR 2026) | 0.819 | 0.808 | 0.705 |
+
+- **AC also held** on the 859 images before them (positions 200–1058): 0.893 / 0.858.
+- **Severity-1 fog / contrast:** M1 0.959 / 0.947, CDFs 0.633 / 0.661.
+- **FPR95, common families:** M1 0.216, CDFs 0.417.
+- **The panel's bootstrap intervals** (not re-run by me):
+  - AC − CDFs: +0.082 [+0.075, +0.089] common, +0.053 [+0.048, +0.059] extra;
+  - M1 − AC: +0.021 [+0.015, +0.027] common, −0.001 [−0.007, +0.004] extra.
+
+**Ruled out by the panel:**
+- topology: the Euler characteristic adds +0.004 [−0.016, +0.022] over the means;
+- whitening the peak shares: −0.034 held out, because it divides out the shared flattening;
+- comparing small image cells: −0.112;
+- other content keys: no gain;
+- NAP's published form: 0.302.
+
+**Weak spots.**
+- Brightness (about 0.53 at severity 1), saturate and spatter stay weak for every row. The detector is trained to ignore photometric changes (L10 of the briefing).
+- M1 loses there against the level row: brightness −0.075, saturate −0.057.
+
+**Real fog is unproven.**
+- **Synthetic test:** 24 Cityscapes frames with fog synthesised from a guessed depth map, each AUROC about ±0.08. The plain level tied the new rows.
+- **Bank domain:** with the COCO bank, every content-conditioned row fell to 0.54–0.80. So the clean bank must come from the deployment camera.
+- **The deciding test** is Foggy Cityscapes: clean and foggy versions of the same scenes, with a Cityscapes clean bank.
+
+**Data caveat.** For their checks, the panelists read positions 200–1969 of the running 5,000-image pass.
+- Positions 1970–4999 (about 3,030 images) are unread by anyone, so they are the clean confirmation set for these rows.
+- The pre-registered decision on the level row is unaffected, because its rule was fixed beforehand. It will also be reported on 1970–4999.
+
+**Open decisions (user):**
+- the headline row and its rule, before 1970–4999 are read. The proposal is M1 primary on 1970–4999 with AC as the ablation; the alternative is panelist A's frozen rule;
+- the downloads of Foggy Cityscapes and ACDC;
+- the framing, "corruptions flatten or shift the early channels".
+
+**Credits:**
+- A: the mechanism and the row;
+- C: the same row, found independently, and the negative result for topology;
+- D: the two-axis framing and the driving plan;
+- E: the level arm and the same-scene oracle;
+- B: the ratio-artefact critique and the whitened baseline.
+
 ## 2026-10-01 (evening): The back of the detector as a content key
 
 **Goal (user).** "I want to detect the corruption of the images, not how the performance will drop."
