@@ -78,6 +78,22 @@ Two clean train images went through the real checkpoint on the CPU, with a proto
 
   The cycle rule matters more deeper into the diagram and in later stages. The **edges** control measures whether the difference at K = 1% carries any signal.
 
+## Follow-up 1 (1 October 2026): channel statistics
+
+The question (user): "if we compare each channel with the own training average, how would the performance change?" The follow-up also tests two of the variants in `docs/dev-log.md` (2026-10-01).
+
+1. **Statistics.** For each of the four pilot conv inputs, taken as |x|, and for each image:
+   - **means:** each channel's mean (C values);
+   - **top:** the mean of each channel's largest k values, with k = max(1, round(1% of H·W)) (C values);
+   - **p99:** the k-th largest value, which is the nearest-rank 99th percentile (C values);
+   - **grid:** each channel's mean on a 4 × 4 grid, from adaptive average pooling (16·C values).
+2. **Two comparisons for each statistic:**
+   - **kNN,** as in the pilot: the mean Euclidean distance to the 5 nearest of the 2,000 bank images.
+   - **Own training average:** per layer, the mean over dimensions of |v − μ| / σ. μ and σ (population) are computed per dimension over the same 2,000 bank images. σ is floored at 1% of the median of the layer's positive σ, so that channels that are dead on clean images cannot dominate.
+3. **Combining layers.** Per-layer scores are z-scored with the pilot's 500 clean z-statistics images and summed over the four layers, as in the pilot.
+4. **Same images and report.** The pilot's bank, z-statistics images and 200 val images × 96 conditions, and the same report machinery. The kNN on channel means must reproduce the pilot's channel-means row, with AUROC within 0.001.
+5. **Out of scope:** the fixed heavy-edge list (dev-log variant 1).
+
 ## What counts as a positive pilot
 
 - **mst** beats **edges** and **acts** on mean AUROC (common families) and on ρ(Δscore, ΔLRP) within conditions. The bootstrap interval of the difference must exclude 0.
