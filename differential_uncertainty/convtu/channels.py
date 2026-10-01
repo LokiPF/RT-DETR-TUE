@@ -34,6 +34,14 @@ def channel_statistics(x: torch.Tensor) -> dict:
     return {key: value.cpu().numpy().astype(np.float32) for key, value in out.items()}
 
 
+@torch.inference_mode()
+def channel_means(x: torch.Tensor) -> dict:
+    """Only the means statistic of channel_statistics, computed the same way; small enough for 5,000 images."""
+    if x.ndim != 4:
+        raise ValueError("expected a batch of shape (N, C, H, W)")
+    return {"means": x.abs().float().mean(dim=(2, 3)).cpu().numpy().astype(np.float32)}
+
+
 def fit_own_average(reference: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-dimension clean mean and population spread; the spread is floored so dead dimensions stay finite."""
     reference = np.asarray(reference, dtype=np.float64)

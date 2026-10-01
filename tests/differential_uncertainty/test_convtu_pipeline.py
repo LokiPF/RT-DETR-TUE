@@ -208,6 +208,63 @@ def test_channels_phase_refuses_a_bank_that_differs_from_the_pilot(small, detect
         baselines.run_phase("convtu-channels", small)
 
 
+def test_gpu_cap_takes_a_smaller_share_when_a_phase_asks_for_one(monkeypatch):
+    calls = []
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda device: type("Properties", (), {"total_memory": 32 * 2**30})())
+    monkeypatch.setattr(torch.cuda, "set_per_process_memory_fraction",
+                        lambda fraction, device=None: calls.append((fraction, device)))
+    convtu._cap_gpu_memory("cuda:0", 1.5)
+    assert calls == [(1.5 / 32, torch.device("cuda:0"))]
+
+
+def _means(settings):
+    for phase in ("test", "convtu-means"):
+        baselines.run_phase(phase, settings)
+
+
+def test_means_phase_covers_every_evaluation_image_and_resumes(small, detector, monkeypatch):
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 1)  # the confirmation is not limited to the pilot's images
+    capped = []
+    monkeypatch.setattr(convtu, "_cap_gpu_memory",
+                        lambda device, gib=convtu.GPU_MEMORY_CAP_GIB: capped.append((device, gib)))
+    _means(small)
+    assert capped == [("cpu", convtu.MEANS_GPU_CAP_GIB)]
+    files = sorted((small.output / convtu.MEANS_FOLDER).glob("*.npz"))
+    assert [f.stem for f in files] == sorted(p.stem for p in baselines.evaluation(small)) and len(files) == 2
+    with np.load(files[0]) as stats:
+        assert set(stats.files) == set(convtu.MEANS_KEYS)
+        assert [stats[key].shape for key in convtu.MEANS_KEYS] == [(96, 2), (96, 3), (96, 4), (96, 5)]
+        assert all(stats[key].dtype == np.float32 for key in convtu.MEANS_KEYS)
+    stamp = files[0].stat().st_mtime_ns
+    baselines.run_phase("convtu-means", small)
+    assert files[0].stat().st_mtime_ns == stamp
+
+
+def test_means_phase_reproduces_the_channel_statistics_means_exactly(small, detector, monkeypatch):
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)
+    _channels(small)
+    baselines.run_phase("convtu-means", small)
+    paths = sorted((small.output / convtu.CHANNELS_FOLDER).glob("*.npz"))
+    assert len(paths) == 2
+    for path in paths:
+        with np.load(path) as full, np.load(small.output / convtu.MEANS_FOLDER / path.name) as means:
+            for key in convtu.MEANS_KEYS:
+                np.testing.assert_array_equal(means[key], full[key])
+
+
+def test_means_phase_detects_changed_corruptions(small, detector, monkeypatch):
+    _means(small)
+    stem = sorted((small.output / convtu.MEANS_FOLDER).glob("*.npz"))[0].stem
+    (small.output / convtu.MEANS_FOLDER / f"{stem}.npz").unlink()
+    stored = dict(np.load(small.output / "test" / f"{stem}.npz"))
+    stored["digests"] = stored["digests"].copy()
+    stored["digests"][11] = "0" * 16
+    np.savez(small.output / "test" / f"{stem}.npz", **stored)
+    with pytest.raises(ValueError, match="corruptions differ"):
+        baselines.run_phase("convtu-means", small)
+
+
 def test_channel_statistics_reproduce_the_pilot_on_the_fake_backbone(small, detector, monkeypatch):
     from differential_uncertainty.baselines import report as baseline_report
     from differential_uncertainty.baselines.activation_cdf import stage_zstats

@@ -110,7 +110,7 @@ def test_cli_accepts_the_convtu_phases(monkeypatch, tmp_path):
     base = ["--output", str(tmp_path / "out"), "--checkpoint", "c.pth", "--coco-train-images", "train",
             "--coco-val-images", "val", "--coco-annotations", "ann.json", "--discopatch-root", "dcp"]
     phases = ("convtu-calibrate", "convtu-bank", "convtu-zstats", "convtu-scores", "convtu-report",
-              "convtu-channels", "convtu-channels-report")
+              "convtu-channels", "convtu-channels-report", "convtu-means")
     for phase in phases:
         assert cli.main(["baselines-coco", "--phase", phase, *base]) == 0
     assert tuple(seen) == phases

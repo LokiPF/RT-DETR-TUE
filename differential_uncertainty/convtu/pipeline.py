@@ -19,7 +19,7 @@ from ..baselines.activation_cdf import stage_zstats, zscored_sum
 from ..baselines.pipeline import (TEST_KEYS, Settings, _atomic_json, _atomic_npz, _load_npz, _progress,
                                   _train_loader, _valid_existing, _variant_stream, evaluation)
 from ..extraction import load_frozen_detector, prepare_image
-from .channels import STATISTICS, channel_statistics
+from .channels import STATISTICS, channel_means, channel_statistics
 from .features import KNN_NEIGHBOURS, REPRESENTATIONS, knn_scores, layer_features, layer_specs
 from .graph import EDGE_CAP, FRACTION, conv_top_merges, heaviest_weight
 from .tap import LAYER_NAMES, ConvInputs
@@ -36,6 +36,9 @@ SCORE_KEYS = (*REPRESENTATIONS, *(f"{rep}_layers" for rep in REPRESENTATIONS), "
 CHANNELS_FOLDER = "test_convtu_channels"
 CHANNEL_KEYS = tuple(f"{statistic}_s{stage}" for statistic in STATISTICS for stage in range(1, 5))
 REPRODUCTION_RTOL = 1e-4  # the bank's channel means must equal the pilot bank's means this closely
+MEANS_FOLDER = "test_convtu_means"  # channel means of every evaluation image, for the 5,000-image confirmation
+MEANS_KEYS = tuple(f"means_s{stage}" for stage in range(1, 5))
+MEANS_GPU_CAP_GIB = 1.5  # the backbone-only means pass needs well under 1 GiB
 
 
 def _folder(settings: Settings):
@@ -83,13 +86,13 @@ def _sync(device) -> None:
         torch.cuda.synchronize()
 
 
-def _cap_gpu_memory(device) -> None:
+def _cap_gpu_memory(device, gib: float = GPU_MEMORY_CAP_GIB) -> None:
     """Make the pilot run out of memory itself before it squeezes the other sessions on the shared GPU."""
     device = torch.device(device)
     if device.type != "cuda":
         return
     total = torch.cuda.get_device_properties(device).total_memory
-    torch.cuda.set_per_process_memory_fraction(min(1.0, GPU_MEMORY_CAP_GIB * 2**30 / total), device)
+    torch.cuda.set_per_process_memory_fraction(min(1.0, gib * 2**30 / total), device)
 
 
 def _gpu_memory_record(device) -> dict:
@@ -323,11 +326,11 @@ def channels_zstats_path(settings: Settings):
     return _folder(settings) / "channels_zstats.npz"
 
 
-def _batch_channel_statistics(taps, batch) -> dict:
+def _batch_channel_statistics(taps, batch, statistics=channel_statistics) -> dict:
     inputs = taps(batch.to(taps.kernels[0].device))
     out = {}
     for layer, spec in enumerate(layer_specs(inputs, taps.kernels)):
-        for statistic, values in channel_statistics(inputs[layer]).items():
+        for statistic, values in statistics(inputs[layer]).items():
             out[f"{statistic}_{spec.name}"] = values
     return out
 
@@ -336,12 +339,12 @@ def _concatenated(parts: list) -> dict:
     return {key: np.concatenate([part[key] for part in parts]) for key in parts[0]}
 
 
-def image_channel_statistics(taps, arrays, batch_size) -> dict:
-    """Every channel statistic of every pilot layer for all conditions of one image, (96, dim) per key."""
+def image_channel_statistics(taps, arrays, batch_size, statistics=channel_statistics) -> dict:
+    """Channel statistics of every pilot layer for all conditions of one image, (96, dim) per key."""
     parts = []
     for start in range(0, len(arrays), batch_size):
         batch = torch.stack([prepare_image(Image.fromarray(a), IMAGE_SIZE) for a in arrays[start:start + batch_size]])
-        parts.append(_batch_channel_statistics(taps, batch))
+        parts.append(_batch_channel_statistics(taps, batch, statistics))
     out = _concatenated(parts)
     if not all(np.isfinite(value).all() for value in out.values()):
         raise ValueError("channel statistics are not finite")
@@ -390,6 +393,32 @@ def phase_channels(settings: Settings) -> None:
                 _progress("convtu-channels", done, len(pending), started)
 
 
+def phase_means(settings: Settings) -> None:
+    """Channel means of the pilot layers for every condition of every evaluation image (5,000-image confirmation).
+
+    Resumable image by image, so it can run in the short gaps that the other sessions leave on the GPU.
+    """
+    folder = settings.output / MEANS_FOLDER
+    pending = [p for p in evaluation(settings) if not _valid_existing(folder / f"{p.stem}.npz", MEANS_KEYS)]
+    absent = [p.name for p in pending if not (settings.output / "test" / f"{p.stem}.npz").exists()]
+    if absent:
+        raise ValueError(f"run the test phase first: {len(absent)} detector results are missing, e.g. {absent[0]}")
+    if not pending:
+        return
+    _cap_gpu_memory(settings.device, MEANS_GPU_CAP_GIB)
+    started = time.time()
+    with _conv_inputs(settings) as taps:
+        for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
+            stem = Path(name).stem
+            stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
+            if list(stored) != [protocol.digest(a) for a in arrays]:
+                raise ValueError(f"corruptions differ from the detector pass for {name}")
+            _atomic_npz(folder / f"{stem}.npz",
+                        **image_channel_statistics(taps, arrays, settings.batch_size, channel_means))
+            if done % 25 == 0:
+                _progress("convtu-means", done, len(pending), started)
+
+
 def phase_report(settings: Settings) -> None:
     from .report import build_pilot_report
     build_pilot_report(settings, [p.name for p in pilot_images(settings)])
@@ -426,4 +455,4 @@ def phase_channels_report(settings: Settings) -> None:
 
 PHASES = {"convtu-calibrate": phase_calibrate, "convtu-bank": phase_bank, "convtu-zstats": phase_zstats,
           "convtu-scores": phase_scores, "convtu-report": phase_report, "convtu-channels": phase_channels,
-          "convtu-channels-report": phase_channels_report}
+          "convtu-channels-report": phase_channels_report, "convtu-means": phase_means}
