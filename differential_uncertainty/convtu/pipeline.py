@@ -19,6 +19,7 @@ from ..baselines.activation_cdf import stage_zstats, zscored_sum
 from ..baselines.pipeline import (TEST_KEYS, Settings, _atomic_json, _atomic_npz, _load_npz, _progress,
                                   _train_loader, _valid_existing, _variant_stream, evaluation)
 from ..extraction import load_frozen_detector, prepare_image
+from .channels import STATISTICS, channel_statistics
 from .features import KNN_NEIGHBOURS, REPRESENTATIONS, knn_scores, layer_features, layer_specs
 from .graph import EDGE_CAP, FRACTION, conv_top_merges, heaviest_weight
 from .tap import LAYER_NAMES, ConvInputs
@@ -32,6 +33,8 @@ GPU_MEMORY_CAP_GIB = 5.5  # the pilot's allocator limit on the shared GPU; the C
 PILOT_IMAGES = 200  # the first images of the seed-44 evaluation order, all 96 conditions
 IMAGE_SIZE = (640, 640)
 SCORE_KEYS = (*REPRESENTATIONS, *(f"{rep}_layers" for rep in REPRESENTATIONS), "tau_k", "read", "rounds")
+CHANNELS_FOLDER = "test_convtu_channels"
+CHANNEL_KEYS = tuple(f"{statistic}_s{stage}" for statistic in STATISTICS for stage in range(1, 5))
 
 
 def _folder(settings: Settings):
@@ -311,10 +314,70 @@ def phase_scores(settings: Settings) -> None:
                 _progress("convtu-scores", done, len(pending), started)
 
 
+def channels_bank_path(settings: Settings):
+    return _folder(settings) / "channels_bank.npz"
+
+
+def channels_zstats_path(settings: Settings):
+    return _folder(settings) / "channels_zstats.npz"
+
+
+def _batch_channel_statistics(taps, batch) -> dict:
+    inputs = taps(batch.to(taps.kernels[0].device))
+    out = {}
+    for layer, spec in enumerate(layer_specs(inputs, taps.kernels)):
+        for statistic, values in channel_statistics(inputs[layer]).items():
+            out[f"{statistic}_{spec.name}"] = values
+    return out
+
+
+def _concatenated(parts: list) -> dict:
+    return {key: np.concatenate([part[key] for part in parts]) for key in parts[0]}
+
+
+def image_channel_statistics(taps, arrays, batch_size) -> dict:
+    """Every channel statistic of every pilot layer for all conditions of one image, (96, dim) per key."""
+    parts = []
+    for start in range(0, len(arrays), batch_size):
+        batch = torch.stack([prepare_image(Image.fromarray(a), IMAGE_SIZE) for a in arrays[start:start + batch_size]])
+        parts.append(_batch_channel_statistics(taps, batch))
+    out = _concatenated(parts)
+    if not all(np.isfinite(value).all() for value in out.values()):
+        raise ValueError("channel statistics are not finite")
+    return out
+
+
+def phase_channels(settings: Settings) -> None:
+    """Channel statistics of the pilot layers: the bank and z-statistics images, then every pilot variant."""
+    folder = settings.output / CHANNELS_FOLDER
+    pending = [p for p in pilot_images(settings) if not _valid_existing(folder / f"{p.stem}.npz", CHANNEL_KEYS)]
+    absent = [p.name for p in pending if not (settings.output / "test" / f"{p.stem}.npz").exists()]
+    if absent:
+        raise ValueError(f"run the test phase first: {len(absent)} detector results are missing, e.g. {absent[0]}")
+    clean = {"bank": channels_bank_path(settings), "zstats": channels_zstats_path(settings)}
+    if not pending and all(path.exists() for path in clean.values()):
+        return
+    _cap_gpu_memory(settings.device)
+    started = time.time()
+    with _conv_inputs(settings) as taps:
+        for split, path in clean.items():
+            if not path.exists():
+                _atomic_npz(path, **_concatenated(
+                    [_batch_channel_statistics(taps, batch) for batch in _clean_batches(settings, split)]))
+        for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
+            stem = Path(name).stem
+            stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
+            if list(stored) != [protocol.digest(a) for a in arrays]:
+                raise ValueError(f"corruptions differ from the detector pass for {name}")
+            _atomic_npz(folder / f"{stem}.npz", **image_channel_statistics(taps, arrays, settings.batch_size))
+            if done % 10 == 0:
+                _progress("convtu-channels", done, len(pending), started)
+
+
 def phase_report(settings: Settings) -> None:
     from .report import build_pilot_report
     build_pilot_report(settings, [p.name for p in pilot_images(settings)])
 
 
 PHASES = {"convtu-calibrate": phase_calibrate, "convtu-bank": phase_bank, "convtu-zstats": phase_zstats,
-          "convtu-scores": phase_scores, "convtu-report": phase_report}
+          "convtu-scores": phase_scores, "convtu-report": phase_report, "convtu-channels": phase_channels}

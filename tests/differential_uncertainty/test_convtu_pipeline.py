@@ -155,3 +155,43 @@ def test_every_gpu_phase_caps_its_memory_first(small, detector, monkeypatch):
     assert capped == ["cpu"] * 4
     calibration = json.loads(convtu.calibration_path(small).read_text())
     assert calibration["peak_gpu_reserved_gib"] is None and "peak_gpu_gib" not in calibration
+
+
+def _channels(settings):
+    for phase in ("test", "convtu-channels"):
+        baselines.run_phase(phase, settings)
+
+
+def test_channels_phase_stores_every_statistic_and_resumes(small, detector, monkeypatch):
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)
+    capped = []
+    monkeypatch.setattr(convtu, "_cap_gpu_memory", lambda device: capped.append(device))
+    _channels(small)
+    assert capped == ["cpu"]
+    with np.load(convtu.channels_bank_path(small)) as bank:
+        assert bank["means_s1"].shape == (6, 2) and bank["grid_s1"].shape == (6, 32)
+        assert bank["top_s4"].shape == (6, 5) and bank["p99_s4"].shape == (6, 5)
+    with np.load(convtu.channels_zstats_path(small)) as zstats:
+        assert zstats["means_s2"].shape == (3, 3)
+    files = sorted((small.output / convtu.CHANNELS_FOLDER).glob("*.npz"))
+    assert len(files) == 2
+    with np.load(files[0]) as stats:
+        assert set(stats.files) == set(convtu.CHANNEL_KEYS)
+        assert stats["means_s4"].shape == (96, 5) and stats["grid_s4"].shape == (96, 80)
+        assert np.isfinite(stats["grid_s1"]).all()
+    stamp = files[0].stat().st_mtime_ns
+    baselines.run_phase("convtu-channels", small)
+    assert files[0].stat().st_mtime_ns == stamp
+
+
+def test_channels_phase_detects_changed_corruptions(small, detector, monkeypatch):
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)
+    _channels(small)
+    stem = sorted((small.output / convtu.CHANNELS_FOLDER).glob("*.npz"))[0].stem
+    (small.output / convtu.CHANNELS_FOLDER / f"{stem}.npz").unlink()
+    stored = dict(np.load(small.output / "test" / f"{stem}.npz"))
+    stored["digests"] = stored["digests"].copy()
+    stored["digests"][7] = "0" * 16
+    np.savez(small.output / "test" / f"{stem}.npz", **stored)
+    with pytest.raises(ValueError, match="corruptions differ"):
+        baselines.run_phase("convtu-channels", small)
