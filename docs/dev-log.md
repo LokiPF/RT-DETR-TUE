@@ -2,6 +2,19 @@
 
 Dated observations and decisions that don't belong in a results document. Newest first.
 
+## 2026-10-01 (later): Own training average vs kNN on channel means
+
+**Answer** (details in `docs/conv-tu-pilot-results.md`, section "Follow-up: channel statistics"):
+- **Separation is about the same as kNN.** Comparing each channel with its own clean average gives 0.794 against 0.798 AUROC on the common families, and 0.818 against 0.847 on the extra ones.
+- **Ranking conditions by harm is much better:** ρ(score, LRP) across conditions is 0.68 against 0.50, the same as the full-CDF monitor.
+- **One mean per channel comes close to the full CDF.** It gets within 0.03 AUROC of the full per-channel CDF monitor, and tracks within-condition harm slightly better.
+- **Tails and position don't help on COCO.** Per-channel tails (top-1% means, 99th percentiles) and a 4 × 4 grid are all worse.
+
+**What it means for the next step:**
+- The separation signal lives in per-channel activation levels at stages 1–3, and a single mean per channel captures most of it.
+- Every activation monitor tracks harm weakly within a condition: at most 0.13 (Hashemi et al. on the decoder queries), against 0.26 for SAOD min and 0.34 for ContrastiveConf.
+- So a combination of a channel-level shift score with an output-based harm score is the natural next thing to try. A coarse grid stays worth testing on the fixed-camera driving data.
+
 ## 2026-10-01: Channel identity, not edge identity
 
 **Observation from the conv-TU pilot** (`docs/conv-tu-pilot-results.md`). Three of the four representations are sorted top-K lists: the diagram's top 1%, the heaviest edges, and the largest activations. All three separate at about 0.66 AUROC. The unsorted channel means (mean |x| per input channel, in a fixed channel order) reach 0.798 on the common families and 0.847 on the extra ones. The likely reason: a sorted top-K list mixes channels and positions and sees only the extreme tail of the map. The channel means keep which channel is which and average over the whole map, and noise or blur raise or lower specific channels.

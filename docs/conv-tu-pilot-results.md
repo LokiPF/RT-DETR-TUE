@@ -80,3 +80,48 @@ The fingerprint's largest edge over the heaviest edges is at stage 4, the layer 
 - **Sample size.** These are 200 images, not the 5,000 of `docs/coco-baseline-numbers.md`, so the intervals are wider. The baseline rows differ from that document only through the image subset: they use the full run's stored LRP threshold (0.55) and per-fold λ.
 - **ContrastiveConf intervals** leave out λ uncertainty. The pilot keeps the full run's per-fold λ fixed in every bootstrap draw, while the full report refits it (final review, finding M6).
 - **One setting of K.** The pilot tested K = 1% of nodes only. Deeper into the diagram, the gap between mst and edges grows: 10–25% at stages 3–4 for K = 25–50% on one clean image.
+
+## Follow-up: channel statistics (1 October 2026)
+
+**The question:** what changes if each channel is compared with its own clean training average, as the ICPR monitor does, instead of with kNN on the whole vector of channel means? It uses the same four layers, the same 2,000-image bank, the same 500 z-statistics images, and the same 200 images × 96 conditions. The plan is `docs/superpowers/plans/2026-10-01-conv-tu-channel-statistics.md`; the tables are in `docs/results/conv-tu-pilot-channels/`.
+
+**Checks:**
+- **Exact reproduction.** The kNN-on-channel-means row reproduces the pilot's channel-means row exactly: every difference in the report is 0.000. Underneath, the bank's channel means are bitwise identical to the pilot's. The recomputed z-statistics and the per-layer scores of all 19,200 variants agree within 5e-7 relative.
+- **No floored dimensions.** No dimension of any statistic is floored (the floor is 1% of the median positive spread). So no own-average row is driven by channels that are dead on clean images.
+
+**The answer:**
+- **Separation on the common families is about the same.** AUROC is 0.794 against 0.798 for kNN; the difference is −0.005 [−0.021, +0.011].
+- **The extra families are slightly worse:** 0.818 against 0.847 (−0.029 [−0.043, −0.016]).
+- **Ranking conditions by harm is much better.** ρ(score, LRP) across conditions is 0.677 [0.645, 0.705] against 0.500 [0.462, 0.527], the same as the CDF monitor's 0.677.
+- **Within-condition harm tracking stays weak:** 0.055 against 0.074, not significantly different.
+- **Against the full-CDF monitor,** which compares each channel's whole distribution with its own training CDF, one mean per channel:
+  - comes within 0.032 AUROC on the common families (−0.032 [−0.045, −0.018]);
+  - matches it on the extra families (+0.010 [−0.002, +0.021]);
+  - tracks within-condition harm slightly better (+0.034 [+0.007, +0.060]).
+
+**The other variants:**
+- **Per-channel tails do not beat the plain means.** The top-1% mean and the 99th percentile both lose to the plain means under either comparison. The own-average comparison does rescue them, from about 0.64 to 0.75–0.77 AUROC on the common families.
+- **The 4 × 4 grid is worst.** It reaches 0.510 AUROC on the common families with kNN, which is chance, and 0.646 with the own average. Even coarse position brings back the content variation that the dev log predicted for COCO. A fixed-camera driving dataset is still untested.
+
+| Row | AUROC common | AUROC extra | ρ(Δscore, ΔLRP) within | ρ(score, LRP) conditions | AURC all |
+|---|---|---|---|---|---|
+| Channel means, kNN (= the pilot's control) | 0.798 [0.780, 0.816] | 0.847 [0.829, 0.864] | 0.074 [0.021, 0.123] | 0.500 [0.462, 0.527] | 0.649 [0.620, 0.679] |
+| Channel means vs own training average | 0.794 [0.777, 0.810] | 0.818 [0.803, 0.832] | 0.055 [0.003, 0.108] | 0.677 [0.645, 0.705] | 0.659 [0.630, 0.688] |
+| Per-channel top-1% means, kNN | 0.637 [0.616, 0.657] | 0.728 [0.710, 0.744] | 0.060 [−0.012, 0.128] | 0.381 [0.346, 0.424] | 0.678 [0.648, 0.708] |
+| Per-channel top-1% means vs own average | 0.765 [0.742, 0.790] | 0.721 [0.704, 0.740] | 0.105 [0.043, 0.166] | 0.645 [0.614, 0.668] | 0.670 [0.642, 0.697] |
+| Per-channel 99th percentiles, kNN | 0.633 [0.612, 0.653] | 0.729 [0.711, 0.746] | 0.042 [−0.027, 0.110] | 0.351 [0.311, 0.394] | 0.679 [0.649, 0.708] |
+| Per-channel 99th percentiles vs own average | 0.751 [0.728, 0.776] | 0.726 [0.709, 0.745] | 0.088 [0.025, 0.148] | 0.655 [0.622, 0.680] | 0.673 [0.644, 0.700] |
+| 4 × 4-grid channel means, kNN | 0.510 [0.494, 0.526] | 0.606 [0.588, 0.623] | 0.097 [0.038, 0.156] | 0.275 [0.242, 0.315] | 0.663 [0.633, 0.693] |
+| 4 × 4-grid channel means vs own average | 0.646 [0.632, 0.660] | 0.774 [0.759, 0.789] | 0.071 [0.017, 0.122] | 0.530 [0.499, 0.570] | 0.660 [0.630, 0.689] |
+| Activation CDFs (Becker et al., ICPR 2026) | 0.825 [0.807, 0.845] | 0.808 [0.791, 0.824] | 0.021 [−0.036, 0.075] | 0.677 [0.649, 0.708] | 0.664 [0.635, 0.692] |
+
+Differences, first row minus second:
+
+| Pair | Δ AUROC common | Δ AUROC extra | Δ ρ within | Δ AURC all |
+|---|---|---|---|---|
+| means vs own average − means kNN | −0.005 [−0.021, +0.011] | −0.029 [−0.043, −0.016] | −0.019 [−0.073, +0.035] | +0.011 [+0.000, +0.023] |
+| top-1% vs own average − means vs own average | −0.028 [−0.051, −0.006] | −0.096 [−0.114, −0.079] | +0.049 [−0.018, +0.111] | +0.011 [+0.001, +0.021] |
+| grid kNN − means kNN | −0.288 [−0.310, −0.269] | −0.241 [−0.260, −0.224] | +0.023 [−0.026, +0.073] | +0.014 [+0.003, +0.025] |
+| means vs own average − Activation CDFs | −0.032 [−0.045, −0.018] | +0.010 [−0.002, +0.021] | +0.034 [+0.007, +0.060] | −0.005 [−0.010, +0.000] |
+
+**By layer:** the own average beats kNN at the two ends, at stage 1 (0.780 vs 0.741 AUROC common) and stage 4 (0.612 vs 0.535). kNN is ahead at stages 2 and 3 (0.824 and 0.825 vs 0.800 and 0.793). The per-layer numbers for every row are in `depth.csv`.
