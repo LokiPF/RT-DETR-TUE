@@ -11,8 +11,10 @@ import numpy as np
 
 from .activation_cdf import BINS as CDF_BINS
 from .hashemi import K as HASHEMI_K
-from . import metrics, protocol
-from .coco_quality import CocoGroundTruth, coco_map, coco_results, per_image_ap
+from degradation_monitor import corruptions
+from degradation_monitor.datasets import coco
+from . import metrics
+from degradation_monitor.datasets.coco import CocoGroundTruth, coco_map, coco_results, per_image_ap
 
 METHODS = ("saod_top3", "saod_min", "contrastive", "knn", "discopatch", "hashemi", "hashemi_enc", "cdf", "cdf_sum")
 LABELS = {"saod_top3": "SAOD, mean of top 3", "saod_min": "SAOD, min (1 − max confidence)",
@@ -27,10 +29,10 @@ KNN_KS = (1, 10, 50, 100, 200)
 SEPARATION = ("auroc", "aupr", "fpr95")
 BOOTSTRAP_SAMPLES = 1000
 DIFFERENCE_METRICS = ("auroc_common", "auroc_extra", "aupr_common", "aupr_extra", "fpr95_common", "fpr95_extra")
-SEVERITY = np.array([s for _, s in protocol.CONDITIONS])
-CORRUPTED = np.arange(1, len(protocol.CONDITIONS))
-COMMON = np.array([c for c, (f, _) in enumerate(protocol.CONDITIONS) if f in protocol.COMMON_FAMILIES])
-EXTRA = np.array([c for c, (f, _) in enumerate(protocol.CONDITIONS) if f in protocol.EXTRA_FAMILIES])
+SEVERITY = np.array([s for _, s in corruptions.CONDITIONS])
+CORRUPTED = np.arange(1, len(corruptions.CONDITIONS))
+COMMON = np.array([c for c, (f, _) in enumerate(corruptions.CONDITIONS) if f in corruptions.COMMON_FAMILIES])
+EXTRA = np.array([c for c, (f, _) in enumerate(corruptions.CONDITIONS) if f in corruptions.EXTRA_FAMILIES])
 TEST_ARRAYS = ("saod_min", "saod_top3", "conf_pos", "conf_neg", "knn", "det_scores", "det_labels", "det_boxes")
 
 
@@ -59,14 +61,14 @@ def separation_rows(scores: dict, folds, per_fold_methods=()) -> list[dict]:
     for method, values in scores.items():
         by_fold = method in per_fold_methods
         for c in CORRUPTED:
-            family, severity = protocol.CONDITIONS[c]
+            family, severity = corruptions.CONDITIONS[c]
             if by_fold:
                 parts = [_separation(values[folds == f, 0], values[folds == f, c]) for f in np.unique(folds)]
                 result = {key: float(np.mean([p[key] for p in parts])) for key in SEPARATION}
             else:
                 result = _separation(values[:, 0], values[:, c])
             rows.append({"method": method, "family": family, "severity": int(severity),
-                         "group": "common" if family in protocol.COMMON_FAMILIES else "extra",
+                         "group": "common" if family in corruptions.COMMON_FAMILIES else "extra",
                          "pooling": "fold-averaged" if by_fold else "pooled", **result})
     return rows
 
@@ -75,7 +77,7 @@ def aggregate_rows(rows: list[dict]) -> list[dict]:
     out = []
     for method in dict.fromkeys(r["method"] for r in rows):
         for group in ("common", "extra", "all"):
-            for severity in (*protocol.SEVERITIES, "all"):
+            for severity in (*corruptions.SEVERITIES, "all"):
                 chosen = [r for r in rows if r["method"] == method
                           and (group == "all" or r["group"] == group)
                           and (severity == "all" or r["severity"] == severity)]
@@ -144,7 +146,7 @@ def _markdown(tables: dict, summary: dict, methods=METHODS, labels=LABELS, title
                   "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
         for method in present:
             cells = {r["severity"]: r for r in aggregates if r["method"] == method and r["group"] == group}
-            by_severity = " | ".join(_fmt(cells[s]["auroc"]) if s in cells else "–" for s in protocol.SEVERITIES)
+            by_severity = " | ".join(_fmt(cells[s]["auroc"]) if s in cells else "–" for s in corruptions.SEVERITIES)
             lines.append(f"| {labels[method]} | {by_severity} | "
                          f"{_with_ci(intervals, f'{method}:auroc_{group}') if intervals else _fmt(cells['all']['auroc'])} | "
                          f"{_with_ci(intervals, f'{method}:aupr_{group}') if intervals else _fmt(cells['all']['aupr'])} | "
@@ -193,7 +195,7 @@ def _stack(folder: Path, names, keys) -> dict:
 def build_report(settings) -> None:
     from .pipeline import evaluation
     names = [p.name for p in evaluation(settings)]
-    folds = protocol.assign_folds(len(names))
+    folds = coco.assign_folds(len(names))
     test = _stack(settings.output / "test", names, TEST_ARRAYS)
     dcp_folder = settings.output / "test_dcp"
     dcp = _stack(dcp_folder, names, ("dcp",))["dcp"] if dcp_folder.exists() else None
@@ -214,7 +216,7 @@ def build_report(settings) -> None:
     condition_map = np.array([
         coco_map(gt, [r for k, i in enumerate(ids) for r in coco_results(
             i, test["det_scores"][k, c], test["det_labels"][k, c], test["det_boxes"][k, c], gt.category_ids)], ids)
-        for c in range(len(protocol.CONDITIONS))
+        for c in range(len(corruptions.CONDITIONS))
     ])
 
     per_fold_methods = () if consistent else ("contrastive",)
@@ -233,7 +235,7 @@ def build_report(settings) -> None:
                      for key in point]
     conditions = [{"family": f, "severity": s, "map": float(condition_map[c]),
                    **{f"mean_{m}": float(v[:, c].mean()) for m, v in scores.items()}}
-                  for c, (f, s) in enumerate(protocol.CONDITIONS)]
+                  for c, (f, s) in enumerate(corruptions.CONDITIONS)]
     knn_k = [{"k": k, "mean_auroc_common": float(metrics.condition_aurocs(
         test["knn"][:, 0, k - 1], test["knn"][:, COMMON, k - 1].T).mean())} for k in KNN_KS]
     timing_path = settings.output / "timing.json"
@@ -242,7 +244,7 @@ def build_report(settings) -> None:
         timing = [{"part": key, "ms": value} for key, value in json.loads(timing_path.read_text()).items()
                   if key.endswith("_ms")]
     summary = {
-        "images": len(names), "folds": protocol.FOLDS, "lambda_per_fold": per_fold,
+        "images": len(names), "folds": coco.FOLDS, "lambda_per_fold": per_fold,
         "lambda_folds_agree": consistent, "images_with_ap": int(np.isfinite(ap).sum()),
         "clean_map": float(condition_map[0]), "knn_k": KNN_K, "theta": 0.3,
         "bootstrap_samples": BOOTSTRAP_SAMPLES, "discopatch_included": dcp is not None,

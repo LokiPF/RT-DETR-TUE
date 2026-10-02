@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..baselines import metrics, protocol
+from degradation_monitor import corruptions
+from degradation_monitor.datasets import coco
+from ..baselines import metrics
 from ..baselines import report as baseline_report
 from . import conditioned
 from .channels import channel_method_scores
@@ -219,8 +221,8 @@ def _markdown(summary: dict) -> str:
         lines += ["", "## AUROC by family at severities 1 / 3 / 5 (all images)", "",
                   "| Family | " + " | ".join(FAMILY_ROWS[m] for m in shown) + " |",
                   "|---|" + "---|" * len(shown)]
-        for name in protocol.FAMILIES:
-            marker = " *" if name in protocol.EXTRA_FAMILIES else ""
+        for name in corruptions.FAMILIES:
+            marker = " *" if name in corruptions.EXTRA_FAMILIES else ""
             cells = [" / ".join(f"{family[m][name][s]:.2f}" for s in ("1", "3", "5")) for m in shown]
             lines.append(f"| {name.replace('_', ' ')}{marker} | " + " | ".join(cells) + " |")
         lines += ["", "`*` marks the extra families."]
@@ -252,7 +254,7 @@ def build_confirmation_report(settings) -> None:
     summed, _ = channel_method_scores(bank, zstats, means, [f"s{stage}" for stage in range(1, 5)], statistics=("means",))
     scores.update({"ch_means_knn": summed["ch_means_knn"], "ch_means_own": summed["ch_means_own"]})
     scores.update(_baselines(settings, names))
-    folds = protocol.assign_folds(len(names))
+    folds = coco.assign_folds(len(names))
     subsets = {"all": np.arange(len(names)), "untouched": np.arange(min(UNTOUCHED_START, len(names)), len(names)),
                "held_out": np.arange(screen_count, len(names)), "screen": np.arange(screen_count)}
     subsets = {name: rows for name, rows in subsets.items() if len(rows)}

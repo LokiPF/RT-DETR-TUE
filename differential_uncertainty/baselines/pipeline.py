@@ -18,12 +18,14 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 from degradation_monitor.detector.model import prepare_image
-from . import discopatch, protocol
+from degradation_monitor import corruptions
+from degradation_monitor.datasets import coco
+from . import discopatch
 from .activation_cdf import BINS as CDF_BINS
 from .activation_cdf import MARGIN as CDF_MARGIN
 from .activation_cdf import STAGES as CDF_STAGES
 from .activation_cdf import CdfMonitor, ChannelRanges, ReferenceHistograms, stage_zstats, zscored_sum
-from .coco_quality import CocoGroundTruth, coco_map, coco_results
+from degradation_monitor.datasets.coco import CocoGroundTruth, coco_map, coco_results
 from degradation_monitor.detector.taps import DetectorTap
 from .discopatch import DisCoPatchScorer, train_discopatch
 from .hashemi import K as HASHEMI_K
@@ -67,14 +69,14 @@ class Settings:
             "checkpoint": str(self.checkpoint), "train_images": str(self.train_images),
             "val_images": str(self.val_images), "annotations": str(self.annotations),
             "discopatch_root": str(self.discopatch_root), "limit": self.limit, "seed": self.seed,
-            "folds": protocol.FOLDS, "top_k": TOP_K, "knn_k": KNN_K,
+            "folds": coco.FOLDS, "top_k": TOP_K, "knn_k": KNN_K,
             "knn_k_max": KNN_K_MAX, "theta": THETA,
-            "conditions": [list(c) for c in protocol.CONDITIONS],
+            "conditions": [list(c) for c in corruptions.CONDITIONS],
         }
 
 
 def evaluation(settings: Settings) -> list[Path]:
-    images = protocol.evaluation_images(settings.val_images, seed=settings.seed)
+    images = coco.evaluation_images(settings.val_images, seed=settings.seed)
     return images[: settings.limit] if settings.limit else images
 
 
@@ -169,11 +171,11 @@ def _bounded(pool, function, items, in_flight):
 def _variant_stream(settings: Settings, paths):
     if settings.workers == 0:
         for path in paths:
-            yield protocol.load_variants(path)
+            yield corruptions.load_variants(path)
         return
     context = multiprocessing.get_context("spawn")
     with context.Pool(settings.workers) as pool:
-        yield from _bounded(pool, protocol.load_variants, paths, 2 * settings.workers)
+        yield from _bounded(pool, corruptions.load_variants, paths, 2 * settings.workers)
 
 
 def _detector_scores(tap, bank, arrays, batch_size, device) -> dict:
@@ -195,7 +197,7 @@ def _detector_scores(tap, bank, arrays, batch_size, device) -> dict:
 
 def phase_sanity(settings: Settings) -> float:
     gt = CocoGroundTruth(settings.annotations)
-    images = protocol.list_images(settings.val_images)
+    images = coco.list_images(settings.val_images)
     results = []
     with DetectorTap(settings.checkpoint, settings.device) as tap:
         for start in range(0, len(images), settings.batch_size):
@@ -229,7 +231,7 @@ def phase_bank(settings: Settings) -> None:
     path = settings.output / "bank" / "knn_bank.npy"
     if path.exists():
         return
-    paths = protocol.list_images(settings.train_images)
+    paths = coco.list_images(settings.train_images)
     loader = DataLoader(_Prepared(paths), batch_size=settings.batch_size,
                         num_workers=settings.workers, pin_memory=True)
     features, started = [], time.time()
@@ -263,7 +265,7 @@ def phase_test(settings: Settings) -> None:
     with DetectorTap(settings.checkpoint, settings.device) as tap:
         for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
             values = _detector_scores(tap, bank, arrays, settings.batch_size, settings.device)
-            values["digests"] = np.array([protocol.digest(a) for a in arrays])
+            values["digests"] = np.array([corruptions.digest(a) for a in arrays])
             _atomic_npz(folder / f"{Path(name).stem}.npz", **values)
             if done % 25 == 0:
                 _progress("test", done, len(pending), started)
@@ -275,7 +277,7 @@ def phase_train_discopatch(settings: Settings) -> None:
         raise ValueError(f"{_discopatch_checkpoint(settings)} already exists; remove it to train again")
     _atomic_json(settings.output / "discopatch" / "training.json",
                  {"epochs": settings.epochs, "seed": settings.seed, "numerics": discopatch.TRAINING_NUMERICS})
-    train_discopatch(protocol.list_images(settings.train_images), settings.output / "discopatch",
+    train_discopatch(coco.list_images(settings.train_images), settings.output / "discopatch",
                      epochs=settings.epochs, num_workers=settings.workers, seed=settings.seed,
                      root=settings.discopatch_root)
 
@@ -305,7 +307,7 @@ def phase_discopatch_scores(settings: Settings) -> None:
     for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
         stem = Path(name).stem
         stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
-        if list(stored) != [protocol.digest(a) for a in arrays]:
+        if list(stored) != [corruptions.digest(a) for a in arrays]:
             raise ValueError(f"corruptions differ from the detector pass for {name}")
         dcp = scorer.score(arrays, name)
         if not np.isfinite(dcp).all():
@@ -337,7 +339,7 @@ def phase_hashemi_fit(settings: Settings) -> None:
     path = _hashemi_intervals(settings)
     if path.exists():
         return
-    paths = protocol.list_images(settings.train_images)
+    paths = coco.list_images(settings.train_images)
     stats = {name: NeuronStats() for name in HASHEMI_LAYERS}
     started = time.time()
     with DetectorTap(settings.checkpoint, settings.device, hidden=True) as tap:
@@ -360,7 +362,7 @@ def phase_cdf_fit(settings: Settings) -> None:
     path = _cdf_reference(settings)
     if path.exists():
         return
-    paths = protocol.list_images(settings.train_images)
+    paths = coco.list_images(settings.train_images)
     ranges = {stage: ChannelRanges() for stage in CDF_STAGES}
     with DetectorTap(settings.checkpoint, settings.device, hidden=True) as tap:
         started = time.time()
@@ -391,7 +393,7 @@ def phase_cdf_zstats(settings: Settings) -> None:
     reference = _cdf_reference(settings)
     if not reference.exists():
         raise ValueError(f"run the cdf-fit phase first: {reference} is missing")
-    paths = protocol.list_images(settings.train_images)
+    paths = coco.list_images(settings.train_images)
     chosen = np.sort(np.random.default_rng(settings.seed).choice(len(paths), size=min(CDF_ZSTAT_IMAGES, len(paths)),
                                                                 replace=False))
     monitor = CdfMonitor(reference, settings.device)
@@ -451,7 +453,7 @@ def phase_activation_scores(settings: Settings) -> None:
         for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
             stem = Path(name).stem
             stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
-            if list(stored) != [protocol.digest(a) for a in arrays]:
+            if list(stored) != [corruptions.digest(a) for a in arrays]:
                 raise ValueError(f"corruptions differ from the detector pass for {name}")
             values = _activation_scores(tap, hashemi_monitor, cdf_monitor, zstats, arrays, settings.batch_size)
             if not all(np.isfinite(v).all() for v in values.values()):

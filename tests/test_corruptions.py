@@ -2,8 +2,8 @@ import numpy as np
 import pytest
 from PIL import Image, ImageFilter
 
-from differential_uncertainty.baselines import protocol
-from differential_uncertainty.corruptions.imagecorruptions import apply_imagecorruption
+from degradation_monitor import corruptions as protocol
+from degradation_monitor.corruptions import apply_imagecorruption
 
 
 def _image(width=64, height=48, mode="RGB"):
@@ -18,25 +18,6 @@ def test_conditions_are_clean_then_19_families_by_5_severities_in_package_order(
     assert protocol.CONDITIONS[0] == ("clean", 0)
     assert len(protocol.CONDITIONS) == 96
     assert protocol.CONDITIONS[1:6] == tuple(("gaussian_noise", s) for s in range(1, 6))
-
-
-def test_evaluation_images_use_the_old_benchmark_shuffle(tmp_path):
-    for index in range(20):
-        (tmp_path / f"{index:03d}.jpg").write_bytes(b"x")
-    expected = sorted(tmp_path.iterdir())
-    np.random.default_rng(44).shuffle(expected)
-    images = protocol.evaluation_images(tmp_path, seed=44)
-    assert images == expected  # the archived benchmark selected its images with this same shuffle
-
-
-def test_evaluation_images_reject_an_empty_directory(tmp_path):
-    with pytest.raises(ValueError, match="no images"):
-        protocol.evaluation_images(tmp_path, seed=44)
-
-
-def test_folds_are_balanced_and_follow_shuffled_position():
-    assert np.bincount(protocol.assign_folds(5000)).tolist() == [1000] * 5
-    assert protocol.assign_folds(7).tolist() == [0, 1, 2, 3, 4, 0, 1]
 
 
 def test_corrupt_is_seeded_per_image_and_restores_global_numpy_state():

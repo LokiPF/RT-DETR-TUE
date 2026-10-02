@@ -122,7 +122,7 @@ def test_worker_pool_returns_every_image_in_order_with_identical_corruptions(tmp
     pooled = list(pipeline._variant_stream(_settings(tmp_path, workers=1), paths))  # 2 in flight < 3 images
     assert [name for name, _ in pooled] == [p.name for p in paths]
     for (_, expected), (_, actual) in zip(in_process, pooled):
-        assert [pipeline.protocol.digest(a) for a in actual] == [pipeline.protocol.digest(a) for a in expected]
+        assert [pipeline.corruptions.digest(a) for a in actual] == [pipeline.corruptions.digest(a) for a in expected]
 
 
 def _fake_scorer(monkeypatch, score):

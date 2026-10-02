@@ -14,7 +14,8 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..baselines import protocol
+from degradation_monitor import corruptions
+from degradation_monitor.datasets import coco
 from ..baselines.activation_cdf import stage_zstats, zscored_sum
 from ..baselines.pipeline import (TEST_KEYS, Settings, _atomic_json, _atomic_npz, _load_npz, _progress,
                                   _train_loader, _valid_existing, _variant_stream, evaluation)
@@ -77,7 +78,7 @@ def _conv_inputs(settings: Settings) -> ConvInputs:
 
 
 def _clean_batches(settings: Settings, split: str):
-    paths = protocol.list_images(settings.train_images)
+    paths = coco.list_images(settings.train_images)
     return _train_loader(settings, [paths[i] for i in train_splits(len(paths), settings.seed)[split]])
 
 
@@ -311,7 +312,7 @@ def phase_scores(settings: Settings) -> None:
         for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
             stem = Path(name).stem
             stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
-            if list(stored) != [protocol.digest(a) for a in arrays]:
+            if list(stored) != [corruptions.digest(a) for a in arrays]:
                 raise ValueError(f"corruptions differ from the detector pass for {name}")
             _atomic_npz(folder / f"{stem}.npz", **image_scores(taps, arrays, bank, zstats, cuts, settings.batch_size))
             if done % 5 == 0:
@@ -386,7 +387,7 @@ def phase_channels(settings: Settings) -> None:
         for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
             stem = Path(name).stem
             stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
-            if list(stored) != [protocol.digest(a) for a in arrays]:
+            if list(stored) != [corruptions.digest(a) for a in arrays]:
                 raise ValueError(f"corruptions differ from the detector pass for {name}")
             _atomic_npz(folder / f"{stem}.npz", **image_channel_statistics(taps, arrays, settings.batch_size))
             if done % 10 == 0:
@@ -411,7 +412,7 @@ def phase_means(settings: Settings) -> None:
         for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
             stem = Path(name).stem
             stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
-            if list(stored) != [protocol.digest(a) for a in arrays]:
+            if list(stored) != [corruptions.digest(a) for a in arrays]:
                 raise ValueError(f"corruptions differ from the detector pass for {name}")
             _atomic_npz(folder / f"{stem}.npz",
                         **image_channel_statistics(taps, arrays, settings.batch_size, channel_means_and_top))

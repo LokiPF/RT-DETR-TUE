@@ -4,9 +4,11 @@ import json
 import numpy as np
 import pytest
 
-from differential_uncertainty.baselines import protocol, report
+from degradation_monitor import corruptions
+from degradation_monitor.datasets import coco
+from differential_uncertainty.baselines import report
 
-SEVERITY = np.array([s for _, s in protocol.CONDITIONS], float)
+SEVERITY = np.array([s for _, s in corruptions.CONDITIONS], float)
 
 
 def _scores(n=30):
@@ -16,7 +18,7 @@ def _scores(n=30):
 
 
 def test_separation_rows_cover_every_method_and_condition_with_the_right_pooling():
-    folds = protocol.assign_folds(30)
+    folds = coco.assign_folds(30)
     rows = report.separation_rows(_scores(), folds, per_fold_methods=("contrastive",))
     assert len(rows) == len(report.METHODS) * 95
     assert {r["pooling"] for r in rows if r["method"] == "contrastive"} == {"fold-averaged"}
@@ -25,7 +27,7 @@ def test_separation_rows_cover_every_method_and_condition_with_the_right_pooling
 
 
 def test_aggregate_rows_average_common_and_extra_families_separately():
-    rows = report.separation_rows(_scores(), protocol.assign_folds(30))
+    rows = report.separation_rows(_scores(), coco.assign_folds(30))
     keys = {(r["method"], r["group"], r["severity"]) for r in report.aggregate_rows(rows)}
     assert {("knn", "common", "all"), ("knn", "extra", 5), ("knn", "all", "all")} <= keys
 
@@ -38,7 +40,7 @@ def test_headline_numbers_include_pairwise_differences_and_no_harm():
 
 
 def test_headline_numbers_fold_average_the_methods_asked_for():
-    scores, folds = _scores(), protocol.assign_folds(30)
+    scores, folds = _scores(), coco.assign_folds(30)
     numbers = report.headline_numbers(scores, folds, per_fold_methods=("contrastive",))
     values = scores["contrastive"]
     expected = np.mean([report.metrics.condition_aurocs(values[folds == f, 0], values[folds == f][:, report.COMMON].T).mean()
@@ -47,7 +49,7 @@ def test_headline_numbers_fold_average_the_methods_asked_for():
 
 
 def test_write_outputs_creates_csv_json_and_markdown(tmp_path):
-    rows = report.separation_rows(_scores(), protocol.assign_folds(30))
+    rows = report.separation_rows(_scores(), coco.assign_folds(30))
     report.write_outputs(tmp_path, {"separation": rows, "aggregates": report.aggregate_rows(rows)},
                          {"lambda_per_fold": {"0": 5.0}, "clean_map": 0.48})
     assert (tmp_path / "separation.csv").exists()
@@ -164,8 +166,8 @@ def test_differences_cover_every_separation_metric_for_both_family_groups():
 
 
 def test_write_outputs_takes_other_methods_labels_and_title(tmp_path):
-    scores = {"mine": np.random.default_rng(0).normal(size=(6, len(protocol.CONDITIONS)))}
-    rows = report.separation_rows(scores, protocol.assign_folds(6))
+    scores = {"mine": np.random.default_rng(0).normal(size=(6, len(corruptions.CONDITIONS)))}
+    rows = report.separation_rows(scores, coco.assign_folds(6))
     report.write_outputs(tmp_path, {"separation": rows, "aggregates": report.aggregate_rows(rows)}, {"x": 1},
                          methods=("mine",), labels={"mine": "My method"}, title="# Pilot")
     text = (tmp_path / "report.md").read_text()

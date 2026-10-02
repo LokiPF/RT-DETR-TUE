@@ -1,14 +1,13 @@
-"""Fixed COCO protocol for the baselines: conditions, evaluation images, folds, seeded corruptions."""
+"""The corruption protocol: clean plus 19 imagecorruptions families x severities 1-5, one seeded draw per image and condition."""
 from __future__ import annotations
 
 import hashlib
+import inspect
 import zlib
 from pathlib import Path
 
 import numpy as np
 from PIL import Image
-
-from ..corruptions.imagecorruptions import apply_imagecorruption
 
 COMMON_FAMILIES = (
     "gaussian_noise", "shot_noise", "impulse_noise", "defocus_blur", "glass_blur",
@@ -21,31 +20,49 @@ SEVERITIES = (1, 2, 3, 4, 5)
 CONDITIONS = (("clean", 0),) + tuple(
     (family, severity) for family in FAMILIES for severity in SEVERITIES
 )
-FOLDS = 5
-_SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
-def list_images(root) -> list[Path]:
-    root = Path(root)
-    if not root.is_dir():
-        raise ValueError(f"image directory does not exist: {root}")
-    return sorted(p for p in root.iterdir() if p.is_file() and p.suffix.lower() in _SUFFIXES)
+class _NumpyCompatibility:
+    def __getattr__(self, name: str):
+        if name == "float_":
+            return np.float64
+        return getattr(np, name)
 
 
-def evaluation_images(val_root, *, seed: int) -> list[Path]:
-    """All val images in the old benchmark's seeded shuffle order; the order defines the folds."""
-    images = list_images(val_root)
-    if not images:
-        raise ValueError(f"no images found in {val_root}")
-    np.random.default_rng(seed).shuffle(images)
-    return images
+def _prepare_compatibility() -> None:
+    import imagecorruptions.corruptions as upstream
+
+    if not hasattr(upstream.np, "float_"):
+        upstream.np = _NumpyCompatibility()
+    if "multichannel" not in inspect.signature(upstream.gaussian).parameters:
+        gaussian = upstream.gaussian
+
+        def compatible_gaussian(image, *args, multichannel=None, **kwargs):
+            if multichannel:
+                kwargs["channel_axis"] = -1
+            return gaussian(image, *args, **kwargs)
+
+        upstream.gaussian = compatible_gaussian
+
+    random_noise = getattr(getattr(upstream, "sk", None), "util", None)
+    random_noise = getattr(random_noise, "random_noise", None)
+    if random_noise is not None and not getattr(random_noise, "_fixed_legacy_rng", False):
+        def compatible_random_noise(image, mode="gaussian", rng=None, clip=True, **kwargs):
+            if rng is None:
+                rng = int(np.random.randint(0, 2**32))
+            return random_noise(image, mode=mode, rng=rng, clip=clip, **kwargs)
+
+        compatible_random_noise._fixed_legacy_rng = True
+        upstream.sk.util.random_noise = compatible_random_noise
 
 
-def assign_folds(count: int, folds: int = FOLDS) -> np.ndarray:
-    """Fold of each image from its shuffled position: 0, 1, ..., folds - 1, 0, 1, ..."""
-    if count <= 0 or folds < 2:
-        raise ValueError("count must be positive and folds at least 2")
-    return np.arange(count) % folds
+def apply_imagecorruption(image: Image.Image, name: str, severity: int) -> Image.Image:
+    from imagecorruptions import corrupt
+
+    _prepare_compatibility()
+    pixels = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    output = corrupt(pixels, corruption_name=name, severity=severity)
+    return Image.fromarray(np.asarray(output, dtype=np.uint8), mode="RGB")
 
 
 def variant_seed(image_id: str, family: str, severity: int) -> int:

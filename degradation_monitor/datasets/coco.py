@@ -1,13 +1,59 @@
-"""Detection quality on COCO: per-image AP and mAP (pycocotools)."""
+"""COCO 2017: clean train images, the seed-44 val order and its folds, and the ground truth the baselines need."""
 from __future__ import annotations
 
 import contextlib
 import io
 import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
 import numpy as np
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
+
+FOLDS = 5
+SEED = 44
+# Disjoint seeded draws of train images. "reserved" was the archived conv-TU pilot's calibration set; the slot is kept
+# so that the bank and z-statistics images stay exactly those the stored references were computed from.
+SPLIT_IMAGES = (("reserved", 200), ("bank", 2000), ("zstats", 500))
+_SUFFIXES = {".jpg", ".jpeg", ".png"}
+
+
+def list_images(root) -> list[Path]:
+    root = Path(root)
+    if not root.is_dir():
+        raise ValueError(f"image directory does not exist: {root}")
+    return sorted(p for p in root.iterdir() if p.is_file() and p.suffix.lower() in _SUFFIXES)
+
+
+def evaluation_images(val_root, *, seed: int) -> list[Path]:
+    """All val images in the old benchmark's seeded shuffle order; the order defines the folds."""
+    images = list_images(val_root)
+    if not images:
+        raise ValueError(f"no images found in {val_root}")
+    np.random.default_rng(seed).shuffle(images)
+    return images
+
+
+def assign_folds(count: int, folds: int = FOLDS) -> np.ndarray:
+    """Fold of each image from its shuffled position: 0, 1, ..., folds - 1, 0, 1, ..."""
+    if count <= 0 or folds < 2:
+        raise ValueError("count must be positive and folds at least 2")
+    return np.arange(count) % folds
+
+
+def train_splits(count: int, seed: int = SEED) -> dict:
+    """Sorted, disjoint, seeded draws of train-image indices: reserved, bank and z-statistics."""
+    needed = sum(size for _, size in SPLIT_IMAGES)
+    if count < needed:
+        raise ValueError(f"the reference needs {needed} train images, found {count}")
+    order = np.random.default_rng(seed).permutation(count)
+    out, start = {}, 0
+    for name, size in SPLIT_IMAGES:
+        out[name] = np.sort(order[start:start + size])
+        start += size
+    return out
 
 
 def _quiet():
@@ -79,3 +125,30 @@ def per_image_ap(gt, results_by_image, image_ids) -> np.ndarray:
         ap = _evaluate(gt, detections, [image_id]) if objects else -1.0
         values.append(ap if ap >= 0 else math.nan)
     return np.array(values)
+
+
+@dataclass(frozen=True)
+class Coco:
+    """What a stage needs from the dataset; a Cityscapes module would offer the same five methods."""
+    train_root: Path
+    val_root: Path
+    annotations: Path
+    seed: int = SEED
+    limit: Optional[int] = None
+
+    def train_images(self) -> list[Path]:
+        return list_images(self.train_root)
+
+    def reference_split(self, name: str) -> list[Path]:
+        paths = self.train_images()
+        return [paths[i] for i in train_splits(len(paths), self.seed)[name]]
+
+    def evaluation_images(self) -> list[Path]:
+        images = evaluation_images(self.val_root, seed=self.seed)
+        return images[: self.limit] if self.limit else images
+
+    def folds(self) -> np.ndarray:
+        return assign_folds(len(self.evaluation_images()))
+
+    def ground_truth(self) -> CocoGroundTruth:
+        return CocoGroundTruth(self.annotations)
