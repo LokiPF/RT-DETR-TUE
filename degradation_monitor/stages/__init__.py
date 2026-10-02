@@ -1,7 +1,7 @@
 """The runnable, resumable steps. Each refuses inputs that changed since its results were written."""
 from __future__ import annotations
 
-from . import baselines
+from . import baselines, method
 
 STAGES = {
     "check": baselines.check,
@@ -13,6 +13,8 @@ STAGES = {
     "cdf-fit": baselines.cdf_fit,
     "cdf-zstats": baselines.cdf_zstats,
     "activation-pass": baselines.activation_pass,
+    "method-reference": method.method_reference,
+    "method-pass": method.method_pass,
     "timing": baselines.timing,
 }
 

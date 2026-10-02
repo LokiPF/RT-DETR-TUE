@@ -322,3 +322,36 @@ def test_channel_statistics_reproduce_the_pilot_on_the_fake_backbone(small, dete
     _, per_layer = channels.channel_method_scores(bank, zstats, test, layers)
     pilot = baseline_report._stack(small.output / "test_convtu", names, ("means_layers",))["means_layers"]
     np.testing.assert_allclose(per_layer["ch_means_knn"], pilot, rtol=1e-6)
+
+
+def test_the_new_method_stages_store_exactly_what_the_old_phases_stored(small, detector, monkeypatch, tmp_path):
+    from degradation_monitor.datasets import coco
+    from degradation_monitor.detector.taps import EarlyChannelTaps
+    from degradation_monitor.method.statistics import KEYS
+    from degradation_monitor.settings import Settings
+    from degradation_monitor.stages import baselines as baseline_stages
+    from degradation_monitor.stages import method as method_stages
+    from degradation_monitor.stages import run_stage
+    monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)
+    _channels(small)
+    baselines.run_phase("convtu-means", small)
+    monkeypatch.setattr(coco, "SPLIT_IMAGES", (("reserved", 2), ("bank", 6), ("zstats", 3)))  # the fixture's sizes
+    monkeypatch.setattr(method_stages, "early_taps", lambda _settings: EarlyChannelTaps(FakeBackbone()))
+    monkeypatch.setattr(baseline_stages, "DetectorTap", FakeTap)
+    small.checkpoint.write_bytes(b"weights")
+    settings = Settings(run=tmp_path / "run", checkpoint=small.checkpoint, train_images=small.train_images,
+                        val_images=small.val_images, annotations=small.annotations, discopatch_root=tmp_path,
+                        limit=2, workers=0, device="cpu", batch_size=small.batch_size)
+    settings.layout.knn_bank.parent.mkdir(parents=True)
+    np.save(settings.layout.knn_bank, np.random.default_rng(0).normal(size=(256, 512)).astype(np.float16))
+    for name in ("detector-pass", "method-reference", "method-pass"):
+        run_stage(name, settings)
+    pairs = [(convtu.channels_bank_path(small), settings.layout.method_bank),
+             (convtu.channels_zstats_path(small), settings.layout.method_zstats)]
+    pairs += [(small.output / convtu.MEANS_FOLDER / p.name, p)
+              for p in sorted(settings.layout.scores("method").glob("*.npz"))]
+    assert len(pairs) == 4
+    for old, new in pairs:
+        with np.load(old) as before, np.load(new) as after:
+            for key in KEYS:
+                np.testing.assert_array_equal(after[key], before[key])
