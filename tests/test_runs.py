@@ -47,6 +47,19 @@ def test_a_run_folder_refuses_another_protocol(tmp_path):
         manifest.check_protocol({"seed": 45, "limit": 10, "conditions": [["clean", 0], ["fog", 1]]})
 
 
+def test_a_run_folder_with_scores_but_no_recorded_protocol_is_refused(tmp_path):
+    layout = RunLayout(tmp_path / "unconverted")
+    atomic_npz(layout.score_file("detector", "a.jpg"), x=np.arange(3))
+    with pytest.raises(ValueError, match="holds score files"):
+        Manifest(layout).check_protocol({"seed": 999, "limit": 3})
+    assert not layout.manifest.exists()
+    fresh = RunLayout(tmp_path / "fresh")  # reference files and an empty score folder do not count
+    atomic_npz(fresh.method_bank, x=np.arange(3))
+    fresh.scores("detector").mkdir(parents=True)
+    Manifest(fresh).check_protocol({"seed": 44, "limit": None})
+    assert Manifest(fresh).read()["protocol"] == {"seed": 44, "limit": None}
+
+
 def test_a_score_folder_refuses_inputs_other_than_its_own(tmp_path):
     manifest = Manifest(RunLayout(tmp_path))
     manifest.check_inputs("activations", {"cdf_reference": "aa", "hashemi_k": 2.0})
@@ -54,6 +67,17 @@ def test_a_score_folder_refuses_inputs_other_than_its_own(tmp_path):
     with pytest.raises(ValueError, match="inputs of scores/activations changed .*cdf_reference"):
         manifest.check_inputs("activations", {"cdf_reference": "bb", "hashemi_k": 2.0})
     assert json.loads((tmp_path / "manifest.json").read_text())["inputs"]["activations"]["cdf_reference"] == "aa"
+
+
+def test_a_score_folder_with_files_but_no_recorded_inputs_is_refused(tmp_path):
+    layout = RunLayout(tmp_path)
+    manifest = Manifest(layout)
+    atomic_npz(layout.score_file("activations", "a.jpg"), x=np.arange(3))
+    with pytest.raises(ValueError, match="scores/activations already holds files"):
+        manifest.check_inputs("activations", {"cdf_reference": "aa", "hashemi_k": 2.0})
+    layout.scores("discopatch").mkdir(parents=True)
+    manifest.check_inputs("discopatch", {"discriminator": "dd"})
+    assert manifest.read()["inputs"] == {"discopatch": {"discriminator": "dd"}}
 
 
 def test_the_environment_is_recorded_once(tmp_path):

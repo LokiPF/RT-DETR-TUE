@@ -185,6 +185,7 @@ class Manifest:
     """manifest.json: the run's protocol, its environment, and the inputs each score folder was computed from."""
 
     def __init__(self, layout: RunLayout):
+        self.layout = layout
         self.path = layout.manifest
 
     def read(self) -> dict:
@@ -195,22 +196,39 @@ class Manifest:
         data.update(_plain(sections))
         atomic_json(self.path, data)
 
+    def _holds_scores(self, folder: str) -> bool:
+        """Whether scores/<folder>/ already holds a result file."""
+        return any(self.layout.scores(folder).glob("*.npz"))
+
     def check_protocol(self, protocol: dict) -> None:
-        """Record the protocol of a new run folder; refuse a run folder made with another protocol."""
+        """Record the protocol of a new run folder; refuse a run folder made with another protocol.
+
+        A run folder that already holds score files but records no protocol is refused too; files under reference/
+        do not count.
+        """
         protocol = _plain(protocol)
         recorded = self.read().get("protocol")
         if recorded is None:
+            if any(self._holds_scores(folder) for folder in SCORE_KEYS):
+                raise ValueError("this run folder already holds score files but its manifest records no protocol; "
+                                 f"convert it or start a new run folder: {self.path}")
             self.update(protocol=protocol)
         elif recorded != protocol:
             changed = sorted(k for k in set(recorded) | set(protocol) if recorded.get(k) != protocol.get(k))
             raise ValueError(f"this run folder was made with another protocol ({', '.join(changed)}): {self.path}")
 
     def check_inputs(self, folder: str, inputs: dict) -> None:
-        """Record what a score folder is computed from; refuse to add to it if it was computed from something else."""
+        """Record what a score folder is computed from; refuse to add to it if it was computed from something else.
+
+        A score folder that already holds files but has no recorded inputs is refused too.
+        """
         inputs = _plain(inputs)
         data = self.read()
         recorded = data.get("inputs", {}).get(folder)
         if recorded is None:
+            if self._holds_scores(folder):
+                raise ValueError(f"scores/{folder} already holds files but the manifest records no inputs for it: "
+                                 f"{self.path}")
             data.setdefault("inputs", {})[folder] = inputs
             atomic_json(self.path, data)
         elif recorded != inputs:
