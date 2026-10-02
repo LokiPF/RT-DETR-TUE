@@ -8,8 +8,6 @@ import numpy as np
 from scipy.stats import rankdata
 from sklearn.metrics import average_precision_score
 
-from ..corruptions import COMMON_CONDITIONS, EXTRA_CONDITIONS
-
 
 def _score_vector(values, *, name: str) -> np.ndarray:
     try:
@@ -66,14 +64,6 @@ def group_separation(clean, degraded) -> tuple[float, float, float]:
     return (float(condition_aurocs(clean, degraded).mean()),
             float(np.mean([aupr(clean, row) for row in degraded])),
             float(np.mean([fpr_at_95_tpr(clean, row) for row in degraded])))
-
-
-def group_aurocs(scores, rows) -> tuple[float, float]:
-    """Mean AUROC over the common and over the extra conditions, on the given images."""
-    values = np.asarray(scores, dtype=np.float64)[np.asarray(rows)]
-    clean = values[:, 0]
-    return (float(condition_aurocs(clean, values[:, COMMON_CONDITIONS].T).mean()),
-            float(condition_aurocs(clean, values[:, EXTRA_CONDITIONS].T).mean()))
 
 
 def stage_zstats(stage_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:

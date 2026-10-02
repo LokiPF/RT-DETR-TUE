@@ -77,13 +77,3 @@ def test_group_separation_averages_the_three_metrics_over_conditions():
     assert auroc == pytest.approx(np.mean([m.auroc(clean, row) for row in degraded]))
     assert aupr == pytest.approx(np.mean([m.aupr(clean, row) for row in degraded]))
     assert fpr95 == pytest.approx(np.mean([m.fpr_at_95_tpr(clean, row) for row in degraded]))
-
-
-def test_group_aurocs_average_the_common_and_the_extra_conditions_on_the_chosen_images():
-    from degradation_monitor import corruptions
-    rng = np.random.default_rng(0)
-    scores = rng.normal(size=(30, 96)) + np.linspace(0, 1, 96)[None]
-    rows = np.array([0, 0, 3, 7, 12])
-    common, extra = m.group_aurocs(scores, rows)
-    assert common == pytest.approx(np.mean([m.auroc(scores[rows, 0], scores[rows, c]) for c in corruptions.COMMON_CONDITIONS]))
-    assert extra == pytest.approx(np.mean([m.auroc(scores[rows, 0], scores[rows, c]) for c in corruptions.EXTRA_CONDITIONS]))
