@@ -106,15 +106,3 @@ def test_floored_dimensions_are_counted_and_can_be_left_out():
     # kept, the floored dimension dominates the layer score; left out, it cannot move it at all
     assert (kept["ch_top_own"][1, :, 0] > quiet["ch_top_own"][1, :, 0] + 10).all()
     np.testing.assert_allclose(dropped["ch_top_own"][1, :, 0], quiet["ch_top_own"][1, :, 0])
-
-
-def test_the_new_four_stage_rows_equal_the_old_channel_method_scores_bit_for_bit():
-    from degradation_monitor.method import scores as method_scores
-    rng = np.random.default_rng(9)
-    widths = {"s1": 3, "s2": 4, "s3": 5, "s4": 6}
-    bank = {f"means_{l}": rng.random((30, c)).astype(np.float32) for l, c in widths.items()}
-    zstats = {f"means_{l}": rng.random((12, c)).astype(np.float32) for l, c in widths.items()}
-    test = {f"means_{l}": rng.random((4, 7, c)).astype(np.float32) for l, c in widths.items()}
-    old, _ = channels.channel_method_scores(bank, zstats, test, list(widths), statistics=("means",))
-    assert np.array_equal(method_scores.means_knn_scores(test, bank, zstats)[0], old["ch_means_knn"])
-    assert np.array_equal(method_scores.means_own_scores(test, bank, zstats)[0], old["ch_means_own"])

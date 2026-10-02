@@ -10,7 +10,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from degradation_monitor.evaluation.metrics import stage_zstats, zscored_sum
+from ..baselines.activation_cdf import stage_zstats, zscored_sum
 from .features import knn_scores
 
 STATISTICS = ("means", "top", "p99", "grid")

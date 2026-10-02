@@ -14,12 +14,11 @@ import numpy as np
 import torch
 from PIL import Image
 
-from degradation_monitor import corruptions
-from degradation_monitor.datasets import coco
-from degradation_monitor.evaluation.metrics import stage_zstats, zscored_sum
+from ..baselines import protocol
+from ..baselines.activation_cdf import stage_zstats, zscored_sum
 from ..baselines.pipeline import (TEST_KEYS, Settings, _atomic_json, _atomic_npz, _load_npz, _progress,
                                   _train_loader, _valid_existing, _variant_stream, evaluation)
-from degradation_monitor.detector.model import load_frozen_detector, prepare_image
+from ..extraction import load_frozen_detector, prepare_image
 from .channels import STATISTICS, channel_means_and_top, channel_statistics
 from .features import KNN_NEIGHBOURS, REPRESENTATIONS, knn_scores, layer_features, layer_specs
 from .graph import EDGE_CAP, FRACTION, conv_top_merges, heaviest_weight
@@ -78,7 +77,7 @@ def _conv_inputs(settings: Settings) -> ConvInputs:
 
 
 def _clean_batches(settings: Settings, split: str):
-    paths = coco.list_images(settings.train_images)
+    paths = protocol.list_images(settings.train_images)
     return _train_loader(settings, [paths[i] for i in train_splits(len(paths), settings.seed)[split]])
 
 
@@ -312,7 +311,7 @@ def phase_scores(settings: Settings) -> None:
         for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
             stem = Path(name).stem
             stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
-            if list(stored) != [corruptions.digest(a) for a in arrays]:
+            if list(stored) != [protocol.digest(a) for a in arrays]:
                 raise ValueError(f"corruptions differ from the detector pass for {name}")
             _atomic_npz(folder / f"{stem}.npz", **image_scores(taps, arrays, bank, zstats, cuts, settings.batch_size))
             if done % 5 == 0:
@@ -387,7 +386,7 @@ def phase_channels(settings: Settings) -> None:
         for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
             stem = Path(name).stem
             stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
-            if list(stored) != [corruptions.digest(a) for a in arrays]:
+            if list(stored) != [protocol.digest(a) for a in arrays]:
                 raise ValueError(f"corruptions differ from the detector pass for {name}")
             _atomic_npz(folder / f"{stem}.npz", **image_channel_statistics(taps, arrays, settings.batch_size))
             if done % 10 == 0:
@@ -412,7 +411,7 @@ def phase_means(settings: Settings) -> None:
         for done, (name, arrays) in enumerate(_variant_stream(settings, pending), start=1):
             stem = Path(name).stem
             stored = _load_npz(settings.output / "test" / f"{stem}.npz", TEST_KEYS)["digests"]
-            if list(stored) != [corruptions.digest(a) for a in arrays]:
+            if list(stored) != [protocol.digest(a) for a in arrays]:
                 raise ValueError(f"corruptions differ from the detector pass for {name}")
             _atomic_npz(folder / f"{stem}.npz",
                         **image_channel_statistics(taps, arrays, settings.batch_size, channel_means_and_top))
@@ -429,6 +428,41 @@ def phase_conditioned_report(settings: Settings) -> None:
     build_confirmation_report(settings)
 
 
+def phase_report(settings: Settings) -> None:
+    from .report import build_pilot_report
+    build_pilot_report(settings, [p.name for p in pilot_images(settings)])
+
+
+def phase_channels_report(settings: Settings) -> None:
+    """Score the stored channel statistics both ways and report them next to the pilot rows and the baselines."""
+    from ..baselines import report as baseline_report
+    from .channels import LABELS as CHANNEL_LABELS
+    from .channels import STD_FLOOR, channel_method_scores, floored_counts, method_name
+    from .report import build_pilot_report
+    clean = (channels_bank_path(settings), channels_zstats_path(settings))
+    if not all(path.exists() for path in clean):
+        raise ValueError("run the convtu-channels phase first")
+    names = [p.name for p in pilot_images(settings)]
+    with np.load(clean[0]) as bank, np.load(clean[1]) as zstats:
+        bank, zstats = dict(bank), dict(zstats)
+    test = baseline_report._stack(settings.output / CHANNELS_FOLDER, names, CHANNEL_KEYS)
+    layers = [f"s{stage}" for stage in range(1, 5)]
+    summed, per_layer = channel_method_scores(bank, zstats, test, layers)
+    counts = floored_counts(bank, layers)
+    labels = dict(CHANNEL_LABELS)
+    floored = [statistic for statistic in STATISTICS if any(counts[f"{statistic}_{layer}"] for layer in layers)]
+    if floored:
+        live, live_layers = channel_method_scores(bank, zstats, test, layers, drop_floored=True)
+        for statistic in floored:
+            name = method_name(statistic, "own")
+            summed[f"{name}_live"], per_layer[f"{name}_live"] = live[name], live_layers[name]
+            labels[f"{name}_live"] = f"{CHANNEL_LABELS[name]}, floored dimensions left out"
+    build_pilot_report(settings, names, extra=summed, extra_layers=per_layer, extra_labels=labels,
+                       extra_summary={"channel_floored_dimensions": counts, "channel_std_floor": STD_FLOOR},
+                       folder_name="results_convtu_channels", title="# Conv TU pilot: channel statistics")
+
+
 PHASES = {"convtu-calibrate": phase_calibrate, "convtu-bank": phase_bank, "convtu-zstats": phase_zstats,
-          "convtu-scores": phase_scores, "convtu-channels": phase_channels, "convtu-means": phase_means,
+          "convtu-scores": phase_scores, "convtu-report": phase_report, "convtu-channels": phase_channels,
+          "convtu-channels-report": phase_channels_report, "convtu-means": phase_means,
           "convtu-conditioned-report": phase_conditioned_report}

@@ -17,10 +17,3 @@ def test_channel_statistics_give_the_mean_and_the_top_one_percent_mean_of_each_c
     assert KEYS == tuple(f"{s}_s{l}" for s in ("means", "top") for l in range(1, 5))
     with pytest.raises(ValueError):
         channel_statistics(torch.zeros(2, 10, 10))
-
-
-def test_channel_statistics_equal_the_old_pilot_statistics():
-    from differential_uncertainty.convtu.channels import channel_statistics as old
-    x = torch.randn(3, 4, 20, 20)
-    new, before = channel_statistics(x), old(x)
-    assert np.array_equal(new["means"], before["means"]) and np.array_equal(new["top"], before["top"])

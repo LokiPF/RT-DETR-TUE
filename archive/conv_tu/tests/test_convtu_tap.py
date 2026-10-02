@@ -3,10 +3,10 @@ from pathlib import Path
 import pytest
 import torch
 
-from fakes import FakeBackbone
+from convtu_fakes import FakeBackbone
 from differential_uncertainty.convtu.graph import folded_kernel
 from differential_uncertainty.convtu.tap import ConvInputs, LAYER_NAMES
-from degradation_monitor.detector.model import load_frozen_detector
+from differential_uncertainty.extraction import load_frozen_detector
 
 CHECKPOINT = Path("/home/yuchen/YuchenZ/UE/RT-DETRv2-UE/pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth")
 
