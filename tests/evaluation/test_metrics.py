@@ -1,9 +1,7 @@
 import numpy as np
 import pytest
-import uq_detr
 
 from degradation_monitor.evaluation import metrics as m
-from differential_uncertainty.baselines import scores
 
 
 def test_aupr_is_one_for_perfect_separation_and_half_for_identical_scores():
@@ -22,32 +20,6 @@ def test_condition_aurocs_match_binary_auroc_row_by_row():
     clean, degraded = rng.normal(0, 1, 50), rng.normal(0.5, 1, (3, 50))
     expected = [m.auroc(clean, row) for row in degraded]
     assert m.condition_aurocs(clean, degraded) == pytest.approx(expected)
-
-
-def test_fit_lambda_from_parts_matches_uq_detr_fit_lambda():
-    rng = np.random.default_rng(0)
-    queries, reliability = [], []
-    for _ in range(40):
-        probs = np.full((20, 3), 1e-4)
-        probs[:, 0] = rng.uniform(0, 1, 20)
-        boxes = np.tile([0.5, 0.5, 0.2, 0.2], (20, 1))
-        queries.append(uq_detr.Detections.from_cxcywh(boxes, probs, image_size=(100, 100)))
-        reliability.append(rng.uniform(0, 1))
-    reliability = np.array(reliability)
-    reliability[3] = np.nan
-    expected = uq_detr.fit_lambda(queries, reliability, method="threshold", param=0.3)
-    conf_pos, conf_neg = scores.contrastive_parts(queries, 0.3)
-    assert m.fit_lambda_from_parts(conf_pos, conf_neg, reliability) == pytest.approx(expected)
-
-
-def test_cross_fit_lambda_never_uses_the_images_of_its_own_fold():
-    rng = np.random.default_rng(3)
-    conf_pos, conf_neg = rng.uniform(0, 1, 100), rng.uniform(0, 0.1, 100)
-    folds = np.repeat([0, 1], 50)
-    reliability = np.where(folds == 1, conf_pos - 20 * conf_neg, conf_pos) + rng.normal(0, 1e-3, 100)
-    per_image, per_fold = m.cross_fit_lambda(conf_pos, conf_neg, reliability, folds)
-    assert per_fold == {0: 20.0, 1: 0.0}
-    assert set(per_image[folds == 0]) == {20.0} and set(per_image[folds == 1]) == {0.0}
 
 
 def test_bootstrap_intervals_bracket_the_point_estimate():

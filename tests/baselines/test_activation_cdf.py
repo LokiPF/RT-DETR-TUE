@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from differential_uncertainty.baselines import activation_cdf as cdf
+from degradation_monitor.baselines import activation_cdf as cdf
 
 
 def test_ranges_widen_by_the_margin_and_survive_a_constant_channel():

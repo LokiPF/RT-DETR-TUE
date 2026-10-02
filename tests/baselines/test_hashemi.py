@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 import torch
 
-from differential_uncertainty.baselines import hashemi
+from degradation_monitor.baselines import hashemi
 
 
 def test_streaming_stats_match_numpy_even_with_a_large_offset():

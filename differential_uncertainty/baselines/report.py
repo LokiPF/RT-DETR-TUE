@@ -9,8 +9,9 @@ from pathlib import Path
 
 import numpy as np
 
-from .activation_cdf import BINS as CDF_BINS
-from .hashemi import K as HASHEMI_K
+from degradation_monitor.baselines.activation_cdf import BINS as CDF_BINS
+from degradation_monitor.baselines.contrastive_conf import cross_fit_lambda
+from degradation_monitor.baselines.hashemi import K as HASHEMI_K
 from degradation_monitor import corruptions
 from degradation_monitor.datasets import coco
 from degradation_monitor.evaluation import metrics
@@ -201,7 +202,7 @@ def build_report(settings) -> None:
                      for k, i in enumerate(ids)]
     ap = per_image_ap(gt, {i: coco_results(i, s, l, b, gt.category_ids) for i, s, l, b in clean_records}, ids)
     clean_pos, clean_neg = test["conf_pos"][:, 0], test["conf_neg"][:, 0]
-    per_image_lambda, per_fold = metrics.cross_fit_lambda(clean_pos, clean_neg, ap, folds)
+    per_image_lambda, per_fold = cross_fit_lambda(clean_pos, clean_neg, ap, folds)
     consistent = len(set(per_fold.values())) == 1
     ordered = {m: v for m, v in method_scores(test, dcp, per_image_lambda, activation=activation).items()}
     scores = {m: ordered[m] for m in METHODS if m in ordered}
@@ -218,7 +219,7 @@ def build_report(settings) -> None:
 
     def statistic(draw):
         # Duplicated images stay in their own fold, so a fold's lambda never sees its own images.
-        lam, _ = metrics.cross_fit_lambda(clean_pos[draw], clean_neg[draw], ap[draw], folds[draw])
+        lam, _ = cross_fit_lambda(clean_pos[draw], clean_neg[draw], ap[draw], folds[draw])
         drawn = {m: v[draw] for m, v in scores.items()}
         drawn["contrastive"] = -(test["conf_pos"][draw] - lam[:, None] * test["conf_neg"][draw])
         return headline_numbers({m: drawn[m] for m in scores}, folds[draw], per_fold_methods)

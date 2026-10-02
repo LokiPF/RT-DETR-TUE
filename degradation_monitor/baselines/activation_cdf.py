@@ -18,6 +18,7 @@ import torch
 BINS = 1000
 MARGIN = 0.2
 STAGES = ("C1", "C2", "C3", "C4", "C5")
+ZSTAT_IMAGES = 5000  # seeded sample of clean train images for the per-stage z-statistics
 
 
 class ChannelRanges:

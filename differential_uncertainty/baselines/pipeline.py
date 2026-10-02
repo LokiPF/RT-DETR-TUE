@@ -21,19 +21,21 @@ from degradation_monitor.detector.model import prepare_image
 from degradation_monitor import corruptions
 from degradation_monitor.datasets import coco
 from degradation_monitor.evaluation.metrics import stage_zstats, zscored_sum
-from . import discopatch
-from .activation_cdf import BINS as CDF_BINS
-from .activation_cdf import MARGIN as CDF_MARGIN
-from .activation_cdf import STAGES as CDF_STAGES
-from .activation_cdf import CdfMonitor, ChannelRanges, ReferenceHistograms
 from degradation_monitor.datasets.coco import CocoGroundTruth, coco_map, coco_results
 from degradation_monitor.detector.taps import DetectorTap
-from .discopatch import DisCoPatchScorer, train_discopatch
-from .hashemi import K as HASHEMI_K
-from .hashemi import LAYERS as HASHEMI_LAYERS
-from .hashemi import HashemiMonitor, NeuronStats, save_intervals
-from .scores import (contrastive_parts, knn_distances, normalize_rows, query_detections,
-                     saod_uncertainty, top_detections)
+from degradation_monitor.baselines import discopatch
+from degradation_monitor.baselines.activation_cdf import BINS as CDF_BINS
+from degradation_monitor.baselines.activation_cdf import MARGIN as CDF_MARGIN
+from degradation_monitor.baselines.activation_cdf import STAGES as CDF_STAGES
+from degradation_monitor.baselines.activation_cdf import CdfMonitor, ChannelRanges, ReferenceHistograms
+from degradation_monitor.baselines.contrastive_conf import contrastive_parts, query_detections
+from degradation_monitor.baselines.discopatch import DisCoPatchScorer, train_discopatch
+from degradation_monitor.baselines.hashemi import K as HASHEMI_K
+from degradation_monitor.baselines.hashemi import LAYERS as HASHEMI_LAYERS
+from degradation_monitor.baselines.hashemi import HashemiMonitor, NeuronStats, save_intervals
+from degradation_monitor.baselines.knn import knn_distances, normalize_rows
+from degradation_monitor.baselines.saod import saod_uncertainty
+from degradation_monitor.detector.postprocess import top_detections
 
 TOP_K = 100
 KNN_K = 100

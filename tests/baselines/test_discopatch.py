@@ -3,7 +3,7 @@ import pytest
 import torch
 from PIL import Image
 
-from differential_uncertainty.baselines import discopatch as dp
+from degradation_monitor.baselines import discopatch as dp
 
 pytestmark = pytest.mark.skipif(not dp.DEFAULT_ROOT.exists(), reason="DisCoPatch repository not available")
 
