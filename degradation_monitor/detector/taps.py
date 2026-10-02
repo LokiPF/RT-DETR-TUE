@@ -1,5 +1,4 @@
-"""Frozen RT-DETRv2 forward pass exposing logits, boxes, the pooled last backbone stage and, on request,
-the backbone stages C1-C5, the hybrid encoder's output maps and the last decoder layer's queries."""
+"""Forward hooks on the frozen RT-DETRv2: logits, boxes and the pooled last stage; the hidden layers the activation monitors read; and the early-channel inputs our method reads."""
 from __future__ import annotations
 
 from functools import partial
@@ -8,7 +7,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..extraction import load_frozen_detector, prepare_image
+from .model import load_frozen_detector, prepare_image
 
 QUERY_COUNT = 300
 CLASS_COUNT = 80
@@ -102,6 +101,47 @@ class DetectorTap:
             handle.remove()
         self._handles = []
         self.model = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+
+EARLY_STAGES = 4
+EARLY_LAYERS = tuple(f"res_layers.{s}.blocks.1.branch2a.conv" for s in range(EARLY_STAGES))
+
+
+class EarlyChannelTaps:
+    """The inputs of the first conv in the second block of each backbone stage: the four post-ReLU maps our method reads.
+
+    For a 640 x 640 image they have shapes (64, 160, 160), (128, 80, 80), (256, 40, 40) and (512, 20, 20).
+    """
+
+    def __init__(self, backbone: torch.nn.Module):
+        self.backbone = backbone
+        self.device = next(backbone.parameters()).device
+        convs = [backbone.res_layers[s].blocks[1].branch2a.conv for s in range(EARLY_STAGES)]
+        self._inputs: list = [None] * EARLY_STAGES
+        self._handles = [conv.register_forward_pre_hook(partial(self._capture, index))
+                         for index, conv in enumerate(convs)]
+
+    def _capture(self, index, _module, inputs):
+        self._inputs[index] = inputs[0]
+
+    @torch.inference_mode()
+    def __call__(self, batch: torch.Tensor) -> list[torch.Tensor]:
+        self._inputs = [None] * EARLY_STAGES
+        self.backbone(batch.to(self.device))
+        if any(value is None for value in self._inputs):
+            raise RuntimeError("an early-channel input was not captured")
+        return [value.float() for value in self._inputs]
+
+    def close(self) -> None:
+        for handle in self._handles:
+            handle.remove()
+        self._handles = []
 
     def __enter__(self):
         return self

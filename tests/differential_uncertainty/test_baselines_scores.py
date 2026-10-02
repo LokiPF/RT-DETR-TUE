@@ -14,16 +14,6 @@ def _outputs(max_probs, classes=3):
     return logit(probs), boxes
 
 
-def test_top_detections_ranks_query_class_pairs_and_scales_boxes_to_pixels():
-    logits = logit(np.array([[0.2, 0.9], [0.7, 0.1]]))
-    boxes = np.array([[0.5, 0.5, 0.2, 0.4], [0.25, 0.25, 0.5, 0.5]])
-    top, labels, xyxy = scores.top_detections(logits, boxes, image_size=(100, 50), top_k=3)
-    assert top == pytest.approx([0.9, 0.7, 0.2], abs=1e-6)
-    assert labels.tolist() == [1, 0, 0]
-    assert xyxy[0] == pytest.approx([40, 15, 60, 35])
-    assert xyxy[1] == pytest.approx([0, 0, 50, 25])
-
-
 def test_saod_uncertainty_averages_one_minus_confidence_of_the_m_best():
     top = np.array([0.1, 0.9, 0.8])
     assert scores.saod_uncertainty(top, 1) == pytest.approx(0.1)

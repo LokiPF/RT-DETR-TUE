@@ -1,9 +1,16 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
 from torch import nn
 
-from differential_uncertainty.baselines import detector
+from fakes import FakeBackbone
+from degradation_monitor.detector import taps as detector
+from degradation_monitor.detector.model import load_frozen_detector
+from degradation_monitor.detector.taps import EARLY_LAYERS, EarlyChannelTaps
+
+CHECKPOINT = Path("/home/yuchen/YuchenZ/UE/RT-DETRv2-UE/pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth")
 
 
 class FakeDetector(nn.Module):
@@ -39,7 +46,7 @@ def test_tap_rejects_non_finite_outputs(monkeypatch):
             tap.run([np.zeros((8, 8, 3), np.uint8)])
 
 
-class FakeBackbone(nn.Module):
+class FakeHiddenBackbone(nn.Module):
     """C1 (input of the first stage) = level + 1, and stage i adds 1 each time: C1..C5 = level + 1, 1, 2, 3, 4."""
 
     def __init__(self):
@@ -59,7 +66,7 @@ class FakeHiddenDetector(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.backbone = FakeBackbone()
+        self.backbone = FakeHiddenBackbone()
         self.encoder = nn.Identity()
         self.decoder = nn.Module()
         self.decoder.decoder = nn.Module()
@@ -97,3 +104,36 @@ def test_hidden_layers_need_a_hidden_tap(monkeypatch):
     with detector.DetectorTap("unused.pth", "cpu", image_size=(8, 8)) as tap:
         with pytest.raises(RuntimeError, match="hidden=True"):
             tap.forward_hidden(tap.prepare([np.zeros((8, 8, 3), np.uint8)]))
+
+
+def test_early_channel_taps_capture_the_tensors_entering_each_stage_conv():
+    backbone = FakeBackbone()
+    batch = torch.rand(2, 3, 640, 640)
+    with EarlyChannelTaps(backbone) as taps:
+        inputs = taps(batch)
+    with torch.no_grad():
+        x = backbone.pool(batch)
+        expected = []
+        for stage in backbone.res_layers:
+            entering = torch.relu(stage.blocks[0](x))
+            expected.append(entering)
+            x = stage.blocks[1](entering)
+    assert [tuple(t.shape) for t in inputs] == [(2, 2, 16, 16), (2, 3, 8, 8), (2, 4, 4, 4), (2, 5, 2, 2)]
+    for got, want in zip(inputs, expected):
+        assert torch.allclose(got, want)
+
+
+def test_closing_the_early_channel_taps_removes_their_hooks():
+    backbone = FakeBackbone()
+    taps = EarlyChannelTaps(backbone)
+    taps.close()
+    assert all(len(stage.blocks[1].branch2a.conv._forward_pre_hooks) == 0 for stage in backbone.res_layers)
+    assert EARLY_LAYERS[0] == "res_layers.0.blocks.1.branch2a.conv"
+
+
+@pytest.mark.skipif(not CHECKPOINT.exists(), reason="needs the RT-DETRv2-R18 checkpoint")
+def test_the_real_backbone_gives_the_four_early_channel_maps():
+    model = load_frozen_detector(CHECKPOINT, torch.device("cpu"))
+    with EarlyChannelTaps(model.backbone) as taps:
+        inputs = taps(torch.rand(1, 3, 640, 640))
+    assert [tuple(t.shape) for t in inputs] == [(1, 64, 160, 160), (1, 128, 80, 80), (1, 256, 40, 40), (1, 512, 20, 20)]

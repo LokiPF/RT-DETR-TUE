@@ -3,8 +3,8 @@ import torch
 from PIL import Image
 from torch import nn
 
-import differential_uncertainty.extraction as extraction
-from differential_uncertainty.extraction import checkpoint_state, load_frozen_detector, prepare_image
+import degradation_monitor.detector.model as extraction
+from degradation_monitor.detector.model import checkpoint_state, load_frozen_detector, prepare_image
 
 
 def test_checkpoint_state_accepts_ema_model_and_direct_tensor_states():

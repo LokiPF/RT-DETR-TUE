@@ -18,7 +18,7 @@ from ..baselines import protocol
 from ..baselines.activation_cdf import stage_zstats, zscored_sum
 from ..baselines.pipeline import (TEST_KEYS, Settings, _atomic_json, _atomic_npz, _load_npz, _progress,
                                   _train_loader, _valid_existing, _variant_stream, evaluation)
-from ..extraction import load_frozen_detector, prepare_image
+from degradation_monitor.detector.model import load_frozen_detector, prepare_image
 from .channels import STATISTICS, channel_means_and_top, channel_statistics
 from .features import KNN_NEIGHBOURS, REPRESENTATIONS, knn_scores, layer_features, layer_specs
 from .graph import EDGE_CAP, FRACTION, conv_top_merges, heaviest_weight

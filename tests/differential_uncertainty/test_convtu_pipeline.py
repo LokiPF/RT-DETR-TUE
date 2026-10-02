@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
-from convtu_fakes import FakeBackbone
+from fakes import FakeBackbone
 from differential_uncertainty.baselines import pipeline as baselines
 from differential_uncertainty.convtu import pipeline as convtu
 from differential_uncertainty.convtu.tap import ConvInputs
@@ -76,7 +76,7 @@ def test_zstats_refuse_a_bank_from_another_calibration(small):
 
 import torch
 
-from convtu_fakes import FakeTap
+from fakes import FakeTap
 
 
 @pytest.fixture

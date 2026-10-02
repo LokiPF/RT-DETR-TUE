@@ -17,14 +17,14 @@ import torch
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
-from ..extraction import prepare_image
+from degradation_monitor.detector.model import prepare_image
 from . import discopatch, protocol
 from .activation_cdf import BINS as CDF_BINS
 from .activation_cdf import MARGIN as CDF_MARGIN
 from .activation_cdf import STAGES as CDF_STAGES
 from .activation_cdf import CdfMonitor, ChannelRanges, ReferenceHistograms, stage_zstats, zscored_sum
 from .coco_quality import CocoGroundTruth, coco_map, coco_results
-from .detector import DetectorTap
+from degradation_monitor.detector.taps import DetectorTap
 from .discopatch import DisCoPatchScorer, train_discopatch
 from .hashemi import K as HASHEMI_K
 from .hashemi import LAYERS as HASHEMI_LAYERS

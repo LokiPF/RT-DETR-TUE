@@ -1,3 +1,4 @@
+"""Build the fixed RT-DETRv2-R18, load its frozen COCO checkpoint, and prepare images for it."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -9,11 +10,12 @@ from PIL import Image
 from torch import Tensor, nn
 from torchvision.transforms.v2 import functional as vision
 
-from src.nn.backbone.presnet import PResNet
-from src.zoo.rtdetr.hybrid_encoder import HybridEncoder
-from src.zoo.rtdetr.rtdetr import RTDETR
-from src.zoo.rtdetr.rtdetrv2_decoder import RTDETRTransformerv2
+from .rtdetrv2.nn.backbone.presnet import PResNet
+from .rtdetrv2.zoo.rtdetr.hybrid_encoder import HybridEncoder
+from .rtdetrv2.zoo.rtdetr.rtdetr import RTDETR
+from .rtdetrv2.zoo.rtdetr.rtdetrv2_decoder import RTDETRTransformerv2
 
+IMAGE_SIZE = (640, 640)  # RT-DETRv2 fixes its input size in training and at inference
 
 
 def build_fixed_detector() -> RTDETR:

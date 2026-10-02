@@ -1,4 +1,4 @@
-"""Small stand-ins for the RT-DETRv2 backbone and the detector tap, for the conv-TU tests."""
+"""Small stand-ins for the RT-DETRv2 backbone and the detector tap."""
 import numpy as np
 import torch
 from torch import nn
