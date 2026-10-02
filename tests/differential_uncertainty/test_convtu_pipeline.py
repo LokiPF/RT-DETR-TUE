@@ -267,7 +267,8 @@ def test_means_phase_detects_changed_corruptions(small, detector, monkeypatch):
 
 
 def test_conditioned_report_writes_every_row_and_checks_the_screen_images(small, detector, monkeypatch):
-    from differential_uncertainty.convtu import conditioned, confirmation
+    from differential_uncertainty.convtu import confirmation
+    from degradation_monitor.method import reference as conditioned
     monkeypatch.setattr(convtu, "PILOT_IMAGES", 1)
     monkeypatch.setattr(conditioned, "NEIGHBOURS", 3)
     monkeypatch.setattr(confirmation, "BOOTSTRAP_SAMPLES", 20)

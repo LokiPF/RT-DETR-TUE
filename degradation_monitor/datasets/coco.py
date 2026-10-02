@@ -12,11 +12,13 @@ import numpy as np
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
+from ..method.reference import BANK_IMAGES, ZSTAT_IMAGES
+
 FOLDS = 5
 SEED = 44
 # Disjoint seeded draws of train images. "reserved" was the archived conv-TU pilot's calibration set; the slot is kept
 # so that the bank and z-statistics images stay exactly those the stored references were computed from.
-SPLIT_IMAGES = (("reserved", 200), ("bank", 2000), ("zstats", 500))
+SPLIT_IMAGES = (("reserved", 200), ("bank", BANK_IMAGES), ("zstats", ZSTAT_IMAGES))
 _SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 

@@ -1,4 +1,4 @@
-"""Content-conditioned reference: judge the early stages' channels against clean images of similar scenes.
+"""Our scores: level, peak share and the two-axis score, all judged against similar clean scenes, plus three ablation rows.
 
 The back of the detector (stage 4) barely reacts to corruption but still describes the scene, so its channel means
 pick the k most similar clean bank images. Each early stage is then scored against those neighbours, in two ways:
@@ -11,29 +11,13 @@ channels are either unusually flat or unusually shifted for a scene like it.
 from __future__ import annotations
 
 import numpy as np
+import torch
 
-from degradation_monitor.evaluation.metrics import stage_zstats, zscored_sum
-from .channels import fit_own_average
+from ..evaluation.metrics import stage_zstats, zscored_sum
+from .reference import CHUNK, KEY_LAYER, NEIGHBOURS, SCORED_LAYERS, fit_own_average, nearest_rows
 
-KEY_LAYER = "s4"
-SCORED_LAYERS = ("s1", "s2", "s3")
-NEIGHBOURS = 50
-CHUNK = 2048
 EPS = 1e-6  # keeps the logarithm finite for a channel that is silent on an image
-
-
-def nearest_rows(queries: np.ndarray, reference: np.ndarray, k: int, chunk: int = CHUNK) -> np.ndarray:
-    """Indices of each query's k nearest reference rows (Euclidean), in no particular order."""
-    queries, reference = np.asarray(queries, dtype=np.float64), np.asarray(reference, dtype=np.float64)
-    if not 1 <= k <= len(reference):
-        raise ValueError("k must be between 1 and the number of reference rows")
-    reference_sq = (reference ** 2).sum(axis=1)
-    out = np.empty((len(queries), k), dtype=np.int64)
-    for start in range(0, len(queries), chunk):
-        rows = queries[start:start + chunk]
-        distances = (rows ** 2).sum(axis=1)[:, None] + reference_sq[None] - 2 * rows @ reference.T
-        out[start:start + chunk] = np.argpartition(distances, k - 1, axis=1)[:, :k]
-    return out
+KNN_NEIGHBOURS = 5
 
 
 def _flat(values) -> tuple[np.ndarray, tuple]:
@@ -102,8 +86,8 @@ def _combined(columns_of, test: dict, zstats: dict, scored) -> tuple[np.ndarray,
     return zscored_sum(values, mean, std).reshape(leading), values.reshape(*leading, len(scored))
 
 
-def conditioned_scores(test: dict, bank: dict, zstats: dict, key: str = KEY_LAYER, scored=SCORED_LAYERS,
-                       k: int = NEIGHBOURS) -> tuple[np.ndarray, np.ndarray]:
+def level_scores(test: dict, bank: dict, zstats: dict, key: str = KEY_LAYER, scored=SCORED_LAYERS,
+                 k: int = NEIGHBOURS) -> tuple[np.ndarray, np.ndarray]:
     """The level score: z-scored sum over the scored stages and the per-stage scores, keeping test's leading shape.
 
     test, bank and zstats map f"means_{layer}" to channel means: test (..., C), the clean bank and the clean
@@ -137,6 +121,58 @@ def two_axis_scores(test: dict, bank: dict, zstats: dict, key: str = KEY_LAYER, 
     return np.maximum(arms["flatter"], arms["level"]), arms
 
 
-def global_scores(test: dict, bank: dict, zstats: dict, scored=SCORED_LAYERS) -> tuple[np.ndarray, np.ndarray]:
+def global_level_scores(test: dict, bank: dict, zstats: dict, scored=SCORED_LAYERS) -> tuple[np.ndarray, np.ndarray]:
     """The level score against the global clean mean: what the conditioning is compared with."""
     return _combined(lambda values: _global_columns(values, bank, scored), test, zstats, scored)
+
+
+def knn_scores(queries: torch.Tensor, bank: torch.Tensor, neighbours: int = KNN_NEIGHBOURS,
+               chunk: int = 64) -> np.ndarray:
+    """Mean Euclidean distance from each query row to its nearest `neighbours` bank rows (no normalization)."""
+    if queries.ndim != 2 or bank.ndim != 2 or queries.shape[1] != bank.shape[1]:
+        raise ValueError("queries and bank must be (rows, dim) with the same dim")
+    if not 1 <= neighbours <= bank.shape[0]:
+        raise ValueError("neighbours must be between 1 and the bank size")
+    bank = bank.float()
+    out = []
+    for start in range(0, queries.shape[0], chunk):
+        rows = queries[start:start + chunk].to(bank.device, torch.float32)
+        distances = torch.cdist(rows, bank, compute_mode="donot_use_mm_for_euclid_dist")
+        out.append(distances.topk(neighbours, dim=1, largest=False).values.mean(dim=1))
+    return torch.cat(out).cpu().numpy().astype(np.float64)
+
+
+def own_average_scores(values: np.ndarray, mean: np.ndarray, std: np.ndarray) -> np.ndarray:
+    """Mean over dimensions of |value - clean mean| / clean spread: one score per row."""
+    return (np.abs(np.asarray(values, dtype=np.float64) - mean) / std).mean(axis=1)
+
+
+FOUR_LAYERS = ("s1", "s2", "s3", "s4")
+
+
+def _float32(array) -> torch.Tensor:
+    return torch.from_numpy(np.ascontiguousarray(array, dtype=np.float32))
+
+
+def _four_stage_rows(column_of, test: dict, zstats: dict) -> tuple[np.ndarray, np.ndarray]:
+    leading = _flat(test["means_s1"])[1]
+    clean = np.stack([column_of(layer, zstats[f"means_{layer}"]) for layer in FOUR_LAYERS], axis=1)
+    mean, std = stage_zstats(clean)
+    values = np.stack([column_of(layer, test[f"means_{layer}"].reshape(-1, test[f"means_{layer}"].shape[-1]))
+                       for layer in FOUR_LAYERS], axis=1)
+    return zscored_sum(values, mean, std).reshape(leading), values.reshape(*leading, len(FOUR_LAYERS))
+
+
+def means_knn_scores(test: dict, bank: dict, zstats: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Ablation: kNN (5 nearest, unnormalised) on the channel means of all four stages; the pilot's control row."""
+    def column(layer, values):
+        return knn_scores(_float32(values), _float32(bank[f"means_{layer}"]))
+    return _four_stage_rows(column, test, zstats)
+
+
+def means_own_scores(test: dict, bank: dict, zstats: dict) -> tuple[np.ndarray, np.ndarray]:
+    """Ablation: each channel mean against its own clean average, all four stages (Neural Mean Discrepancy-style)."""
+    def column(layer, values):
+        mean, std = fit_own_average(bank[f"means_{layer}"])
+        return own_average_scores(values, mean, std)
+    return _four_stage_rows(column, test, zstats)

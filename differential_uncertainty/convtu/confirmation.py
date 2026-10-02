@@ -12,9 +12,9 @@ import numpy as np
 from degradation_monitor import corruptions
 from degradation_monitor.datasets import coco
 from degradation_monitor.evaluation import metrics
+from degradation_monitor.method import reference as method_reference
+from degradation_monitor.method import scores as method_scores
 from ..baselines import report as baseline_report
-from . import conditioned
-from .channels import channel_method_scores
 
 FOLDER = "results_convtu_conditioned"
 ROWS = ("two_axis", "peak_share", "conditioned", "global_s123", "ch_means_knn", "ch_means_own", "cdf", "discopatch",
@@ -243,13 +243,13 @@ def build_confirmation_report(settings) -> None:
     with np.load(channels_bank_path(settings)) as bank, np.load(channels_zstats_path(settings)) as zstats:
         bank, zstats = {k: bank[k] for k in MEANS_KEYS}, {k: zstats[k] for k in MEANS_KEYS}
     reproduction = _reproduction(settings, names[:screen_count], means)
-    k = conditioned.NEIGHBOURS
-    scores = {"two_axis": conditioned.two_axis_scores(means, bank, zstats, k=k)[0],
-              "peak_share": conditioned.peak_share_scores(means, bank, zstats, k=k)[0],
-              "conditioned": conditioned.conditioned_scores(means, bank, zstats, k=k)[0],
-              "global_s123": conditioned.global_scores(means, bank, zstats)[0]}
-    summed, _ = channel_method_scores(bank, zstats, means, [f"s{stage}" for stage in range(1, 5)], statistics=("means",))
-    scores.update({"ch_means_knn": summed["ch_means_knn"], "ch_means_own": summed["ch_means_own"]})
+    k = method_reference.NEIGHBOURS
+    scores = {"two_axis": method_scores.two_axis_scores(means, bank, zstats, k=k)[0],
+              "peak_share": method_scores.peak_share_scores(means, bank, zstats, k=k)[0],
+              "conditioned": method_scores.level_scores(means, bank, zstats, k=k)[0],
+              "global_s123": method_scores.global_level_scores(means, bank, zstats)[0]}
+    scores.update({"ch_means_knn": method_scores.means_knn_scores(means, bank, zstats)[0],
+                   "ch_means_own": method_scores.means_own_scores(means, bank, zstats)[0]})
     scores.update(_baselines(settings, names))
     folds = coco.assign_folds(len(names))
     subsets = {"all": np.arange(len(names)), "untouched": np.arange(min(UNTOUCHED_START, len(names)), len(names)),
@@ -272,7 +272,7 @@ def build_confirmation_report(settings) -> None:
                 raise ValueError(f"the screen images do not reproduce the screen's {group} ({expected})")
     summary = {"images": len(names), "screen_images": screen_count, "held_out_images": len(names) - screen_count,
                "untouched_start": UNTOUCHED_START, "untouched_images": len(subsets.get("untouched", [])),
-               "neighbours": k, "key": conditioned.KEY_LAYER, "scored": list(conditioned.SCORED_LAYERS),
+               "neighbours": k, "key": method_reference.KEY_LAYER, "scored": list(method_reference.SCORED_LAYERS),
                "bootstrap_samples": BOOTSTRAP_SAMPLES, "seed": settings.seed, "reproduction_max_relative": reproduction,
                "headline_row": "two_axis", "headline_decision": headline_decision(intervals),
                "decision": decision(intervals["held_out"]), "headline": headline, "by_severity": by_severity,
