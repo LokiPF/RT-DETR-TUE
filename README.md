@@ -52,7 +52,11 @@ Then edit the paths in `configs/coco.toml`.
 The four passes (`detector-pass`, `discopatch-pass`, `activation-pass` and `method-pass`) resume image by image. The
 bank and the fits write their result once and are skipped when it exists; DisCoPatch's training refuses to overwrite a
 finished discriminator. An interrupted fit or training starts again. Every stage refuses a run folder made with another
-protocol, and the passes refuse corrupted images or fitted references that changed since their results were written.
+protocol; the later passes refuse corrupted images that differ from the detector pass's, and the passes refuse fitted
+references that changed since their results were written.
+
+Use one run folder per protocol — a limited smoke run gets its own folder with `--run DIR` — and run one stage at a time
+per run folder, because the stages share its manifest.
 
 ```bash
 python -m degradation_monitor <stage> [--config configs/coco.toml] [--device cuda:0] [--limit N]
