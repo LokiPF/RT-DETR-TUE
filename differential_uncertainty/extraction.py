@@ -14,8 +14,6 @@ from src.zoo.rtdetr.hybrid_encoder import HybridEncoder
 from src.zoo.rtdetr.rtdetr import RTDETR
 from src.zoo.rtdetr.rtdetrv2_decoder import RTDETRTransformerv2
 
-from .config import FIXED_CONFIG, ExperimentConfig
-from .persistence import Layer2Capture, batched_persistence
 
 
 def build_fixed_detector() -> RTDETR:
@@ -76,73 +74,3 @@ def prepare_image(image: Image.Image, image_size: tuple[int, int]) -> Tensor:
     finally:
         resized.close()
 
-
-def _padded_ids(boxes: Tensor, logits: Tensor, persistence: Tensor) -> Tensor:
-    fields = (boxes, logits, persistence)
-    if any(field.ndim != 2 or not field.is_floating_point() or not bool(torch.isfinite(field).all()) for field in fields):
-        raise ValueError("detector outputs must be finite rank-two floating tensors")
-    if len({field.shape[0] for field in fields}) != 1:
-        raise ValueError("detector output query counts must agree")
-    query_count = boxes.shape[0]
-    if query_count < 2:
-        return torch.empty(0, dtype=torch.int64)
-    repeated = torch.stack([field.eq(field[-1]).reshape(query_count, -1).all(dim=1) for field in fields]).all(dim=0)
-    start = query_count - 1
-    while start > 0 and bool(repeated[start - 1]):
-        start -= 1
-    if query_count - start < 2:
-        return torch.empty(0, dtype=torch.int64)
-    return torch.arange(start, query_count, dtype=torch.int64)
-
-
-class RTDETRExtractor:
-    def __init__(self, checkpoint_path: str | Path, device: torch.device, config: ExperimentConfig = FIXED_CONFIG) -> None:
-        self.device = device
-        self.config = config
-        self.model: nn.Module | None = load_frozen_detector(checkpoint_path, device)
-        self.capture: Layer2Capture | None = Layer2Capture(self.model.decoder, layer=config.persistence_layer)
-
-    @torch.inference_mode()
-    def extract_batch(self, images: Tensor) -> list[dict[str, Tensor]]:
-        if self.model is None or self.capture is None:
-            raise RuntimeError("extractor is closed")
-        if not isinstance(images, Tensor) or images.ndim != 4 or images.shape[1] != 3:
-            raise ValueError("images must be a rank-four NCHW RGB tensor")
-        if tuple(images.shape[2:]) != self.config.image_size or images.shape[0] == 0:
-            raise ValueError("images must be a nonempty configured-size batch")
-        outputs = self.model(images.to(self.device))
-        if not isinstance(outputs, Mapping) or not isinstance(outputs.get("pred_logits"), Tensor) or not isinstance(outputs.get("pred_boxes"), Tensor):
-            raise ValueError("detector must return pred_logits and pred_boxes tensors")
-        logits, boxes = outputs["pred_logits"], outputs["pred_boxes"]
-        features, weight = self.capture.take()
-        persistence = batched_persistence(weight, features.reshape(-1, features.shape[-1])).reshape(features.shape[0], features.shape[1], -1)
-        expected_logits = (images.shape[0], self.config.query_count, self.config.class_count)
-        expected_boxes = (images.shape[0], self.config.query_count, 4)
-        expected_persistence = (images.shape[0], self.config.query_count, self.config.persistence_dim)
-        if tuple(logits.shape) != expected_logits or tuple(boxes.shape) != expected_boxes or tuple(persistence.shape) != expected_persistence:
-            raise ValueError("detector output shapes do not match the fixed configuration")
-        records = []
-        for item_logits, item_boxes, item_persistence in zip(logits, boxes, persistence, strict=True):
-            padded_ids = _padded_ids(item_boxes, item_logits, item_persistence)
-            stored_logits = item_logits.detach().to("cpu", torch.float16, copy=True)
-            stored_persistence = item_persistence.detach().to("cpu", torch.float16, copy=True)
-            if not bool(torch.isfinite(stored_logits).all()) or not bool(torch.isfinite(stored_persistence).all()):
-                raise ValueError("stored detector outputs must be finite after float16 conversion")
-            records.append({
-                "logits": stored_logits,
-                "persistence": stored_persistence,
-                "padded_ids": padded_ids,
-            })
-        return records
-
-    def close(self) -> None:
-        if self.capture is not None:
-            self.capture.close()
-        self.capture = None
-        self.model = None
-
-    def __enter__(self) -> RTDETRExtractor:
-        return self
-
-    def __exit__(self, *_exc: object) -> None:
-        self.close()

@@ -1,8 +1,10 @@
 import numpy as np
 import pytest
-from PIL import Image, ImageFilter
+from PIL import Image
 
+from differential_uncertainty import benchmark
 from differential_uncertainty.baselines import protocol
+from differential_uncertainty.corruptions import apply_corruption
 from differential_uncertainty.corruptions.imagecorruptions import apply_imagecorruption
 
 
@@ -23,10 +25,9 @@ def test_conditions_are_clean_then_19_families_by_5_severities_in_package_order(
 def test_evaluation_images_use_the_old_benchmark_shuffle(tmp_path):
     for index in range(20):
         (tmp_path / f"{index:03d}.jpg").write_bytes(b"x")
-    expected = sorted(tmp_path.iterdir())
-    np.random.default_rng(44).shuffle(expected)
     images = protocol.evaluation_images(tmp_path, seed=44)
-    assert images == expected  # the archived benchmark selected its images with this same shuffle
+    assert images == benchmark._select_images(tmp_path, 20, seed=44)
+    assert images[:8] == benchmark._select_images(tmp_path, 8, seed=44)
 
 
 def test_evaluation_images_reject_an_empty_directory(tmp_path):
@@ -62,8 +63,7 @@ def test_gaussian_blur_uses_the_imagecorruptions_package_not_the_old_pil_blur():
     image = _image()
     ours = np.asarray(protocol.corrupt(image, "a.jpg", "gaussian_blur", 5))
     assert np.array_equal(ours, np.asarray(apply_imagecorruption(image, "gaussian_blur", 5)))
-    old_pil_blur = np.asarray(image.convert("RGB").filter(ImageFilter.GaussianBlur(12)))  # the archived level-5 blur
-    assert not np.array_equal(ours, old_pil_blur)
+    assert not np.array_equal(ours, np.asarray(apply_corruption(image, "gaussian_blur", 5)))
 
 
 @pytest.mark.parametrize("family, severity", [("rain", 3), ("fog", 0), ("fog", 6), ("fog", 2.0)])

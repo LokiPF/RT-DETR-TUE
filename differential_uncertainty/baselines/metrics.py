@@ -8,10 +8,32 @@ import numpy as np
 from scipy.stats import ConstantInputWarning, pearsonr, rankdata, spearmanr
 from sklearn.metrics import average_precision_score
 
-from ..evaluation import binary_auroc
-
 COVERAGES = tuple(np.round(np.linspace(1.0, 0.05, 20), 4))
 UQ_DETR_LAMBDA_GRID = (0, 0.25, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20)  # uq_detr.fit_lambda default
+
+
+def _score_vector(values, *, name: str) -> np.ndarray:
+    try:
+        source = values if isinstance(values, np.ndarray) else list(values)
+        array = np.asarray(source, dtype=float)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{name} must be a non-empty finite one-dimensional input") from error
+    if array.ndim != 1 or not array.size or not bool(np.isfinite(array).all()):
+        raise ValueError(f"{name} must be a non-empty finite one-dimensional input")
+    return array
+
+
+def binary_auroc(clean, corrupted) -> float:
+    """Return tie-correct AUROC, with larger values indicating corruption."""
+    clean_values = _score_vector(clean, name="clean scores")
+    corrupted_values = _score_vector(corrupted, name="corrupted scores")
+    ranks = rankdata(np.concatenate((clean_values, corrupted_values)), method="average")
+    positives = corrupted_values.size
+    rank_sum = float(ranks[clean_values.size :].sum())
+    return float(
+        (rank_sum - positives * (positives + 1) / 2)
+        / (clean_values.size * positives)
+    )
 
 
 def auroc(clean, degraded) -> float:

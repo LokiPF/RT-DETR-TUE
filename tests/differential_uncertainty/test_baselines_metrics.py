@@ -77,3 +77,20 @@ def test_bootstrap_intervals_bracket_the_point_estimate():
                             200, samples=200, seed=1)
     low, high = intervals["mean_auroc"]
     assert low <= point <= high
+
+
+from differential_uncertainty.baselines.metrics import binary_auroc
+
+
+def test_binary_auroc_is_tie_correct_and_uses_larger_as_corrupted():
+    assert binary_auroc([0, 1], [1, 2]) == pytest.approx(0.875)
+    assert binary_auroc([1, 2], [0, 1]) == pytest.approx(0.125)
+
+
+@pytest.mark.parametrize("clean, corrupted", [
+    ([], [1]), ([1], []), ([float("nan")], [1]), ([1], [float("inf")]),
+    ([[1]], [2]), (1, [2]),
+])
+def test_binary_auroc_rejects_nonfinite_empty_or_non_vector_inputs(clean, corrupted):
+    with pytest.raises(ValueError, match="one-dimensional"):
+        binary_auroc(clean, corrupted)
