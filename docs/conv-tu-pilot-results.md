@@ -1,5 +1,7 @@
 # Conv-layer Topological Uncertainty: pilot results
 
+> **Note, 2 October 2026.** The pilot's code is archived in `archive/conv_tu/`, and its plan in `docs/archive/plans/`.
+
 Run on 30 September 2026, following `docs/superpowers/plans/2026-09-30-conv-tu-pilot.md` and the design in `docs/conv-tu-pilot-design.md`. The raw tables, `summary.json`, the calibration and the z-statistics are in `docs/results/conv-tu-pilot/`.
 
 What was scored: the first 200 COCO val2017 images of the seed-44 order, each in all 96 conditions (19,200 variants). The layers were the four stride-1 3 × 3 convs `res_layers[s].blocks[1].branch2a.conv`, and the fingerprint was the exact top K = 1% of each conv graph's persistence diagram. The nine baseline rows are recomputed on the same 200 images.

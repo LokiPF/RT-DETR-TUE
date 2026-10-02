@@ -571,7 +571,7 @@ provides two things: baselines that need no detector, and ideas for damage-aware
      lack the cues needed for detection, supports this.
 8. **Expect family-dependent results.** ImageNet-OOD found that blur and noise can move a
    feature-based score in opposite directions. Our own earlier 250-image pilot, with a different and
-   older score ([results](coco-imagecorruptions-250-pilot-results.md)), already showed near-chance
+   older score ([results](archive/coco-imagecorruptions-250-pilot-results.md)), already showed near-chance
    AUROC for brightness, saturate, fog and elastic transform. Per-family reporting will make this
    visible, and it is more detailed than most prior work.
 9. **Add baselines that need no detector.**

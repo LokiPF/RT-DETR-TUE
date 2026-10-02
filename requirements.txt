@@ -1,8 +1,9 @@
 torch>=2.3.0
 torchvision>=0.18.0
-matplotlib>=3.5
 numpy
 pillow
 scipy
+scikit-learn
+pycocotools
+uq-detr
 imagecorruptions==1.1.2
-numba>=0.59

@@ -1,5 +1,7 @@
 # Conv-layer Topological Uncertainty: pilot design
 
+> **Note, 2 October 2026.** The pilot's code is archived in `archive/conv_tu/`, and its plan in `docs/archive/plans/`.
+
 Decisions of 30 September 2026. The pilot plan is
 `docs/superpowers/plans/2026-09-30-conv-tu-pilot.md`.
 

@@ -1,88 +1,87 @@
-# Fixed COCO corruption benchmark
+# Corruption detection inside a frozen object detector
 
-This repository tests whether a pretrained RT-DETRv2-R18 can detect image corruption
-from its query representations. It builds a fingerprint bank from clean COCO training
-images and evaluates clean versus corrupted COCO validation images. Nothing is trained.
+This repository detects image corruption (fog, blur, noise, compression and more) from inside a frozen
+RT-DETRv2-R18 trained on COCO. Nothing is trained for it. The repository holds our method and the six published
+baselines we compare it with. All of them are evaluated on COCO val2017 under 19 imagecorruptions families at five
+severities.
 
-The benchmark covers all 19 configured corruption families at severities 4 and 5.
-Levels 1 through 3 are not evaluated.
+**Our method, the two-axis score.**
+- **Two numbers per channel.** In the backbone's stages 1–3, each channel gives its level (mean |activation|) and its
+  peak share (how far its strongest 1% of positions stand out).
+- **A reference of similar scenes.** Both numbers are compared with the 50 clean COCO train scenes most like the image,
+  found by the stage-4 channel means.
+- **Flatten or shift.** A corruption either flattens the peaks (fog, contrast, blur) or shifts the level (noise). The
+  score is the larger of the two deviations.
 
-## Fixed scores
+On all 5,000 COCO val images it reaches AUROC 0.917 on the 15 common families and 0.858 on the 4 extra ones. The
+strongest baseline, the activation CDFs of Becker et al. (ICPR 2026), reaches 0.821 and 0.807. The details are in
+`docs/conv-tu-conditioned-results.md`.
 
-The fingerprint score uses one fixed method:
+## Layout
 
-1. Keep non-padded training queries with maximum sigmoid confidence of at least 0.5.
-2. Build a 2,000-row bank with seeded Algorithm R reservoir sampling.
-3. For each validation query, average its cosine distance to the five nearest bank rows.
-4. Take the confidence-weighted mean across the image's non-padded queries.
-
-The two baselines are:
-
-- confidence: one minus the maximum sigmoid confidence;
-- entropy: normalized Shannon entropy of the highest-confidence non-padded query.
-
-Larger values mean stronger evidence of corruption for all three scores.
-
-## Run the benchmark
-
-Use Python 3.10 or newer, install a PyTorch build for your machine, and then run:
-
-```bash
-python -m pip install -r requirements.txt
+```
+degradation_monitor/
+  cli.py, settings.py, runs.py, corruptions.py
+  datasets/coco.py         COCO: train images, the seed-44 val order and folds, ground truth
+  detector/                the frozen RT-DETRv2-R18: vendored code (rtdetrv2/), loader, post-processing, hooks
+  baselines/               SAOD, ContrastiveConf, kNN, DisCoPatch, Hashemi et al., activation CDFs: one file each
+  method/                  our method: channel statistics, the clean reference, the scores and the ablation rows
+  evaluation/              separation metrics, the paired bootstrap and the report
+  stages/                  the runnable, resumable steps
+configs/coco.toml          this machine's paths and run options
+scripts/convert_runs.py    the one-time conversion of the old run folder
+archive/                   retired methods, read only (archive/README.md)
+docs/                      results, decisions and the dev log (docs/README.md)
+tests/                     mirrors degradation_monitor/
 ```
 
-Provide a compatible RT-DETRv2-R18 checkpoint and flat COCO `train2017` and
-`val2017` image directories. COCO annotations and manifests are not needed.
+## Setup
+
+- **Python packages:** Python 3.11 and the packages in `requirements.txt`. Install a PyTorch build for your machine
+  first.
+- **The detector checkpoint:** RT-DETRv2-R18 trained on COCO, `rtdetrv2_r18vd_120e_coco` (48.1 AP). The vendored model
+  code comes from github.com/lyuwenyu/RT-DETR (Apache-2.0).
+- **COCO 2017:** `train2017`, `val2017` and `annotations/instances_val2017.json`.
+- **DisCoPatch** (Caetano et al., ICCV 2025): a clone of github.com/caetas/DisCoPatch, with its own requirements. Its
+  commit is recorded in each run's `manifest.json`.
+
+Then edit the paths in `configs/coco.toml`.
+
+## Running
+
+Each stage is resumable image by image. Each refuses a run folder made with another protocol, and inputs that changed
+since its results were written.
 
 ```bash
-python -m differential_uncertainty benchmark-coco \
-  --checkpoint /path/to/rtdetrv2_checkpoint.pth \
-  --coco-train-images /path/to/coco/train2017 \
-  --coco-val-images /path/to/coco/val2017 \
-  --reference-count 2500 \
-  --evaluation-count 2500 \
-  --output runs/fingerprint-coco-2500 \
-  --device cuda:0 \
-  --batch-size 4 \
-  --seed 44
+python -m degradation_monitor <stage> [--config configs/coco.toml] [--device cuda:0] [--limit N]
+                                      [--batch-size N] [--workers N] [--gpu-memory-gib X] [--run DIR]
 ```
 
-The value 2,500 is an example, not a default. Both image-count flags are required.
-Optional defaults are `--device cuda:0`, `--batch-size 1`, and `--seed 44`.
+| Stage | What it computes | Needs |
+|---|---|---|
+| `check` | that every input exists, and the clean COCO val AP (about 0.48) | – |
+| `knn-bank` | the kNN baseline's bank: pooled last-stage features of every COCO train image | – |
+| `detector-pass` | for every val image under all 96 conditions: SAOD, ContrastiveConf's parts, kNN distances, detections | `knn-bank` |
+| `discopatch-train` | DisCoPatch's discriminator, with the official code and settings | – |
+| `discopatch-pass` | DisCoPatch's scores | `detector-pass`, `discopatch-train` |
+| `hashemi-fit`, `cdf-fit`, `cdf-zstats` | the activation monitors' clean statistics | `cdf-fit` before `cdf-zstats` |
+| `activation-pass` | the scores of Hashemi et al. and of the activation CDFs | `detector-pass` and the three fits |
+| `method-reference` | our method's clean reference: 2,000 bank and 500 z-statistics train images | – |
+| `method-pass` | our method's channel statistics | `detector-pass` |
+| `report` | every table, both pre-registered decisions, per-condition mAP | `detector-pass`; the others when present |
+| `timing` | milliseconds per image for the detector and each monitor | `knn-bank` |
 
-Run the same command again to resume an interruption. The output directory keeps:
+Run the tests with `python -m pytest -q`.
 
-- `run_config.json`: the fixed run configuration;
-- `bank_progress.pt`: partial bank state, replaced by `bank.pt` when complete;
-- `scores/`: one JSON file per completed validation image;
-- `evaluation_progress.pt`: the next image and NumPy state for stochastic corruptions.
+## Results
 
-## Outputs
-
-A completed run writes:
-
-- `per_image_scores.csv`: clean, severity-4, and severity-5 image scores;
-- `results.csv`: AUROC for every corruption and severity;
-- `summary.json`: the 38 task results, aggregate scores, and paired comparisons;
-- `report.md`: the complete plain-language report;
-- `corruption_auroc_bars.png`: grouped per-corruption AUROC bars.
-
-The aggregate is the equal-weight mean across the 38 corruption-and-severity tasks.
-Paired whole-image bootstrap intervals compare the fingerprint with each baseline on
-the supplied evaluation set. They describe stability on that set, not population
-confidence. This benchmark measures corruption ranking, not detector accuracy or mAP.
-
-## Method-selection pilot
-
-The chart below is the earlier evidence used to choose the fixed method. That pilot
-used 1,000 COCO-val reference images and 250 evaluation images: 150 for method
-selection and 100 held out for validation. It predates the current COCO-train to
-COCO-val runner and is not the final 2,500-by-2,500 result.
-
-On the held-out pilot images, mean AUROC across the 38 strong-corruption tasks was
-0.822 for the fingerprint, 0.813 for confidence, and 0.822 for entropy. The paired
-intervals for fingerprint minus either baseline included zero, so the pilot did not
-establish that the fingerprint was better overall. The per-corruption chart shows
-where each score was stronger or weaker; an AUROC of 0.5 is chance-level ranking.
-
-![Method-selection pilot: per-corruption AUROC at severities 4 and 5](docs/assets/fingerprint-method-selection-pilot-auroc.png)
+- **The run folder** (`run` in the config):
+  - `manifest.json`: the protocol, the environment and the inputs of every score folder;
+  - `reference/`: what the clean train images provide;
+  - `scores/`: one file per val image for each pass;
+  - `reports/coco/`: the report.
+- **Hard links:** the converted `runs/coco/` shares its per-image files and fitted references with
+  `runs/coco-baselines/` through hard links, so an in-place edit of either copy changes both. The stages are safe,
+  because they write a new file and rename it.
+- **The tables kept in the repository:** `docs/results/coco/`. The documents that explain them are listed in
+  `docs/README.md`.
