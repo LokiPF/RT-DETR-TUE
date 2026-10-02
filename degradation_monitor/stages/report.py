@@ -1,0 +1,89 @@
+"""The report stage: read every stored score and write the report to reports/coco/."""
+from __future__ import annotations
+
+import json
+import multiprocessing
+
+import numpy as np
+
+from .. import corruptions
+from ..datasets.coco import coco_map, coco_results, per_image_ap
+from ..evaluation import report as tables
+from ..method.statistics import KEYS
+from ..runs import sha1, stack
+
+DETECTOR_ARRAYS = ("saod_min", "saod_top3", "conf_pos", "conf_neg", "knn", "det_scores", "det_labels", "det_boxes")
+ACTIVATION_ARRAYS = ("hashemi_decoder", "hashemi_encoder", "cdf_backbone_z", "cdf_backbone")
+_MAP_INPUTS = None  # what the forked mAP workers read
+
+
+def _results(gt, ids, detector, condition) -> list:
+    """COCO result records of every image under one condition."""
+    return [r for k, i in enumerate(ids)
+            for r in coco_results(i, detector["det_scores"][k, condition], detector["det_labels"][k, condition],
+                                  detector["det_boxes"][k, condition], gt.category_ids)]
+
+
+def _condition_map(condition: int) -> float:
+    gt, ids, detector = _MAP_INPUTS
+    return coco_map(gt, _results(gt, ids, detector, condition), ids)
+
+
+def condition_maps(gt, ids, detector, workers: int) -> np.ndarray:
+    """Each condition's mAP over the evaluation images, in forked worker processes when workers > 1."""
+    global _MAP_INPUTS
+    _MAP_INPUTS = (gt, ids, detector)
+    try:
+        conditions = range(len(corruptions.CONDITIONS))
+        if workers > 1:
+            with multiprocessing.get_context("fork").Pool(workers) as pool:
+                return np.array(pool.map(_condition_map, conditions))
+        return np.array([_condition_map(c) for c in conditions])
+    finally:
+        _MAP_INPUTS = None
+
+
+def _method_reference(layout):
+    """The sha1 of the method's reference, or None when the method pass never ran; refuses a pass without it."""
+    if not layout.scores("method").exists():
+        return None
+    missing = [path.name for path in (layout.method_bank, layout.method_zstats) if not path.exists()]
+    if missing:
+        raise ValueError(f"run the method-reference stage first: {', '.join(missing)} missing")
+    return {"method_bank": sha1(layout.method_bank), "method_zstats": sha1(layout.method_zstats)}
+
+
+def _method_rows(layout, names) -> dict:
+    """Our six rows, from the stored statistics and the reference's."""
+    statistics = stack(layout.scores("method"), names, KEYS)
+    with np.load(layout.method_bank) as bank, np.load(layout.method_zstats) as zstats:
+        bank, zstats = {k: bank[k] for k in KEYS}, {k: zstats[k] for k in KEYS}
+    return tables.method_rows(statistics, bank, zstats)
+
+
+def write_report(settings, manifest) -> None:
+    """Every table of the report, from the stored scores of every pass that ran."""
+    layout = settings.layout
+    reference = _method_reference(layout)  # checked first: the mAP below takes minutes on all 5,000 images
+    names = [p.name for p in settings.dataset.evaluation_images()]
+    detector = stack(layout.scores("detector"), names, DETECTOR_ARRAYS)
+    discopatch = stack(layout.scores("discopatch"), names, ("dcp",))["dcp"] if layout.scores("discopatch").exists() \
+        else None
+    activations = stack(layout.scores("activations"), names, ACTIVATION_ARRAYS) \
+        if layout.scores("activations").exists() else None
+    scores = tables.baseline_rows(detector, discopatch=discopatch, activations=activations)
+    gt = settings.dataset.ground_truth()
+    ids = [gt.image_id(n) for n in names]
+    condition_map = condition_maps(gt, ids, detector, settings.workers)
+    clean = {i: coco_results(i, detector["det_scores"][k, 0], detector["det_labels"][k, 0], detector["det_boxes"][k, 0],
+                             gt.category_ids) for k, i in enumerate(ids)}
+    ap = per_image_ap(gt, clean, ids)
+    if reference:
+        scores.update(_method_rows(layout, names))
+    timing = json.loads(layout.timing.read_text()) if layout.timing.exists() else {}
+    report_tables, summary = tables.build_tables(scores, detector, ap, settings.dataset.folds(), condition_map,
+                                                 seed=settings.seed, samples=tables.BOOTSTRAP_SAMPLES,
+                                                 workers=settings.workers, timing=timing)
+    summary["inputs"] = {**manifest.read().get("inputs", {}), **({"method": reference} if reference else {})}
+    tables.write_outputs(layout.report(), report_tables, summary)
+    print(f"[report] headline: {summary['headline_decision']}; level score: {summary['level_decision']}", flush=True)

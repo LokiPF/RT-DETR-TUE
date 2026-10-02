@@ -1,7 +1,7 @@
 """The runnable, resumable steps. Each refuses inputs that changed since its results were written."""
 from __future__ import annotations
 
-from . import baselines, method
+from . import baselines, method, report
 
 STAGES = {
     "check": baselines.check,
@@ -15,6 +15,7 @@ STAGES = {
     "activation-pass": baselines.activation_pass,
     "method-reference": method.method_reference,
     "method-pass": method.method_pass,
+    "report": report.write_report,
     "timing": baselines.timing,
 }
 
