@@ -1,7 +1,9 @@
 # Archived docs
 
 Reports, notes and plans of retired work, moved here unchanged on 2 October 2026. Paths inside them are as they were
-written: a link to `docs/<name>` now means `docs/archive/<name>`. Their code is in `archive/` at the repository root.
+written: a moved file now lives here, with plans and specs under `plans/` and `specs/`, and paths to the kept docs are
+unchanged. The code of the decoder-query fingerprint and of the conv-TU pilot is in `archive/` at the repository root;
+the code of the August scene-uncertainty experiments is not on this branch.
 
 - `scene-uncertainty-*.md`: the August scene-uncertainty experiments on the decoder queries.
 - `coco-imagecorruptions-250-pilot-results.md` and `results/coco-imagecorruptions-250/`: the 250-image pilot of the

@@ -49,12 +49,14 @@ Then edit the paths in `configs/coco.toml`.
 
 ## Running
 
-Each stage is resumable image by image. Each refuses a run folder made with another protocol, and inputs that changed
-since its results were written.
+The four passes (`detector-pass`, `discopatch-pass`, `activation-pass` and `method-pass`) resume image by image. The
+bank and the fits write their result once and are skipped when it exists; DisCoPatch's training refuses to overwrite a
+finished discriminator. An interrupted fit or training starts again. Every stage refuses a run folder made with another
+protocol, and the passes refuse corrupted images or fitted references that changed since their results were written.
 
 ```bash
 python -m degradation_monitor <stage> [--config configs/coco.toml] [--device cuda:0] [--limit N]
-                                      [--batch-size N] [--workers N] [--gpu-memory-gib X] [--run DIR]
+                                      [--batch-size N] [--workers N] [--gpu-memory-gib X] [--epochs N] [--run DIR]
 ```
 
 | Stage | What it computes | Needs |
@@ -69,9 +71,9 @@ python -m degradation_monitor <stage> [--config configs/coco.toml] [--device cud
 | `method-reference` | our method's clean reference: 2,000 bank and 500 z-statistics train images | – |
 | `method-pass` | our method's channel statistics | `detector-pass` |
 | `report` | every table, both pre-registered decisions, per-condition mAP | `detector-pass`; the others when present |
-| `timing` | milliseconds per image for the detector and each monitor | `knn-bank` |
+| `timing` | milliseconds per image for the detector and each baseline; our method's added cost is not timed yet | `knn-bank` |
 
-Run the tests with `python -m pytest -q`.
+Run the tests with `python -m pytest -q`; pytest is not in `requirements.txt`.
 
 ## Results
 

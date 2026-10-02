@@ -2,7 +2,7 @@
 
 > **Note, 2 October 2026.** The harm sections are superseded: harm is no longer an objective. The clean branch's
 > report reproduces this doc's separation numbers exactly (`tests/test_equivalence.py`), and its tables are in
-> `docs/results/coco/`.
+> `docs/results/coco/`. Its plans are now in `docs/archive/plans/`.
 
 These are the numbers for the six baselines we compare against on COCO:
 - SAOD, ContrastiveConf, kNN and DisCoPatch;

@@ -2,7 +2,7 @@
 
 > **Note, 2 October 2026.** Since 1 October the goal is detecting corruption, not predicting how much it harms the
 > detector (dev log, 1 October). The harm metrics below are no longer computed. The report computes AUROC, AUPR and
-> FPR95, with each condition's mAP as context.
+> FPR95, with each condition's mAP as context. The plans it names are now in `docs/archive/plans/`.
 
 *Decision record, 27 September 2026. The sources and reasoning are in
 [literature-review-image-corruption-detection.md](literature-review-image-corruption-detection.md).*
