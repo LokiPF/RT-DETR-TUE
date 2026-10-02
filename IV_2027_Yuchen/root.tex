@@ -1,0 +1,55 @@
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts    % to override locked commands
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% REQUIRED PACKAGES %
+\usepackage{multirow}
+\usepackage{lipsum}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage[ruled,vlined]{algorithm2e}
+\usepackage{graphicx}
+\graphicspath{{./Figures/}}
+%\usepackage[hidelinks]{hyperref}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\title{\LARGE \bf Your Paper Title Here}
+
+% author names and affiliations
+
+% \author{
+% 	\parbox{\textwidth}{%
+% 		\centering
+% 		First Author$^{1}$, Second Author$^{1}$, Third Author$^{2}$%
+% 	}%
+% 	\thanks{$^{1}$Affiliation 1, City, Country
+% 		{\tt\small email1@example.com, email2@example.com}}%
+% 	\thanks{$^{2}$Affiliation 2, City, Country
+% 		{\tt\small email3@example.com}}%
+% }
+
+\hyphenation{tem-por-ary}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\begin{document}
+	
+	\maketitle
+	\thispagestyle{empty}
+	\pagestyle{empty}
+
+    \input{chapters/01_Abstract}
+    \input{chapters/02_Intro}
+    \input{chapters/03_RelatedWorks}
+    \input{chapters/04_Methods}
+    \input{chapters/05_Experiment}
+    \input{chapters/06_Conclusion}
+
+
+	\bibliographystyle{IEEEtran}
+	% Your .bib file here
+	\bibliography{root} 
+	
+\end{document}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

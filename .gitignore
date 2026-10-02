@@ -14,3 +14,4 @@ runs/
 /evaluate_confidence_decile_auroc.py
 /make_meeting_entropy_video.py
 /just_for_meeting/
+/output/

@@ -1,0 +1,16 @@
+\section{Introduction}
+the detector would still output prediction,
+but it is not safe in those condition we didnt train for.
+so it is also important to know when should we stop, apart from having the high classification and localization accuracy from the detector.
+
+
+we found that,
+The earlier stage is more sensitive to the corruption in the image than in the later stage, which is more tuned for the detector output.
+
+different corruption have different effect on the channel reaction. For example,... (example a bit why, some are increasing the average reaction, some are making the variance bigger)
+
+At last, we were using the first stages to calcualte the channel behavior, compare them with the closest images in the cleaning image bank (selected with the later stage, which is more about he scenario setting of the image, because it doesnt seem reasonable to compare a beach image with some busy road image for example, they definitely have very different channel reaction, and that's why we choose to use closer images.)
+
+We validate the result for different detectors... (some numbers and trend)
+
+\label{sec:introduction}
