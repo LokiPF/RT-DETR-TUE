@@ -1,0 +1,14 @@
+# This machine's paths and the run options. Stages: python -m degradation_monitor <stage> --config configs/coco.toml
+# The method's fixed choices are constants in degradation_monitor/method/, not settings.
+run = "/home/yuchen/YuchenZ/UE/philip_sa/runs/coco"
+checkpoint = "/home/yuchen/YuchenZ/UE/RT-DETRv2-UE/pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth"
+train_images = "/home/yuchen/YuchenZ/Datasets/coco/train2017"
+val_images = "/home/yuchen/YuchenZ/Datasets/coco/val2017"
+annotations = "/home/yuchen/YuchenZ/Datasets/coco/annotations/instances_val2017.json"
+discopatch_root = "/home/yuchen/YuchenZ/UE/DisCoPatch"
+device = "cuda:0"
+batch_size = 8
+workers = 9
+gpu_memory_gib = 5.5  # the GPU is shared with other people's jobs
+epochs = 65
+seed = 44
