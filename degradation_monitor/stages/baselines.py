@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-import os
+import shutil
 import time
 
 import numpy as np
@@ -140,7 +140,7 @@ def discopatch_train(settings, manifest) -> None:
     trained = train_discopatch(settings.dataset.train_images(), layout.discopatch_dir / "training",
                                epochs=settings.epochs, num_workers=settings.workers, seed=settings.seed,
                                root=settings.discopatch_root)
-    os.link(trained, layout.discopatch_checkpoint)
+    shutil.copy2(trained, layout.discopatch_checkpoint)
 
 
 def discopatch_pass(settings, manifest) -> None:

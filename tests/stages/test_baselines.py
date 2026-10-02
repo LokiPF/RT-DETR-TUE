@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 
 import numpy as np
 import pytest
@@ -185,19 +186,23 @@ def test_training_refuses_to_overwrite_a_finished_discriminator(tmp_path, monkey
     assert calls == []
 
 
-def test_a_lower_epoch_budget_keeps_the_run_folder_and_the_trained_discriminator_is_linked(tmp_path, fakes,
+def test_a_lower_epoch_budget_keeps_the_run_folder_and_the_trained_discriminator_is_copied(tmp_path, fakes,
                                                                                             monkeypatch):
+    trained = []
+
     def fake_train(paths, models_dir, **kwargs):
-        trained = models_dir / "DisCoPatch" / "Discriminator_coco.pt"
-        trained.parent.mkdir(parents=True)
-        trained.write_bytes(b"trained")
-        return trained
+        trained.append(models_dir / "DisCoPatch" / "Discriminator_coco.pt")
+        trained[0].parent.mkdir(parents=True)
+        trained[0].write_bytes(b"trained")
+        return trained[0]
 
     monkeypatch.setattr(stage, "train_discopatch", fake_train)
     _detector(_settings(tmp_path))
     settings = _settings(tmp_path, epochs=30)  # the epoch budget is not part of the protocol
     run_stage("discopatch-train", settings)
     assert settings.layout.discopatch_checkpoint.read_bytes() == b"trained"
+    # a copy: a retrain rewrites the trained file in place, which would destroy a linked discriminator moved aside
+    assert not os.path.samefile(settings.layout.discopatch_checkpoint, trained[0])
     training = json.loads(settings.layout.discopatch_training.read_text())
     assert training["epochs"] == 30 and training["numerics"] == stage.discopatch.TRAINING_NUMERICS
 
