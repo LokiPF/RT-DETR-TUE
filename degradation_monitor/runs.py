@@ -215,7 +215,8 @@ class Manifest:
             self.update(protocol=protocol)
         elif recorded != protocol:
             changed = sorted(k for k in set(recorded) | set(protocol) if recorded.get(k) != protocol.get(k))
-            raise ValueError(f"this run folder was made with another protocol ({', '.join(changed)}): {self.path}")
+            raise ValueError(f"this run folder was made with another protocol ({', '.join(changed)}): {self.path}; use "
+                             "another run folder (--run DIR), or delete its manifest.json if it holds no results yet")
 
     def check_inputs(self, folder: str, inputs: dict) -> None:
         """Record what a score folder is computed from; refuse to add to it if it was computed from something else.

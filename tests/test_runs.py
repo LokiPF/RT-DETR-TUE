@@ -43,8 +43,9 @@ def test_a_run_folder_refuses_another_protocol(tmp_path):
     manifest = Manifest(RunLayout(tmp_path))
     manifest.check_protocol({"seed": 44, "limit": None, "conditions": [("clean", 0), ("fog", 1)]})
     manifest.check_protocol({"seed": 44, "limit": None, "conditions": [["clean", 0], ["fog", 1]]})  # tuples == lists
-    with pytest.raises(ValueError, match=r"another protocol \(limit, seed\)"):
+    with pytest.raises(ValueError, match=r"another protocol \(limit, seed\)") as refused:
         manifest.check_protocol({"seed": 45, "limit": 10, "conditions": [["clean", 0], ["fog", 1]]})
+    assert "--run DIR" in str(refused.value)  # the refusal names the way out
 
 
 def test_a_run_folder_with_scores_but_no_recorded_protocol_is_refused(tmp_path):
