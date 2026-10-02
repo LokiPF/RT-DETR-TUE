@@ -24,25 +24,6 @@ def test_condition_aurocs_match_binary_auroc_row_by_row():
     assert m.condition_aurocs(clean, degraded) == pytest.approx(expected)
 
 
-def test_spearman_drops_nan_pairs_and_needs_three_points():
-    assert m.spearman([1, 2, 3, np.nan], [2, 4, 6, 1]) == pytest.approx(1.0)
-    assert np.isnan(m.spearman([1, 2], [1, 2]))
-
-
-def test_mean_within_condition_spearman_skips_conditions_without_defined_risk():
-    delta_scores = np.array([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0]])
-    delta_risks = np.array([[1.0, np.nan], [2.0, np.nan], [3.0, np.nan]])
-    assert m.mean_within_condition_spearman(delta_scores, delta_risks) == pytest.approx(1.0)
-
-
-def test_risk_coverage_keeps_lowest_scores_ignores_undefined_risk_and_oracle_is_best():
-    scores_ = np.array([0.1, 0.2, 0.9, 0.8, 0.5])
-    risks = np.array([0.0, 0.1, 1.0, 0.2, np.nan])
-    _, kept = m.risk_coverage(scores_, risks, coverages=(1.0, 0.5))
-    assert kept.tolist() == pytest.approx([np.nanmean(risks), 0.05])
-    assert m.aurc(risks, risks, coverages=(1.0, 0.5)) <= m.aurc(scores_, risks, coverages=(1.0, 0.5))
-
-
 def test_fit_lambda_from_parts_matches_uq_detr_fit_lambda():
     rng = np.random.default_rng(0)
     queries, reliability = [], []

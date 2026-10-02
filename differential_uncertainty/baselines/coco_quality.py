@@ -1,4 +1,4 @@
-"""Detection quality on COCO: per-image LRP (uq-detr), per-image AP and mAP (pycocotools)."""
+"""Detection quality on COCO: per-image AP and mAP (pycocotools)."""
 from __future__ import annotations
 
 import contextlib
@@ -6,11 +6,8 @@ import io
 import math
 
 import numpy as np
-import uq_detr
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
-
-DEFAULT_LRP_GRID = tuple(np.round(np.arange(0.05, 0.951, 0.05), 2))
 
 
 def _quiet():
@@ -42,51 +39,6 @@ class CocoGroundTruth:
         crowd = [a for a in anns if a.get("iscrowd", 0)]
         labels = np.array([self.label_of[a["category_id"]] for a in plain], dtype=np.int64)
         return xyxy(plain), labels, xyxy(crowd)
-
-
-def _ioa(boxes, regions):
-    """Intersection over each box's own area, shape (boxes, regions)."""
-    x1 = np.maximum(boxes[:, None, 0], regions[None, :, 0])
-    y1 = np.maximum(boxes[:, None, 1], regions[None, :, 1])
-    x2 = np.minimum(boxes[:, None, 2], regions[None, :, 2])
-    y2 = np.minimum(boxes[:, None, 3], regions[None, :, 3])
-    inter = np.clip(x2 - x1, 0, None) * np.clip(y2 - y1, 0, None)
-    area = np.clip(boxes[:, 2] - boxes[:, 0], 0, None) * np.clip(boxes[:, 3] - boxes[:, 1], 0, None)
-    return inter / np.maximum(area[:, None], 1e-12)
-
-
-def filter_detections(scores, labels, boxes, threshold, crowd_boxes, crowd_ioa=0.5):
-    scores, labels = np.asarray(scores), np.asarray(labels)
-    boxes = np.asarray(boxes, dtype=np.float64).reshape(-1, 4)
-    keep = scores >= threshold
-    if crowd_boxes.size and boxes.size:
-        keep &= ~(_ioa(boxes, crowd_boxes) >= crowd_ioa).any(axis=1)
-    return scores[keep], labels[keep], boxes[keep]
-
-
-def image_lrp(scores, labels, boxes, gt_boxes, gt_labels, crowd_boxes, threshold) -> float:
-    kept_scores, kept_labels, kept_boxes = filter_detections(scores, labels, boxes, threshold, crowd_boxes)
-    if kept_scores.size == 0 and gt_labels.size == 0:
-        return math.nan
-    dets = uq_detr.Detections(boxes=kept_boxes, scores=kept_scores, labels=kept_labels)
-    truth = uq_detr.GroundTruth(boxes=gt_boxes.reshape(-1, 4), labels=gt_labels)
-    return float(uq_detr.lrp([dets], [truth], iou_threshold=0.5).score)
-
-
-def _dataset_lrp(records, gt, threshold) -> float:
-    dets, truths = [], []
-    for image_id, scores, labels, boxes in records:
-        gt_boxes, gt_labels, crowd = gt.boxes(image_id)
-        s, l, b = filter_detections(scores, labels, boxes, threshold, crowd)
-        dets.append(uq_detr.Detections(boxes=b, scores=s, labels=l))
-        truths.append(uq_detr.GroundTruth(boxes=gt_boxes, labels=gt_labels))
-    return float(uq_detr.lrp(dets, truths, iou_threshold=0.5).score)
-
-
-def select_lrp_threshold(records, gt, grid=DEFAULT_LRP_GRID) -> float:
-    """Confidence threshold with the lowest dataset LRP; ties go to the lowest threshold."""
-    values = [(_dataset_lrp(records, gt, t), t) for t in grid]
-    return float(min(values, key=lambda item: (item[0], item[1]))[1])
 
 
 def coco_results(image_id, scores, labels, boxes, category_ids) -> list[dict]:

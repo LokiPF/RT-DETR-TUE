@@ -1,10 +1,9 @@
-"""Turn stored baseline scores into separation, harm, interval and runtime tables."""
+"""Turn stored baseline scores into separation, interval and runtime tables."""
 from __future__ import annotations
 
 import csv
 import json
 import math
-import warnings
 from itertools import combinations
 from pathlib import Path
 
@@ -13,8 +12,7 @@ import numpy as np
 from .activation_cdf import BINS as CDF_BINS
 from .hashemi import K as HASHEMI_K
 from . import metrics, protocol
-from .coco_quality import (CocoGroundTruth, coco_map, coco_results, image_lrp, per_image_ap,
-                           select_lrp_threshold)
+from .coco_quality import CocoGroundTruth, coco_map, coco_results, per_image_ap
 
 METHODS = ("saod_top3", "saod_min", "contrastive", "knn", "discopatch", "hashemi", "hashemi_enc", "cdf", "cdf_sum")
 LABELS = {"saod_top3": "SAOD, mean of top 3", "saod_min": "SAOD, min (1 − max confidence)",
@@ -28,8 +26,7 @@ KNN_K = 100
 KNN_KS = (1, 10, 50, 100, 200)
 SEPARATION = ("auroc", "aupr", "fpr95")
 BOOTSTRAP_SAMPLES = 1000
-DIFFERENCE_METRICS = ("auroc_common", "auroc_extra", "aupr_common", "aupr_extra", "fpr95_common",
-                      "fpr95_extra", "rho_within", "rho_condition_lrp", "aurc_all")
+DIFFERENCE_METRICS = ("auroc_common", "auroc_extra", "aupr_common", "aupr_extra", "fpr95_common", "fpr95_extra")
 SEVERITY = np.array([s for _, s in protocol.CONDITIONS])
 CORRUPTED = np.arange(1, len(protocol.CONDITIONS))
 COMMON = np.array([c for c, (f, _) in enumerate(protocol.CONDITIONS) if f in protocol.COMMON_FAMILIES])
@@ -87,43 +84,6 @@ def aggregate_rows(rows: list[dict]) -> list[dict]:
     return out
 
 
-def _pools():
-    yield "all", np.arange(len(protocol.CONDITIONS))
-    for s in protocol.SEVERITIES:
-        yield f"severity {s}", np.r_[0, CORRUPTED[SEVERITY[CORRUPTED] == s]]
-    for family in protocol.FAMILIES:
-        yield family, np.r_[0, [c for c in CORRUPTED if protocol.CONDITIONS[c][0] == family]]
-
-
-def _nanmean_columns(values):
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)
-        return np.nanmean(values, axis=0)
-
-
-def harm_rows(scores: dict, lrp: np.ndarray, condition_map: np.ndarray):
-    mean_lrp = _nanmean_columns(lrp)
-    delta_risk = lrp[:, CORRUPTED] - lrp[:, [0]]
-    harm, pools = [], []
-    for method, values in scores.items():
-        means = values.mean(axis=0)
-        delta_score = values[:, CORRUPTED] - values[:, [0]]
-        row = {"method": method,
-               "rho_condition_map": metrics.spearman(means[CORRUPTED], condition_map[CORRUPTED]),
-               "rho_condition_lrp": metrics.spearman(means[CORRUPTED], mean_lrp[CORRUPTED]),
-               "rho_within": metrics.mean_within_condition_spearman(delta_score, delta_risk)}
-        for s in protocol.SEVERITIES:
-            columns = SEVERITY[CORRUPTED] == s
-            row[f"rho_within_sev{s}"] = metrics.mean_within_condition_spearman(
-                delta_score[:, columns], delta_risk[:, columns])
-        harm.append(row)
-        for pool, columns in _pools():
-            pooled_scores, pooled_risk = values[:, columns].ravel(), lrp[:, columns].ravel()
-            pools.append({"method": method, "pool": pool, "aurc": metrics.aurc(pooled_scores, pooled_risk),
-                          "aurc_oracle": metrics.aurc(pooled_risk, pooled_risk)})
-    return harm, pools
-
-
 def _group_separation(clean, degraded):
     """Mean AUROC, AUPR and FPR95 over the conditions (rows) of `degraded`."""
     return (float(metrics.condition_aurocs(clean, degraded).mean()),
@@ -131,14 +91,12 @@ def _group_separation(clean, degraded):
             float(np.mean([metrics.fpr_at_95_tpr(clean, row) for row in degraded])))
 
 
-def headline_numbers(scores: dict, lrp: np.ndarray, folds=None, per_fold_methods=()) -> dict:
-    """Aggregates used for intervals, computed identically on the full set and on each draw.
+def headline_numbers(scores: dict, folds=None, per_fold_methods=()) -> dict:
+    """Separation aggregates used for intervals, computed identically on the full set and on each draw.
 
     Methods in `per_fold_methods` get fold-averaged separation numbers, matching separation_rows.
     """
     out = {}
-    delta_risk = lrp[:, CORRUPTED] - lrp[:, [0]]
-    mean_lrp = _nanmean_columns(lrp)
     for method, values in scores.items():
         for group, columns in (("common", COMMON), ("extra", EXTRA)):
             if method in per_fold_methods:
@@ -150,10 +108,6 @@ def headline_numbers(scores: dict, lrp: np.ndarray, folds=None, per_fold_methods
             out[f"{method}:auroc_{group}"] = float(auroc_value)
             out[f"{method}:aupr_{group}"] = float(aupr_value)
             out[f"{method}:fpr95_{group}"] = float(fpr_value)
-        out[f"{method}:rho_within"] = metrics.mean_within_condition_spearman(
-            values[:, CORRUPTED] - values[:, [0]], delta_risk)
-        out[f"{method}:rho_condition_lrp"] = metrics.spearman(values.mean(axis=0)[CORRUPTED], mean_lrp[CORRUPTED])
-        out[f"{method}:aurc_all"] = metrics.aurc(values.ravel(), lrp.ravel())
     for a, b in combinations(scores, 2):
         for metric in DIFFERENCE_METRICS:
             out[f"{a} - {b}:{metric}"] = out[f"{a}:{metric}"] - out[f"{b}:{metric}"]
@@ -196,27 +150,14 @@ def _markdown(tables: dict, summary: dict, methods=METHODS, labels=LABELS, title
                          f"{_with_ci(intervals, f'{method}:aupr_{group}') if intervals else _fmt(cells['all']['aupr'])} | "
                          f"{_with_ci(intervals, f'{method}:fpr95_{group}') if intervals else _fmt(cells['all']['fpr95'])} |")
         lines.append("")
-    harm = tables.get("harm", [])
-    pools = {(r["method"], r["pool"]): r for r in tables.get("aurc_pools", [])}
-    if harm:
-        lines += ["## Harm alignment", "",
-                  "| Method | ρ(score, mAP), conditions | ρ(score, LRP), conditions | ρ(Δscore, ΔLRP), within condition | AURC all (oracle) |",
-                  "| --- | ---: | ---: | ---: | ---: |"]
-        for row in harm:
-            m = row["method"]
-            pool = pools.get((m, "all"), {})
-            lines.append(f"| {labels[m]} | {_fmt(row['rho_condition_map'])} | "
-                         f"{_with_ci(intervals, f'{m}:rho_condition_lrp')} | {_with_ci(intervals, f'{m}:rho_within')} | "
-                         f"{_with_ci(intervals, f'{m}:aurc_all')} ({_fmt(pool.get('aurc_oracle'))}) |")
-        lines.append("")
     differences = tables.get("differences", [])
     if differences:
         lines += ["## Differences between methods", "",
-                  "| Pair | Δ AUROC common | Δ ρ within condition | Δ AURC all |", "| --- | ---: | ---: | ---: |"]
+                  "| Pair | Δ AUROC common | Δ AUROC extra | Δ FPR95 common |", "| --- | ---: | ---: | ---: |"]
         pairs = dict.fromkeys(r["quantity"].split(":")[0] for r in differences)
         for pair in pairs:
             lines.append(f"| {pair} | {_with_ci(intervals, f'{pair}:auroc_common')} | "
-                         f"{_with_ci(intervals, f'{pair}:rho_within')} | {_with_ci(intervals, f'{pair}:aurc_all')} |")
+                         f"{_with_ci(intervals, f'{pair}:auroc_extra')} | {_with_ci(intervals, f'{pair}:fpr95_common')} |")
         lines.append("")
     timing = tables.get("timing", [])
     if timing:
@@ -270,13 +211,6 @@ def build_report(settings) -> None:
     ordered = {m: v for m, v in method_scores(test, dcp, per_image_lambda, activation=activation).items()}
     scores = {m: ordered[m] for m in METHODS if m in ordered}
 
-    threshold = select_lrp_threshold(clean_records, gt)
-    lrp = np.full((len(names), len(protocol.CONDITIONS)), np.nan)
-    for k, image_id in enumerate(ids):
-        gt_boxes, gt_labels, crowd = gt.boxes(image_id)
-        for c in range(len(protocol.CONDITIONS)):
-            lrp[k, c] = image_lrp(test["det_scores"][k, c], test["det_labels"][k, c], test["det_boxes"][k, c],
-                                  gt_boxes, gt_labels, crowd, threshold)
     condition_map = np.array([
         coco_map(gt, [r for k, i in enumerate(ids) for r in coco_results(
             i, test["det_scores"][k, c], test["det_labels"][k, c], test["det_boxes"][k, c], gt.category_ids)], ids)
@@ -285,21 +219,19 @@ def build_report(settings) -> None:
 
     per_fold_methods = () if consistent else ("contrastive",)
     separation = separation_rows(scores, folds, per_fold_methods=per_fold_methods)
-    harm, pools = harm_rows(scores, lrp, condition_map)
-    point = headline_numbers(scores, lrp, folds, per_fold_methods)
+    point = headline_numbers(scores, folds, per_fold_methods)
 
     def statistic(draw):
         # Duplicated images stay in their own fold, so a fold's lambda never sees its own images.
         lam, _ = metrics.cross_fit_lambda(clean_pos[draw], clean_neg[draw], ap[draw], folds[draw])
         drawn = {m: v[draw] for m, v in scores.items()}
         drawn["contrastive"] = -(test["conf_pos"][draw] - lam[:, None] * test["conf_neg"][draw])
-        return headline_numbers({m: drawn[m] for m in scores}, lrp[draw], folds[draw], per_fold_methods)
+        return headline_numbers({m: drawn[m] for m in scores}, folds[draw], per_fold_methods)
 
     ranges = metrics.bootstrap(statistic, len(names), samples=BOOTSTRAP_SAMPLES, seed=settings.seed)
     interval_rows = [{"quantity": key, "point": point[key], "low": ranges[key][0], "high": ranges[key][1]}
                      for key in point]
     conditions = [{"family": f, "severity": s, "map": float(condition_map[c]),
-                   "mean_lrp": float(_nanmean_columns(lrp)[c]), "images_undefined_lrp": int(np.isnan(lrp[:, c]).sum()),
                    **{f"mean_{m}": float(v[:, c].mean()) for m, v in scores.items()}}
                   for c, (f, s) in enumerate(protocol.CONDITIONS)]
     knn_k = [{"k": k, "mean_auroc_common": float(metrics.condition_aurocs(
@@ -312,14 +244,12 @@ def build_report(settings) -> None:
     summary = {
         "images": len(names), "folds": protocol.FOLDS, "lambda_per_fold": per_fold,
         "lambda_folds_agree": consistent, "images_with_ap": int(np.isfinite(ap).sum()),
-        "lrp_threshold": threshold, "images_with_undefined_clean_lrp": int(np.isnan(lrp[:, 0]).sum()),
         "clean_map": float(condition_map[0]), "knn_k": KNN_K, "theta": 0.3,
         "bootstrap_samples": BOOTSTRAP_SAMPLES, "discopatch_included": dcp is not None,
         "activation_monitors_included": activation is not None, "hashemi_k": HASHEMI_K, "cdf_bins": CDF_BINS,
     }
     write_outputs(settings.output / "results", {
-        "separation": separation, "aggregates": aggregate_rows(separation), "harm": harm,
-        "aurc_pools": pools, "conditions": conditions,
+        "separation": separation, "aggregates": aggregate_rows(separation), "conditions": conditions,
         "intervals": [r for r in interval_rows if " - " not in r["quantity"]],
         "differences": [r for r in interval_rows if " - " in r["quantity"]],
         "knn_k": knn_k, "timing": timing,

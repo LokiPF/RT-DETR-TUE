@@ -1,14 +1,13 @@
-"""Separation, harm and inference helpers; every score is oriented so higher means more degraded."""
+"""Separation and inference helpers; every score is oriented so higher means more degraded."""
 from __future__ import annotations
 
 import math
 import warnings
 
 import numpy as np
-from scipy.stats import ConstantInputWarning, pearsonr, rankdata, spearmanr
+from scipy.stats import ConstantInputWarning, pearsonr, rankdata
 from sklearn.metrics import average_precision_score
 
-COVERAGES = tuple(np.round(np.linspace(1.0, 0.05, 20), 4))
 UQ_DETR_LAMBDA_GRID = (0, 0.25, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20)  # uq_detr.fit_lambda default
 
 
@@ -60,36 +59,6 @@ def condition_aurocs(clean, degraded) -> np.ndarray:
     joined = np.concatenate([np.broadcast_to(clean, (degraded.shape[0], n)), degraded], axis=1)
     ranks = rankdata(joined, method="average", axis=1)
     return (ranks[:, n:].sum(axis=1) - m * (m + 1) / 2) / (n * m)
-
-
-def spearman(x, y) -> float:
-    x, y = np.asarray(x, float), np.asarray(y, float)
-    keep = np.isfinite(x) & np.isfinite(y)
-    if keep.sum() < 3:
-        return math.nan
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", ConstantInputWarning)
-        return float(spearmanr(x[keep], y[keep]).statistic)
-
-
-def mean_within_condition_spearman(delta_scores, delta_risks) -> float:
-    """Mean over conditions (columns) of the per-image Spearman correlation."""
-    values = [spearman(delta_scores[:, c], delta_risks[:, c]) for c in range(delta_scores.shape[1])]
-    values = [v for v in values if not math.isnan(v)]
-    return float(np.mean(values)) if values else math.nan
-
-
-def risk_coverage(scores, risks, coverages=COVERAGES):
-    """Mean risk of the images kept when the highest-scoring ones are rejected first."""
-    scores, risks = np.asarray(scores, float), np.asarray(risks, float)
-    keep = np.isfinite(risks)
-    ranked = risks[keep][np.argsort(scores[keep], kind="stable")]
-    kept = [ranked[: max(1, int(math.ceil(c * ranked.size)))].mean() for c in coverages]
-    return np.asarray(coverages, float), np.asarray(kept, float)
-
-
-def aurc(scores, risks, coverages=COVERAGES) -> float:
-    return float(risk_coverage(scores, risks, coverages)[1].mean())
 
 
 def fit_lambda_from_parts(conf_pos, conf_neg, reliability, grid=UQ_DETR_LAMBDA_GRID):

@@ -30,28 +30,16 @@ def test_aggregate_rows_average_common_and_extra_families_separately():
     assert {("knn", "common", "all"), ("knn", "extra", 5), ("knn", "all", "all")} <= keys
 
 
-def test_harm_rows_correlations_and_aurc_pools():
-    scores = _scores()
-    condition_map = 0.5 - 0.05 * SEVERITY
-    lrp = np.tile(1.0 - condition_map, (30, 1)) + np.random.default_rng(2).normal(0, 0.01, (30, 96))
-    harm, pools = report.harm_rows(scores, lrp, condition_map)
-    knn = next(r for r in harm if r["method"] == "knn")
-    assert knn["rho_condition_map"] < -0.9 and knn["rho_condition_lrp"] > 0.9
-    assert len(pools) == len(report.METHODS) * (1 + 5 + 19)
-    assert all(p["aurc"] >= p["aurc_oracle"] - 1e-12 for p in pools)
-
-
-def test_headline_numbers_include_pairwise_differences():
-    rng = np.random.default_rng(4)
-    numbers = report.headline_numbers(_scores(), rng.uniform(0, 1, (30, 96)))
+def test_headline_numbers_include_pairwise_differences_and_no_harm():
+    numbers = report.headline_numbers(_scores())
     difference = numbers["saod_top3 - knn:auroc_common"]
     assert difference == pytest.approx(numbers["saod_top3:auroc_common"] - numbers["knn:auroc_common"])
+    assert not any(key.endswith((":rho_within", ":rho_condition_lrp", ":aurc_all")) for key in numbers)
 
 
 def test_headline_numbers_fold_average_the_methods_asked_for():
     scores, folds = _scores(), protocol.assign_folds(30)
-    lrp = np.random.default_rng(5).uniform(0, 1, (30, 96))
-    numbers = report.headline_numbers(scores, lrp, folds, per_fold_methods=("contrastive",))
+    numbers = report.headline_numbers(scores, folds, per_fold_methods=("contrastive",))
     values = scores["contrastive"]
     expected = np.mean([report.metrics.condition_aurocs(values[folds == f, 0], values[folds == f][:, report.COMMON].T).mean()
                         for f in range(5)])
@@ -61,9 +49,9 @@ def test_headline_numbers_fold_average_the_methods_asked_for():
 def test_write_outputs_creates_csv_json_and_markdown(tmp_path):
     rows = report.separation_rows(_scores(), protocol.assign_folds(30))
     report.write_outputs(tmp_path, {"separation": rows, "aggregates": report.aggregate_rows(rows)},
-                         {"lambda_per_fold": {"0": 5.0}, "lrp_threshold": 0.3})
+                         {"lambda_per_fold": {"0": 5.0}, "clean_map": 0.48})
     assert (tmp_path / "separation.csv").exists()
-    assert json.loads((tmp_path / "summary.json").read_text())["lrp_threshold"] == 0.3
+    assert json.loads((tmp_path / "summary.json").read_text())["clean_map"] == 0.48
     text = (tmp_path / "report.md").read_text()
     assert "ContrastiveConf" in text and "DisCoPatch" in text and "AUPR" in text
 
@@ -126,11 +114,11 @@ def test_build_report_end_to_end_on_a_tiny_fixture(tmp_path, monkeypatch):
     summary = json.loads((results / "summary.json").read_text())
     assert summary["images"] == 15 and len(summary["lambda_per_fold"]) == 5
     assert summary["discopatch_included"] is False and summary["activation_monitors_included"] is False
-    for name in ("separation", "aggregates", "harm", "aurc_pools", "conditions", "intervals", "differences", "knn_k"):
+    for name in ("separation", "aggregates", "conditions", "intervals", "differences", "knn_k"):
         assert (results / f"{name}.csv").exists(), name
     assert "ContrastiveConf" in (results / "report.md").read_text()
     header = (results / "conditions.csv").read_text().splitlines()[0].split(",")
-    assert "images_undefined_lrp" in header
+    assert "map" in header and "images_undefined_lrp" not in header
 
 
 def test_build_report_includes_the_activation_monitors_when_scored(tmp_path, monkeypatch):
@@ -149,7 +137,7 @@ def test_build_report_includes_the_activation_monitors_when_scored(tmp_path, mon
     summary = json.loads((results / "summary.json").read_text())
     assert summary["activation_monitors_included"] is True
     assert summary["hashemi_k"] == 2.0 and summary["cdf_bins"] == 1000
-    with (results / "harm.csv").open() as handle:
+    with (results / "separation.csv").open() as handle:
         methods = {row["method"] for row in csv.DictReader(handle)}
     assert {"hashemi", "hashemi_enc", "cdf", "cdf_sum"} <= methods
     text = (results / "report.md").read_text()
@@ -168,7 +156,7 @@ def test_method_scores_add_the_activation_monitors_only_when_given():
 
 
 def test_differences_cover_every_separation_metric_for_both_family_groups():
-    numbers = report.headline_numbers(_scores(), np.random.default_rng(6).uniform(0, 1, (30, 96)))
+    numbers = report.headline_numbers(_scores())
     for metric in report.SEPARATION:
         for group in ("common", "extra"):
             key = f"saod_top3 - knn:{metric}_{group}"
