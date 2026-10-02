@@ -2,6 +2,17 @@
 
 Dated observations and decisions that don't belong in a results document. Newest first.
 
+## 2026-10-02: The 5,000-image confirmation passes
+
+Both pre-registered decisions are confirmed. The details are in `docs/conv-tu-conditioned-results.md`.
+- **The headline, the two-axis score, on all 5,000 images:** AUROC 0.917 common and 0.858 extra.
+  - It beats the activation CDFs by +0.096 [+0.093, +0.100] and +0.051 [+0.048, +0.054].
+  - It beats the level score by +0.076 [+0.073, +0.079] on the common families.
+  - The 3,030 untouched images give the same result: 0.916 / 0.858.
+- **The level score, on the 4,800 held-out images:** it beats the global average by +0.041 common and +0.037 extra, and the CDFs by +0.020 and +0.059. Every interval is above 0.
+- **The cost of the flatter arm:** on the extra families, the two-axis score is 0.008 [0.005, 0.010] below the level score.
+- **The equivalence reference:** `docs/results/conv-tu-conditioned/summary.json` is what the clean branch must reproduce.
+
 ## 2026-10-01 (night): Corruptions flatten or shift the early channels
 
 **Source.** The detection-only roundtable proposed this; all five panelists gave it their first vote. The record is in `docs/roundtable-2026-10-01-detection/`. I re-implemented the two leading rows from their written spec (`verify_panel_rows.py` in that folder) and reproduced the panel's point estimates exactly.
