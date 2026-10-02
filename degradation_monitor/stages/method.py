@@ -1,7 +1,8 @@
 """Our method's stages: the clean reference statistics, then those of every evaluation image under all 96 conditions.
 
-Both store each channel's level and top-1% mean. The report compares them with the reference, so an ablation of the
-bank size, k or the key needs no new pass.
+Both store each channel's level and top-1% mean. The report compares them with the reference, so changing k (up to the
+2,000 bank images) or the key needs no new pass; a larger bank, such as the 5,000-image ablation in docs/todo.md, needs
+the statistics of more clean train images first.
 """
 from __future__ import annotations
 
