@@ -1,0 +1,5 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib"
+# "tests/differential_uncertainty" is removed again in Task 13, with the last old test.
+pythonpath = [".", "tests", "tests/differential_uncertainty"]
