@@ -20,11 +20,12 @@ from torch.utils.data import DataLoader, Dataset
 from degradation_monitor.detector.model import prepare_image
 from degradation_monitor import corruptions
 from degradation_monitor.datasets import coco
+from degradation_monitor.evaluation.metrics import stage_zstats, zscored_sum
 from . import discopatch
 from .activation_cdf import BINS as CDF_BINS
 from .activation_cdf import MARGIN as CDF_MARGIN
 from .activation_cdf import STAGES as CDF_STAGES
-from .activation_cdf import CdfMonitor, ChannelRanges, ReferenceHistograms, stage_zstats, zscored_sum
+from .activation_cdf import CdfMonitor, ChannelRanges, ReferenceHistograms
 from degradation_monitor.datasets.coco import CocoGroundTruth, coco_map, coco_results
 from degradation_monitor.detector.taps import DetectorTap
 from .discopatch import DisCoPatchScorer, train_discopatch

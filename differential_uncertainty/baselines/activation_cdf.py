@@ -118,17 +118,3 @@ class CdfMonitor:
     def scores(self, stages) -> np.ndarray:
         """The plain sum over all channels of all stages."""
         return self.stage_scores(stages).sum(axis=1)
-
-
-def stage_zstats(stage_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Mean and population standard deviation of each stage's score over clean images."""
-    stage_scores = np.asarray(stage_scores, dtype=np.float64)
-    mean, std = stage_scores.mean(axis=0), stage_scores.std(axis=0)
-    if not np.all(std > 0):
-        raise ValueError("every stage needs a positive spread over the clean images")
-    return mean, std
-
-
-def zscored_sum(stage_scores: np.ndarray, mean, std) -> np.ndarray:
-    """Sum over stages of each stage's score standardised with clean-image statistics."""
-    return ((np.asarray(stage_scores, dtype=np.float64) - np.asarray(mean)) / np.asarray(std)).sum(axis=1)

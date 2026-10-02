@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from ..baselines.activation_cdf import stage_zstats, zscored_sum
+from degradation_monitor.evaluation.metrics import stage_zstats, zscored_sum
 from .channels import fit_own_average
 
 KEY_LAYER = "s4"

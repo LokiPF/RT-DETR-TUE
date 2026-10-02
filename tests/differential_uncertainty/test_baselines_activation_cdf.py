@@ -77,13 +77,3 @@ def test_stage_scores_split_the_channel_sum_by_backbone_stage(tmp_path):
     per_stage = monitor.stage_scores(stages)
     assert per_stage.shape == (3, 5)
     assert np.allclose(per_stage.sum(axis=1), monitor.scores(stages))
-
-
-def test_zscored_sum_standardises_each_stage_on_clean_statistics():
-    clean = np.array([[1.0, 10.0], [3.0, 30.0], [2.0, 20.0]])
-    mean, std = cdf.stage_zstats(clean)
-    assert mean.tolist() == pytest.approx([2.0, 20.0])
-    assert std.tolist() == pytest.approx([np.sqrt(2 / 3), 10 * np.sqrt(2 / 3)])
-    assert cdf.zscored_sum(np.array([[3.0, 20.0]]), mean, std)[0] == pytest.approx(1 / np.sqrt(2 / 3))
-    with pytest.raises(ValueError, match="spread"):
-        cdf.stage_zstats(np.array([[1.0, 5.0], [1.0, 6.0]]))

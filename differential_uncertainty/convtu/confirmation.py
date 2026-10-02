@@ -11,7 +11,7 @@ import numpy as np
 
 from degradation_monitor import corruptions
 from degradation_monitor.datasets import coco
-from ..baselines import metrics
+from degradation_monitor.evaluation import metrics
 from ..baselines import report as baseline_report
 from . import conditioned
 from .channels import channel_method_scores
@@ -47,10 +47,7 @@ FAMILY_ROWS = {"two_axis": "Two-axis", "peak_share": "Peak share", "conditioned"
 
 def group_aurocs(scores: np.ndarray, rows) -> tuple[float, float]:
     """Mean AUROC over the common and over the extra conditions, on the given images."""
-    values = np.asarray(scores, dtype=np.float64)[np.asarray(rows)]
-    clean = values[:, 0]
-    return (float(metrics.condition_aurocs(clean, values[:, baseline_report.COMMON].T).mean()),
-            float(metrics.condition_aurocs(clean, values[:, baseline_report.EXTRA].T).mean()))
+    return metrics.group_aurocs(scores, rows)
 
 
 def bootstrap_intervals(scores: dict, rows, samples: int = BOOTSTRAP_SAMPLES, seed: int = 44,

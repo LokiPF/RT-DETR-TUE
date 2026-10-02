@@ -16,7 +16,7 @@ from PIL import Image
 
 from degradation_monitor import corruptions
 from degradation_monitor.datasets import coco
-from ..baselines.activation_cdf import stage_zstats, zscored_sum
+from degradation_monitor.evaluation.metrics import stage_zstats, zscored_sum
 from ..baselines.pipeline import (TEST_KEYS, Settings, _atomic_json, _atomic_npz, _load_npz, _progress,
                                   _train_loader, _valid_existing, _variant_stream, evaluation)
 from degradation_monitor.detector.model import load_frozen_detector, prepare_image

@@ -13,7 +13,7 @@ from .activation_cdf import BINS as CDF_BINS
 from .hashemi import K as HASHEMI_K
 from degradation_monitor import corruptions
 from degradation_monitor.datasets import coco
-from . import metrics
+from degradation_monitor.evaluation import metrics
 from degradation_monitor.datasets.coco import CocoGroundTruth, coco_map, coco_results, per_image_ap
 
 METHODS = ("saod_top3", "saod_min", "contrastive", "knn", "discopatch", "hashemi", "hashemi_enc", "cdf", "cdf_sum")
@@ -86,13 +86,6 @@ def aggregate_rows(rows: list[dict]) -> list[dict]:
     return out
 
 
-def _group_separation(clean, degraded):
-    """Mean AUROC, AUPR and FPR95 over the conditions (rows) of `degraded`."""
-    return (float(metrics.condition_aurocs(clean, degraded).mean()),
-            float(np.mean([metrics.aupr(clean, row) for row in degraded])),
-            float(np.mean([metrics.fpr_at_95_tpr(clean, row) for row in degraded])))
-
-
 def headline_numbers(scores: dict, folds=None, per_fold_methods=()) -> dict:
     """Separation aggregates used for intervals, computed identically on the full set and on each draw.
 
@@ -102,11 +95,11 @@ def headline_numbers(scores: dict, folds=None, per_fold_methods=()) -> dict:
     for method, values in scores.items():
         for group, columns in (("common", COMMON), ("extra", EXTRA)):
             if method in per_fold_methods:
-                parts = [_group_separation(values[folds == f, 0], values[folds == f][:, columns].T)
+                parts = [metrics.group_separation(values[folds == f, 0], values[folds == f][:, columns].T)
                          for f in np.unique(folds)]
                 auroc_value, aupr_value, fpr_value = np.mean(parts, axis=0)
             else:
-                auroc_value, aupr_value, fpr_value = _group_separation(values[:, 0], values[:, columns].T)
+                auroc_value, aupr_value, fpr_value = metrics.group_separation(values[:, 0], values[:, columns].T)
             out[f"{method}:auroc_{group}"] = float(auroc_value)
             out[f"{method}:aupr_{group}"] = float(aupr_value)
             out[f"{method}:fpr95_{group}"] = float(fpr_value)

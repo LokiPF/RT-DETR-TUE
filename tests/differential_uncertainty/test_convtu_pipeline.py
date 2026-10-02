@@ -297,7 +297,7 @@ def test_conditioned_report_writes_every_row_and_checks_the_screen_images(small,
 
 def test_channel_statistics_reproduce_the_pilot_on_the_fake_backbone(small, detector, monkeypatch):
     from differential_uncertainty.baselines import report as baseline_report
-    from differential_uncertainty.baselines.activation_cdf import stage_zstats
+    from degradation_monitor.evaluation.metrics import stage_zstats
     from differential_uncertainty.convtu import channels
     from differential_uncertainty.convtu.features import knn_scores
     monkeypatch.setattr(convtu, "PILOT_IMAGES", 2)

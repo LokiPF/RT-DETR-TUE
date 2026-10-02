@@ -1,12 +1,15 @@
-"""Separation and inference helpers; every score is oriented so higher means more degraded."""
+"""Separation metrics, per-stage z-scoring and the paired bootstrap; every score is oriented so higher means more degraded."""
 from __future__ import annotations
 
 import math
+import multiprocessing
 import warnings
 
 import numpy as np
 from scipy.stats import ConstantInputWarning, pearsonr, rankdata
 from sklearn.metrics import average_precision_score
+
+from ..corruptions import COMMON_CONDITIONS, EXTRA_CONDITIONS
 
 UQ_DETR_LAMBDA_GRID = (0, 0.25, 0.5, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20)  # uq_detr.fit_lambda default
 
@@ -61,6 +64,35 @@ def condition_aurocs(clean, degraded) -> np.ndarray:
     return (ranks[:, n:].sum(axis=1) - m * (m + 1) / 2) / (n * m)
 
 
+def group_separation(clean, degraded) -> tuple[float, float, float]:
+    """Mean AUROC, AUPR and FPR95 over the conditions (rows) of `degraded`."""
+    return (float(condition_aurocs(clean, degraded).mean()),
+            float(np.mean([aupr(clean, row) for row in degraded])),
+            float(np.mean([fpr_at_95_tpr(clean, row) for row in degraded])))
+
+
+def group_aurocs(scores, rows) -> tuple[float, float]:
+    """Mean AUROC over the common and over the extra conditions, on the given images."""
+    values = np.asarray(scores, dtype=np.float64)[np.asarray(rows)]
+    clean = values[:, 0]
+    return (float(condition_aurocs(clean, values[:, COMMON_CONDITIONS].T).mean()),
+            float(condition_aurocs(clean, values[:, EXTRA_CONDITIONS].T).mean()))
+
+
+def stage_zstats(stage_scores: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Mean and population standard deviation of each stage's score over clean images."""
+    stage_scores = np.asarray(stage_scores, dtype=np.float64)
+    mean, std = stage_scores.mean(axis=0), stage_scores.std(axis=0)
+    if not np.all(std > 0):
+        raise ValueError("every stage needs a positive spread over the clean images")
+    return mean, std
+
+
+def zscored_sum(stage_scores: np.ndarray, mean, std) -> np.ndarray:
+    """Sum over stages of each stage's score standardised with clean-image statistics."""
+    return ((np.asarray(stage_scores, dtype=np.float64) - np.asarray(mean)) / np.asarray(std)).sum(axis=1)
+
+
 def fit_lambda_from_parts(conf_pos, conf_neg, reliability, grid=UQ_DETR_LAMBDA_GRID):
     """uq_detr.fit_lambda on precomputed Conf+/Conf-: first lambda with the highest Pearson r."""
     conf_pos, conf_neg, reliability = (np.asarray(v, float) for v in (conf_pos, conf_neg, reliability))
@@ -87,9 +119,29 @@ def cross_fit_lambda(conf_pos, conf_neg, reliability, folds):
     return np.array([per_fold[int(f)] for f in folds]), per_fold
 
 
-def bootstrap(statistic, n_images: int, samples: int = 1000, seed: int = 44) -> dict:
-    """Paired whole-image bootstrap: the same resampled images feed every quantity in `statistic`."""
+_STATISTIC = None  # the statistic forked bootstrap workers evaluate
+
+
+def _evaluate(draw):
+    return _STATISTIC(draw)
+
+
+def bootstrap(statistic, n_images: int, samples: int = 1000, seed: int = 44, workers: int = 1) -> dict:
+    """Paired whole-image bootstrap: the same resampled images feed every quantity in `statistic`.
+
+    The draws come from one seeded generator in a fixed order, so `workers` (forked processes) changes only the speed.
+    """
+    global _STATISTIC
     generator = np.random.default_rng(seed)
-    draws = [statistic(generator.integers(0, n_images, n_images)) for _ in range(samples)]
-    return {key: tuple(float(v) for v in np.nanpercentile([d[key] for d in draws], (2.5, 97.5)))
-            for key in draws[0]}
+    draws = [generator.integers(0, n_images, n_images) for _ in range(samples)]
+    if workers > 1:
+        _STATISTIC = statistic
+        try:
+            with multiprocessing.get_context("fork").Pool(workers) as pool:
+                values = pool.map(_evaluate, draws, chunksize=max(1, samples // (4 * workers)))
+        finally:
+            _STATISTIC = None
+    else:
+        values = [statistic(draw) for draw in draws]
+    return {key: tuple(float(v) for v in np.nanpercentile([d[key] for d in values], (2.5, 97.5)))
+            for key in values[0]}

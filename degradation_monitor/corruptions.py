@@ -20,6 +20,9 @@ SEVERITIES = (1, 2, 3, 4, 5)
 CONDITIONS = (("clean", 0),) + tuple(
     (family, severity) for family in FAMILIES for severity in SEVERITIES
 )
+CORRUPTED_CONDITIONS = np.arange(1, len(CONDITIONS))
+COMMON_CONDITIONS = np.array([c for c, (f, _) in enumerate(CONDITIONS) if f in COMMON_FAMILIES])
+EXTRA_CONDITIONS = np.array([c for c, (f, _) in enumerate(CONDITIONS) if f in EXTRA_FAMILIES])
 
 
 class _NumpyCompatibility:

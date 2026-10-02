@@ -3,7 +3,8 @@ import json
 import numpy as np
 import pytest
 
-from differential_uncertainty.baselines import metrics, report
+from degradation_monitor.evaluation import metrics
+from differential_uncertainty.baselines import report
 from differential_uncertainty.convtu import confirmation
 
 
