@@ -1,0 +1,42 @@
+[21:29:29] === raw block outputs
+[21:29:33] A: blocks 3, 6, 9 + key 12   two-axis     0.7880 / 0.7394  sev1 0.6780 / 0.5690 | sev1: fog 0.654 contra 0.684 zoom_b 0.882 gaussi 0.718 bright 0.516 satura 0.521 spatte 0.453 frost 0.578 elasti 0.527 motion 0.657
+[21:29:33] A: blocks 3, 6, 9 + key 12   flatter arm  0.7866 / 0.7261  sev1 0.6853 / 0.5700 | sev1: fog 0.577 contra 0.596 zoom_b 0.902 gaussi 0.747 bright 0.518 satura 0.504 spatte 0.444 frost 0.612 elasti 0.534 motion 0.663
+[21:29:33] A: blocks 3, 6, 9 + key 12   level arm    0.7780 / 0.7477  sev1 0.6568 / 0.5629 | sev1: fog 0.698 contra 0.724 zoom_b 0.813 gaussi 0.713 bright 0.504 satura 0.535 spatte 0.460 frost 0.555 elasti 0.522 motion 0.630
+[21:29:33] B: blocks 1, 2, 3 + key 12   two-axis     0.8591 / 0.8371  sev1 0.8103 / 0.7031 | sev1: fog 0.922 contra 0.934 zoom_b 0.927 gaussi 0.964 bright 0.526 satura 0.573 spatte 0.500 frost 0.750 elasti 0.559 motion 0.800
+[21:29:33] B: blocks 1, 2, 3 + key 12   flatter arm  0.8303 / 0.7967  sev1 0.7731 / 0.6908 | sev1: fog 0.676 contra 0.692 zoom_b 0.861 gaussi 0.981 bright 0.528 satura 0.536 spatte 0.531 frost 0.809 elasti 0.548 motion 0.741
+[21:29:33] B: blocks 1, 2, 3 + key 12   level arm    0.8196 / 0.8209  sev1 0.7551 / 0.6598 | sev1: fog 0.916 contra 0.929 zoom_b 0.905 gaussi 0.902 bright 0.515 satura 0.573 spatte 0.465 frost 0.565 elasti 0.506 motion 0.758
+[21:29:34] A - B: common -0.0711 [-0.0850, -0.0566]; extra -0.0977 [-0.1099, -0.0845]; common_s1 -0.1323 [-0.1484, -0.1142]; extra_s1 -0.1341 [-0.1470, -0.1197]
+[21:29:34] depth b0   level 0.756/0.724  share 0.819/0.753  flatter 0.851/0.793
+[21:29:34] depth b1   level 0.774/0.756  share 0.795/0.750  flatter 0.833/0.781
+[21:29:35] depth b2   level 0.769/0.805  share 0.748/0.767  flatter 0.769/0.788
+[21:29:35] depth b3   level 0.758/0.782  share 0.747/0.722  flatter 0.826/0.797
+[21:29:35] depth b4   level 0.700/0.698  share 0.722/0.692  flatter 0.828/0.804
+[21:29:35] depth b5   level 0.668/0.656  share 0.665/0.629  flatter 0.811/0.761
+[21:29:35] depth b6   level 0.670/0.632  share 0.585/0.552  flatter 0.731/0.663
+[21:29:35] depth b7   level 0.677/0.611  share 0.578/0.531  flatter 0.671/0.592
+[21:29:35] depth b8   level 0.640/0.591  share 0.530/0.503  flatter 0.581/0.523
+[21:29:35] depth b9   level 0.601/0.565  share 0.496/0.480  flatter 0.542/0.514
+[21:29:35] depth b10  level 0.596/0.556  share 0.499/0.485  flatter 0.561/0.523
+[21:29:35] depth b11  level 0.576/0.545  share 0.485/0.481  flatter 0.573/0.534
+[21:29:35] depth b12  level 0.614/0.569  share 0.543/0.523  flatter 0.550/0.523
+[21:29:35] === layer-normed (the detector's features)
+[21:29:40] A: blocks 3, 6, 9 + key 12   two-axis     0.7716 / 0.7460  sev1 0.6612 / 0.5728 | sev1: fog 0.597 contra 0.624 zoom_b 0.830 gaussi 0.728 bright 0.516 satura 0.509 spatte 0.490 frost 0.626 elasti 0.508 motion 0.647
+[21:29:40] A: blocks 3, 6, 9 + key 12   flatter arm  0.7626 / 0.7569  sev1 0.6612 / 0.5833 | sev1: fog 0.527 contra 0.524 zoom_b 0.821 gaussi 0.759 bright 0.523 satura 0.491 spatte 0.521 frost 0.667 elasti 0.500 motion 0.639
+[21:29:40] A: blocks 3, 6, 9 + key 12   level arm    0.7618 / 0.7467  sev1 0.6455 / 0.5634 | sev1: fog 0.634 contra 0.662 zoom_b 0.778 gaussi 0.726 bright 0.506 satura 0.529 spatte 0.467 frost 0.554 elasti 0.512 motion 0.638
+[21:29:40] B: blocks 1, 2, 3 + key 12   two-axis     0.8482 / 0.8431  sev1 0.7966 / 0.6982 | sev1: fog 0.850 contra 0.874 zoom_b 0.915 gaussi 0.965 bright 0.530 satura 0.550 spatte 0.502 frost 0.785 elasti 0.538 motion 0.797
+[21:29:40] B: blocks 1, 2, 3 + key 12   flatter arm  0.7995 / 0.8436  sev1 0.7413 / 0.6894 | sev1: fog 0.514 contra 0.510 zoom_b 0.833 gaussi 0.994 bright 0.542 satura 0.517 spatte 0.540 frost 0.828 elasti 0.520 motion 0.709
+[21:29:40] B: blocks 1, 2, 3 + key 12   level arm    0.8327 / 0.8365  sev1 0.7703 / 0.6810 | sev1: fog 0.861 contra 0.884 zoom_b 0.893 gaussi 0.949 bright 0.526 satura 0.566 spatte 0.463 frost 0.610 elasti 0.506 motion 0.797
+[21:29:41] A - B: common -0.0767 [-0.0890, -0.0632]; extra -0.0971 [-0.1080, -0.0851]; common_s1 -0.1354 [-0.1487, -0.1202]; extra_s1 -0.1254 [-0.1355, -0.1139]
+[21:29:41] depth lnb0 level 0.791/0.766  share 0.776/0.727  flatter 0.821/0.800
+[21:29:41] depth lnb1 level 0.799/0.776  share 0.772/0.716  flatter 0.817/0.818
+[21:29:41] depth lnb2 level 0.773/0.815  share 0.720/0.735  flatter 0.687/0.808
+[21:29:41] depth lnb3 level 0.765/0.789  share 0.720/0.692  flatter 0.804/0.831
+[21:29:41] depth lnb4 level 0.738/0.729  share 0.674/0.633  flatter 0.819/0.793
+[21:29:41] depth lnb5 level 0.730/0.713  share 0.621/0.572  flatter 0.793/0.769
+[21:29:41] depth lnb6 level 0.672/0.647  share 0.579/0.549  flatter 0.695/0.651
+[21:29:41] depth lnb7 level 0.661/0.605  share 0.573/0.527  flatter 0.663/0.612
+[21:29:42] depth lnb8 level 0.603/0.573  share 0.525/0.497  flatter 0.596/0.564
+[21:29:42] depth lnb9 level 0.559/0.545  share 0.493/0.483  flatter 0.563/0.561
+[21:29:42] depth lnb10 level 0.562/0.545  share 0.492/0.475  flatter 0.577/0.561
+[21:29:42] depth lnb11 level 0.553/0.533  share 0.479/0.470  flatter 0.555/0.535
+[21:29:42] depth lnb12 level 0.581/0.551  share 0.537/0.522  flatter 0.513/0.491

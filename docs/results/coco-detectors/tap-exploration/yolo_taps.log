@@ -1,0 +1,31 @@
+[21:27:01] 300 development images x 96 conditions
+[21:27:13] A: 2, 4, 6 + key 8 (plan)  two-axis     0.8813 / 0.8404  sev1 0.8056 / 0.6593 | sev1: fog 0.734 contra 0.759 zoom_b 0.887 gaussi 0.935 bright 0.495 satura 0.558 spatte 0.507 frost 0.576 elasti 0.573 motion 0.858
+[21:27:13] A: 2, 4, 6 + key 8 (plan)  flatter arm  0.8675 / 0.7233  sev1 0.7837 / 0.6210 | sev1: fog 0.752 contra 0.772 zoom_b 0.914 gaussi 0.881 bright 0.495 satura 0.573 spatte 0.427 frost 0.598 elasti 0.551 motion 0.846
+[21:27:13] A: 2, 4, 6 + key 8 (plan)  level arm    0.8701 / 0.8584  sev1 0.8029 / 0.6925 | sev1: fog 0.725 contra 0.754 zoom_b 0.807 gaussi 0.967 bright 0.501 satura 0.565 spatte 0.579 frost 0.549 elasti 0.600 motion 0.870
+[21:27:13] B: 2, 4, 6 + key 10        two-axis     0.8678 / 0.8281  sev1 0.7877 / 0.6433 | sev1: fog 0.684 contra 0.714 zoom_b 0.895 gaussi 0.908 bright 0.497 satura 0.541 spatte 0.494 frost 0.562 elasti 0.569 motion 0.841
+[21:27:13] B: 2, 4, 6 + key 10        flatter arm  0.8517 / 0.7093  sev1 0.7703 / 0.6138 | sev1: fog 0.710 contra 0.736 zoom_b 0.919 gaussi 0.875 bright 0.503 satura 0.570 spatte 0.398 frost 0.602 elasti 0.525 motion 0.827
+[21:27:13] B: 2, 4, 6 + key 10        level arm    0.8590 / 0.8456  sev1 0.7877 / 0.6728 | sev1: fog 0.662 contra 0.694 zoom_b 0.830 gaussi 0.942 bright 0.493 satura 0.530 spatte 0.563 frost 0.513 elasti 0.622 motion 0.853
+[21:27:13] C: 1, 3, 5 + key 7         two-axis     0.8979 / 0.8755  sev1 0.8382 / 0.7169 | sev1: fog 0.867 contra 0.882 zoom_b 0.871 gaussi 0.979 bright 0.502 satura 0.601 spatte 0.531 frost 0.593 elasti 0.560 motion 0.854
+[21:27:13] C: 1, 3, 5 + key 7         flatter arm  0.8639 / 0.7390  sev1 0.7895 / 0.6604 | sev1: fog 0.902 contra 0.913 zoom_b 0.898 gaussi 0.770 bright 0.475 satura 0.652 spatte 0.472 frost 0.584 elasti 0.591 motion 0.851
+[21:27:13] C: 1, 3, 5 + key 7         level arm    0.8856 / 0.8835  sev1 0.8181 / 0.7132 | sev1: fog 0.770 contra 0.792 zoom_b 0.830 gaussi 0.990 bright 0.529 satura 0.571 spatte 0.589 frost 0.629 elasti 0.523 motion 0.866
+[21:27:13] D: 1, 2, 3 + key 10        two-axis     0.8932 / 0.8790  sev1 0.8384 / 0.7268 | sev1: fog 0.871 contra 0.888 zoom_b 0.925 gaussi 0.992 bright 0.502 satura 0.613 spatte 0.489 frost 0.591 elasti 0.534 motion 0.864
+[21:27:13] D: 1, 2, 3 + key 10        flatter arm  0.8001 / 0.6272  sev1 0.7527 / 0.6742 | sev1: fog 0.901 contra 0.913 zoom_b 0.942 gaussi 0.801 bright 0.472 satura 0.661 spatte 0.474 frost 0.601 elasti 0.532 motion 0.853
+[21:27:13] D: 1, 2, 3 + key 10        level arm    0.8915 / 0.8986  sev1 0.8352 / 0.7386 | sev1: fog 0.803 contra 0.821 zoom_b 0.839 gaussi 0.998 bright 0.529 satura 0.610 spatte 0.524 frost 0.609 elasti 0.554 motion 0.872
+[21:27:13] E: 0, 1, 2 + key 10        two-axis     0.8869 / 0.8862  sev1 0.8231 / 0.7539 | sev1: fog 0.917 contra 0.933 zoom_b 0.934 gaussi 0.992 bright 0.506 satura 0.665 spatte 0.505 frost 0.628 elasti 0.547 motion 0.849
+[21:27:13] E: 0, 1, 2 + key 10        flatter arm  0.7948 / 0.6799  sev1 0.7568 / 0.7272 | sev1: fog 0.942 contra 0.951 zoom_b 0.951 gaussi 0.865 bright 0.451 satura 0.716 spatte 0.498 frost 0.606 elasti 0.559 motion 0.867
+[21:27:13] E: 0, 1, 2 + key 10        level arm    0.8828 / 0.8974  sev1 0.8226 / 0.7477 | sev1: fog 0.833 contra 0.857 zoom_b 0.828 gaussi 0.998 bright 0.550 satura 0.624 spatte 0.528 frost 0.637 elasti 0.557 motion 0.829
+[21:27:14] B - A: common -0.0135 [-0.0188, -0.0081]; extra -0.0122 [-0.0168, -0.0079]; common_s1 -0.0180 [-0.0255, -0.0102]; extra_s1 -0.0160 [-0.0237, -0.0087]
+[21:27:15] C - A: common +0.0166 [+0.0095, +0.0236]; extra +0.0352 [+0.0295, +0.0408]; common_s1 +0.0326 [+0.0228, +0.0427]; extra_s1 +0.0576 [+0.0480, +0.0673]
+[21:27:16] D - A: common +0.0119 [+0.0032, +0.0198]; extra +0.0386 [+0.0316, +0.0452]; common_s1 +0.0327 [+0.0195, +0.0439]; extra_s1 +0.0675 [+0.0561, +0.0780]
+[21:27:16] E - A: common +0.0057 [-0.0059, +0.0158]; extra +0.0458 [+0.0364, +0.0543]; common_s1 +0.0175 [+0.0022, +0.0322]; extra_s1 +0.0946 [+0.0807, +0.1068]
+[21:27:16] depth l0   level 0.781/0.772  share 0.811/0.752  flatter 0.794/0.778
+[21:27:17] depth l1   level 0.804/0.825  share 0.830/0.790  flatter 0.710/0.563
+[21:27:17] depth l2   level 0.855/0.876  share 0.828/0.799  flatter 0.749/0.598
+[21:27:17] depth l3   level 0.834/0.819  share 0.814/0.774  flatter 0.788/0.628
+[21:27:17] depth l4   level 0.776/0.749  share 0.813/0.768  flatter 0.808/0.680
+[21:27:17] depth l5   level 0.784/0.730  share 0.792/0.748  flatter 0.823/0.751
+[21:27:17] depth l6   level 0.625/0.585  share 0.714/0.646  flatter 0.775/0.693
+[21:27:17] depth l7   level 0.632/0.609  share 0.717/0.665  flatter 0.776/0.707
+[21:27:17] depth l8   level 0.711/0.701  share 0.596/0.602  flatter 0.734/0.682
+[21:27:17] depth l9   level 0.673/0.660  share 0.770/0.724  flatter 0.668/0.626
+[21:27:18] depth l10  level 0.629/0.652  share 0.750/0.694  flatter 0.691/0.633
