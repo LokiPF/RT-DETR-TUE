@@ -28,7 +28,7 @@ SCORE_KEYS = {
     "method": tuple(f"{statistic}_s{stage}" for statistic in ("means", "top") for stage in range(1, 5)),
 }
 PACKAGES = ("torch", "torchvision", "numpy", "scipy", "scikit-image", "scikit-learn", "imagecorruptions", "uq-detr",
-            "pycocotools", "Pillow")
+            "pycocotools", "Pillow", "ultralytics", "rfdetr")
 
 
 @dataclass(frozen=True)

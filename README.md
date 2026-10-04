@@ -24,11 +24,13 @@ degradation_monitor/
   cli.py, settings.py, runs.py, corruptions.py
   datasets/coco.py         COCO: train images, the seed-44 val order and folds, ground truth
   detector/                the frozen RT-DETRv2-R18: vendored code (rtdetrv2/), loader, post-processing, hooks
+  detectors/               one adapter per further detector: YOLO11m, Faster R-CNN, RF-DETR-M
   baselines/               SAOD, ContrastiveConf, kNN, DisCoPatch, Hashemi et al., activation CDFs: one file each
   method/                  our method: channel statistics, the clean reference, the scores and the ablation rows
   evaluation/              separation metrics, the paired bootstrap and the report
   stages/                  the runnable, resumable steps
 configs/coco.toml          this machine's paths and run options
+configs/coco-detectors.toml  the further detectors' weights, run root and clean-AP floors
 scripts/convert_runs.py    the one-time conversion of the old run folder
 archive/                   retired methods, read only (archive/README.md)
 docs/                      results, decisions and the dev log (docs/README.md)
@@ -78,6 +80,17 @@ python -m degradation_monitor <stage> [--config configs/coco.toml] [--device cud
 | `timing` | milliseconds per image for the detector and each baseline; our method's added cost is not timed yet | `knn-bank` |
 
 Run the tests with `python -m pytest -q`; pytest is not in `requirements.txt`.
+
+### Three more detectors
+
+`python -m degradation_monitor.stages.detectors <check|fit|pass|report> --config configs/coco-detectors.toml` runs
+YOLO11m, Faster R-CNN R50-FPN v2 and RF-DETR-M on the same COCO-C images as RT-DETR. `fit` builds each detector's
+clean references from COCO train images in three resumable passes. `pass` generates each val image's 96 versions
+once, checks them against `runs/coco/`'s digests and feeds all three detectors; `--first N` stops after N images.
+`report` writes each detector's report and `runs/coco-detectors/summary.md`, the table of all four; `--first N` is a
+smoke report on the first N images. Each detector reads the method's three earliest feature levels and its deepest as
+the key: stages for the CNNs, blocks 1-3 and 12 for RF-DETR's ViT. ContrastiveConf and Hashemi et al. exist for the
+DETR-type detectors only.
 
 ## Results
 

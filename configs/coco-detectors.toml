@@ -1,0 +1,16 @@
+# Three more frozen COCO detectors on COCO-C (docs/superpowers/plans/2026-10-04-four-detectors-coco-c.md).
+# Stages: python -m degradation_monitor.stages.detectors <check|fit|pass|report> --config configs/coco-detectors.toml
+base = "coco.toml"  # the dataset, the seed, the device and the workers
+run = "/home/yuchen/YuchenZ/UE/philip_sa/runs/coco-detectors"  # one folder per detector, laid out like runs/coco/
+reference_run = "/home/yuchen/YuchenZ/UE/philip_sa/runs/coco"  # RT-DETR's run: the digests and DisCoPatch's scores
+gpu_memory_gib = 8.0  # the card is shared
+
+[weights]
+yolo11m = "/home/yuchen/YuchenZ/lab/Detector_test/yolo11m.pt"
+faster_rcnn_r50_fpn_v2 = "/home/yuchen/.cache/torch/hub/checkpoints/fasterrcnn_resnet50_fpn_v2_coco-dd69338a.pth"
+rfdetr_m = "/home/yuchen/.roboflow/models/rf-detr-medium.pth"
+
+[clean_ap_floor]  # the published COCO val AP minus 0.03
+yolo11m = 0.485
+faster_rcnn_r50_fpn_v2 = 0.437
+rfdetr_m = 0.517
