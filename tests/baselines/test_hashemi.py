@@ -88,3 +88,13 @@ def test_encoder_shares_per_map_weight_back_to_the_pooled_share(tmp_path):
     sizes = np.array([64, 16, 4])
     assert per_map.shape == (2, 3) and np.allclose(per_map[:, 1], 1.0)
     assert np.allclose((per_map * sizes).sum(axis=1) / sizes.sum(), pooled)
+
+
+def test_hashemi_saves_and_reads_only_the_decoder(tmp_path):
+    stats = hashemi.NeuronStats()
+    stats.update(torch.zeros(3, 4, 2))
+    stats.update(torch.ones(3, 4, 2))
+    hashemi.save_intervals(tmp_path / "intervals.npz", {"decoder": stats}, images=6)
+    monitor = hashemi.HashemiMonitor(tmp_path / "intervals.npz", "cpu")
+    assert set(monitor.stats) == {"decoder"}
+    assert monitor.decoder_share(torch.full((2, 4, 2), 10.0)).tolist() == [1.0, 1.0]

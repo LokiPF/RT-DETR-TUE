@@ -91,8 +91,11 @@ def baseline_rows(detector: dict, discopatch=None, activations=None) -> dict:
     if discopatch is not None:
         rows["discopatch"] = discopatch
     if activations is not None:
-        rows.update(hashemi=activations["hashemi_decoder"], hashemi_enc=activations["hashemi_encoder"],
-                    cdf=activations["cdf_backbone_z"], cdf_sum=activations["cdf_backbone"])
+        rows.update(cdf=activations["cdf_backbone_z"], cdf_sum=activations["cdf_backbone"])
+        if "hashemi_decoder" in activations:
+            rows["hashemi"] = activations["hashemi_decoder"]
+        if "hashemi_encoder" in activations:
+            rows["hashemi_enc"] = activations["hashemi_encoder"]
     return rows
 
 
@@ -233,11 +236,14 @@ def build_tables(scores: dict, detector: dict, ap, folds, condition_map, *, seed
     """
     folds, ap = np.asarray(folds), np.asarray(ap)
 
+    contrastive_ready = "conf_pos" in detector and "conf_neg" in detector
+
     def rows_of(chosen):
         """Every present row on the chosen images (repeats allowed), and ContrastiveConf's lambda per fold."""
-        contrastive, lam = contrastive_scores(detector["conf_pos"][chosen], detector["conf_neg"][chosen], ap[chosen],
-                                              folds[chosen])
-        drawn = {**{m: v[chosen] for m, v in scores.items()}, "contrastive": contrastive}
+        drawn, lam = {m: v[chosen] for m, v in scores.items()}, {}
+        if contrastive_ready:
+            drawn["contrastive"], lam = contrastive_scores(detector["conf_pos"][chosen], detector["conf_neg"][chosen],
+                                                           ap[chosen], folds[chosen])
         return {m: drawn[m] for m in ROWS if m in drawn}, lam
 
     sets = image_sets(len(folds))
@@ -247,7 +253,7 @@ def build_tables(scores: dict, detector: dict, ap, folds, condition_map, *, seed
         point_scores, lambdas[name] = rows_of(rows)
         if name == "all":
             all_scores = point_scores
-        per_fold = () if len(set(lambdas[name].values())) == 1 else ("contrastive",)
+        per_fold = () if len(set(lambdas[name].values())) <= 1 else ("contrastive",)
         separation = separation_rows(point_scores, folds[rows], per_fold)
         aggregates = aggregate_rows(separation)
         tables["separation"] += [{"subset": name, **row} for row in separation]
@@ -275,7 +281,7 @@ def build_tables(scores: dict, detector: dict, ap, folds, condition_map, *, seed
     summary = {
         "images": len(folds), "image_sets": {name: len(rows) for name, rows in sets.items()},
         "screen_images": SCREEN_IMAGES, "untouched_start": UNTOUCHED_START, "folds": FOLDS,
-        "lambda_per_fold": lambdas, "lambda_folds_agree": {n: len(set(v.values())) == 1 for n, v in lambdas.items()},
+        "lambda_per_fold": lambdas, "lambda_folds_agree": {n: len(set(v.values())) == 1 for n, v in lambdas.items() if v},
         "images_with_ap": int(np.isfinite(ap).sum()), "clean_map": float(condition_map[0]),
         "rows": list(all_scores), "knn_k": KNN_K, "theta": THETA, "hashemi_k": HASHEMI_K, "cdf_bins": CDF_BINS,
         "neighbours": method_reference.NEIGHBOURS, "key": method_reference.KEY_LAYER,

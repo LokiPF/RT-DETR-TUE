@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+from pathlib import Path
 
 import numpy as np
 
@@ -12,8 +13,10 @@ from ..evaluation import report as tables
 from ..method.statistics import KEYS
 from ..runs import sha1, stack
 
-DETECTOR_ARRAYS = ("saod_min", "saod_top3", "conf_pos", "conf_neg", "knn", "det_scores", "det_labels", "det_boxes")
-ACTIVATION_ARRAYS = ("hashemi_decoder", "hashemi_encoder", "cdf_backbone_z", "cdf_backbone")
+DETECTOR_ARRAYS = ("saod_min", "saod_top3", "knn", "det_scores", "det_labels", "det_boxes")
+CONTRASTIVE_ARRAYS = ("conf_pos", "conf_neg")  # DETR-type detectors only
+ACTIVATION_ARRAYS = ("cdf_backbone_z", "cdf_backbone")
+HASHEMI_ARRAYS = ("hashemi_decoder", "hashemi_encoder")  # RT-DETR both, RF-DETR the decoder, CNN detectors neither
 _MAP_INPUTS = None  # what the forked mAP workers read
 
 
@@ -61,15 +64,24 @@ def _method_rows(layout, names) -> dict:
     return tables.method_rows(statistics, bank, zstats)
 
 
+def _stack_present(folder, names, required, optional) -> dict:
+    """The required arrays, and those optional ones the score files hold: one pass writes every file alike."""
+    first, present = folder / f"{Path(names[0]).stem}.npz", ()
+    if first.exists():
+        with np.load(first) as data:
+            present = tuple(key for key in optional if key in data.files)
+    return stack(folder, names, required + present)
+
+
 def write_report(settings, manifest) -> None:
     """Every table of the report, from the stored scores of every pass that ran."""
     layout = settings.layout
     reference = _method_reference(layout)  # checked first: the mAP below takes minutes on all 5,000 images
     names = [p.name for p in settings.dataset.evaluation_images()]
-    detector = stack(layout.scores("detector"), names, DETECTOR_ARRAYS)
+    detector = _stack_present(layout.scores("detector"), names, DETECTOR_ARRAYS, CONTRASTIVE_ARRAYS)
     discopatch = stack(layout.scores("discopatch"), names, ("dcp",))["dcp"] if layout.scores("discopatch").exists() \
         else None
-    activations = stack(layout.scores("activations"), names, ACTIVATION_ARRAYS) \
+    activations = _stack_present(layout.scores("activations"), names, ACTIVATION_ARRAYS, HASHEMI_ARRAYS) \
         if layout.scores("activations").exists() else None
     scores = tables.baseline_rows(detector, discopatch=discopatch, activations=activations)
     gt = settings.dataset.ground_truth()

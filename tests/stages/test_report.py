@@ -116,3 +116,20 @@ def test_the_report_stage_needs_the_method_reference_when_the_method_pass_ran(ru
         atomic_npz(run.layout.score_file("method", path.name), **_statistics(rng, 96))
     with pytest.raises(ValueError, match="run the method-reference stage first"):
         run_stage("report", run)
+
+
+def test_the_report_stage_leaves_out_the_rows_a_detector_does_not_have(run):
+    """A CNN detector: no ContrastiveConf and no Hashemi; the activation CDFs alone among the activation monitors."""
+    rng = np.random.default_rng(11)
+    for path in sorted(run.layout.scores("detector").glob("*.npz")):
+        with np.load(path) as data:
+            kept = {k: data[k] for k in data.files if k not in ("conf_pos", "conf_neg")}
+        atomic_npz(path, **kept)
+        stages = rng.uniform(0, 1, (96, 5))
+        atomic_npz(run.layout.score_file("activations", path.name), cdf_backbone=stages.sum(1),
+                   cdf_backbone_z=stages.sum(1), cdf_stages=stages)
+    run_stage("report", run)
+    summary = json.loads((run.layout.report() / "summary.json").read_text())
+    assert {"saod_top3", "saod_min", "knn", "cdf", "cdf_sum"} <= set(summary["rows"])
+    assert not {"contrastive", "hashemi", "hashemi_enc"} & set(summary["rows"])
+    assert summary["lambda_folds_agree"] == {}

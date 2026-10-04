@@ -58,7 +58,7 @@ def outside_counts(values: torch.Tensor, mean: torch.Tensor, std: torch.Tensor, 
 
 def save_intervals(path, stats: dict, images: int) -> None:
     arrays = {}
-    for name in LAYERS:
+    for name in (n for n in LAYERS if n in stats):  # RT-DETR has all four layers, RF-DETR the decoder only
         arrays[f"{name}_mean"], arrays[f"{name}_std"] = stats[name].result()
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -72,7 +72,8 @@ class HashemiMonitor:
     def __init__(self, path, device, k: float = K):
         with np.load(path, allow_pickle=False) as data:
             self.stats = {name: (torch.from_numpy(data[f"{name}_mean"]).to(device),
-                                 torch.from_numpy(data[f"{name}_std"]).to(device)) for name in LAYERS}
+                                 torch.from_numpy(data[f"{name}_std"]).to(device))
+                          for name in LAYERS if f"{name}_mean" in data.files}
         self.k = k
 
     def decoder_share(self, decoder: torch.Tensor) -> np.ndarray:
