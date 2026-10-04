@@ -142,6 +142,22 @@ def test_the_check_records_each_clean_ap_and_refuses_a_detector_below_its_floor(
         stage.check(replace(config, floors={"yolo11m": 0.5, "rfdetr_m": 0.0}))
 
 
+def test_the_check_records_the_choices_each_folders_results_depend_on(config):
+    """The check writes each folder's protocol first, and a protocol that changes later locks the folder out."""
+    stage.check(config)
+    protocols = {name: json.loads(config.settings(name).layout.manifest.read_text())["protocol"]
+                 for name in config.detectors}
+    for protocol in protocols.values():
+        assert protocol["float32_matmul_precision"] == "highest"
+        assert protocol["cudnn_allow_tf32"] == torch.backends.cudnn.allow_tf32  # cuDNN's convolutions, TF32 or not
+    rfdetr, yolo = protocols["rfdetr_m"]["adapter"], protocols["yolo11m"]["adapter"]
+    assert rfdetr["decoder"] == "transformer.decoder.layers[-1] output, before the decoder's final LayerNorm"
+    assert rfdetr["maps"] == "levels and cdf: raw block outputs (0: the embeddings), before the backbone's LayerNorm"
+    assert rfdetr["resize"] == "bilinear, no antialiasing"
+    assert yolo["letterbox"] == "Ultralytics LetterBox, auto=True, stride 32, centred, grey 114"
+    assert yolo["nms"] == "one label per box, as predict does, no time limit"
+
+
 def test_the_fit_writes_every_reference_and_records_the_adapters_protocol(config):
     stage.fit(config)
     calls = FakeAdapter.calls

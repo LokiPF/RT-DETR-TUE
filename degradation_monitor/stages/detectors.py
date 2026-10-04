@@ -106,7 +106,8 @@ def _manifest(config, name) -> Manifest:
     settings.layout.root.mkdir(parents=True, exist_ok=True)
     manifest = Manifest(settings.layout)
     manifest.check_protocol({**settings.protocol(), "detector": name, "adapter": adapter_class(name).protocol,
-                             "float32_matmul_precision": torch.get_float32_matmul_precision()})
+                             "float32_matmul_precision": torch.get_float32_matmul_precision(),
+                             "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32})
     manifest.record_environment(settings.discopatch_root)
     return manifest
 

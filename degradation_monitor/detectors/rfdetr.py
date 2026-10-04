@@ -5,7 +5,7 @@ no strides, so its levels are blocks: the raw outputs of blocks 1, 2 and 3 score
 tokens regathered from the attention windows (chosen on positions 0-1969, 4 October). CDF maps: the embeddings and
 the same four blocks. kNN: block 12 after the backbone's LayerNorm, the feature the detector reads, mean-pooled.
 Detections as RT-DETR's: the sigmoid of every query's logits for COCO's 80 categories, the top 100 (query, class)
-pairs.
+pairs. Hashemi et al.: the last decoder layer's output, RT-DETR's hook point, before the decoder's final LayerNorm.
 """
 from __future__ import annotations
 
@@ -27,7 +27,10 @@ class RfDetrM:
     batch_size = 32
     fit_batch_size = 32  # every image is resized to 576 x 576, so a batch may mix image sizes
     detr = True
-    protocol = {"levels": BLOCKS, "cdf": CDF_BLOCKS, "pooled": "layernorm(block 12)", "size": RESOLUTION,
+    protocol = {"levels": BLOCKS, "cdf": CDF_BLOCKS,
+                "maps": "levels and cdf: raw block outputs (0: the embeddings), before the backbone's LayerNorm",
+                "pooled": "layernorm(block 12)", "size": RESOLUTION, "resize": "bilinear, no antialiasing",
+                "decoder": "transformer.decoder.layers[-1] output, before the decoder's final LayerNorm",
                 "classes": "the 80 COCO category columns of 91"}
 
     def __init__(self, weights, device):

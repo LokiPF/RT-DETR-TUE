@@ -29,7 +29,8 @@ class Yolo11m:
     fit_batch_size = 1  # clean train images differ in size, and a letterboxed batch needs one size
     detr = False
     protocol = {"levels": LEVEL_LAYERS, "cdf": CDF_LAYERS, "pooled": POOLED_LAYER, "size": SIZE,
-                "confidence": CONFIDENCE, "iou": IOU}
+                "letterbox": "Ultralytics LetterBox, auto=True, stride 32, centred, grey 114",
+                "confidence": CONFIDENCE, "iou": IOU, "nms": "one label per box, as predict does, no time limit"}
 
     def __init__(self, weights, device):
         from ultralytics import YOLO
