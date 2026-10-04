@@ -8,3 +8,4 @@ pycocotools
 uq-detr
 imagecorruptions==1.1.2
 rfdetr==1.11.2
+ultralytics==8.3.235
