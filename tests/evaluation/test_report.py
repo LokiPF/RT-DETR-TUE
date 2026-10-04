@@ -189,6 +189,19 @@ def test_report_without_the_activation_monitors_says_the_headline_is_unavailable
     assert "unavailable" in text and report.LABELS["two_axis"] in text and report.LABELS["cdf"] not in text
 
 
+def test_the_report_title_counts_the_baseline_families_present(small_sets):
+    """A CNN detector has neither ContrastiveConf nor Hashemi et al.; RT-DETR has all six families."""
+    title = "# Corruption detection on COCO: our method and {} baselines\n"
+    rows = ("two_axis", "level", "global_level", "saod_top3", "saod_min", "knn", "discopatch", "cdf", "cdf_sum")
+    cnn = {key: value for key, value in _detector(40).items() if key not in ("conf_pos", "conf_neg")}
+    ap = np.random.default_rng(3).uniform(0, 1, 40)
+    tables, summary = report.build_tables(_scores(40, rows), cnn, ap, assign_folds(40), 0.5 - 0.05 * SEVERITY,
+                                          seed=44, samples=2)
+    assert report.markdown(summary, tables).startswith(title.format("four"))
+    tables, summary = _tables(_scores(40, rows + ("hashemi", "hashemi_enc")), 40, samples=2)  # and ContrastiveConf
+    assert report.markdown(summary, tables).startswith(title.format("six"))
+
+
 def test_write_outputs_creates_csv_json_and_markdown(small_sets, tmp_path):
     tables, summary = _tables(_scores(40, ("two_axis", "level", "global_level", "cdf", "discopatch")), 40)
     report.write_outputs(tmp_path, tables, summary)

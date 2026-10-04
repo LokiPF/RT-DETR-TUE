@@ -1,4 +1,4 @@
-"""The report: separation of our method and the six baselines on four image sets.
+"""The report: separation of our method and the baselines a detector has (all six for RT-DETR) on four image sets.
 
 Every score is oriented so that higher means more likely corrupted. For each image set the report gives:
 - every row's AUROC, AUPR and FPR95 per condition;
@@ -52,6 +52,10 @@ LABELS = {
     "cdf": "Activation CDFs (Becker et al., ICPR 2026)",
     "cdf_sum": "Activation CDFs, plain channel sum (sensitivity)",
 }
+BASELINE_FAMILIES = {"SAOD": ("saod_top3", "saod_min"), "ContrastiveConf": ("contrastive",), "kNN": ("knn",),
+                     "DisCoPatch": ("discopatch",), "Hashemi et al.": ("hashemi", "hashemi_enc"),
+                     "activation CDFs": ("cdf", "cdf_sum")}  # the title counts the families a report's rows hold
+NUMBER_WORDS = ("no", "one", "two", "three", "four", "five", "six")
 REFERENCES = ("two_axis", "level")  # rows whose differences with every other row get intervals
 METRICS = ("auroc", "aupr", "fpr95")
 GROUPS = ("common", "extra")
@@ -338,7 +342,9 @@ def _set_section(summary: dict, name: str) -> list:
 
 
 def markdown(summary: dict, tables: dict) -> str:
-    lines = ["# Corruption detection on COCO: our method and six baselines", "",
+    families = sum(any(row in summary["rows"] for row in rows) for rows in BASELINE_FAMILIES.values())
+    lines = [f"# Corruption detection on COCO: our method and {NUMBER_WORDS[families]} "
+             f"baseline{'' if families == 1 else 's'}", "",
              f"**Headline (two-axis score, all images and the untouched ones):** {summary['headline_decision']}.", "",
              f"**Pre-registered level score (held-out images):** {summary['level_decision']}.", "",
              "Every score is oriented so that higher means more likely corrupted. ↑ higher is better, ↓ lower is "
