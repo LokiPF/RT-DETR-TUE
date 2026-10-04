@@ -120,6 +120,8 @@ def config(tmp_path, images, monkeypatch):
 def _write_summary(folder, two_axis, cdf, subsets=("all", "untouched")):
     head = {"two_axis": {"auroc_common": two_axis, "auroc_extra": two_axis - 0.05},
             "cdf": {"auroc_common": cdf, "auroc_extra": cdf - 0.02},
+            "cdf_sum": {"auroc_common": cdf + 0.01, "auroc_extra": cdf},  # sensitivity rows, ahead of the CDFs
+            "hashemi_enc": {"auroc_common": cdf + 0.02, "auroc_extra": cdf},
             "saod_top3": {"auroc_common": 0.6, "auroc_extra": 0.6}}
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "summary.json").write_text(json.dumps({
@@ -300,6 +302,8 @@ def test_the_cross_detector_table_lists_every_detector(config):
     _write_summary(config.settings("rfdetr_m").layout.report(), 0.86, 0.79, subsets=("all",))  # a smoke report
     rows = stage.cross_table(config)
     assert [r["detector"] for r in rows] == ["rtdetrv2_r18", "yolo11m", "rfdetr_m"]
-    assert rows[1]["all_two_axis_auroc_common"] == 0.9 and rows[1]["best_baseline"] == "cdf"
+    assert rows[1]["all_two_axis_auroc_common"] == 0.9
+    assert [(r["best_baseline"], r["best_baseline_auroc_common"]) for r in rows] == [
+        ("cdf", 0.821), ("cdf", 0.8), ("cdf", 0.79)]  # never a sensitivity row, though both lead
     assert rows[2]["untouched_two_axis_auroc_common"] is None
     assert "| rfdetr_m |" in (config.run / "summary.md").read_text() and (config.run / "summary.csv").exists()

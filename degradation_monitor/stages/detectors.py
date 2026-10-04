@@ -62,6 +62,7 @@ DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "coco-detecto
 CONFIG_KEYS = {"base", "run", "reference_run", "gpu_memory_gib", "weights", "clean_ap_floor"}
 FOLDERS = ("detector", "activations", "method")
 PROGRESS_IMAGES = 2000  # the fit reports its progress about every this many images
+SENSITIVITY_ROWS = ("hashemi_enc", "cdf_sum")  # variants the reports show for sensitivity: never the best baseline
 
 
 @dataclass(frozen=True)
@@ -426,7 +427,7 @@ def cross_table(config) -> list:
                     row[f"{subset}_{method}_auroc_{group}"] = _auroc(summary, subset, method, group)
         row["two_axis_severity1_common"] = summary["by_severity"]["all"]["two_axis"]["common"][0]
         head = summary["headline"]["all"]
-        best = max((m for m in head if m not in OURS), key=lambda m: head[m]["auroc_common"])
+        best = max((m for m in head if m not in OURS + SENSITIVITY_ROWS), key=lambda m: head[m]["auroc_common"])
         row["best_baseline"], row["best_baseline_auroc_common"] = best, head[best]["auroc_common"]
         rows.append(row)
     config.run.mkdir(parents=True, exist_ok=True)
