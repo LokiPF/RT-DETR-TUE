@@ -420,7 +420,7 @@ def cross_table(config) -> list:
     for name, path in sources.items():
         summary = json.loads(path.read_text())
         row = {"detector": name, "images": summary["images"], "clean_map": summary["clean_map"],
-               "headline_decision": summary["headline_decision"]}
+               "headline_decision": summary["headline_decision"], "level_decision": summary["level_decision"]}
         for subset in ("all", "untouched"):
             for method in ("two_axis", "cdf"):
                 for group in ("common", "extra"):
@@ -438,7 +438,8 @@ def cross_table(config) -> list:
     lines = ["# The two-axis score on four COCO detectors", "",
              "AUROC, common / extra families. Untouched: positions 1970 and later.", "",
              "| Detector | Images | Clean mAP | Two-axis, all | Two-axis, untouched | Two-axis, severity 1 common "
-             "| CDFs, all | Best baseline, common | Headline |", "|---|---|---|---|---|---|---|---|---|"]
+             "| CDFs, all | Best baseline, common | Headline | Level rule |",
+             "|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
         lines.append(
             f"| {r['detector']} | {r['images']} | {_cell(r['clean_map'])} "
@@ -446,7 +447,8 @@ def cross_table(config) -> list:
             f"| {_cell(r['untouched_two_axis_auroc_common'])} / {_cell(r['untouched_two_axis_auroc_extra'])} "
             f"| {_cell(r['two_axis_severity1_common'])} "
             f"| {_cell(r['all_cdf_auroc_common'])} / {_cell(r['all_cdf_auroc_extra'])} "
-            f"| {r['best_baseline']} {_cell(r['best_baseline_auroc_common'])} | {r['headline_decision']} |")
+            f"| {r['best_baseline']} {_cell(r['best_baseline_auroc_common'])} | {r['headline_decision']} "
+            f"| {r['level_decision']} |")
     (config.run / "summary.md").write_text("\n".join(lines) + "\n")
     return rows
 

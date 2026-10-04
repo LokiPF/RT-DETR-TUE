@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 from dataclasses import replace
@@ -117,7 +118,7 @@ def config(tmp_path, images, monkeypatch):
     return stage.load_config(tmp_path / "detectors.toml")
 
 
-def _write_summary(folder, two_axis, cdf, subsets=("all", "untouched")):
+def _write_summary(folder, two_axis, cdf, subsets=("all", "untouched"), level="confirmed"):
     head = {"two_axis": {"auroc_common": two_axis, "auroc_extra": two_axis - 0.05},
             "cdf": {"auroc_common": cdf, "auroc_extra": cdf - 0.02},
             "cdf_sum": {"auroc_common": cdf + 0.01, "auroc_extra": cdf},  # sensitivity rows, ahead of the CDFs
@@ -126,7 +127,7 @@ def _write_summary(folder, two_axis, cdf, subsets=("all", "untouched")):
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "summary.json").write_text(json.dumps({
         "images": 5000, "clean_map": 0.45, "headline": {s: head for s in subsets}, "headline_decision": "confirmed",
-        "by_severity": {"all": {"two_axis": {"common": [two_axis - 0.1] * 5}}}}))
+        "level_decision": level, "by_severity": {"all": {"two_axis": {"common": [two_axis - 0.1] * 5}}}}))
 
 
 def test_the_detectors_config_gives_one_settings_per_detector(config):
@@ -298,12 +299,19 @@ def test_first_applies_to_the_pass_and_report_only(config, tmp_path):
 
 def test_the_cross_detector_table_lists_every_detector(config):
     _write_summary(RunLayout(config.reference_run).report(), 0.917, 0.821)
-    _write_summary(config.settings("yolo11m").layout.report(), 0.9, 0.8)
-    _write_summary(config.settings("rfdetr_m").layout.report(), 0.86, 0.79, subsets=("all",))  # a smoke report
+    _write_summary(config.settings("yolo11m").layout.report(), 0.9, 0.8, level="not confirmed")
+    _write_summary(config.settings("rfdetr_m").layout.report(), 0.86, 0.79, subsets=("all",),  # a smoke report
+                   level="unavailable: our method's scores are missing")
     rows = stage.cross_table(config)
     assert [r["detector"] for r in rows] == ["rtdetrv2_r18", "yolo11m", "rfdetr_m"]
     assert rows[1]["all_two_axis_auroc_common"] == 0.9
     assert [(r["best_baseline"], r["best_baseline_auroc_common"]) for r in rows] == [
         ("cdf", 0.821), ("cdf", 0.8), ("cdf", 0.79)]  # never a sensitivity row, though both lead
     assert rows[2]["untouched_two_axis_auroc_common"] is None
-    assert "| rfdetr_m |" in (config.run / "summary.md").read_text() and (config.run / "summary.csv").exists()
+    levels = ["confirmed", "not confirmed", "unavailable: our method's scores are missing"]
+    assert [r["level_decision"] for r in rows] == levels
+    with (config.run / "summary.csv").open(newline="") as handle:
+        assert [r["level_decision"] for r in csv.DictReader(handle)] == levels
+    table = (config.run / "summary.md").read_text().splitlines()
+    assert table[4].endswith("| Headline | Level rule |") and any(line.startswith("| rfdetr_m |") for line in table)
+    assert next(line for line in table if line.startswith("| yolo11m |")).endswith("| confirmed | not confirmed |")
