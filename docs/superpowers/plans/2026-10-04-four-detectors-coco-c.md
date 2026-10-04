@@ -357,7 +357,7 @@ def adapter():
 
 
 def _image():
-    return np.asarray(Image.open(IMAGE).convert("RGB"))
+    return np.array(Image.open(IMAGE).convert("RGB"))  # writable, as the stages' images are
 
 
 def test_yolo_levels_and_cdf_maps_have_the_backbone_shapes(adapter):
@@ -564,7 +564,7 @@ def adapter():
 
 
 def _image():
-    return np.asarray(Image.open(IMAGE).convert("RGB"))
+    return np.array(Image.open(IMAGE).convert("RGB"))  # writable, as the stages' images are
 
 
 def test_faster_rcnn_levels_have_the_resnet50_shapes_without_padding(adapter):
@@ -763,7 +763,7 @@ def adapter():
 
 
 def _image():
-    return np.asarray(Image.open(IMAGE).convert("RGB"))
+    return np.array(Image.open(IMAGE).convert("RGB"))  # writable, as the stages' images are
 
 
 def test_rfdetr_blocks_regather_into_the_detectors_own_feature_maps(adapter):
@@ -1702,6 +1702,7 @@ def image_files(adapter, references, arrays) -> dict:
             activations["hashemi_decoder"] = references["hashemi"].decoder_share(out.decoder)
         for folder, values in zip(FOLDERS, (detector, activations, _method_statistics(out))):
             parts[folder].append(values)
+        del out  # its maps are views into the full feature maps: free them before the next forward pass
     files = {folder: {key: np.concatenate([p[key] for p in pieces]) for key in pieces[0]}
              for folder, pieces in parts.items()}
     for folder, values in files.items():
