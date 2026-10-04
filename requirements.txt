@@ -7,3 +7,4 @@ scikit-learn
 pycocotools
 uq-detr
 imagecorruptions==1.1.2
+rfdetr==1.11.2
