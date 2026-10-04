@@ -49,3 +49,9 @@ def test_yolo_detections_match_ultralytics_predict(adapter):
     best = int(np.argmax(confidences))
     assert out.labels[0, 0] == int(reference.boxes.cls[best])
     assert out.boxes[0, 0] == pytest.approx(reference.boxes.xyxy[best].numpy(), abs=1.0)
+
+
+def test_yolo_crops_an_odd_letterbox_padding_where_ultralytics_puts_the_image(adapter):
+    image = np.random.default_rng(0).integers(0, 256, (427, 640, 3), dtype=np.uint8)  # 21 grey rows: 10 above, 11 below
+    out = adapter([image], heads=False)
+    assert tuple(out.cdf[0].shape) == (1, 64, 213, 320)  # the stride-2 stem keeps the cell of rows 10-11

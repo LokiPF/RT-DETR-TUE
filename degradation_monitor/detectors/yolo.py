@@ -55,7 +55,7 @@ class Yolo11m:
         input_height, input_width = boxed[0].shape[:2]
         ratio = min(SIZE / height, SIZE / width)
         new_height, new_width = round(height * ratio), round(width * ratio)
-        region = Region(top=(input_height - new_height) / 2, left=(input_width - new_width) / 2,
+        region = Region(top=(input_height - new_height) // 2, left=(input_width - new_width) // 2,
                         height=new_height, width=new_width)
         batch = torch.from_numpy(np.stack(boxed)).permute(0, 3, 1, 2).float().div_(255.0)
         return batch, region
