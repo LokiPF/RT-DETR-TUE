@@ -100,16 +100,32 @@ def load_config(path, run=None) -> DetectorsConfig:
                            floors=dict(values["clean_ap_floor"]), gpu_memory_gib=float(values["gpu_memory_gib"]))
 
 
+def _precision() -> dict:
+    """The process-wide float32 settings: matmuls (importing rfdetr switches them to TF32) and cuDNN's convolutions."""
+    return {"float32_matmul_precision": torch.get_float32_matmul_precision(),
+            "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32}
+
+
 def _manifest(config, name) -> Manifest:
     """The detector folder's manifest, once its protocol is checked: the weights, the evaluation and the adapter's."""
     settings = config.settings(name)
     settings.layout.root.mkdir(parents=True, exist_ok=True)
     manifest = Manifest(settings.layout)
     manifest.check_protocol({**settings.protocol(), "detector": name, "adapter": adapter_class(name).protocol,
-                             "float32_matmul_precision": torch.get_float32_matmul_precision(),
-                             "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32})
+                             **_precision()})
     manifest.record_environment(settings.discopatch_root)
     return manifest
+
+
+def _check_precision(manifest, name) -> None:
+    """Refuse to compute at another precision than the folder's protocol records. The protocol reads the precision
+    before any adapter loads; this check, after the loads, makes the record hold for the computation too."""
+    recorded = manifest.read()["protocol"]
+    changed = [f"{key} from {recorded.get(key)!r} to {value!r}" for key, value in _precision().items()
+               if recorded.get(key) != value]
+    if changed:
+        raise RuntimeError(f"loading the adapters changed {'; '.join(changed)}, so {name} would not compute at the "
+                           f"precision its protocol records: {manifest.path}")
 
 
 class _RgbImages(Dataset):
@@ -150,6 +166,7 @@ def check(config) -> None:
         images = list_images(settings.val_images)
         cap_gpu_memory(settings.device, settings.gpu_memory_gib)
         adapter = load_adapter(name, config.weights[name], settings.device)
+        _check_precision(manifest, name)
         results = []
         for path, arrays in zip(images, _batches(images, 1, settings.workers)):  # val images differ in size
             out = adapter(arrays)
@@ -252,8 +269,7 @@ def _cdf_zstats(adapter, settings) -> None:
 def fit(config) -> None:
     """Every detector's clean references, from the first pass whose files are missing onward."""
     for name in config.detectors:
-        settings = config.settings(name)
-        _manifest(config, name)
+        settings, manifest = config.settings(name), _manifest(config, name)
         layout, detr = settings.layout, adapter_class(name).detr
         passes = ((_clean_pass, _clean_pass_done(layout, detr)), (_cdf_histograms, layout.cdf_reference.exists()),
                   (_cdf_zstats, layout.cdf_zstats.exists()))
@@ -262,6 +278,7 @@ def fit(config) -> None:
             continue
         cap_gpu_memory(settings.device, settings.gpu_memory_gib)
         adapter = load_adapter(name, config.weights[name], settings.device)
+        _check_precision(manifest, name)
         for step, _ in passes[start:]:  # a redone pass makes every later pass stale
             step(adapter, settings)
         adapter.close()
@@ -326,9 +343,10 @@ def _complete(layout, image) -> bool:
 def shared_pass(config, first=None) -> None:
     """Every evaluation image's 96 versions, generated once, through every detector; resumable image by image."""
     names = config.detectors
-    layouts = {name: config.settings(name).layout for name in names}
+    layouts, manifests = {name: config.settings(name).layout for name in names}, {}
     for name in names:
         manifest, detr = _manifest(config, name), adapter_class(name).detr
+        manifests[name] = manifest
         if not _fitted(layouts[name], detr):
             raise ValueError(f"run the fit stage first: {name}'s references are missing")
         for folder, inputs in _inputs(layouts[name], detr).items():
@@ -340,6 +358,8 @@ def shared_pass(config, first=None) -> None:
         return
     cap_gpu_memory(base.device, config.gpu_memory_gib)
     adapters = {name: load_adapter(name, config.weights[name], base.device) for name in names}
+    for name in names:  # once every adapter is loaded: a later one could change what an earlier one computes with
+        _check_precision(manifests[name], name)
     references = {name: _references(config, name) for name in names}
     reference_run, started = RunLayout(config.reference_run), time.time()
     for done, (image, arrays) in enumerate(variant_stream(base, pending), start=1):

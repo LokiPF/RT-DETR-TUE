@@ -158,6 +158,41 @@ def test_the_check_records_the_choices_each_folders_results_depend_on(config):
     assert yolo["nms"] == "one label per box, as predict does, no time limit"
 
 
+SWITCHES = {"float32_matmul_precision": lambda: torch.set_float32_matmul_precision("high"),  # as importing rfdetr does
+            "cudnn_allow_tf32": lambda: setattr(torch.backends.cudnn, "allow_tf32", False)}
+
+
+@pytest.fixture
+def restored_precision():
+    """Every float32 setting a switch changes, put back exactly, so that nothing leaks into later tests."""
+    backends = torch.backends
+    saved = (torch.get_float32_matmul_precision(), backends.cudnn.allow_tf32, backends.cuda.matmul.fp32_precision,
+             backends.mkldnn.matmul.fp32_precision)
+    yield
+    torch.set_float32_matmul_precision(saved[0])
+    backends.cudnn.allow_tf32 = saved[1]
+    backends.cuda.matmul.fp32_precision, backends.mkldnn.matmul.fp32_precision = saved[2:]
+
+
+@pytest.mark.parametrize("setting", list(SWITCHES))
+@pytest.mark.parametrize("which", ["check", "fit", "pass"])
+def test_a_stage_refuses_to_compute_when_loading_an_adapter_changed_the_precision(config, monkeypatch, which, setting,
+                                                                                restored_precision):
+    assert (torch.get_float32_matmul_precision(), torch.backends.cudnn.allow_tf32) == ("highest", True)
+    if which == "pass":
+        stage.fit(config)  # at the precision the protocols record
+
+    def switching(name, weights, device):
+        SWITCHES[setting]()
+        return FakeAdapter(name)
+
+    monkeypatch.setattr(stage, "load_adapter", switching)
+    calls = FakeAdapter.calls
+    with pytest.raises(RuntimeError, match=setting):
+        {"check": stage.check, "fit": stage.fit, "pass": stage.shared_pass}[which](config)
+    assert FakeAdapter.calls == calls  # refused before any forward pass
+
+
 def test_the_fit_writes_every_reference_and_records_the_adapters_protocol(config):
     stage.fit(config)
     calls = FakeAdapter.calls
