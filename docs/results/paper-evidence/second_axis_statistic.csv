@@ -1,0 +1,5 @@
+statistic,peak_share_common,peak_share_extra,peak_share_common_s1,peak_share_extra_s1,flatter_arm_common,flatter_arm_extra,flatter_arm_common_s1,flatter_arm_extra_s1,two_axis_common,two_axis_extra,two_axis_common_s1,two_axis_extra_s1
+log ratio (ours),0.8983,0.8606,0.8161,0.6794,0.6980,0.5701,0.7174,0.5919,0.9169,0.8584,0.8626,0.7055
+raw ratio,0.8805,0.8533,0.7921,0.6666,0.6096,0.4435,0.6421,0.5594,0.8990,0.8451,0.8482,0.6967
+log top-1% mean,0.8590,0.8251,0.7509,0.6400,0.8629,0.6762,0.7880,0.6839,0.8993,0.8617,0.8273,0.6984
+top-1% mean,0.8251,0.8172,0.7075,0.6135,0.8502,0.6539,0.7809,0.6804,0.8979,0.8600,0.8280,0.6981

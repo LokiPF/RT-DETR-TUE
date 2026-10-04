@@ -12,6 +12,10 @@ The documents behind the paper. Older work is in `archive/`.
   `../archive/README.md`.
 - `superpowers/plans/2026-10-01-content-conditioned-confirmation.md`: the confirmation's pre-registered plan, with
   its amendments.
+- `paper-storyline.md`: the paper's storyline. It gives the chain of observations that leads to the method, a
+  section-by-section outline, and the figures and tables still to make.
+- `results/paper-evidence/`: the evidence tables and draft figures behind the storyline's claims (2 October). The
+  scripts are in `../scripts/paper/`.
 - `dev-log.md`: dated observations and decisions, newest first.
 - `todo.md`: the open ablations and experiments.
 

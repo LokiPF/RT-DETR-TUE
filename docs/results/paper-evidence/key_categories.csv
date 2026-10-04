@@ -1,0 +1,13 @@
+category,bank_rate,neighbours_if_present,neighbours_if_absent,images_with
+person,0.5475,0.7955,0.4386,2693
+wall-other-merged,0.3550,0.6257,0.2718,1799
+sky-other-merged,0.3460,0.7035,0.2197,1677
+tree-merged,0.3245,0.6249,0.2267,1759
+building-other-merged,0.2060,0.4495,0.1204,1031
+grass-merged,0.1885,0.4510,0.1637,986
+pavement-merged,0.1550,0.3958,0.1303,890
+table-merged,0.1525,0.4043,0.0916,862
+floor-other-merged,0.1255,0.3034,0.1105,739
+fence-merged,0.1210,0.2474,0.1058,584
+road,0.1115,0.3981,0.0801,657
+window-other,0.1095,0.2716,0.1117,519

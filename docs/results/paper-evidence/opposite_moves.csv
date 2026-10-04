@@ -1,0 +1,16 @@
+family,stage,spearman_peakiness_vs_flattening,densest_third_flatten,peakiest_third_flatten,channels_sharpening_on_most_images,channels
+fog,s1,-0.4263,0.9249,0.6628,9,64
+fog,s2,-0.5989,0.9127,0.5106,29,128
+fog,s3,-0.4707,0.7654,0.4714,86,256
+contrast,s1,-0.4885,0.9255,0.5986,11,64
+contrast,s2,-0.6052,0.9262,0.4980,28,128
+contrast,s3,-0.5205,0.7903,0.4384,89,256
+zoom_blur,s1,-0.4752,0.9059,0.6622,11,64
+zoom_blur,s2,-0.4706,0.8171,0.5027,33,128
+zoom_blur,s3,-0.3937,0.6527,0.3616,121,256
+defocus_blur,s1,-0.4026,0.9098,0.6943,9,64
+defocus_blur,s2,-0.4160,0.8119,0.5335,32,128
+defocus_blur,s3,-0.1463,0.5979,0.4881,118,256
+gaussian_blur,s1,-0.3913,0.9161,0.6985,8,64
+gaussian_blur,s2,-0.3870,0.7974,0.5299,35,128
+gaussian_blur,s3,-0.1292,0.5912,0.4981,113,256

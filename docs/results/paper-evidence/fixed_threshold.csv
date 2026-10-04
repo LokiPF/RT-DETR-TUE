@@ -1,0 +1,4 @@
+alpha,threshold,false_alarms_clean_val,flagged_common_s1,flagged_common_s2,flagged_common_s3,flagged_common_s4,flagged_common_s5,flagged_extra_s1,flagged_extra_s2,flagged_extra_s3,flagged_extra_s4,flagged_extra_s5
+0.1000,1.6748,0.1112,0.6614,0.7786,0.8327,0.8635,0.8887,0.3180,0.6151,0.7337,0.8139,0.8827
+0.0500,2.2371,0.0546,0.4633,0.6321,0.7122,0.7617,0.7977,0.1655,0.4416,0.6532,0.7591,0.8259
+0.0100,3.1775,0.0154,0.1881,0.3612,0.4757,0.5369,0.5889,0.0376,0.1901,0.4461,0.6306,0.7182
