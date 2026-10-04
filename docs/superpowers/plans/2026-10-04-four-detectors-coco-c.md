@@ -106,7 +106,7 @@
 
 ## Review Focus
 
-1. **Padding inside a detector's input** (YOLO's letterbox rows, Faster R-CNN's padding to 32) must stay out of the channel statistics. Otherwise the bank and the test images are compared on different regions. Tests: Task 1 `test_region_crops_the_padding_away`, Task 2 `test_yolo_levels_and_cdf_maps_have_the_backbone_shapes`, Task 3 `test_faster_rcnn_levels_have_the_resnet50_shapes_without_padding`.
+1. **Padding inside a detector's input** (YOLO's letterbox rows, Faster R-CNN's padding to 32) must stay out of the channel statistics. Otherwise the bank and the test images are compared on different regions. Tests: Task 1 `test_region_crops_the_padding_away`, Task 2 `test_yolo_levels_and_cdf_maps_have_the_backbone_shapes` and `test_yolo_crops_an_odd_letterbox_padding_where_ultralytics_puts_the_image`, Task 3 `test_faster_rcnn_levels_have_the_resnet50_shapes_without_padding`.
 2. **Label conventions:** YOLO uses 0–79, while torchvision and RF-DETR use COCO category ids 1–90. All must end as labels 0–79 in COCO's sorted order, or the mAP and the per-image AP are wrong. Tests: Task 1 `test_the_category_mapping_matches_the_coco_annotations`, and the detection tests of Tasks 2–4.
 3. **The fits run the backbone alone** (`heads=False`), some before RF-DETR is loaded and the shared pass with it loaded. They must see the very maps the shared pass sees, at the same matmul precision, or the references describe other features than the test images. Tests: the `heads=False` assertions in Tasks 2, 3 and 4; Task 4's check that loading RF-DETR leaves the precision at `"highest"`; Task 6's check that the protocol records it.
 4. **The shared pass must feed every detector RT-DETR's own corrupted images, and must refuse fits that changed after scores were written.** Tests: Task 6 `test_the_pass_refuses_corruptions_that_differ_from_the_reference_run` and `test_the_pass_refuses_scores_from_a_changed_fit`.
@@ -388,6 +388,12 @@ def test_yolo_detections_match_ultralytics_predict(adapter):
     best = int(np.argmax(confidences))
     assert out.labels[0, 0] == int(reference.boxes.cls[best])
     assert out.boxes[0, 0] == pytest.approx(reference.boxes.xyxy[best].numpy(), abs=1.0)
+
+
+def test_yolo_crops_an_odd_letterbox_padding_where_ultralytics_puts_the_image(adapter):
+    image = np.random.default_rng(0).integers(0, 256, (427, 640, 3), dtype=np.uint8)  # 21 grey rows: 10 above, 11 below
+    out = adapter([image], heads=False)
+    assert tuple(out.cdf[0].shape) == (1, 64, 213, 320)  # the stride-2 stem keeps the cell of rows 10-11
 ```
 
 - [ ] **Step 2: Run them to see them fail**
@@ -459,8 +465,8 @@ class Yolo11m:
         input_height, input_width = boxed[0].shape[:2]
         ratio = min(SIZE / height, SIZE / width)
         new_height, new_width = round(height * ratio), round(width * ratio)
-        region = Region(top=(input_height - new_height) / 2, left=(input_width - new_width) / 2,
-                        height=new_height, width=new_width)
+        region = Region(top=(input_height - new_height) // 2, left=(input_width - new_width) // 2,
+                        height=new_height, width=new_width)  # an odd grey row or column goes below or right
         batch = torch.from_numpy(np.stack(boxed)).permute(0, 3, 1, 2).float().div_(255.0)
         return batch, region
 
@@ -511,7 +517,7 @@ Expected: PASS.
 If the detection test fails on a value, compare `prepare` and `_detections` with Ultralytics' `LetterBox` and `non_max_suppression` arguments before changing the test. The test's numbers come from Ultralytics' own `predict`.
 
 Run: `CUDA_VISIBLE_DEVICES= /home/yuchen/miniconda3/envs/UE/bin/python -m pytest -q`
-Expected: `165 passed, 1 skipped`.
+Expected: `166 passed, 1 skipped`.
 
 - [ ] **Step 5: Commit**
 
@@ -701,7 +707,7 @@ Run: `CUDA_VISIBLE_DEVICES= /home/yuchen/miniconda3/envs/UE/bin/python -m pytest
 Expected: PASS.
 
 Run: `CUDA_VISIBLE_DEVICES= /home/yuchen/miniconda3/envs/UE/bin/python -m pytest -q`
-Expected: `167 passed, 1 skipped`.
+Expected: `168 passed, 1 skipped`.
 
 - [ ] **Step 5: Commit**
 
@@ -900,7 +906,7 @@ Run: `CUDA_VISIBLE_DEVICES= /home/yuchen/miniconda3/envs/UE/bin/python -m pytest
 Expected: PASS.
 
 Run: `CUDA_VISIBLE_DEVICES= /home/yuchen/miniconda3/envs/UE/bin/python -m pytest -q`
-Expected: `169 passed, 1 skipped`.
+Expected: `170 passed, 1 skipped`.
 
 - [ ] **Step 5: Commit**
 
@@ -1070,7 +1076,7 @@ Run: `CUDA_VISIBLE_DEVICES= /home/yuchen/miniconda3/envs/UE/bin/python -m pytest
 Expected: PASS. `tests/evaluation/test_report_golden.py` must pass unchanged.
 
 Run: `CUDA_VISIBLE_DEVICES= /home/yuchen/miniconda3/envs/UE/bin/python -m pytest -q`
-Expected: `171 passed, 1 skipped`.
+Expected: `172 passed, 1 skipped`.
 
 - [ ] **Step 5: Commit**
 
@@ -1879,7 +1885,7 @@ Run: `CUDA_VISIBLE_DEVICES= /home/yuchen/miniconda3/envs/UE/bin/python -m pytest
 Expected: PASS.
 
 Run: `CUDA_VISIBLE_DEVICES= /home/yuchen/miniconda3/envs/UE/bin/python -m pytest -q`
-Expected: `181 passed, 1 skipped`.
+Expected: `182 passed, 1 skipped`.
 
 - [ ] **Step 5: Commit**
 
