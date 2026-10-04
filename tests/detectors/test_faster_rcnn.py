@@ -18,7 +18,7 @@ def adapter():
 
 
 def _image():
-    return np.asarray(Image.open(IMAGE).convert("RGB"))
+    return np.array(Image.open(IMAGE).convert("RGB"))  # writable, as the stages' images are
 
 
 def test_faster_rcnn_levels_have_the_resnet50_shapes_without_padding(adapter):
