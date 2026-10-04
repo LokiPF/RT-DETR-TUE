@@ -51,6 +51,8 @@ class FasterRcnn:
 
     @torch.inference_mode()
     def __call__(self, arrays, heads: bool = True) -> Outputs:
+        if len({a.shape[:2] for a in arrays}) > 1:  # the crop follows the first image; the transform would pad the rest
+            raise ValueError("an adapter batch must hold images of one size")
         images = [torch.from_numpy(np.ascontiguousarray(a)).permute(2, 0, 1).float().div(255.0).to(self.device)
                   for a in arrays]
         self._maps.clear()

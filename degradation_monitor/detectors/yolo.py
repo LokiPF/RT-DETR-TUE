@@ -50,6 +50,8 @@ class Yolo11m:
         """The letterboxed batch (RGB in [0, 1]) and where the image lies in it."""
         from ultralytics.data.augment import LetterBox
 
+        if len({a.shape[:2] for a in arrays}) > 1:  # the region and the boxes follow the first image
+            raise ValueError("an adapter batch must hold images of one size")
         height, width = arrays[0].shape[:2]
         letterbox = LetterBox(new_shape=(SIZE, SIZE), auto=True, stride=32)
         boxed = [letterbox(image=np.ascontiguousarray(a)) for a in arrays]

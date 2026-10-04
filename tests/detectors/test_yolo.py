@@ -55,3 +55,9 @@ def test_yolo_crops_an_odd_letterbox_padding_where_ultralytics_puts_the_image(ad
     image = np.random.default_rng(0).integers(0, 256, (427, 640, 3), dtype=np.uint8)  # 21 grey rows: 10 above, 11 below
     out = adapter([image], heads=False)
     assert tuple(out.cdf[0].shape) == (1, 64, 213, 320)  # the stride-2 stem keeps the cell of rows 10-11
+
+
+def test_yolo_refuses_a_batch_of_two_image_sizes(adapter):
+    arrays = [np.zeros((48, 64, 3), np.uint8), np.zeros((47, 64, 3), np.uint8)]  # both letterbox to 480 x 640
+    with pytest.raises(ValueError, match="an adapter batch must hold images of one size"):
+        adapter(arrays, heads=False)  # the crop would follow the first image alone

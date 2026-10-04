@@ -50,3 +50,9 @@ def test_faster_rcnn_detections_match_the_model(adapter):
     assert out.scores[0, :n] == pytest.approx(result["scores"].numpy(), abs=1e-4)
     assert out.labels[0, :n].tolist() == LABEL_OF_CATEGORY[result["labels"].numpy()].tolist()
     assert (out.labels[0] >= 0).all() and out.scores[0, n:].sum() == 0
+
+
+def test_faster_rcnn_refuses_a_batch_of_two_image_sizes(adapter):
+    arrays = [np.zeros((48, 64, 3), np.uint8), np.zeros((47, 64, 3), np.uint8)]  # the transform pads them together
+    with pytest.raises(ValueError, match="an adapter batch must hold images of one size"):
+        adapter(arrays, heads=False)  # the crop would follow the first image alone
