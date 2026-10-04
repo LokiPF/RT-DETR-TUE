@@ -95,9 +95,13 @@ def load_config(path, run=None) -> DetectorsConfig:
         raise ValueError(f"unknown detectors in {path}: {', '.join(strange)}; choose from {', '.join(DETECTORS)}")
     if set(values["clean_ap_floor"]) != set(weights):
         raise ValueError(f"{path}: every detector needs a clean AP floor, and only those")
-    return DetectorsConfig(base=load_settings(path.parent / values["base"]), run=Path(run or values["run"]),
-                           reference_run=Path(values["reference_run"]), weights=weights,
-                           floors=dict(values["clean_ap_floor"]), gpu_memory_gib=float(values["gpu_memory_gib"]))
+    run, reference_run = Path(run or values["run"]), Path(values["reference_run"])
+    if run.resolve().is_relative_to(reference_run.resolve()):
+        raise ValueError(f"the run root {run} is the reference run {reference_run} or lies inside it, and the "
+                         "reference run is only read: choose another run root (--run DIR)")
+    return DetectorsConfig(base=load_settings(path.parent / values["base"]), run=run, reference_run=reference_run,
+                           weights=weights, floors=dict(values["clean_ap_floor"]),
+                           gpu_memory_gib=float(values["gpu_memory_gib"]))
 
 
 def _precision() -> dict:

@@ -134,6 +134,18 @@ def test_the_detectors_config_gives_one_settings_per_detector(config):
     assert settings.gpu_memory_gib == 8.0 and settings.workers == 0
 
 
+def test_the_run_root_must_lie_outside_the_reference_run(config, tmp_path):
+    """The reference run is only read: a mistyped --run must not put detector folders or the table into it."""
+    path, reference = tmp_path / "detectors.toml", config.reference_run
+    (tmp_path / "link").symlink_to(reference, target_is_directory=True)
+    for run in (reference, reference / "detectors", reference / ".." / "coco", tmp_path / "link" / "detectors"):
+        with pytest.raises(ValueError, match="reference run"):
+            stage.load_config(path, run=run)
+    assert stage.main(["check", "--config", str(path), "--run", str(reference)]) == 2
+    assert not (reference / "yolo11m").exists()
+    assert stage.load_config(path).run == tmp_path / "runs" / "coco-detectors"  # a sibling named coco-... is fine
+
+
 def test_the_check_records_each_clean_ap_and_refuses_a_detector_below_its_floor(config):
     stage.check(config)
     manifest = json.loads(config.settings("yolo11m").layout.manifest.read_text())
