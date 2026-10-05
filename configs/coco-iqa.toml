@@ -1,0 +1,7 @@
+# Four detector-free image-quality baselines on COCO-C (docs/superpowers/plans/2026-10-05-iqa-baselines-coco-c.md).
+# Stages: python -m degradation_monitor.stages.iqa <fit|pass|timing|report> --config configs/coco-iqa.toml
+base = "coco.toml"  # the dataset, its train and evaluation images, the seed, the device and the workers
+run = "/home/yuchen/YuchenZ/UE/philip_sa/runs/coco-iqa"
+reference_run = "/home/yuchen/YuchenZ/UE/philip_sa/runs/coco"  # RT-DETR's run: the digests; also a detector run
+detectors_config = "coco-detectors.toml"  # the other detectors' run folders
+gpu_memory_gib = 8.0  # the card is shared

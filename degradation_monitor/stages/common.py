@@ -51,6 +51,29 @@ def clean_loader(settings, paths) -> DataLoader:
                       pin_memory=torch.cuda.is_available())
 
 
+class _RgbImages(Dataset):
+    def __init__(self, paths):
+        self.paths = list(paths)
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, index):
+        with Image.open(self.paths[index]) as source:
+            return np.asarray(source.convert("RGB"), dtype=np.uint8).copy()
+
+
+def rgb_batches(paths, size, workers):
+    """Lists of `size` RGB arrays, in the order of `paths`."""
+    return DataLoader(_RgbImages(paths), batch_size=size, num_workers=workers, collate_fn=list)
+
+
+def report_peak_memory(label, device) -> None:
+    """The process's peak GPU memory so far, for the sessions that share the card."""
+    if torch.device(device).type == "cuda":
+        print(f"[{label}] peak GPU memory {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB", flush=True)
+
+
 def bounded(pool, function, items, in_flight):
     """Ordered results with at most `in_flight` tasks queued, so memory stays bounded."""
     iterator = iter(items)
