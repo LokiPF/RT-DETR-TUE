@@ -3,6 +3,9 @@ from pathlib import Path
 
 import pytest
 
+from degradation_monitor.datasets.cityscapes import Cityscapes
+from degradation_monitor.datasets.coco import Coco
+from degradation_monitor.runs import Manifest
 from degradation_monitor.settings import load_settings
 
 CONFIG = """
@@ -52,3 +55,29 @@ def test_the_repository_config_names_every_path():
     settings = load_settings(Path(__file__).parents[1] / "configs" / "coco.toml")
     assert settings.run.is_absolute() and settings.run.name == "coco"
     assert settings.gpu_memory_gib == 5.5 and settings.seed == 44
+
+
+def test_the_benchmark_chooses_the_dataset_and_names_the_protocol(tmp_path):
+    (tmp_path / "ckpt.pth").write_bytes(b"weights")
+    coco_settings = load_settings(_config(tmp_path))
+    cityscapes_settings = load_settings(_config(tmp_path, CONFIG + 'benchmark = "cityscapes"\n'))
+    assert type(coco_settings.dataset) is Coco and coco_settings.protocol()["dataset"] == "coco"
+    assert type(cityscapes_settings.dataset) is Cityscapes and cityscapes_settings.protocol()["dataset"] == "cityscapes"
+    with pytest.raises(ValueError, match="unknown benchmark 'kitti'"):
+        load_settings(_config(tmp_path, CONFIG + 'benchmark = "kitti"\n'))
+
+
+def test_a_coco_run_folder_refuses_cityscapes_settings(tmp_path):
+    (tmp_path / "ckpt.pth").write_bytes(b"weights")
+    coco_settings = load_settings(_config(tmp_path))
+    Manifest(coco_settings.layout).check_protocol(coco_settings.protocol())
+    cityscapes_settings = load_settings(_config(tmp_path, CONFIG + 'benchmark = "cityscapes"\n'))
+    with pytest.raises(ValueError, match=r"another protocol \(dataset\)"):
+        Manifest(cityscapes_settings.layout).check_protocol(cityscapes_settings.protocol())
+
+
+def test_the_cityscapes_config_points_at_the_fine_tuned_detector():
+    settings = load_settings(Path(__file__).resolve().parents[1] / "cityscapes" / "evaluation" / "cityscapes.toml")
+    assert settings.benchmark == "cityscapes" and settings.run.name == "cityscapes"
+    assert settings.checkpoint.name == "rtdetrv2_r18vd_cityscapes_72e.pth"
+    assert settings.annotations.name == "cityscapes_val_8cls.json" and settings.gpu_memory_gib == 5.5

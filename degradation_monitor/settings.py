@@ -1,4 +1,4 @@
-"""Run settings: the machine's paths and run options, read from a TOML file such as configs/coco.toml.
+"""Run settings: the benchmark, the machine's paths and run options, read from a TOML file such as configs/coco.toml.
 
 The method's fixed choices (k = 50 neighbours, the stage-4 key, stages 1-3, the top 1%, the 2,000 + 500 reference
 images) are constants in degradation_monitor.method, so that a config edit cannot change them.
@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Optional
 
 from .corruptions import CONDITIONS
+from .datasets.cityscapes import Cityscapes
 from .datasets.coco import FOLDS, Coco
 from .runs import RunLayout, sha256
 
 PATH_FIELDS = ("run", "checkpoint", "train_images", "val_images", "annotations", "discopatch_root")
+BENCHMARKS = {"coco": Coco, "cityscapes": Cityscapes}
 
 
 @dataclass(frozen=True)
@@ -32,6 +34,11 @@ class Settings:
     limit: Optional[int] = None
     epochs: int = 65
     seed: int = 44
+    benchmark: str = "coco"
+
+    def __post_init__(self):
+        if self.benchmark not in BENCHMARKS:
+            raise ValueError(f"unknown benchmark {self.benchmark!r}; choose from {', '.join(sorted(BENCHMARKS))}")
 
     @property
     def layout(self) -> RunLayout:
@@ -39,14 +46,15 @@ class Settings:
 
     @property
     def dataset(self) -> Coco:
-        return Coco(self.train_images, self.val_images, self.annotations, seed=self.seed, limit=self.limit)
+        return BENCHMARKS[self.benchmark](self.train_images, self.val_images, self.annotations, seed=self.seed,
+                                          limit=self.limit)
 
     def protocol(self) -> dict:
         """What every result in the run folder depends on; a stage refuses a run folder made with another one."""
         from .baselines.contrastive_conf import THETA
         from .baselines.knn import KNN_K, KNN_K_MAX
         from .detector.postprocess import TOP_K
-        return {"dataset": "coco", "seed": self.seed, "limit": self.limit, "folds": FOLDS,
+        return {"dataset": self.benchmark, "seed": self.seed, "limit": self.limit, "folds": FOLDS,
                 "conditions": [list(c) for c in CONDITIONS], "checkpoint_sha256": sha256(self.checkpoint),
                 "top_k": TOP_K, "knn_k": KNN_K, "knn_k_max": KNN_K_MAX, "theta": THETA}
 

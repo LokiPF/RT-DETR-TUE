@@ -1,0 +1,15 @@
+# RT-DETRv2-R18 fine-tuned on Cityscapes, on Cityscapes-C (cityscapes/evaluation/design.md).
+# Stages: python -m degradation_monitor <stage> --config cityscapes/evaluation/cityscapes.toml
+benchmark = "cityscapes"
+run = "/home/yuchen/YuchenZ/UE/philip_sa/runs/cityscapes"
+checkpoint = "/home/yuchen/YuchenZ/UE/RT-DETRv2-UE/pretrained_weights/rtdetrv2_r18vd_cityscapes_72e.pth"
+train_images = "/home/yuchen/YuchenZ/Datasets/cityscape/leftImg8bit/train"
+val_images = "/home/yuchen/YuchenZ/Datasets/cityscape/leftImg8bit/val"
+annotations = "/home/yuchen/YuchenZ/Datasets/cityscape/annotations_coco/cityscapes_val_8cls.json"
+discopatch_root = "/home/yuchen/YuchenZ/UE/DisCoPatch"
+device = "cuda:0"
+batch_size = 8
+workers = 9
+gpu_memory_gib = 5.5  # the GPU is shared with other people's jobs
+epochs = 65  # DisCoPatch's official setting, as on COCO
+seed = 44
