@@ -20,7 +20,7 @@ Two Cityscapes detectors, frozen and described in this folder, ready for plan 2:
 - **Weights from the last epoch,** for both detectors. Val is evaluated during training but selects nothing.
 - **No AP target.** The APs are reported as they come out.
   - One stop rule: a YOLO mAP50-95 below 0.15 points to a label or class-order bug, so we stop and report.
-- **Where:** this folder, on `fingerprint_bank`. The paper session commits from the same checkout, so every commit names its paths (`git commit -- cityscapes/ …`).
+- **Where:** `cityscapes/models/`, on `fingerprint_bank`. The evaluation (plan 2) gets its own folder beside it, `cityscapes/evaluation/`. The paper session commits from the same checkout, so every commit names its paths (`git commit -- cityscapes/ …`).
 - **Little bookkeeping:** no hashes or provenance records.
 
 ## Layout
@@ -29,14 +29,18 @@ In git:
 
 ```
 cityscapes/
-  finetune-design.md   this spec
-  finetune-plan.md     the implementation plan
-  README.md            the record of both detectors
-  yolo11m.py           prepare | train [--smoke] | val
-  yolo_8cls.yaml       Ultralytics' data file: the dataset folder, train and val, the 8 names
-  rtdetrv2/            RT-DETR's three training files, copied from RT-DETRv2-UE
+  models/              plan 1: the two detectors trained on Cityscapes
+    design.md          this spec
+    plan.md            the implementation plan
+    README.md          the record of both detectors
+    yolo11m.py         prepare | train [--smoke] | val
+    yolo_8cls.yaml     Ultralytics' data file: the dataset folder, train and val, the 8 names
+    rtdetrv2/          RT-DETR's three training files, copied from RT-DETRv2-UE
+  evaluation/          plan 2: Cityscapes-C for both detectors, created with its spec
 tests/test_cityscapes_yolo.py
 ```
+
+`evaluation/` will hold plan 2's spec, plan, configs, results doc and tables. The package code plan 2 changes, such as the Cityscapes dataset and the settings, stays in `degradation_monitor/`, which every stage imports.
 
 Outside git:
 - `Datasets/cityscape/yolo_8cls/`:
@@ -59,7 +63,7 @@ Outside git:
 
 ## YOLO11m
 
-**Data (CPU):** `python cityscapes/yolo11m.py prepare`.
+**Data (CPU):** `python cityscapes/models/yolo11m.py prepare`.
 - **Files:** for each split, one symlink and one label file per image. The label file has one line per box, `class cx cy w h`, normalised by the image's width and height.
 - **Class ids:** the class is the file's `category_id`, unchanged (0–7).
   - Ultralytics' `convert_coco` can't be used: it writes `category_id − 1`, which turns person into −1.
@@ -68,12 +72,12 @@ Outside git:
 - **Nothing is clipped:** every box lies inside its image and none has zero size (checked on 5 October).
 - **Counts:** the command prints the images and boxes per split. Expected: 2,975 images and 50,347 boxes in train, 500 and 9,792 in val.
 
-**Training (GPU):** `python cityscapes/yolo11m.py train`.
+**Training (GPU):** `python cityscapes/models/yolo11m.py train`.
 - **`--smoke`:** 1 epoch on 5% of train. It measures peak GPU memory and seconds per epoch, before we ask for the full run.
 - **The full run:** 100 epochs, expected to take 1–2 h.
 - **Memory cap:** the script caps its own GPU memory at 12 GiB. The smoke run shows whether the peak fits.
 
-**Clean AP (GPU, under a minute):** `python cityscapes/yolo11m.py val`.
+**Clean AP (GPU, under a minute):** `python cityscapes/models/yolo11m.py val`.
 - Ultralytics' val of the frozen `last.pt` on the 500 val images at 640: mAP50-95, mAP50 and the table per class.
 - Ultralytics' own end-of-training val scores `best.pt`, so this command runs on `last.pt` itself.
 
