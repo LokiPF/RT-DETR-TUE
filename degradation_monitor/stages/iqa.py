@@ -40,7 +40,7 @@ from ..evaluation.report import LABELS
 from ..runs import Manifest, RunLayout, atomic_json, atomic_npz, load_npz, progress, sha1, sha256, stack
 from ..settings import load_settings
 from .baselines import TIMING_IMAGES, TIMING_WARMUP
-from .common import cap_gpu_memory, open_rgb, report_peak_memory, rgb_batches, variant_stream
+from .common import cap_gpu_memory, median_ms, open_rgb, report_peak_memory, rgb_batches, variant_stream
 from .detectors import load_config as load_detectors_config
 from .report import write_report
 
@@ -193,21 +193,9 @@ def timing(config) -> None:
     models, _, _ = _loaded_models(config)
     _manifest(config, models)
     images = [open_rgb(p) for p in base.dataset.evaluation_images()[:TIMING_IMAGES]]
-    on_gpu = torch.cuda.is_available() and str(base.device).startswith("cuda")
 
     def timed(part):
-        for array in images[:TIMING_WARMUP]:
-            part([array])
-        values = []
-        for array in images:
-            if on_gpu:
-                torch.cuda.synchronize()
-            start = time.perf_counter()
-            part([array])
-            if on_gpu:
-                torch.cuda.synchronize()
-            values.append(1000.0 * (time.perf_counter() - start))
-        return float(np.median(values))
+        return median_ms(lambda array: part([array]), images, TIMING_WARMUP, base.device)
 
     detector = RunLayout(config.reference_run).timing
     result = {"images": len(images), "batch_size": 1, "device": str(base.device),

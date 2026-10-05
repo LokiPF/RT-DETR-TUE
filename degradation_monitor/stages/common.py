@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import time
 from collections import deque
 from pathlib import Path
 
@@ -72,6 +73,24 @@ def report_peak_memory(label, device) -> None:
     """The process's peak GPU memory so far, for the sessions that share the card."""
     if torch.device(device).type == "cuda":
         print(f"[{label}] peak GPU memory {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB", flush=True)
+
+
+def median_ms(function, inputs, warmup: int, device) -> float:
+    """The median wall time of function(item) over inputs, in ms, after warmup calls on the first inputs; on a GPU,
+    synchronised before and after each call. Both timing stages measure every model this way."""
+    on_gpu = torch.cuda.is_available() and str(device).startswith("cuda")
+    for item in inputs[:warmup]:
+        function(item)
+    values = []
+    for item in inputs:
+        if on_gpu:
+            torch.cuda.synchronize()
+        start = time.perf_counter()
+        function(item)
+        if on_gpu:
+            torch.cuda.synchronize()
+        values.append(1000.0 * (time.perf_counter() - start))
+    return float(np.median(values))
 
 
 def bounded(pool, function, items, in_flight):
