@@ -1,0 +1,37 @@
+# RT-DETRv2-R18 fine-tuned on Cityscapes train (8 classes) from the COCO checkpoint:
+#   python tools/train.py -c configs/rtdetrv2/rtdetrv2_r18vd_cityscapes.yml \
+#       -t pretrained_weights/rtdetrv2_r18vd_120e_coco_rerun_48.1.pth --seed 0
+# The schedule is the repository's standard fine-tuning recipe (include/dataloader.yml, include/optimizer.yml):
+# 72 epochs at a total batch of 16, AdamW 1e-4 (backbone 1e-5), EMA, AMP, multi-scale 480-800 and the photometric,
+# zoom-out and IoU-crop augmentations until epoch 71, evaluation at 640 x 640. RT-DATR (Lin et al., 2025) trains
+# RT-DETR on Cityscapes the same way (72 epochs, 480-800 multi-scale, 640 x 640 evaluation).
+__include__: [
+  '../dataset/cityscapes_detection.yml',
+  '../runtime.yml',
+  './include/dataloader.yml',
+  './include/optimizer.yml',
+  './include/rtdetrv2_r50vd.yml',
+]
+
+
+output_dir: ./output/rtdetrv2_r18vd_cityscapes
+
+
+PResNet:
+  depth: 18
+  freeze_at: -1
+  freeze_norm: False
+  pretrained: False
+
+
+HybridEncoder:
+  in_channels: [128, 256, 512]
+  hidden_dim: 256
+  expansion: 0.5
+
+
+RTDETRTransformerv2:
+  num_layers: 3
+
+
+epoches: 72

@@ -1,0 +1,44 @@
+task: detection
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox', ]
+
+# Cityscapes fine annotations, 8 instance classes (person, rider, car, truck, bus, train, motorcycle, bicycle),
+# converted by dataset_tools/cityscapes_converter.py with category ids 0-7 used directly as labels.
+num_classes: 8
+remap_mscoco_category: False
+
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /home/yuchen/YuchenZ/Datasets/cityscape/leftImg8bit/
+    ann_file: /home/yuchen/YuchenZ/Datasets/cityscape/annotations_coco/cityscapes_train_8cls.json
+    return_masks: False
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: True
+  num_workers: 8
+  drop_last: True
+  collate_fn:
+    type: BatchImageCollateFunction
+
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /home/yuchen/YuchenZ/Datasets/cityscape/leftImg8bit/
+    ann_file: /home/yuchen/YuchenZ/Datasets/cityscape/annotations_coco/cityscapes_val_8cls.json
+    return_masks: False
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: False
+  num_workers: 8
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFunction
