@@ -133,3 +133,34 @@ def test_the_report_stage_leaves_out_the_rows_a_detector_does_not_have(run):
     assert {"saod_top3", "saod_min", "knn", "cdf", "cdf_sum"} <= set(summary["rows"])
     assert not {"contrastive", "hashemi", "hashemi_enc"} & set(summary["rows"])
     assert summary["lambda_folds_agree"] == {}
+
+
+def test_the_report_adds_extra_rows_and_writes_where_it_is_told(run, tmp_path, monkeypatch):
+    from degradation_monitor.runs import Manifest
+    from degradation_monitor.stages.report import write_report
+
+    monkeypatch.setattr(method_reference, "NEIGHBOURS", 3)
+    rng = np.random.default_rng(9)
+    for path in sorted(run.layout.scores("detector").glob("*.npz")):
+        atomic_npz(run.layout.score_file("method", path.name), **_statistics(rng, 96))
+    atomic_npz(run.layout.method_bank, **_statistics(rng, 6))
+    atomic_npz(run.layout.method_zstats, **_statistics(rng, 4))
+    extra = {"niqe": rng.uniform(0, 1, (IMAGES, 96)), "clipiqa": rng.uniform(0, 1, (IMAGES, 96))}
+    out = tmp_path / "iqa-report"
+    write_report(run, Manifest(run.layout), out=out, extra_rows=extra, extra_inputs={"iqa": {"scores": "here"}})
+    summary = json.loads((out / "summary.json").read_text())
+    assert {"two_axis", "niqe", "clipiqa"} <= set(summary["rows"])
+    assert "two_axis - niqe:auroc_common" in summary["intervals"]["all"]
+    assert summary["inputs"]["iqa"] == {"scores": "here"}
+    assert not run.layout.report().exists()  # the run folder itself gets no report
+
+
+def test_the_report_refuses_extra_rows_it_cannot_take(run, tmp_path):
+    from degradation_monitor.runs import Manifest
+    from degradation_monitor.stages.report import write_report
+
+    for rows, message in (({"psnr": np.zeros((IMAGES, 96))}, "cannot take from elsewhere: psnr"),
+                          ({"knn": np.zeros((IMAGES, 96))}, "cannot take from elsewhere: knn"),
+                          ({"niqe": np.zeros((IMAGES - 1, 96))}, "one per image and condition: niqe")):
+        with pytest.raises(ValueError, match=message):
+            write_report(run, Manifest(run.layout), out=tmp_path, extra_rows=rows)

@@ -73,8 +73,13 @@ def _stack_present(folder, names, required, optional) -> dict:
     return stack(folder, names, required + present)
 
 
-def write_report(settings, manifest) -> None:
-    """Every table of the report, from the stored scores of every pass that ran."""
+def write_report(settings, manifest, out=None, extra_rows=None, extra_inputs=None) -> None:
+    """Every table of the report, from the stored scores of every pass that ran.
+
+    extra_rows adds rows computed elsewhere, the image-quality baselines (EXTRA_ROWS): (images, 96) arrays in
+    evaluation order. out writes the report to another folder, so that a read-only run can get one. extra_inputs is
+    merged into the summary's inputs.
+    """
     layout = settings.layout
     reference = _method_reference(layout)  # checked first: the mAP below takes minutes on all 5,000 images
     names = [p.name for p in settings.dataset.evaluation_images()]
@@ -84,6 +89,16 @@ def write_report(settings, manifest) -> None:
     activations = _stack_present(layout.scores("activations"), names, ACTIVATION_ARRAYS, HASHEMI_ARRAYS) \
         if layout.scores("activations").exists() else None
     scores = tables.baseline_rows(detector, discopatch=discopatch, activations=activations)
+    if extra_rows:
+        refused = sorted(set(extra_rows) - set(tables.EXTRA_ROWS))
+        if refused:
+            raise ValueError(f"rows a report cannot take from elsewhere: {', '.join(refused)}")
+        shape = (len(names), len(corruptions.CONDITIONS))
+        wrong = sorted(k for k, v in extra_rows.items() if np.shape(v) != shape)
+        if wrong:
+            raise ValueError(f"extra rows need {shape[0]} x {shape[1]} values, one per image and condition: "
+                             f"{', '.join(wrong)}")
+        scores.update(extra_rows)
     gt = settings.dataset.ground_truth()
     ids = [gt.image_id(n) for n in names]
     condition_map = condition_maps(gt, ids, detector, settings.workers)
@@ -96,6 +111,7 @@ def write_report(settings, manifest) -> None:
     report_tables, summary = tables.build_tables(scores, detector, ap, settings.dataset.folds(), condition_map,
                                                  seed=settings.seed, samples=tables.BOOTSTRAP_SAMPLES,
                                                  workers=settings.workers, timing=timing)
-    summary["inputs"] = {**manifest.read().get("inputs", {}), **({"method": reference} if reference else {})}
-    tables.write_outputs(layout.report(), report_tables, summary)
+    summary["inputs"] = {**manifest.read().get("inputs", {}), **({"method": reference} if reference else {}),
+                         **(extra_inputs or {})}
+    tables.write_outputs(out or layout.report(), report_tables, summary)
     print(f"[report] headline: {summary['headline_decision']}; level score: {summary['level_decision']}", flush=True)

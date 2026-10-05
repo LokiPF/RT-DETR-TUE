@@ -33,7 +33,10 @@ from ..runs import atomic_json
 from .metrics import aupr, auroc, bootstrap, condition_aurocs, fpr_at_95_tpr, group_separation
 
 OURS = ("two_axis", "peak_share", "level", "global_level", "means_knn", "means_own")
-BASELINES = ("saod_top3", "saod_min", "contrastive", "knn", "discopatch", "hashemi", "hashemi_enc", "cdf", "cdf_sum")
+BASELINES = ("saod_top3", "saod_min", "contrastive", "knn", "discopatch", "hashemi", "hashemi_enc", "cdf", "cdf_sum",
+             "niqe", "niqe_default", "arniqa", "arniqa_proto", "clipiqa")
+# the rows a report takes from outside its run folder: the image-quality baselines
+EXTRA_ROWS = ("niqe", "niqe_default", "arniqa", "arniqa_proto", "clipiqa")
 ROWS = OURS + BASELINES
 LABELS = {
     "two_axis": "Two-axis: flatter or shifted vs the 50 most similar clean scenes (headline)",
@@ -51,11 +54,18 @@ LABELS = {
     "hashemi_enc": "Hashemi et al., encoder maps (sensitivity)",
     "cdf": "Activation CDFs (Becker et al., ICPR 2026)",
     "cdf_sum": "Activation CDFs, plain channel sum (sensitivity)",
+    "niqe": "NIQE, pristine model refitted on clean train images",
+    "niqe_default": "NIQE, published pristine model (sensitivity)",
+    "arniqa": "ARNIQA quality (KADID-10k regressor)",
+    "arniqa_proto": "ARNIQA embedding vs the clean prototype (Becker et al.)",
+    "clipiqa": "CLIP-IQA, zero-shot (\"Good photo.\" / \"Bad photo.\")",
 }
 BASELINE_FAMILIES = {"SAOD": ("saod_top3", "saod_min"), "ContrastiveConf": ("contrastive",), "kNN": ("knn",),
                      "DisCoPatch": ("discopatch",), "Hashemi et al.": ("hashemi", "hashemi_enc"),
-                     "activation CDFs": ("cdf", "cdf_sum")}  # the title counts the families a report's rows hold
-NUMBER_WORDS = ("no", "one", "two", "three", "four", "five", "six")
+                     "activation CDFs": ("cdf", "cdf_sum"),
+                     "NIQE": ("niqe", "niqe_default"), "ARNIQA": ("arniqa",), "ARNIQA prototype": ("arniqa_proto",),
+                     "CLIP-IQA": ("clipiqa",)}  # the title counts the families a report's rows hold
+NUMBER_WORDS = ("no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten")
 REFERENCES = ("two_axis", "level")  # rows whose differences with every other row get intervals
 METRICS = ("auroc", "aupr", "fpr95")
 GROUPS = ("common", "extra")

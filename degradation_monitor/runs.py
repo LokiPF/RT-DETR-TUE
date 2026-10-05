@@ -26,6 +26,7 @@ SCORE_KEYS = {
                     "cdf_stages"),
     "discopatch": ("dcp",),
     "method": tuple(f"{statistic}_s{stage}" for statistic in ("means", "top") for stage in range(1, 5)),
+    "iqa": ("niqe", "niqe_default", "arniqa", "arniqa_proto", "clipiqa", "niqe_blocks", "digests"),
 }
 PACKAGES = ("torch", "torchvision", "numpy", "scipy", "scikit-image", "scikit-learn", "imagecorruptions", "uq-detr",
             "pycocotools", "Pillow", "ultralytics", "rfdetr")

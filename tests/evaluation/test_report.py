@@ -202,6 +202,14 @@ def test_the_report_title_counts_the_baseline_families_present(small_sets):
     assert report.markdown(summary, tables).startswith(title.format("six"))
 
 
+def test_the_report_title_counts_the_image_quality_families(small_sets):
+    rows = ("two_axis", "level", "global_level", "saod_top3", "saod_min", "knn", "discopatch", "cdf", "cdf_sum",
+            "hashemi", "hashemi_enc", "niqe", "niqe_default", "arniqa", "arniqa_proto", "clipiqa")
+    tables, summary = _tables(_scores(40, rows), 40, samples=2)  # and ContrastiveConf: ten families
+    assert report.markdown(summary, tables).startswith("# Corruption detection on COCO: our method and ten baselines\n")
+    assert report.LABELS["arniqa_proto"] in report.markdown(summary, tables)
+
+
 def test_write_outputs_creates_csv_json_and_markdown(small_sets, tmp_path):
     tables, summary = _tables(_scores(40, ("two_axis", "level", "global_level", "cdf", "discopatch")), 40)
     report.write_outputs(tmp_path, tables, summary)
