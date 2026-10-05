@@ -16,9 +16,9 @@
   CLIPIQAFixed model of configs/clipiqa/clipiqa_attribute_test.py): CLIP RN50 on the image at its own size with the
   positional embedding removed, the softmax of its logits for "Good photo." against "Bad photo.", the first
   probability. On the GPU the weights are fp16, as the official build_model makes them; on the CPU, fp32.
-- NIQE in the scores: a version with fewer than two blocks without a NaN has no covariance (snow and frost can
-  blank blocks). Both NIQE rows give it NIQE_UNSCORABLE, above every real distance, so it counts as degraded;
-  niqe_blocks records each version's count.
+- NIQE in the scores: a version with no block free of NaN (snow and frost can blank blocks) has no NIQE features, and
+  pyiqa's NIQE is NaN for it. Both NIQE rows give it NIQE_UNSCORABLE, above every real distance, so it counts as
+  degraded; niqe_blocks records each version's count.
 
 Every model reads the uint8 RGB image at its own size.
 """
@@ -127,7 +127,9 @@ class NiqeFit:
 CLIP_PROMPTS = ("Good photo.", "Bad photo.")
 ARNIQA_REGRESSOR = "kadid"
 ARNIQA_CROP = 224  # the paper's crops: the centre and the four corners, of the image and of its half-size version
-NIQE_MIN_BLOCKS = 2  # with fewer blocks without a NaN, a version's covariance is undefined
+# a version needs one block without a NaN: with none, pyiqa's NIQE is NaN; with one, its covariance is zero and its
+# score finite
+NIQE_MIN_BLOCKS = 1
 NIQE_UNSCORABLE = 1e6  # such a version's NIQE score: above every real distance, so it counts as degraded
 ROWS = ("niqe", "niqe_default", "arniqa", "arniqa_proto", "clipiqa")
 
@@ -223,7 +225,7 @@ class IqaModels:
     protocol = {
         "niqe": {"block": NIQE_BLOCK, "sharpness": NIQE_SHARPNESS, "luma": "rounded Y in [0, 255], float64",
                  "refit": "estimatemodelparam.m", "default": "modelparameters.mat",
-                 "unscorable": f"fewer than {NIQE_MIN_BLOCKS} blocks without a NaN: {NIQE_UNSCORABLE:g}"},
+                 "unscorable": f"no block without a NaN: {NIQE_UNSCORABLE:g}"},
         "arniqa": {"regressor": "kadid10k", "source": "miccunifi/ARNIQA test.py",
                    "crops": f"centre and four corners, {ARNIQA_CROP} x {ARNIQA_CROP}, zero-padded, at both sizes",
                    "half_size": "PIL bicubic to (W // 2, H // 2)",
@@ -258,8 +260,9 @@ class IqaModels:
 
     @torch.inference_mode()
     def niqe_rows(self, arrays) -> dict:
-        """Both NIQE rows, and niqe_blocks: each version's blocks without a NaN. A version with fewer than
-        NIQE_MIN_BLOCKS of them has no covariance; both rows give it NIQE_UNSCORABLE."""
+        """Both NIQE rows, and niqe_blocks: each version's blocks without a NaN. A version with none has no NIQE
+        features; both rows give it NIQE_UNSCORABLE. With one, pyiqa's covariance is zero, and the score stays
+        pyiqa's."""
         self._references()
         features = niqe_block_features(niqe_luma(to_unit_tensor(arrays, self.device)))[0]
         blocks = (~features.isnan().any(dim=2)).sum(dim=1)

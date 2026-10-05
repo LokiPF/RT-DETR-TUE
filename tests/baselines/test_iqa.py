@@ -135,17 +135,18 @@ def test_the_scores_rise_with_strong_noise(models):
 
 
 @needs_weights
-@pytest.mark.filterwarnings(r"ignore:cov\(\)")  # torch.cov warns on the one-block version, as it should
-def test_niqe_scores_a_version_with_fewer_than_two_blocks_as_most_degraded(models, monkeypatch):
+@pytest.mark.filterwarnings(r"ignore:cov\(\)")  # torch.cov warns on the version with no block, as it should
+def test_niqe_scores_a_version_with_no_block_free_of_nan_as_most_degraded(models, monkeypatch):
     models.niqe_refit, models.prototype = iqa.published_niqe(), np.full(4096, 1 / 64.0)
     features = torch.from_numpy(np.random.default_rng(1).uniform(0.1, 1.0, (3, 4, 36)))
-    features[1, 1:, 0] = float("nan")  # one block left without a NaN
-    features[2, :, 5] = float("nan")  # none left
+    features[1, 1:, 0] = float("nan")  # one block left without a NaN: pyiqa's covariance is zero, its score finite
+    features[2, :, 5] = float("nan")  # none left: pyiqa's NIQE would be NaN
     monkeypatch.setattr(iqa, "niqe_block_features", lambda luma: (features, None))
     rows = models.niqe_rows([_image()] * 3)
     assert rows["niqe_blocks"].tolist() == [4, 1, 0]
-    assert 0 < rows["niqe"][0] < iqa.NIQE_UNSCORABLE and 0 < rows["niqe_default"][0] < iqa.NIQE_UNSCORABLE
-    assert rows["niqe"][1:].tolist() == rows["niqe_default"][1:].tolist() == [iqa.NIQE_UNSCORABLE] * 2
+    for row in ("niqe", "niqe_default"):
+        assert all(0 < value < iqa.NIQE_UNSCORABLE for value in rows[row][:2].tolist()), row
+        assert rows[row][2].item() == iqa.NIQE_UNSCORABLE, row
 
 
 @needs_weights
