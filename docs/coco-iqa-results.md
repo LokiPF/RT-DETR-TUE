@@ -2,7 +2,7 @@
 
 Run on 5 October 2026, following `docs/superpowers/plans/2026-10-05-iqa-baselines-coco-c.md`. Four detector-free image-quality (IQA) baselines, in five rows, were scored once on the COCO-C images of the four-detector study (`docs/coco-detectors-results.md`). Each detector's report was then rebuilt with the five rows added. The tables are in `docs/results/coco-iqa/`.
 
-**Both ARNIQA rows are ahead of the two-axis score on all four detectors.** Their AUROC is higher on the common and on the extra families, on all images and on the untouched ones, and every one of these 32 intervals excludes 0. NIQE with its refitted model is ahead in one place: RF-DETR-M's common families. The two-axis score is ahead of CLIP-IQA and of the published NIQE everywhere.
+**Both ARNIQA rows are ahead of the two-axis score on all four detectors.** Their AUROC is higher on the common and on the extra families, on all images and on the untouched ones, and every one of these 32 intervals excludes 0. On AUROC, NIQE with its refitted model is ahead in one place, RF-DETR-M's common families, and NIQE with the published model nowhere. The two NIQE models differ in their clean images: JPEG-compressed COCO train photos for the refit, 125 pristine photos for the published model. The two-axis score is ahead of CLIP-IQA and of the published NIQE everywhere on AUROC.
 
 | Detector | Two-axis − ARNIQA quality, common | Two-axis − ARNIQA quality, extra | Two-axis − ARNIQA prototype, common | Two-axis − ARNIQA prototype, extra |
 |---|---|---|---|---|
@@ -34,7 +34,7 @@ All images; a negative Δ means the ARNIQA row is ahead. The untouched images gi
 | AUROC extra ↑ | The same, over the 20 conditions of the 4 extra families | 0.5 = chance, 1 = perfect |
 | FPR95 ↓ | The share of clean images flagged when the threshold catches 95% of the corrupted ones | 0 = perfect |
 
-- Brackets are 95% paired bootstrap intervals over images (1,000 draws, seed 44). In "two-axis − row", a positive Δ means the two-axis score is better and a negative one that the row is better.
+- Brackets are 95% paired bootstrap intervals over images (1,000 draws, seed 44). In "two-axis − row", a positive ΔAUROC means the two-axis score is better and a negative one that the row is better. For ΔFPR95 it is the reverse, since a lower FPR95 is better.
 - The untouched images are the 3,030 at positions 1970 and later. Nobody read them while the two-axis method was chosen. The IQA rows' settings come from their papers and official code, and were fixed before the pass.
 - An IQA row's numbers are the same for every detector, so the tables give them once.
 - The tables by severity and by family have no intervals.
@@ -43,11 +43,15 @@ All images; a negative Δ means the ARNIQA row is ahead. The untouched images gi
 
 - **Both ARNIQA rows are ahead on every detector, with every interval below 0** (table above). ARNIQA quality reaches 0.927 [0.925, 0.929] on the common families and 0.905 [0.903, 0.907] on the extra ones; the prototype 0.946 [0.944, 0.947] and 0.880 [0.878, 0.882].
 - **The margin grows as the two-axis score weakens.** The IQA rows' AUROC is fixed, while the two-axis score's falls from 0.917 [0.914, 0.920] on RT-DETRv2-R18 to 0.844 [0.841, 0.847] on RF-DETR-M (common families). Against ARNIQA quality, the gap on the common families runs from −0.010 on RT-DETRv2-R18 to −0.083 on RF-DETR-M.
-- **NIQE (refit) is ahead only on RF-DETR-M's common families:** two-axis − NIQE (refit) is −0.010 [−0.013, −0.007] on all images and −0.010 [−0.014, −0.007] on the untouched ones. Everywhere else the two-axis score is ahead of it, every interval above 0. The smallest margin is on Faster R-CNN's common families: +0.009 [+0.005, +0.013], and +0.008 [+0.003, +0.013] on the untouched images.
-- **The two-axis score is ahead of CLIP-IQA and of the published NIQE in every cell,** by +0.043 to +0.199 and +0.027 to +0.118 on all images, every interval above 0.
-- **Where ARNIQA leads:** most on brightness and saturate, where the two-axis score is weakest at mild severity. It also leads on frost on every detector, and by wide margins on fog, blur, JPEG and pixelate where a detector's two-axis score is weak on them. **Where the two-axis score leads ARNIQA:** spatter on every detector, elastic transform on three, and JPEG against the quality row on three.
-- **By severity:** on the common families both ARNIQA rows are above the two-axis score at every severity on every detector, by the most at severity 1. On the extra families the two-axis score passes ARNIQA quality at high severity on three detectors; RF-DETR-M's stays below at every severity.
-- **What the models saw in training is context, not a measured cause.** ARNIQA's encoder was trained on synthetic distortions (blur, noise, compression, brightness, colour, contrast and pixelation, but no weather). Its KADID-10k regressor was fitted on ratings of distortion types that include 11 of the 19 COCO-C families. The two-axis score and NIQE are fitted on clean images only, and CLIP-IQA saw no distortions. ARNIQA also leads on frost, which is weather and so not among its training distortions.
+- **On AUROC, NIQE (refit) is ahead only on RF-DETR-M's common families:** two-axis − NIQE (refit) is −0.010 [−0.013, −0.007] on all images and −0.010 [−0.014, −0.007] on the untouched ones. Everywhere else the two-axis score is ahead of it, every interval above 0. The smallest margin is on Faster R-CNN's common families: +0.009 [+0.005, +0.013], and +0.008 [+0.003, +0.013] on the untouched images. The published NIQE is ahead nowhere on AUROC. The two NIQE models differ in their clean images: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model.
+- **On AUROC, the two-axis score is ahead of CLIP-IQA and of the published NIQE in every cell,** by +0.043 to +0.199 and +0.027 to +0.118 on all images, every interval above 0. On FPR95, two NIQE cells go the other way (the FPR95 bullets under "Headline").
+- **Where ARNIQA leads:** averaged over the four detectors, most on saturate and brightness. There the two-axis score gives only 0.50–0.60 and 0.50–0.54 at severity 1. On RF-DETR-M, JPEG and pixelate are also among ARNIQA's largest leads. It leads on frost and fog on every detector, and by wide margins on blur, JPEG and pixelate where a detector's two-axis score is weak on them. **Where the two-axis score leads ARNIQA:**
+  - spatter, on every detector;
+  - elastic transform, against the quality row on all four detectors and against the prototype on three;
+  - JPEG, against the quality row on three detectors;
+  - gaussian and impulse noise, against the quality row on two detectors, by less than 0.005.
+- **By severity:** on the common families both ARNIQA rows are above the two-axis score at every severity on every detector, by the most at severity 1. On the extra families the two-axis score passes ARNIQA quality at high severity on three detectors and the prototype on all four. RF-DETR-M's two-axis score stays below ARNIQA quality at every severity.
+- **What the models saw in training is context, not a measured cause.** ARNIQA's encoder was trained on synthetic distortions (blur, noise, compression, brightness, colour, contrast and pixelation, but no weather). Its KADID-10k regressor was fitted on ratings of distortion types that include 11 of the 19 COCO-C families, some only approximately. The two-axis score and NIQE are fitted on clean images only, and CLIP-IQA saw no distortions. ARNIQA also leads on frost and fog, which are weather and so not among its training distortions.
 - **Cost:** NIQE takes 20.72 ms per image, ARNIQA 5.03 ms and CLIP-IQA 4.82 ms, against the detector's 5.89 ms.
 
 ## What each baseline is
@@ -131,7 +135,7 @@ On the GPU, ARNIQA's encoder runs under autocast and CLIP-IQA with fp16 weights,
 - **The ranks barely move:** Kendall's τ is 0.9977 or more for every row.
 - **The 3 ties on both devices are identical versions.** In one of the three images, `000000040083.jpg`, the clean version and saturate at severities 1–3 are the same image: their digests match. The digests are stored with the per-image scores in `runs/coco-iqa/`, which is not in git.
 - **CLIP-IQA's fp16 scores tie more often:** 61 of 288 values, against 3 in fp32. How much this costs its AUROC was not measured.
-- NIQE's features are float64 on both devices. Where its small differences come from was not traced.
+- NIQE's features are float64 on both devices. Its two rows differ only in the pristine model: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model. Where their small differences come from was not traced.
 
 ## What each model saw in training
 
@@ -147,9 +151,10 @@ This is context for the comparison, for the paper's fairness statement. None of 
   - The detectors themselves were trained on COCO train images with their own augmentations, which this doc does not list.
 
 **Next to this, the results show (measured; whether the training overlap explains them was not tested):**
-- ARNIQA leads most on brightness and saturate, which are among KADID-10k's types.
-- It also leads on frost on every detector, and on fog on three, though its encoder saw no weather.
-- The two-axis score leads it on spatter and elastic transform, neither among KADID-10k's types. It also leads the quality row on JPEG, which is among them, on three detectors.
+- Averaged over the four detectors, ARNIQA leads most on saturate and brightness. On RF-DETR-M, JPEG and pixelate are also among its largest leads. All four families are among the 11 above.
+- It also leads on frost and fog on every detector, though its encoder saw no weather.
+- The two-axis score leads both ARNIQA rows on spatter on every detector. On elastic transform it leads both on three detectors; on RF-DETR-M it leads the quality row but not the prototype. Neither family is among the 11 above.
+- The two-axis score also leads the quality row on JPEG on three detectors, though JPEG is among the 11.
 
 ## Headline: all images and the untouched ones
 
@@ -199,14 +204,15 @@ Bold is the best value in a column over both tables. The two NIQE rows differ in
 |  | Faster R-CNN R50-FPN v2 | +0.062 [+0.057, +0.067] | +0.181 [+0.177, +0.186] | +0.060 [+0.053, +0.067] | +0.179 [+0.173, +0.185] |
 |  | RF-DETR-M | +0.043 [+0.038, +0.048] | +0.153 [+0.148, +0.157] | +0.041 [+0.034, +0.048] | +0.151 [+0.144, +0.157] |
 
-Bold marks the cells where the row is ahead of the two-axis score. Every interval in the table excludes 0.
+Bold marks the cells where the row is ahead of the two-axis score. Every interval in the table excludes 0. As above, the two NIQE rows differ in their pristine model's clean images: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model.
 
 **What else the tables show:**
-- **The untouched images give the same numbers.** The two-axis score is within 0.001 of its value on all images, on every detector, and so is every IQA row except CLIP-IQA, which is within 0.002.
+- **The untouched images give nearly the same numbers (within 0.002).** The two-axis score is within 0.001 of its value on all images, on every detector, and so is every IQA row except CLIP-IQA, which is within 0.002.
 - **FPR95 agrees with AUROC in all but two cells.**
   - The two ARNIQA rows have the lower FPR95 on every detector. On the common families they give 0.178 [0.174, 0.183] (quality) and 0.128 [0.125, 0.131] (prototype), against the two-axis score's 0.226 [0.221, 0.233] on RT-DETRv2-R18 to 0.359 [0.354, 0.364] on RF-DETR-M.
   - On Faster R-CNN's common families, NIQE (refit) has the lower FPR95, though the lower AUROC: 0.338 [0.334, 0.342] against 0.348 [0.342, 0.355]. The paired difference, two-axis minus NIQE (refit), is +0.011 [+0.004, +0.018].
   - On RF-DETR-M's extra families, the published NIQE has the lower FPR95, though the lower AUROC: 0.408 [0.404, 0.412] against 0.438 [0.431, 0.445]. The paired difference is +0.029 [+0.023, +0.038].
+  - These two NIQE rows differ in their pristine model's clean images: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model.
   - In every other cell, FPR95 favours the same side as AUROC, and its interval excludes 0.
 - **AUPR** is in each detector's `report.md`, next to the AUROC and FPR95 of every row.
 
@@ -243,14 +249,16 @@ Extra families:
 - **Common families: both ARNIQA rows are above the two-axis score at every severity on every detector.**
   - The gap is widest at severity 1: 0.877 (quality) and 0.924 (prototype), against 0.863 / 0.825 / 0.794 / 0.786 (RT-DETRv2-R18, YOLO11m, Faster R-CNN, RF-DETR-M).
   - It is narrower at severity 5: 0.953 and 0.958, against 0.951 / 0.931 / 0.916 / 0.878.
-- **Extra families: the two-axis score passes ARNIQA at high severity, except on RF-DETR-M.**
+- **Extra families: the two-axis score passes ARNIQA quality at high severity on three detectors, and the prototype on all four.**
   - Against ARNIQA quality, it is ahead at severity 5 on RT-DETRv2-R18 (0.955 against 0.948). On YOLO11m and Faster R-CNN it is ahead at severities 4 and 5 (0.938 and 0.966, and 0.938 and 0.967, against 0.937 and 0.948).
   - Against the prototype, it is ahead from severity 3 on YOLO11m and Faster R-CNN, and from severity 4 on RT-DETRv2-R18.
   - RF-DETR-M's two-axis score stays below ARNIQA quality at every severity. It passes the prototype only at severity 5 (0.920 against 0.911).
   - At severity 1, both ARNIQA rows lead by the most: 0.846 and 0.845, against 0.705 / 0.704 / 0.670 / 0.680.
-- **NIQE (refit) is above RF-DETR-M's two-axis score at every severity of the common families.** It gives 0.809 / 0.843 / 0.859 / 0.876 / 0.884, against 0.786 / 0.835 / 0.854 / 0.869 / 0.878. It is also above Faster R-CNN's at severities 1 and 2 (0.809 and 0.843, against 0.794 and 0.838).
-- **On the extra families at severity 1, both NIQE rows are above Faster R-CNN's two-axis score,** 0.676 and 0.700 against 0.670. The published one is also above RF-DETR-M's, 0.700 against 0.680. The two NIQE rows differ in their pristine model's clean images (JPEG-compressed COCO photos against 125 pristine photos).
-- **CLIP-IQA is below the two-axis score at every severity, on both family groups and on every detector.** So is the published NIQE on the common families.
+- **The two NIQE rows split.** They differ in their pristine model's clean images: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model.
+  - On the common families, NIQE (refit) is above RF-DETR-M's two-axis score at every severity: 0.809 / 0.843 / 0.859 / 0.876 / 0.884, against 0.786 / 0.835 / 0.854 / 0.869 / 0.878. It is also above Faster R-CNN's at severities 1 and 2 (0.809 and 0.843, against 0.794 and 0.838).
+  - The published NIQE is below the two-axis score at every severity of the common families, on every detector.
+  - On the extra families at severity 1, both NIQE rows are above Faster R-CNN's two-axis score, 0.676 and 0.700 against 0.670. The published one is also above RF-DETR-M's, 0.700 against 0.680.
+- **CLIP-IQA is below the two-axis score at every severity, on both family groups and on every detector.**
 
 ## Families at severities 1, 3 and 5
 
@@ -288,33 +296,58 @@ AUROC at severities 1 / 3 / 5, all images, from each report's `by_family`. `*` m
 | ARNIQA prototype | 84 | 86 | 81 | 90 |
 | CLIP-IQA | 18 | 26 | 34 | 35 |
 
-In the rest of this section, a lead "averaged over the severities" is the mean, over severities 1–5, of the row's AUROC minus the two-axis score's, from `by_family`. These means have no intervals.
+The published NIQE is above the two-axis score in more conditions than the refit on every detector, though its AUROC is lower on the common families. More of its conditions are on the extra families: 7 to 10 of the 20, against 5 for the refit. The two NIQE rows differ in their pristine model's clean images: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model.
 
-**Where the ARNIQA rows lead:**
-- **Brightness and saturate, on every detector, by the widest margins.**
-  - Averaged over the severities, ARNIQA quality is ahead by 0.212 to 0.263 on brightness and by 0.246 to 0.320 on saturate. The prototype is ahead by 0.158 to 0.209 and by 0.204 to 0.278.
+In the rest of this section, a family's lead is the mean, over severities 1–5, of the row's AUROC minus the two-axis score's, from `by_family`. These are point estimates, with no intervals.
+
+**Where the ARNIQA rows lead.** ARNIQA quality has a positive lead on 14 to 17 of the 19 families, depending on the detector, and the prototype on 17 or 18.
+- **Saturate and brightness, by the widest margins averaged over the four detectors.**
+  - Averaged over the detectors, ARNIQA quality leads by 0.277 on saturate and 0.246 on brightness. The prototype leads by 0.235 and 0.192, then by 0.153 on pixelate.
+  - They are both rows' two largest leads on RT-DETRv2-R18 and YOLO11m, and the quality row's on Faster R-CNN.
+  - On Faster R-CNN, the prototype's brightness lead (0.158) comes sixth, after saturate (0.232), zoom blur (0.204), frost (0.168), fog (0.165) and pixelate (0.161).
+  - On RF-DETR-M, JPEG and pixelate join them. The quality row's four largest leads are saturate (0.320), pixelate (0.283), brightness (0.263) and JPEG (0.256). The prototype's are JPEG (0.400), pixelate (0.322), saturate (0.278) and brightness (0.209).
   - At severity 1 the two-axis score gives only 0.50–0.54 on brightness and 0.50–0.60 on saturate, as `docs/coco-detectors-results.md` noted. ARNIQA quality gives 0.63 and 0.96.
-  - On RT-DETRv2-R18, brightness carries all of ARNIQA quality's lead on the common families. Brightness alone contributes +0.017 to that lead, which is +0.010 in all. Over the other 14 common families, the two-axis score is ahead by 0.007.
-  - On the extra families, saturate alone contributes more than the whole lead in seven of the eight comparisons (two ARNIQA rows × four detectors); the exception is ARNIQA quality on RF-DETR-M. Over the other three extra families (speckle noise, gaussian blur and spatter), the two-axis score is ahead of the prototype on all four detectors, by 0.017 to 0.055. It is ahead of ARNIQA quality on three, by 0.020 to 0.035. On RF-DETR-M, ARNIQA quality stays ahead there by 0.003.
-- **Frost on every detector, and fog on three.**
+- **Frost and fog, on every detector.**
   - On frost, ARNIQA quality is ahead by 0.088 to 0.221 and the prototype by 0.060 to 0.194.
-  - On fog, ARNIQA quality is ahead by 0.039 to 0.154 on YOLO11m, Faster R-CNN and RF-DETR-M. On RT-DETRv2-R18, whose two-axis score gives 0.95 / 0.98 / 0.99 there, it is ahead by only 0.003.
-- **Blur, JPEG and pixelation, by more where the two-axis score is weaker.**
-  - On Faster R-CNN, ARNIQA quality is ahead by 0.138 on glass blur and 0.167 on zoom blur.
-  - On RF-DETR-M it is ahead by 0.256 on JPEG and 0.283 on pixelate, where RF-DETR-M's two-axis score stays at 0.57–0.61 and 0.61–0.74 at severities 1 / 3 / 5.
-- **Noise is close to a tie.** On gaussian, shot and impulse noise, both ARNIQA rows are within 0.023 of the two-axis score on every detector.
+  - On fog, ARNIQA quality is ahead by 0.003 to 0.154 and the prototype by 0.014 to 0.165. The smallest leads are on RT-DETRv2-R18, whose two-axis score gives 0.95 / 0.98 / 0.99 there: only 0.003 (quality) and 0.014 (prototype).
+- **Blur, JPEG and pixelation, by more where the two-axis score is weaker.** The largest of these leads, for ARNIQA quality and for the prototype:
+  - on Faster R-CNN, zoom blur (0.167 and 0.204) and glass blur (0.138 and 0.153);
+  - on RF-DETR-M, JPEG (0.256 and 0.400) and pixelate (0.283 and 0.322). There RF-DETR-M's two-axis score stays at 0.57–0.61 and 0.61–0.74 at severities 1 / 3 / 5.
+- **Noise is close to a tie on average, but not at severity 1.**
+  - Averaged over the severities, both ARNIQA rows are within 0.024 of the two-axis score on gaussian, shot and impulse noise, on every detector. The largest gap is 0.0234: the prototype on shot noise, on RT-DETRv2-R18.
+  - The average is held down by severities 3–5, where these AUROCs are at or near 1.00.
+  - At severity 1 the gaps are wider. On RT-DETRv2-R18's shot noise, the prototype leads by 0.091 (0.999 against 0.908) and the quality row by 0.070 (0.977 against 0.908).
 
-**Where the two-axis score leads ARNIQA:**
-- **Spatter, on every detector.**
+**How much of each group's lead one family carries** (point estimates, no intervals):
+- A group's lead is the mean of its families' leads. It equals the headline difference with its sign turned.
+- A family's share is its lead divided by the number of families in the group (15 common, 4 extra). So the shares of a group add up to its lead; rounding can leave 0.001.
+
+| Row | Detector | Common: lead | Brightness's share | The other 14 families' share | Extra: lead | Saturate's share | The other 3 families' share |
+|---|---|---|---|---|---|---|---|
+| ARNIQA quality | RT-DETRv2-R18 | +0.010 | +0.017 | −0.006 | +0.047 | +0.067 | −0.020 |
+|  | YOLO11m | +0.037 | +0.017 | +0.020 | +0.035 | +0.062 | −0.026 |
+|  | Faster R-CNN R50-FPN v2 | +0.064 | +0.014 | +0.050 | +0.053 | +0.069 | −0.015 |
+|  | RF-DETR-M | +0.083 | +0.018 | +0.065 | +0.082 | +0.080 | +0.002 |
+| ARNIQA prototype | RT-DETRv2-R18 | +0.029 | +0.013 | +0.016 | +0.021 | +0.056 | −0.035 |
+|  | YOLO11m | +0.056 | +0.014 | +0.042 | +0.010 | +0.051 | −0.041 |
+|  | Faster R-CNN R50-FPN v2 | +0.083 | +0.011 | +0.072 | +0.028 | +0.058 | −0.030 |
+|  | RF-DETR-M | +0.102 | +0.014 | +0.088 | +0.057 | +0.069 | −0.013 |
+
+- **Common families:** on RT-DETRv2-R18, brightness's share of ARNIQA quality's lead (+0.017) is larger than the whole lead (+0.010), and the other 14 families' share is −0.006. In the seven other comparisons the other 14 families' share is positive.
+- **Extra families:** saturate's share is larger than the whole lead in seven of the eight comparisons, all but ARNIQA quality on RF-DETR-M. In those seven, the other three families' share is negative, from −0.041 to −0.013.
+
+**Where the two-axis score leads ARNIQA.** These are all the families where an ARNIQA row's lead is negative:
+- **Spatter, on every detector, against both rows.**
   - Averaged over the severities, the two-axis score is ahead of ARNIQA quality by 0.080 to 0.168, and of the prototype by 0.162 to 0.250.
   - At severity 5 it gives 1.00 on three detectors and 0.93 on RF-DETR-M, against 0.80 and 0.66.
-- **Elastic transform, on three detectors.**
-  - On RT-DETRv2-R18, YOLO11m and Faster R-CNN, it is ahead of both ARNIQA rows: of the quality row by 0.296, 0.153 and 0.206, and of the prototype by 0.192, 0.049 and 0.103.
+- **Elastic transform, against the quality row on all four detectors and the prototype on three.**
+  - On RT-DETRv2-R18, YOLO11m and Faster R-CNN, it is ahead of the quality row by 0.296, 0.153 and 0.206, and of the prototype by 0.192, 0.049 and 0.103.
   - On RF-DETR-M, whose two-axis score is near chance there (0.54 / 0.52 / 0.50), it is ahead of the quality row by 0.062 and behind the prototype by 0.041.
   - ARNIQA quality itself gives only 0.43 / 0.46 / 0.50 on elastic transform.
 - **JPEG, against ARNIQA quality, on three detectors.**
   - It is ahead by 0.086 on RT-DETRv2-R18, 0.128 on YOLO11m and 0.073 on Faster R-CNN. ARNIQA quality starts at 0.60 at severity 1.
   - The prototype leads on JPEG on all four detectors (0.99 / 1.00 / 1.00).
+- **Gaussian and impulse noise, against ARNIQA quality on YOLO11m and Faster R-CNN,** by less than 0.005.
 - **Ahead of both ARNIQA rows at all five severities:** elastic transform and spatter on RT-DETRv2-R18 and Faster R-CNN, spatter on YOLO11m, and no family on RF-DETR-M.
 
 **NIQE and CLIP-IQA by family:**
@@ -341,8 +374,14 @@ In the rest of this section, a lead "averaged over the severities" is the mean, 
 | spatter * | 0.50 / 0.85 / 0.88 | 0.50 / 0.86 / 0.92 | 0.51 / 0.53 / 0.63 |
 | saturate * | 0.47 / 0.45 / 0.44 | 0.48 / 0.46 / 0.50 | 0.46 / 0.59 / 0.70 |
 
-- **NIQE (refit) on RF-DETR-M:** its lead on the common families comes from JPEG and pixelate. Averaged over the severities, it is ahead by 0.362 and 0.298 there. Over the other 13 common families, the two-axis score is ahead by 0.039.
-- **CLIP-IQA** leads on brightness (by 0.057 to 0.108), motion blur (0.036 to 0.084) and zoom blur (0.017 to 0.179) on every detector. On RF-DETR-M it also leads on JPEG (0.244) and pixelate (0.259).
+- **NIQE (refit) on RF-DETR-M** (point estimates, no intervals): its common-family lead comes from JPEG and pixelate.
+  - Averaged over the severities, it leads by 0.362 on JPEG and 0.298 on pixelate.
+  - In the shares defined above, its lead of +0.010 splits into +0.024 from JPEG, +0.020 from pixelate and −0.034 from the other 13 common families.
+- **CLIP-IQA** leads on brightness (by 0.057 to 0.108), motion blur (0.036 to 0.084) and zoom blur (0.017 to 0.179) on every detector. Its other leads, which complete the list:
+  - Faster R-CNN: pixelate (0.098), glass blur (0.076), frost (0.034), defocus blur (0.026) and gaussian blur (0.013);
+  - RF-DETR-M: pixelate (0.259), JPEG (0.244) and glass blur (0.023);
+  - YOLO11m: frost (0.060);
+  - RT-DETRv2-R18: pixelate (0.001).
 - **The two-axis score leads CLIP-IQA on the four noise families,** by 0.222 to 0.322 on every detector, averaged over the severities. There CLIP-IQA gives 0.59–0.80 at severities 1 / 3 / 5, and less at severity 5 than at severity 1 on three of the four.
 - The two NIQE rows differ in their pristine model's clean images: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model. The next section compares them.
 
@@ -365,7 +404,7 @@ Both rows score the same test-image features; only the pristine model differs. *
 | Model | Rows it gives | ms per image |
 |---|---|---|
 | NIQE | NIQE (refit) and NIQE (published), from the same features | 20.72 |
-| ARNIQA | ARNIQA quality and prototype, from one encoder pass over the ten crops | 5.03 |
+| ARNIQA | ARNIQA quality and prototype, sharing one embedding of the ten crops (the encoder runs once on the five full-size crops and once on the five half-size ones) | 5.03 |
 | CLIP-IQA | CLIP-IQA | 4.82 |
 | RT-DETRv2-R18, the detector alone | — | 5.89 |
 
@@ -392,10 +431,10 @@ Both rows score the same test-image features; only the pristine model differs. *
 
 ## Not yet shown
 
-- **Whether ARNIQA's lead comes from its training distortions.** It leads on frost and fog, which are not among them. The quality row trails on JPEG, which is among them. No experiment separates the training overlap from the rest.
-- **Whether an IQA row and the two-axis score combine well.** They lead on different families: ARNIQA on brightness and saturate, the two-axis score on spatter and elastic transform. No combination was tested.
+- **Whether ARNIQA's lead comes from its training distortions.** It leads on frost and fog, which are not among them. The quality row trails on JPEG, which is among them, on three detectors. No experiment separates the training overlap from the rest.
+- **Whether an IQA row and the two-axis score combine well.** They lead on different families: ARNIQA most on saturate and brightness, the two-axis score on spatter and elastic transform. No combination was tested.
 - **How much CLIP-IQA's fp16 ties cost its AUROC.**
-- **Why the published NIQE falls below chance on frost and elastic transform,** and why the refit does better there and on JPEG.
+- **Why the published NIQE falls below chance on frost and elastic transform,** and why the refit does better there and on JPEG. The two models differ in their clean images (JPEG-compressed COCO photos against 125 pristine photos), but which difference matters was not measured.
 - **The two-axis score's own runtime** next to these models.
 - **The IQA rows on real fog, driving data or Cityscapes-C.** A Cityscapes config can reuse every stage, but nothing was run.
 
@@ -405,7 +444,7 @@ Everything in `docs/results/coco-iqa/`:
 - `summary.md` and `summary.csv`: the two-axis score against each IQA row, on all four detectors.
 - `rtdetrv2_r18/`, `yolo11m/`, `faster_rcnn_r50_fpn_v2/` and `rfdetr_m/`: each detector's report with the five rows.
   - `report.md`: the generated report.
-  - `summary.json`: both decisions and every number above.
+  - `summary.json`: both decisions, and the AUROC, FPR95 and intervals behind every table and comparison in this doc. The timing, the fit counts, NIQE's block counts and the precision check come from the files listed below, and the mean NIQE from `conditions.csv`.
   - `separation.csv`, `aggregates.csv` and `intervals.csv`: per condition, per group and the bootstrap intervals.
   - `conditions.csv`: each condition's mAP and mean scores.
   - `knn_k.csv`: the kNN baseline by k.
