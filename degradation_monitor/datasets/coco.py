@@ -6,7 +6,7 @@ import io
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import ClassVar, Optional
 
 import numpy as np
 from pycocotools.coco import COCO
@@ -22,16 +22,22 @@ SPLIT_IMAGES = (("reserved", 200), ("bank", BANK_IMAGES), ("zstats", ZSTAT_IMAGE
 _SUFFIXES = {".jpg", ".jpeg", ".png"}
 
 
-def list_images(root) -> list[Path]:
+def list_images(root, recursive: bool = False) -> list[Path]:
+    """The images in root (and its subfolders when recursive), sorted; refused when two share a name, because result
+    files and the ground truth are keyed by name."""
     root = Path(root)
     if not root.is_dir():
         raise ValueError(f"image directory does not exist: {root}")
-    return sorted(p for p in root.iterdir() if p.is_file() and p.suffix.lower() in _SUFFIXES)
+    candidates = root.rglob("*") if recursive else root.iterdir()
+    images = sorted(p for p in candidates if p.is_file() and p.suffix.lower() in _SUFFIXES)
+    if len({p.stem for p in images}) != len(images):
+        raise ValueError(f"image names repeat under {root}; result files are keyed by name")
+    return images
 
 
-def evaluation_images(val_root, *, seed: int) -> list[Path]:
+def evaluation_images(val_root, *, seed: int, recursive: bool = False) -> list[Path]:
     """All val images in the old benchmark's seeded shuffle order; the order defines the folds."""
-    images = list_images(val_root)
+    images = list_images(val_root, recursive)
     if not images:
         raise ValueError(f"no images found in {val_root}")
     np.random.default_rng(seed).shuffle(images)
@@ -70,7 +76,12 @@ class CocoGroundTruth:
         if expected_categories is not None and len(self.category_ids) != expected_categories:
             raise ValueError(f"expected {expected_categories} categories, found {len(self.category_ids)}")
         self.label_of = {c: i for i, c in enumerate(self.category_ids)}
-        self._ids = {info["file_name"]: image_id for image_id, info in self.coco.imgs.items()}
+        self._ids = {}
+        for image_id, info in self.coco.imgs.items():
+            name = Path(info["file_name"]).name  # Cityscapes stores split/city/name; images are looked up by name
+            if name in self._ids:
+                raise ValueError(f"{name} appears twice in {annotation_file}")
+            self._ids[name] = image_id
 
     def image_id(self, file_name: str) -> int:
         try:
@@ -131,26 +142,36 @@ def per_image_ap(gt, results_by_image, image_ids) -> np.ndarray:
 
 @dataclass(frozen=True)
 class Coco:
-    """What a stage needs from the dataset; a Cityscapes module would offer the same five methods."""
+    """What a stage needs from the dataset: train images, reference splits, the evaluation order, folds, ground truth.
+
+    The class attributes are what differs between benchmarks: the name, the ground truth's class count, the floor for
+    the detector's clean val AP, whether the images sit in subfolders, and whether the method was screened on these
+    images (then the report adds the screen, held-out and untouched sets and their pre-registered decisions).
+    """
     train_root: Path
     val_root: Path
     annotations: Path
     seed: int = SEED
     limit: Optional[int] = None
+    name: ClassVar[str] = "coco"
+    classes: ClassVar[int] = 80
+    min_clean_ap: ClassVar[float] = 0.45  # the COCO checkpoint's clean val AP is about 0.48
+    recursive: ClassVar[bool] = False
+    screened: ClassVar[bool] = True
 
     def train_images(self) -> list[Path]:
-        return list_images(self.train_root)
+        return list_images(self.train_root, self.recursive)
 
     def reference_split(self, name: str) -> list[Path]:
         paths = self.train_images()
         return [paths[i] for i in train_splits(len(paths), self.seed)[name]]
 
     def evaluation_images(self) -> list[Path]:
-        images = evaluation_images(self.val_root, seed=self.seed)
+        images = evaluation_images(self.val_root, seed=self.seed, recursive=self.recursive)
         return images[: self.limit] if self.limit else images
 
     def folds(self) -> np.ndarray:
         return assign_folds(len(self.evaluation_images()))
 
     def ground_truth(self) -> CocoGroundTruth:
-        return CocoGroundTruth(self.annotations)
+        return CocoGroundTruth(self.annotations, expected_categories=self.classes)
