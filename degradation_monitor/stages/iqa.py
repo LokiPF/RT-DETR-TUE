@@ -95,7 +95,7 @@ def _manifest(config, models) -> Manifest:
     config.layout.root.mkdir(parents=True, exist_ok=True)
     manifest = Manifest(config.layout)
     manifest.check_protocol({
-        "dataset": "coco", "seed": base.seed, "limit": base.limit, "folds": FOLDS,
+        "dataset": base.benchmark, "seed": base.seed, "limit": base.limit, "folds": FOLDS,
         "conditions": [list(c) for c in CONDITIONS], "models": models.protocol,
         "weights": {name: sha256(path) for name, path in weight_files().items()},
         "float32_matmul_precision": torch.get_float32_matmul_precision(),
@@ -212,17 +212,19 @@ def _cell(value) -> str:
 
 
 def iqa_table(config) -> list:
-    """For every detector and row: the row's AUROC and the two-axis score minus it, on all and untouched images."""
+    """For every detector and row: the row's AUROC and the two-axis score minus it, on all images and, for a benchmark
+    with a screening history, on the untouched ones."""
+    subsets = ("all", "untouched") if config.base.dataset.screened else ("all",)
     rows = []
     for name in config.detectors:
         summary = json.loads((config.layout.report(name) / "summary.json").read_text())
         headline, intervals = summary["headline"], summary["intervals"]
         for row in ROWS:
             entry = {"detector": name, "row": row, "label": LABELS[row]}
-            for subset in ("all", "untouched"):
+            for subset in subsets:
                 for group in ("common", "extra"):
                     entry[f"{subset}_auroc_{group}"] = headline.get(subset, {}).get(row, {}).get(f"auroc_{group}")
-            for subset in ("all", "untouched"):
+            for subset in subsets:
                 for group in ("common", "extra"):
                     cell = intervals.get(subset, {}).get(f"two_axis - {row}:auroc_{group}")
                     key = f"{subset}_two_axis_minus_{group}"
@@ -237,17 +239,20 @@ def iqa_table(config) -> list:
         writer.writeheader()
         writer.writerows(rows)
     temporary.replace(config.run / "summary.csv")
+    where = "on all images and on the untouched ones" if len(subsets) == 2 else "on all images"
+    if len(subsets) == 2:
+        header = ("| Detector | Row | AUROC all: common / extra | untouched: common / extra | Two-axis − row, all: "
+                  "common | extra | untouched: common | extra |")
+    else:
+        header = "| Detector | Row | AUROC all: common / extra | Two-axis − row, all: common | extra |"
     lines = ["# The two-axis score against four image-quality baselines", "",
-             "Each row's AUROC, and the two-axis score minus it with 95% paired bootstrap intervals, on all images and on "
-             "the untouched ones.", "",
-             "| Detector | Row | AUROC all: common / extra | untouched: common / extra | Two-axis − row, all: common | "
-             "extra | untouched: common | extra |", "|---|---|---|---|---|---|---|---|"]
+             f"Each row's AUROC, and the two-axis score minus it with 95% paired bootstrap intervals, {where}.", "",
+             header, "|" + "---|" * (2 + 3 * len(subsets))]
     for r in rows:
         aurocs = [" / ".join("–" if r[f"{s}_auroc_{g}"] is None else f"{r[f'{s}_auroc_{g}']:.3f}"
-                             for g in ("common", "extra")) for s in ("all", "untouched")]
+                             for g in ("common", "extra")) for s in subsets]
         cells = [f"{_cell(r[k])} [{_cell(r[k + '_low'])}, {_cell(r[k + '_high'])}]"
-                 for k in ("all_two_axis_minus_common", "all_two_axis_minus_extra",
-                           "untouched_two_axis_minus_common", "untouched_two_axis_minus_extra")]
+                 for k in (f"{s}_two_axis_minus_{g}" for s in subsets for g in ("common", "extra"))]
         lines.append(f"| {r['detector']} | {SHORT_LABELS[r['row']]} | " + " | ".join(aurocs + cells) + " |")
     temporary = config.run / ".summary.md.tmp"
     temporary.write_text("\n".join(lines) + "\n")

@@ -253,3 +253,25 @@ def test_timing_records_each_model_and_the_detector(config):
 def test_first_applies_to_the_pass_and_report_only(config, tmp_path):
     with pytest.raises(SystemExit):
         stage.main(["fit", "--config", str(tmp_path / "iqa.toml"), "--first", "2"])
+
+
+def test_the_iqa_protocol_names_the_benchmark(config):
+    cityscapes = replace(config, base=replace(config.base, benchmark="cityscapes"))
+    stage._manifest(cityscapes, FakeIqa("cpu"))
+    assert json.loads(cityscapes.layout.manifest.read_text())["protocol"]["dataset"] == "cityscapes"
+
+
+def test_the_iqa_table_of_a_benchmark_without_a_screening_history_has_no_untouched_columns(config):
+    config = replace(config, base=replace(config.base, benchmark="cityscapes"))
+    head = {row: {"auroc_common": 0.6, "auroc_extra": 0.55} for row in ROWS}
+    cell = {"point": 0.3, "low": 0.28, "high": 0.32}
+    intervals = {"all": {f"two_axis - {row}:auroc_{g}": cell for row in ROWS for g in ("common", "extra")}}
+    for name in config.detectors:
+        folder = config.layout.report(name)
+        folder.mkdir(parents=True)
+        (folder / "summary.json").write_text(json.dumps({"headline": {"all": head}, "intervals": intervals}))
+    rows = stage.iqa_table(config)
+    assert not any(key.startswith("untouched") for key in rows[0])
+    lines = (config.run / "summary.md").read_text().splitlines()
+    assert "untouched" not in "\n".join(lines)
+    assert lines[4] == "| Detector | Row | AUROC all: common / extra | Two-axis − row, all: common | extra |"

@@ -118,16 +118,18 @@ def config(tmp_path, images, monkeypatch):
     return stage.load_config(tmp_path / "detectors.toml")
 
 
-def _write_summary(folder, two_axis, cdf, subsets=("all", "untouched"), level="confirmed"):
+def _write_summary(folder, two_axis, cdf, subsets=("all", "untouched"), level="confirmed", decisions=True):
     head = {"two_axis": {"auroc_common": two_axis, "auroc_extra": two_axis - 0.05},
             "cdf": {"auroc_common": cdf, "auroc_extra": cdf - 0.02},
             "cdf_sum": {"auroc_common": cdf + 0.01, "auroc_extra": cdf},  # sensitivity rows, ahead of the CDFs
             "hashemi_enc": {"auroc_common": cdf + 0.02, "auroc_extra": cdf},
             "saod_top3": {"auroc_common": 0.6, "auroc_extra": 0.6}}
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / "summary.json").write_text(json.dumps({
-        "images": 5000, "clean_map": 0.45, "headline": {s: head for s in subsets}, "headline_decision": "confirmed",
-        "level_decision": level, "by_severity": {"all": {"two_axis": {"common": [two_axis - 0.1] * 5}}}}))
+    summary = {"images": 5000, "clean_map": 0.45, "headline": {s: head for s in subsets},
+               "by_severity": {"all": {"two_axis": {"common": [two_axis - 0.1] * 5}}}}
+    if decisions:
+        summary.update(headline_decision="confirmed", level_decision=level)
+    (folder / "summary.json").write_text(json.dumps(summary))
 
 
 def test_the_detectors_config_gives_one_settings_per_detector(config):
@@ -336,3 +338,19 @@ def test_the_check_reads_the_val_images_in_city_folders(tmp_path, monkeypatch):
     stage.check(config)
     manifest = json.loads(config.settings("yolo11m").layout.manifest.read_text())
     assert manifest["check"]["images"] == 4 and manifest["protocol"]["dataset"] == "cityscapes"
+
+
+def test_the_cross_table_of_a_benchmark_without_a_screening_history_has_no_decisions(config):
+    config = replace(config, base=replace(config.base, benchmark="cityscapes"))
+    _write_summary(RunLayout(config.reference_run).report("cityscapes"), 0.88, 0.80, subsets=("all",),
+                   decisions=False)
+    for name in config.detectors:
+        _write_summary(config.settings(name).layout.report("cityscapes"), 0.85, 0.79, subsets=("all",),
+                       decisions=False)
+    rows = stage.cross_table(config)
+    assert [r["detector"] for r in rows] == ["rtdetrv2_r18", "yolo11m", "rfdetr_m"]
+    assert "headline_decision" not in rows[0] and "untouched_two_axis_auroc_common" not in rows[0]
+    text = (config.run / "summary.md").read_text()
+    assert text.startswith("# The two-axis score on three Cityscapes-C detectors")
+    assert "ntouched" not in text and "Headline" not in text
+    assert "| yolo11m | 5000 | 0.450 | 0.850 / 0.800 |" in text

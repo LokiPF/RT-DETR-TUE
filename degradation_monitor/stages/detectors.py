@@ -49,7 +49,7 @@ from ..cli import positive_int
 from ..datasets.coco import coco_map, coco_results, list_images
 from ..detectors import DETECTORS, LEVELS, adapter_class, load_adapter
 from ..evaluation.metrics import stage_zstats, zscored_sum
-from ..evaluation.report import OURS
+from ..evaluation.report import NUMBER_WORDS, OURS, TITLES
 from ..method.statistics import KEYS, channel_statistics
 from ..runs import Manifest, RunLayout, atomic_json, atomic_npz, load_npz, progress, sha1
 from ..settings import load_settings
@@ -388,15 +388,22 @@ def _cell(value) -> str:
 
 
 def cross_table(config) -> list:
-    """RT-DETR's and every detector's headline: the two-axis score, the CDFs, the best baseline and the clean mAP."""
-    sources = {"rtdetrv2_r18": RunLayout(config.reference_run).report() / "summary.json"}
-    sources.update({name: config.settings(name).layout.report() / "summary.json" for name in config.detectors})
+    """RT-DETR's and every detector's headline: the two-axis score, the CDFs, the best baseline and the clean mAP.
+
+    A benchmark without a screening history has neither untouched images nor decisions: their columns are left out.
+    """
+    dataset = config.base.dataset
+    subsets = ("all", "untouched") if dataset.screened else ("all",)
+    sources = {"rtdetrv2_r18": RunLayout(config.reference_run).report(dataset.name) / "summary.json"}
+    sources.update({name: config.settings(name).layout.report(dataset.name) / "summary.json"
+                    for name in config.detectors})
     rows = []
     for name, path in sources.items():
         summary = json.loads(path.read_text())
-        row = {"detector": name, "images": summary["images"], "clean_map": summary["clean_map"],
-               "headline_decision": summary["headline_decision"], "level_decision": summary["level_decision"]}
-        for subset in ("all", "untouched"):
+        row = {"detector": name, "images": summary["images"], "clean_map": summary["clean_map"]}
+        if dataset.screened:
+            row.update(headline_decision=summary["headline_decision"], level_decision=summary["level_decision"])
+        for subset in subsets:
             for method in ("two_axis", "cdf"):
                 for group in ("common", "extra"):
                     row[f"{subset}_{method}_auroc_{group}"] = _auroc(summary, subset, method, group)
@@ -410,20 +417,29 @@ def cross_table(config) -> list:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    lines = ["# The two-axis score on four COCO detectors", "",
-             "AUROC, common / extra families. Untouched: positions 1970 and later.", "",
-             "| Detector | Images | Clean mAP | Two-axis, all | Two-axis, untouched | Two-axis, severity 1 common "
-             "| CDFs, all | Best baseline, common | Headline | Level rule |",
-             "|---|---|---|---|---|---|---|---|---|---|"]
+    count = NUMBER_WORDS[len(rows)] if len(rows) < len(NUMBER_WORDS) else str(len(rows))
+    lines = [f"# The two-axis score on {count} {TITLES.get(dataset.name, dataset.name)} detectors", ""]
+    if dataset.screened:
+        lines += ["AUROC, common / extra families. Untouched: positions 1970 and later.", "",
+                  "| Detector | Images | Clean mAP | Two-axis, all | Two-axis, untouched | Two-axis, severity 1 common "
+                  "| CDFs, all | Best baseline, common | Headline | Level rule |",
+                  "|---|---|---|---|---|---|---|---|---|---|"]
+    else:
+        lines += ["AUROC, common / extra families, on all images.", "",
+                  "| Detector | Images | Clean mAP | Two-axis | Two-axis, severity 1 common | CDFs "
+                  "| Best baseline, common |", "|---|---|---|---|---|---|---|"]
     for r in rows:
-        lines.append(
-            f"| {r['detector']} | {r['images']} | {_cell(r['clean_map'])} "
-            f"| {_cell(r['all_two_axis_auroc_common'])} / {_cell(r['all_two_axis_auroc_extra'])} "
-            f"| {_cell(r['untouched_two_axis_auroc_common'])} / {_cell(r['untouched_two_axis_auroc_extra'])} "
-            f"| {_cell(r['two_axis_severity1_common'])} "
-            f"| {_cell(r['all_cdf_auroc_common'])} / {_cell(r['all_cdf_auroc_extra'])} "
-            f"| {r['best_baseline']} {_cell(r['best_baseline_auroc_common'])} | {r['headline_decision']} "
-            f"| {r['level_decision']} |")
+        cells = [r["detector"], str(r["images"]), _cell(r["clean_map"]),
+                 f"{_cell(r['all_two_axis_auroc_common'])} / {_cell(r['all_two_axis_auroc_extra'])}"]
+        if dataset.screened:
+            cells.append(f"{_cell(r['untouched_two_axis_auroc_common'])} / "
+                         f"{_cell(r['untouched_two_axis_auroc_extra'])}")
+        cells += [_cell(r["two_axis_severity1_common"]),
+                  f"{_cell(r['all_cdf_auroc_common'])} / {_cell(r['all_cdf_auroc_extra'])}",
+                  f"{r['best_baseline']} {_cell(r['best_baseline_auroc_common'])}"]
+        if dataset.screened:
+            cells += [r["headline_decision"], r["level_decision"]]
+        lines.append("| " + " | ".join(cells) + " |")
     (config.run / "summary.md").write_text("\n".join(lines) + "\n")
     return rows
 
