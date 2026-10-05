@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -93,3 +94,45 @@ def test_the_data_file_names_the_8_classes_in_order_and_points_at_the_dataset():
     assert data["names"] == dict(enumerate(yolo11m.CLASSES))
     assert Path(data["path"]) == yolo11m.DATASET
     assert (data["train"], data["val"]) == ("images/train", "images/val")
+
+
+class FakeYolo:
+    """Records what the script asks of Ultralytics' YOLO, without loading a model."""
+    calls = []
+
+    def __init__(self, weights):
+        FakeYolo.calls.append(("load", weights))
+
+    def train(self, **arguments):
+        FakeYolo.calls.append(("train", arguments))
+
+    def val(self, **arguments):
+        FakeYolo.calls.append(("val", arguments))
+        return SimpleNamespace(box=SimpleNamespace(map=0.3, map50=0.5))
+
+
+@pytest.fixture
+def fake_yolo(tmp_path, monkeypatch):
+    FakeYolo.calls = []
+    monkeypatch.setattr("ultralytics.YOLO", FakeYolo)
+    monkeypatch.setattr(yolo11m, "RUNS", tmp_path / "runs")
+    monkeypatch.setattr(yolo11m, "cap_gpu_memory", lambda gib: FakeYolo.calls.append(("cap", gib)))
+    monkeypatch.chdir(tmp_path)  # train() moves into RUNS; this puts the working folder back afterwards
+    return FakeYolo.calls
+
+
+def test_train_passes_the_standard_recipe_and_nothing_else(fake_yolo, tmp_path):
+    yolo11m.train()
+    yolo11m.train(smoke=True)
+    where = {"data": str(yolo11m.DATA_YAML), "imgsz": 640, "batch": 16, "device": 0, "project": str(tmp_path / "runs")}
+    load = ("load", str(yolo11m.COCO_WEIGHTS))
+    assert fake_yolo == [("cap", 12.0), load, ("train", {**where, "epochs": 100, "name": "train"}),
+                         ("cap", 12.0), load, ("train", {**where, "epochs": 1, "name": "smoke"})]
+    assert Path.cwd() == (tmp_path / "runs").resolve()  # the AMP check downloads yolo11n.pt here, not into the repo
+
+
+def test_val_measures_the_frozen_weights_at_640(fake_yolo, tmp_path):
+    assert yolo11m.val() == (0.3, 0.5)
+    assert fake_yolo == [("cap", 12.0), ("load", str(yolo11m.FROZEN_WEIGHTS)),
+                         ("val", {"data": str(yolo11m.DATA_YAML), "imgsz": 640, "batch": 16, "device": 0,
+                                  "project": str(tmp_path / "runs"), "name": "val"})]
