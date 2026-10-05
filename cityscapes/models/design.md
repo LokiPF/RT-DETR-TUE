@@ -73,7 +73,7 @@ Outside git:
 - **Counts:** the command prints the images and boxes per split. Expected: 2,975 images and 50,347 boxes in train, 500 and 9,792 in val.
 
 **Training (GPU):** `python cityscapes/models/yolo11m.py train`.
-- **`--smoke`:** 1 epoch on 5% of train. It measures peak GPU memory and seconds per epoch, before we ask for the full run.
+- **`--smoke`:** 1 epoch on all of train. It measures peak GPU memory and seconds per epoch, before we ask for the full run. A full epoch rather than 5% of one, so that the startup and the two val passes don't swamp the timing.
 - **The full run:** 100 epochs, expected to take 1–2 h.
 - **Memory cap:** the script caps its own GPU memory at 12 GiB. The smoke run shows whether the peak fits.
 
@@ -90,7 +90,7 @@ For each detector:
 - where the weights are.
 
 Two notes:
-- **Each toolkit evaluates its own detector here.** RT-DETR's numbers come from pycocotools with 100 detections, YOLO's from Ultralytics' own mAP with 300. Plan 2's check stage measures both detectors through our adapters.
+- **Each toolkit evaluates its own detector here.** RT-DETR's numbers come from faster-coco-eval's COCO evaluation with 100 detections, YOLO's from Ultralytics' own mAP with 300. Plan 2's check stage measures both detectors through our adapters.
 - **"640" doesn't mean the same input size.** YOLO letterboxes 2048×1024 to 640×320, while RT-DETR resizes it to 640×640. YOLO therefore sees half the pixels, and every object is half as tall.
 
 ## Tests (CPU)
