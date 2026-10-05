@@ -8,6 +8,7 @@ Both detectors find the 8 Cityscapes instance classes, with ids 0–7 in this or
 | Detector | Weights | AP on val | AP50 |
 |---|---|---|---|
 | RT-DETRv2-R18 | `/home/yuchen/YuchenZ/UE/RT-DETRv2-UE/pretrained_weights/rtdetrv2_r18vd_cityscapes_72e.pth` | 0.382 | 0.590 |
+| YOLO11m | `/home/yuchen/YuchenZ/lab/Detector_test/yolo11m_cityscapes_100e.pt` | 0.356 | 0.569 |
 
 ## RT-DETRv2-R18
 
@@ -42,6 +43,28 @@ Both detectors find the 8 Cityscapes instance classes, with ids 0–7 in this or
 | train | 0.292 | 0.522 |
 | motorcycle | 0.246 | 0.456 |
 | bicycle | 0.283 | 0.530 |
+
+## YOLO11m
+
+- **Recipe:** Ultralytics 8.3.235's standard fine-tune, from the COCO `yolo11m.pt`, at imgsz 640, for 100 epochs at batch 16. Every other argument keeps its default (`runs/cityscapes-yolo11m/train/args.yaml`).
+  - Here `optimizer=auto` picks AdamW at lr 8.3e-4 with momentum 0.9.
+  - Mosaic stops for the last 10 epochs, and the seed is 0.
+  - Ultralytics transfers 643 of the 649 pretrained tensors. It skips only the class head's three last 1×1 convolutions, whose shapes change from 80 classes to 8.
+  - Trained on 5 October 2026, in 36 min.
+- **Files:** `yolo11m.py` makes the labels and image links (`prepare`), trains (`train`) and measures the frozen weights (`val`). `yolo_8cls.yaml` is Ultralytics' data file.
+  - Ultralytics' own `convert_coco` would turn the person class into −1, so `prepare` keeps each `category_id` as the class.
+- **AP per class on val:** Ultralytics' val of the frozen `last.pt` at 640 (`python yolo11m.py val`; 300 detections).
+
+| Class | AP | AP50 |
+|---|---|---|
+| person | 0.362 | 0.596 |
+| rider | 0.377 | 0.607 |
+| car | 0.577 | 0.764 |
+| truck | 0.334 | 0.475 |
+| bus | 0.527 | 0.667 |
+| train | 0.201 | 0.504 |
+| motorcycle | 0.199 | 0.431 |
+| bicycle | 0.271 | 0.510 |
 
 ## Notes
 
