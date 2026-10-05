@@ -138,12 +138,12 @@ def _method_statistics(out) -> dict:
 
 
 def check(config) -> None:
-    """Every detector's clean AP on every COCO val image; refuses a detector below its floor."""
+    """Every detector's clean AP on every val image of the benchmark (COCO's AP@[.5:.95]); refuses one below its floor."""
     failed = []
     for name in config.detectors:
         settings, manifest = config.settings(name), _manifest(config, name)
         gt = settings.dataset.ground_truth()
-        images = list_images(settings.val_images)
+        images = list_images(settings.val_images, settings.dataset.recursive)
         cap_gpu_memory(settings.device, settings.gpu_memory_gib)
         adapter = load_adapter(name, config.weights[name], settings.device)
         _check_precision(manifest, name)
@@ -155,11 +155,11 @@ def check(config) -> None:
         adapter.close()
         ap = coco_map(gt, results, [gt.image_id(p.name) for p in images])
         manifest.update(check={"coco_val_ap": ap, "images": len(images), "floor": config.floors[name]})
-        print(f"[check] {name}: clean COCO val AP = {ap:.4f} on {len(images)} images", flush=True)
+        print(f"[check] {name}: clean {settings.dataset.name} val AP = {ap:.4f} on {len(images)} images", flush=True)
         if ap < config.floors[name]:
             failed.append(f"{name} {ap:.3f} (floor {config.floors[name]})")
     if failed:
-        raise RuntimeError("clean COCO val AP below the floor: " + "; ".join(failed))
+        raise RuntimeError("clean val AP below the floor: " + "; ".join(failed))
 
 
 def _ranges_path(layout) -> Path:

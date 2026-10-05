@@ -33,7 +33,6 @@ from .common import (cap_gpu_memory, check_digests, clean_loader, image_size, me
 
 TIMING_IMAGES = 100
 TIMING_WARMUP = 10
-MIN_CLEAN_AP = 0.45  # the checkpoint's clean COCO val AP is about 0.48
 
 
 def _load_bank(settings, device) -> torch.Tensor:
@@ -62,15 +61,17 @@ def detector_scores(tap, bank, arrays, batch_size, device) -> dict:
 
 
 def check(settings, manifest) -> float:
-    """Every input exists, then the detector's clean AP on every COCO val image: about 0.48 for this checkpoint.
+    """Every input exists, then the detector's clean AP (COCO's AP@[.5:.95]) on every val image of the benchmark.
 
-    run_stage has already recorded the checkpoint's sha256 in the protocol.
+    run_stage has already recorded the checkpoint's sha256 in the protocol. The detector must predict the annotation
+    file's classes, and its AP must reach the benchmark's floor (COCO: 0.45, for a checkpoint AP of about 0.48).
     """
     for name in PATH_FIELDS:
         if name != "run" and not getattr(settings, name).exists():
             raise ValueError(f"{name} does not exist: {getattr(settings, name)}")
-    gt = settings.dataset.ground_truth()
-    images = list_images(settings.val_images)
+    dataset = settings.dataset
+    gt = dataset.ground_truth()
+    images = list_images(settings.val_images, dataset.recursive)
     results = []
     cap_gpu_memory(settings.device, settings.gpu_memory_gib)
     with DetectorTap(settings.checkpoint, settings.device) as tap:
@@ -78,14 +79,18 @@ def check(settings, manifest) -> float:
             chunk = images[start:start + settings.batch_size]
             arrays = [open_rgb(p) for p in chunk]
             logits, boxes, _ = tap.run(arrays, settings.batch_size)
+            if logits.shape[-1] != len(gt.category_ids):
+                raise ValueError(f"the detector predicts {logits.shape[-1]} classes but {settings.annotations.name} "
+                                 f"has {len(gt.category_ids)}: check the checkpoint and the benchmark in the config")
             for path, array, l, b in zip(chunk, arrays, logits, boxes):
                 s, labels, xyxy = top_detections(l, b, image_size(array), TOP_K)
                 results += coco_results(gt.image_id(path.name), s, labels, xyxy, gt.category_ids)
     ap = coco_map(gt, results, [gt.image_id(p.name) for p in images])
     manifest.update(check={"coco_val_ap": ap, "images": len(images)})
-    print(f"[check] clean COCO val AP = {ap:.4f} on {len(images)} images", flush=True)
-    if ap < MIN_CLEAN_AP:
-        raise RuntimeError(f"clean COCO val AP is {ap:.3f}; expected about 0.48 for this checkpoint")
+    print(f"[check] clean {dataset.name} val AP = {ap:.4f} on {len(images)} images", flush=True)
+    if ap < dataset.min_clean_ap:
+        raise RuntimeError(f"clean {dataset.name} val AP is {ap:.3f}; this benchmark's checkpoint should reach "
+                           f"{dataset.min_clean_ap}")
     return ap
 
 

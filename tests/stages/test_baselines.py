@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -337,3 +338,38 @@ def test_the_gpu_cap_limits_the_process_to_its_share_of_the_card(monkeypatch):
     common.cap_gpu_memory("cuda:0", None)
     common.cap_gpu_memory("cpu", 5.5)
     assert calls == [(5.5 / 32, torch.device("cuda:0"))]
+
+
+class EightClassTap(FakeTap):
+    """FakeTap with the Cityscapes detector's 8 classes."""
+
+    def run(self, arrays, batch_size=32):
+        logits, boxes, pooled = super().run(arrays, batch_size)
+        return logits[:, :, :8], boxes, pooled
+
+
+def test_the_check_refuses_a_detector_whose_classes_differ_from_the_annotations(tmp_path, fakes):
+    settings = replace(_settings(tmp_path), benchmark="cityscapes")
+    names = sorted(p.name for p in settings.val_images.iterdir())
+    settings.annotations.write_text(json.dumps({
+        "images": [{"id": i, "file_name": f"val/x/{n}", "width": 64, "height": 48} for i, n in enumerate(names)],
+        "annotations": [], "categories": [{"id": c, "name": str(c)} for c in range(8)]}))
+    with pytest.raises(ValueError, match="predicts 80 classes but ann.json has 8"):
+        run_stage("check", settings)
+
+
+def test_the_check_reads_city_folders_and_holds_the_detector_to_the_benchmarks_floor(tmp_path, monkeypatch):
+    monkeypatch.setattr(stage, "DetectorTap", EightClassTap)
+    val, rng, entries = tmp_path / "cities", np.random.default_rng(1), []
+    for city in ("aachen", "bochum"):
+        (val / city).mkdir(parents=True)
+        for index in range(2):
+            name = f"{city}_{index:06d}_000019_leftImg8bit.png"
+            Image.fromarray(rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)).save(val / city / name)
+            entries.append({"id": len(entries), "file_name": f"val/{city}/{name}", "width": 64, "height": 48})
+    settings = _settings(tmp_path, val_images=val, benchmark="cityscapes")
+    settings.annotations.write_text(json.dumps({"images": entries, "annotations": [],
+                                                "categories": [{"id": c, "name": str(c)} for c in range(8)]}))
+    with pytest.raises(RuntimeError, match=r"clean cityscapes val AP is 0\.000; .* should reach 0\.35"):
+        run_stage("check", settings)
+    assert json.loads(settings.layout.manifest.read_text())["check"]["images"] == 4

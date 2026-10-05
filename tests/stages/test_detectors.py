@@ -315,3 +315,24 @@ def test_the_cross_detector_table_lists_every_detector(config):
     table = (config.run / "summary.md").read_text().splitlines()
     assert table[4].endswith("| Headline | Level rule |") and any(line.startswith("| rfdetr_m |") for line in table)
     assert next(line for line in table if line.startswith("| yolo11m |")).endswith("| confirmed | not confirmed |")
+
+
+def test_the_check_reads_the_val_images_in_city_folders(tmp_path, monkeypatch):
+    rng, entries = np.random.default_rng(2), []
+    for city in ("aachen", "bochum"):
+        (tmp_path / "val" / city).mkdir(parents=True)
+        for index in range(2):
+            name = f"{city}_{index:06d}_000019_leftImg8bit.png"
+            Image.fromarray(rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)).save(tmp_path / "val" / city / name)
+            entries.append({"id": len(entries), "file_name": f"val/{city}/{name}", "width": 64, "height": 48})
+    (tmp_path / "ann.json").write_text(json.dumps({"images": entries, "annotations": [],
+                                                   "categories": [{"id": c, "name": str(c)} for c in range(8)]}))
+    for name in ("rtdetr.pth", "yolo.pt", "rfdetr.pth"):
+        (tmp_path / name).write_bytes(name.encode())
+    (tmp_path / "base.toml").write_text(BASE.format(root=tmp_path, images=tmp_path) + 'benchmark = "cityscapes"\n')
+    (tmp_path / "detectors.toml").write_text(DETECTORS.format(root=tmp_path))
+    monkeypatch.setattr(stage, "load_adapter", lambda name, weights, device: FakeAdapter(name))
+    config = stage.load_config(tmp_path / "detectors.toml")
+    stage.check(config)
+    manifest = json.loads(config.settings("yolo11m").layout.manifest.read_text())
+    assert manifest["check"]["images"] == 4 and manifest["protocol"]["dataset"] == "cityscapes"
