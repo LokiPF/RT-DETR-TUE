@@ -227,7 +227,7 @@ Numbers measured on the screen or on part of the images are recomputed on all 5,
 - **To make:** the 5,000-image bank. **GPU.** The bank-size curve flattens, so it will likely add little.
 - **Status:** supported.
 
-### C5. Fog flattens the channels; noise re-weights them (shown on RT-DETR; the split depends on the detector)
+### C5. Fog flattens the channels; noise re-weights them
 
 This is the core analysis behind the two axes. Everything above the four-detector block at the end is measured on RT-DETRv2-R18.
 
@@ -275,23 +275,27 @@ This is the core analysis behind the two axes. Everything above the four-detecto
   - **The flattening arm is one-sided on purpose, and that has a cost.** *Raising* the contrast or the gain makes the channels peakier (flattening arm 0.08–0.40). Only the level arm sees it, and weakly (contrast ×1.5: 0.63; gain ×2: 0.76). The two-axis score even falls below chance (contrast ×1.5: 0.45). No benchmark family raises contrast, but sharpening or a gain boost would.
 - **In hand, on four detectors** (5 October; `docs/coco-detectors-results.md`, `docs/results/coco-detectors/arms.csv`; all 5,000 images). Each arm's AUROC at severity 1, flattening / level:
 
-  | Detector | Fog | Gaussian noise | Which arm catches which |
+  | Detector | Fog | Gaussian noise | The stronger arm |
   |---|---|---|---|
-  | RT-DETRv2-R18 | 0.97 / 0.51 | 0.20 / 0.96 | fog by the flattening arm, noise by the level arm |
-  | YOLO11m | 0.89 / 0.74 | 0.76 / 0.99 | the same, less sharply |
-  | Faster R-CNN R50-FPN v2 | 0.75 / 0.69 | 0.46 / 0.99 | noise by the level arm; fog by both, moderately |
-  | RF-DETR-M (DINOv2 ViT-S) | 0.67 / 0.90 | 0.96 / 0.89 | swapped: fog by the level arm, noise by the flattening arm |
+  | RT-DETRv2-R18 | 0.97 / 0.51 | 0.20 / 0.96 | flattening under fog, level under noise |
+  | YOLO11m | 0.89 / 0.74 | 0.76 / 0.99 | the same, by smaller margins |
+  | Faster R-CNN R50-FPN v2 | 0.75 / 0.69 | 0.46 / 0.99 | flattening under fog, by 0.06; level under noise |
+  | RF-DETR-M (DINOv2 ViT-S) | 0.67 / 0.90 | 0.96 / 0.89 | swapped: level under fog, flattening under noise |
 
   - RT-DETR's rows reproduce the numbers above (`arms.csv` equals `arms_by_family.csv` to its rounding).
   - **On YOLO11m noise also moves the flattening arm**, the right way: 0.76 at severity 1 and 0.95 at severity 3. On RT-DETR it points the wrong way.
-  - **On Faster R-CNN the flattening arm points the wrong way under strong blur and loss of contrast.** It gives 0.60 / 0.47 / 0.30 on defocus blur at severities 1 / 3 / 5, and 0.73 / 0.69 / 0.43 on contrast. Yet the unsigned peak-share row still catches its corruptions (0.888 common). So its peak shares move, but not in one direction across channels.
+  - **On Faster R-CNN the flattening arm points the wrong way under strong blur and loss of contrast.** It gives 0.60 / 0.47 / 0.30 on defocus blur at severities 1 / 3 / 5, and 0.73 / 0.69 / 0.43 on contrast. Yet the unsigned peak-share row still catches its corruptions (0.888 common).
   - **The ViT's swap showed first on the 300 development images** that chose its blocks: fog 0.676 / 0.916 and Gaussian noise 0.981 / 0.902 (`docs/results/coco-detectors/tap-exploration/vit_taps.log`).
   - **Contrast splits like fog** on RT-DETR, YOLO11m and RF-DETR-M, and the other noises like Gaussian noise on every detector.
   - **The larger arm catches both on every detector.** At severity 1 the two-axis score reaches 0.95 / 0.84 / 0.80 / 0.89 on fog and 0.93 / 0.97 / 0.99 / 0.94 on Gaussian noise (RT-DETR, YOLO11m, Faster R-CNN, RF-DETR-M).
 - **Status:** measured on all images. On RT-DETR the pure operations support the mechanism: losses of contrast and of sharpness flatten, noise re-weights, and the veil's shape does nothing. Why the peaks fall more than the average (the batch norm's fixed offsets) is still a hypothesis.
-  - **The split is not a property of every detector.** YOLO11m behaves like RT-DETR, Faster R-CNN's channels do not flatten together under blur, and RF-DETR-M's ViT swaps the two roles.
-  - So the paper can state "fog flattens, noise re-weights" for RT-DETR and YOLO11m only. For all four it can state only that the larger arm catches both.
-  - Why the ViT swaps the roles, and why Faster R-CNN's blurred channels do not flatten together, are open. Neither was tested; the pure operations above ran on RT-DETR only.
+  - **Which arm is the stronger differs by detector.**
+    - Under fog the flattening arm is above chance on all four, at every severity: RF-DETR-M 0.67–0.85, Faster R-CNN 0.74–0.77.
+    - Under Gaussian noise the level arm reaches 0.89–0.99 at severity 1 on all four.
+    - At severity 1, the flattening arm is the stronger under fog on RT-DETR, YOLO11m and Faster R-CNN, and the level arm on RF-DETR-M. Under noise the level arm is the stronger on all but RF-DETR-M.
+  - **Why the stronger arm differs between detectors is open.**
+    - On Faster R-CNN the unsigned peak-share row (0.888 common) catches what the signed flattening arm (0.550) misses, and under noise and strong blur the signed arm points peakier on average.
+    - Whether the signs differ across channels, stages or images was not measured. The pure operations above ran on RT-DETR only.
 
 ### C6. One axis or the other, so the score takes the larger arm
 
@@ -397,7 +401,7 @@ The evidence tables of 2 October rule out these as well:
 - **No "the veil's pattern is what the detector sees in fog".** The plasma's zero-mean pattern alone scores 0.498; the loss of contrast does the work (C5).
 
 The four-detector run of 5 October rules out these as well (`docs/coco-detectors-results.md`):
-- **No "fog flattens the channels" for detectors in general.** On RF-DETR-M's ViT, fog moves the levels (level arm 0.90 at severity 1) more than it flattens them (0.67), and noise flattens them (0.96). Say it of RT-DETR and YOLO11m (C5).
+- **No "the flattening arm catches fog and the level arm catches noise" on every detector.** Which arm is the stronger differs. On RF-DETR-M the level arm is the stronger under fog (0.90 against 0.67 at severity 1), and the flattening arm under Gaussian noise (0.96 against 0.89) (C5).
 - **No "the flattening arm always adds over the level score".** On Faster R-CNN it adds +0.001 [−0.002, +0.003] on the common families, and the headline rule is partial there (C7).
 
 ### Evidence plan, by cost
@@ -431,7 +435,6 @@ The four-detector run of 5 October rules out these as well (`docs/coco-detectors
 **Title (open).**
 - "Fog Flattens, Noise Shifts: Detecting Image Corruption in a Frozen Object Detector"
 - "Fog Flattens, Noise Re-weights: …", which is closer to C5: noise moves the channel levels in both directions and leaves their sum alone. "Shifts" still holds if it means that the levels move.
-- **Note for both "Fog Flattens" titles (5 October):** the split holds on RT-DETR and YOLO11m, but RF-DETR-M's ViT swaps it (C5). Such a title describes RT-DETR's channels, not every detector's.
 - "Training-Free Corruption Detection from a Detector's Early Channels"
 
 **Abstract (five sentences).**
@@ -481,7 +484,7 @@ The four-detector run of 5 October rules out these as well (`docs/coco-detectors
 
 **5. Experimental protocol**
 - Detector: RT-DETRv2-R18, COCO, AP 0.479.
-  - For the several-detectors results: YOLO11m, Faster R-CNN R50-FPN v2 and RF-DETR-M, frozen, with clean AP 0.505 / 0.469 / 0.545, read by the tap rule (`docs/coco-detectors-results.md`).
+  - For the several-detectors results: YOLO11m, Faster R-CNN R50-FPN v2 and RF-DETR-M, frozen, with clean AP 0.505 / 0.469 / 0.545, read by the tap rule. YOLO11m's and RF-DETR-M's taps were chosen on 300 development images from positions 0–1969 (`docs/coco-detectors-results.md`).
 - Corruptions: 15 common + 4 extra families, severities 1–5, one seeded draw per image.
 - Metrics: AUROC (main), AUPR and FPR95; paired image bootstrap, 1,000 draws.
 - Image sets: all 5,000, the 3,030 untouched, the 4,800 held out.
@@ -496,7 +499,7 @@ The four-detector run of 5 October rules out these as well (`docs/coco-detectors
   - **Ahead of the activation CDFs on all four,** on both family groups and on all and the untouched images, every interval above 0. On all images the gain is +0.044 to +0.096 on the common families and +0.035 to +0.056 on the extra ones.
   - **At severity 1 too:** 0.863 / 0.825 / 0.794 / 0.786 against the CDFs' 0.707 / 0.729 / 0.701 / 0.703 (common).
   - **The headline rule is confirmed on three detectors and partial on Faster R-CNN,** where the flattening adds nothing over the level score on the common families (+0.001 [−0.002, +0.003]). Report it as it came out.
-  - **Which arm catches fog and which catches noise depends on the detector** (C5). The larger arm catches both on all four.
+  - **Which arm is the stronger under fog and under noise depends on the detector** (C5). The larger arm catches both on all four.
 - **Ablations:**
   - the ladder: global level → similar-scene level → peak share → two-axis;
   - k and bank size (`ablation_k.csv`, `ablation_bank.csv`, `figures/ablation.pdf`);
@@ -515,7 +518,7 @@ The four-detector run of 5 October rules out these as well (`docs/coco-detectors
 - Brightness, saturation and hue changes keep the spatial structure, and barely move the early channels (claim C8).
 - The flattening arm is one-sided: a change that makes the channels peakier, such as more contrast or sharpening, is seen only by the level arm (C5).
 - The reference must match the deployment camera.
-- Four detectors so far. On Faster R-CNN the flattening adds nothing over the level score on the common families, and which arm catches fog or noise depends on the detector (Section 6, C5).
+- Four detectors so far. On Faster R-CNN the flattening adds nothing over the level score on the common families, and which arm is the stronger under fog or noise depends on the detector (Section 6, C5).
 - Synthetic corruptions on COCO.
 
 **9. Conclusion.** Restate the two observations and the one-sentence story. The monitor costs almost nothing, because it reuses what the detector already computes.
@@ -533,7 +536,6 @@ The four-detector run of 5 October rules out these as well (`docs/coco-detectors
 | Table 2: ablation ladder | data in hand, with k and bank size (`figures/ablation.pdf`) |
 | Table 3: families at severities 1 / 3 / 5 | data in hand |
 | Table 4: driving data | to make |
-| Table 5: four detectors, all and untouched images | data in `docs/results/coco-detectors/` (`summary.md`, each detector's report, `arms.csv`) |
 | Runtime (ms per image) | to make |
 
 ## Writing rules for a natural read
@@ -561,7 +563,7 @@ The four-detector run of 5 October rules out these as well (`docs/coco-detectors
 |---|---|
 | "COCO is not driving." | Section 7, driving data (to make) |
 | "Synthetic corruptions only." | Foggy Cityscapes and ACDC (to make) |
-| "Isn't this just NMD or Mahalanobis on channel means?" | The ladder: content matching adds +0.04, the second axis +0.08 on common (RT-DETR). On YOLO11m, Faster R-CNN and RF-DETR-M, content matching adds +0.036 / +0.039 / +0.046 and the second axis +0.019 / +0.001 / +0.036 (Section 6) |
+| "Isn't this just NMD or Mahalanobis on channel means?" | The ladder: content matching adds +0.04, the second axis +0.08 on common (RT-DETR). On YOLO11m, Faster R-CNN and RF-DETR-M, content matching adds +0.036 / +0.039 / +0.046 on the 4,800 held-out images, and the second axis +0.019 / +0.001 / +0.036 on all images (Section 6) |
 | "Tuned on the test set?" | Pre-registered rules; the untouched 3,030 images give the same result |
 | "Sensitive to k or the bank?" | k ablation (flat on the screen); bank-size ablation (to make) |
 | "Why not an image-quality model?" | Image-quality baselines (open) |

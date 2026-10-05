@@ -38,7 +38,11 @@ The pre-registered outcomes, as each detector's `summary.json` gives them:
 - **The margin is smaller off RT-DETR.** On the common families it is +0.096 on RT-DETR, against +0.055, +0.048 and +0.044 on YOLO11m, Faster R-CNN and RF-DETR-M.
 - **The flattening arm adds over the level score on three of the four detectors.** On Faster R-CNN it adds +0.001 [−0.002, +0.003] on the common families on all images, and +0.001 [−0.003, +0.004] on the untouched ones. Both intervals include 0, so the rule's last clause fails and the headline is partial there. The section on Faster R-CNN below shows why.
 - **The level score's rule holds on all four.**
-- **RT-DETR's split of the arms does not carry over as such.** On RT-DETR fog flattens the channels and noise re-weights them, and YOLO11m behaves the same way. Faster R-CNN's flattening arm is weak, and on RF-DETR-M's ViT the two arms swap roles. The two-axis score still catches fog and noise on every detector.
+- **Which arm is the stronger under fog and under noise differs by detector.**
+  - Under fog the flattening arm is above chance on all four, at every severity. Under Gaussian noise the level arm reaches 0.89–0.99 at severity 1 on all four.
+  - At severity 1, the flattening arm is the stronger under fog on RT-DETR, YOLO11m and Faster R-CNN, and the level arm on RF-DETR-M. Under Gaussian noise the level arm is the stronger on all but RF-DETR-M.
+  - Noise also raises YOLO11m's flattening arm, from 0.76 at severity 1 to 1.00 at severity 5, while RT-DETR's falls from 0.20 to 0.00.
+  - The two-axis score catches fog and noise on every detector.
 
 ## The four detectors
 
@@ -186,16 +190,26 @@ So the two scores are tied on AUROC. On the other two metrics they split: the tw
 | Faster R-CNN R50-FPN v2 | **0.550 / 0.495** | 0.862 / 0.871 | 0.863 / 0.852 |
 | RF-DETR-M | 0.820 / 0.779 | 0.808 / 0.814 | 0.844 / 0.823 |
 
-The level arm's AUROC equals the report's level row in every condition. On RT-DETR the flattening arm is weak on average too (0.698), but it is strong exactly where the level misses. On Faster R-CNN it is not:
+The level arm's AUROC equals the report's level row in every condition. On RT-DETR the flattening arm is weak on average too (0.698), but it is strong where the level misses. Averaged over the severities, it gives 0.987 / 0.987 / 0.955 on fog, contrast and zoom blur, against the level's 0.567 / 0.686 / 0.707. On Faster R-CNN it is not:
 - **Where the level is weak, the flattening arm is weak too.** At severity 1, fog gives 0.75 for the flattening arm and 0.69 for the level arm; on RT-DETR it gives 0.97 and 0.51. Averaged over the five severities, Faster R-CNN's level arm reaches 0.732 on fog and 0.877 on contrast, against 0.567 and 0.686 on RT-DETR, so it leaves less to add. On zoom blur both levels are weak (0.703 and 0.707), but Faster R-CNN's flattening arm reaches only 0.59–0.71 across the severities, against 0.93–0.97 on RT-DETR.
-- **On the blurs, the flattening arm falls below chance as the blur grows.** It gives 0.60 / 0.47 / 0.30 on defocus blur at severities 1 / 3 / 5, 0.59 / 0.43 / 0.19 on Gaussian blur, and 0.73 / 0.69 / 0.43 on contrast. Below 0.5 the arm points the wrong way: relative to their neighbours, the corrupted images' channels come out *peakier* than the clean images' do, not flatter. On RT-DETR the same arm rises with the blur (defocus 0.96 / 0.99 / 0.99).
+- **On four of the five blurs, the flattening arm falls below chance as the blur grows.** At severities 1–5:
+  - defocus blur: 0.60 / 0.55 / 0.47 / 0.37 / 0.30;
+  - Gaussian blur: 0.59 / 0.54 / 0.43 / 0.33 / 0.19;
+  - glass blur falls below chance only at severity 5 (0.45), and motion blur at severities 4 and 5 (0.49 and 0.44);
+  - zoom blur stays above chance, between 0.59 and 0.71, and ends at 0.71;
+  - contrast falls below chance at severity 5: 0.73 / 0.73 / 0.69 / 0.59 / 0.43.
+
+  Below 0.5 the arm points the wrong way. Its signed average, over channels and stages and each image against its own neighbours, rates the corrupted images as *peakier* than the clean ones, not flatter. On RT-DETR the same arm rises with the blur (defocus 0.96 / 0.98 / 0.99 / 0.99 / 0.99).
 - **So the larger arm gains on some families and loses on others.** Two-axis minus level, averaged over the five severities:
   - gains: fog +0.090, zoom blur +0.064, contrast +0.032, elastic transform +0.013, JPEG +0.011;
   - losses: brightness −0.080, frost −0.036, glass blur −0.033, motion blur −0.024, defocus blur −0.021, snow −0.007; the other four families are within ±0.001;
   - over the 75 common conditions this nets +0.001. On RT-DETR the same comparison gains +0.405 on fog, +0.293 on contrast and +0.223 on zoom blur, and nets +0.076.
-- **The peak share does move; its signed average over channels does not.** The unsigned peak-share row (the mean |change| over channels) is Faster R-CNN's best row on the common families: 0.888 [0.885, 0.892], ahead of the two-axis score by +0.025 [+0.022, +0.029]. The signed flattening arm, which averages the same changes with their sign, reaches 0.550. So under these corruptions Faster R-CNN's peak shares change, but not in one direction across channels.
+- **The unsigned peak-share row catches what the signed arm misses.** Both compare each channel's peak share with its 50 neighbours' and average over the channels. The peak-share row averages the changes without their sign; the flattening arm keeps the sign.
+  - On Faster R-CNN the unsigned row is the best row on the common families: 0.888 [0.885, 0.892], ahead of the two-axis score by +0.025 [+0.022, +0.029]. The signed arm reaches 0.550.
+  - Under noise and strong blur, the signed arm points peakier on average. It gives 0.46 / 0.26 / 0.08 / 0.02 / 0.01 on Gaussian noise at severities 1–5. At severity 5 it gives 0.30 on defocus blur and 0.19 on Gaussian blur.
+  - Whether the signs differ across channels, across stages or across images was not measured.
 
-Choosing the peak-share row for Faster R-CNN now would be a choice made after reading the test images. The pre-registered headline stays the two-axis score, and its outcome on Faster R-CNN stays partial. The data do not show why Faster R-CNN's blurred channels get peakier, or which channels flatten and which sharpen; that was not measured.
+Choosing the peak-share row for Faster R-CNN now would be a choice made after reading the test images. The pre-registered headline stays the two-axis score, and its outcome on Faster R-CNN stays partial. Why Faster R-CNN's signed arm points peakier under strong blur, where RT-DETR's points flatter, was not measured either.
 
 ## AUROC by severity
 
@@ -266,17 +280,57 @@ The two-axis score's AUROC at severities 1 / 3 / 5, all images. `*` marks the ex
 
 Each detector's `report.md` has the same table with the peak share, the level, the activation CDFs and DisCoPatch.
 
-**Where a baseline leads by more than 0.03** (each `summary.json`'s `by_family`):
-- **At severity 1 the activation CDFs never lead,** on any family or detector. DisCoPatch and kNN do, on frost, elastic transform, spatter and saturate, and on RF-DETR-M's JPEG. The leading baseline reaches only 0.60–0.66 there.
-- **Brightness and saturate stay weak on every detector,** as on RT-DETR: 0.50–0.54 and 0.50–0.60 at severity 1.
-- **YOLO11m and Faster R-CNN, frost and elastic transform.** DisCoPatch leads on frost at every severity (0.66 / 0.83 / 0.87 at severities 1 / 3 / 5). On elastic transform kNN reaches 0.88–0.89 at severity 5, against 0.70–0.74.
-- **Faster R-CNN, zoom blur:** 0.74 / 0.77 / 0.80, against kNN's 0.82 at severity 3 and SAOD min's 0.87 at severity 5.
-- **RF-DETR-M, elastic transform, JPEG and pixelate.**
-  - The two-axis score stays near chance on elastic transform (0.54 / 0.52 / 0.50) and JPEG (0.57 / 0.60 / 0.61), and reaches only 0.74 on pixelate at severity 5.
-  - DisCoPatch, SAOD min (0.74 and 0.81 at severity 5) and kNN (0.92 on pixelate at severity 5) lead there.
-  - The activation CDFs, which read the method's blocks plus the embeddings, are near chance on elastic transform and JPEG too: 0.49 / 0.49 / 0.51 and 0.52 / 0.52 / 0.57.
+**Every cell where a baseline leads the two-axis score by more than 0.03,** at severities 1, 3 and 5. The table covers all images and the seven baselines of the headline table, wherever the detector has them. The numbers come from each `summary.json`'s `by_family`, to 3 decimals.
 
-## Which arm catches fog and which catches noise
+| Detector | Family | Severity | Two-axis | Baselines ahead by more than 0.03 |
+|---|---|---|---|---|
+| RT-DETRv2-R18 | spatter | 1 | 0.568 | kNN 0.599 |
+|  | saturate | 1 | 0.600 | DisCoPatch 0.653 |
+| YOLO11m | frost | 1 | 0.576 | DisCoPatch 0.658 |
+|  | frost | 3 | 0.758 | DisCoPatch 0.832 |
+|  | frost | 5 | 0.802 | DisCoPatch 0.872 |
+|  | brightness | 3 | 0.586 | activation CDFs 0.633 |
+|  | brightness | 5 | 0.716 | activation CDFs 0.759 |
+|  | elastic transform | 1 | 0.545 | SAOD min 0.583, kNN 0.608, DisCoPatch 0.609 |
+|  | elastic transform | 3 | 0.609 | SAOD top-3 0.665, SAOD min 0.686, kNN 0.751, DisCoPatch 0.677, activation CDFs 0.640 |
+|  | elastic transform | 5 | 0.704 | SAOD top-3 0.769, SAOD min 0.790, kNN 0.877, activation CDFs 0.758 |
+|  | spatter | 1 | 0.531 | kNN 0.617 |
+|  | saturate | 1 | 0.591 | DisCoPatch 0.653 |
+| Faster R-CNN R50-FPN v2 | zoom blur | 3 | 0.769 | kNN 0.820, DisCoPatch 0.820 |
+|  | zoom blur | 5 | 0.800 | SAOD min 0.869, DisCoPatch 0.854 |
+|  | frost | 1 | 0.614 | DisCoPatch 0.658 |
+|  | frost | 3 | 0.781 | kNN 0.831, DisCoPatch 0.832 |
+|  | frost | 5 | 0.817 | kNN 0.863, DisCoPatch 0.872 |
+|  | brightness | 3 | 0.632 | activation CDFs 0.671 |
+|  | brightness | 5 | 0.776 | activation CDFs 0.819 |
+|  | elastic transform | 3 | 0.670 | kNN 0.766 |
+|  | elastic transform | 5 | 0.737 | kNN 0.892 |
+|  | spatter | 1 | 0.550 | kNN 0.600 |
+|  | saturate | 1 | 0.503 | DisCoPatch 0.653 |
+| RF-DETR-M | snow | 5 | 0.885 | activation CDFs 0.929 |
+|  | brightness | 3 | 0.591 | activation CDFs 0.714 |
+|  | brightness | 5 | 0.669 | activation CDFs 0.870 |
+|  | elastic transform | 1 | 0.544 | DisCoPatch 0.609 |
+|  | elastic transform | 3 | 0.522 | SAOD top-3 0.611, SAOD min 0.628, kNN 0.633, DisCoPatch 0.677 |
+|  | elastic transform | 5 | 0.505 | SAOD top-3 0.706, SAOD min 0.735, ContrastiveConf 0.589, kNN 0.718, DisCoPatch 0.721 |
+|  | pixelate | 5 | 0.742 | SAOD top-3 0.879, SAOD min 0.898, kNN 0.922 |
+|  | jpeg compression | 1 | 0.565 | DisCoPatch 0.629 |
+|  | jpeg compression | 3 | 0.602 | SAOD min 0.635, DisCoPatch 0.645 |
+|  | jpeg compression | 5 | 0.611 | SAOD top-3 0.750, SAOD min 0.808, ContrastiveConf 0.686, kNN 0.794 |
+|  | saturate | 1 | 0.563 | DisCoPatch 0.653 |
+|  | saturate | 3 | 0.522 | activation CDFs 0.617 |
+|  | saturate | 5 | 0.759 | activation CDFs 0.918 |
+
+The CDFs' plain channel sum, a sensitivity row, leads only in cells already listed.
+
+- **At severity 1 the activation CDFs never lead,** on any family or detector. Three baselines do, in 12 cells: DisCoPatch, kNN, and SAOD min (on YOLO11m's elastic transform). The best baseline in those cells reaches only 0.60–0.66.
+- **At severity 1 the two-axis score is weak on brightness and saturate on every detector:** 0.50–0.54 and 0.50–0.60.
+- **At severities 3 and 5 the activation CDFs lead on brightness** on YOLO11m, Faster R-CNN and RF-DETR-M. On RF-DETR-M they also lead on saturate, and on snow at severity 5.
+- **RF-DETR-M has the most such cells: 13.**
+  - Its two-axis score stays near chance on elastic transform (0.54 / 0.52 / 0.50) and JPEG (0.57 / 0.60 / 0.61).
+  - The activation CDFs, which read the method's blocks plus the embeddings, are near chance there too: 0.49 / 0.49 / 0.51 and 0.52 / 0.52 / 0.57.
+
+## Which arm is the stronger under fog and under noise
 
 From `arms.csv`, all images. AUROC at severities 1 / 3 / 5:
 
@@ -297,15 +351,22 @@ From `arms.csv`, all images. AUROC at severities 1 / 3 / 5:
 
 Bold marks the stronger arm at severity 1.
 
-- **RT-DETRv2-R18: fog through the flattening arm, noise through the level arm.** Under noise the flattening arm points the wrong way (0.20 at severity 1). This reproduces C5 of `docs/paper-storyline.md`.
-- **YOLO11m: the same split, less sharp.** The level arm also sees fog (0.74 at severity 1). Unlike RT-DETR's, YOLO's flattening arm also rises under noise, to 0.95 at severity 3.
-- **Faster R-CNN: noise through the level arm.** The flattening arm is near chance under noise at severity 1 (0.46) and points the wrong way from severity 2 on (0.26, then 0.08). Fog moves both arms only moderately (0.75 and 0.69), and the two-axis score (0.80) is above either arm alone.
-- **RF-DETR-M: the roles swap.** Fog goes through the level arm (0.90 against 0.67), and noise at severity 1 through the flattening arm (0.96 against 0.89). From severity 3 both arms are at 0.99–1.00 under noise.
+- **RT-DETRv2-R18: the flattening arm is the stronger under fog, the level arm under noise.** The level arm barely sees fog (0.51 / 0.58 / 0.62), and under noise the flattening arm points the wrong way (0.20 at severity 1). This reproduces C5 of `docs/paper-storyline.md`.
+- **YOLO11m: the same stronger arms, by smaller margins.**
+  - The level arm also sees fog (0.74 at severity 1).
+  - Noise also raises the flattening arm: 0.76 / 0.87 / 0.95 / 0.98 / 1.00 at severities 1–5, while RT-DETR's falls from 0.20 to 0.00.
+  - From severity 3 on, YOLO11m's flattening arm reads noise at least as strongly as fog: 0.95 / 0.98 / 1.00, against 0.94 / 0.94 / 0.95.
+- **Faster R-CNN: the level arm is the stronger under noise; under fog the arms are close.**
+  - Under noise the flattening arm is near chance at severity 1 (0.46), and points the wrong way from severity 2 on (0.26, then 0.08).
+  - Under fog the arms give 0.74–0.77 (flattening) and 0.69–0.75 (level) across the severities. The two-axis score (0.80 at severity 1) is above either arm alone.
+- **RF-DETR-M: the stronger arms swap.**
+  - Under fog the level arm is the stronger: 0.90 against 0.67 at severity 1. The flattening arm still rises with the severity, to 0.85 at severity 5.
+  - Under noise the flattening arm is the stronger at severity 1: 0.96 against 0.89. From severity 2 both arms are at 0.98–1.00.
   - The swap showed before the run, on the 300 development images. On the raw block outputs at severity 1, fog gave 0.676 for the flattening arm and 0.916 for the level arm, and Gaussian noise 0.981 and 0.902 (`tap-exploration/vit_taps.log`).
-- **Contrast splits like fog** on RT-DETR, YOLO11m and RF-DETR-M. On Faster R-CNN both arms are near 0.75 at severity 1, and the flattening arm falls to 0.43 at severity 5.
-- **The other three noises split like Gaussian noise** at severity 1 on each detector: shot, impulse and speckle noise. On RF-DETR-M, impulse noise is within 0.01 between the arms (0.98 and 0.97).
+- **Under contrast, the stronger arm at severity 1 is the one under fog** on RT-DETR, YOLO11m and RF-DETR-M. On Faster R-CNN both arms are near 0.75 at severity 1 (0.73 and 0.75), and the flattening arm falls to 0.43 at severity 5.
+- **Under the other three noises, the stronger arm at severity 1 is the one under Gaussian noise** on each detector: shot, impulse and speckle noise. On RF-DETR-M, impulse noise is within 0.01 between the arms (0.98 and 0.97).
 
-**What carries over is not which arm a corruption moves, but that it moves one.** At severity 1 the two-axis score reaches 0.95 / 0.84 / 0.80 / 0.89 on fog and 0.93 / 0.97 / 0.99 / 0.94 on Gaussian noise (RT-DETRv2-R18, YOLO11m, Faster R-CNN, RF-DETR-M). Why the ViT's roles swap was not tested.
+**What carries over is that the larger arm catches both.** At severity 1 the two-axis score reaches 0.95 / 0.84 / 0.80 / 0.89 on fog and 0.93 / 0.97 / 0.99 / 0.94 on Gaussian noise (RT-DETRv2-R18, YOLO11m, Faster R-CNN, RF-DETR-M). Why the stronger arms swap on the ViT was not tested.
 
 ## Clean mAP
 
@@ -337,8 +398,8 @@ Bold marks the stronger arm at severity 1.
 
 ## Not yet shown
 
-- **Why Faster R-CNN's flattening arm is weak.** Its peak shares move under corruption, but not in one direction across channels, and under strong blur its flattening arm points the wrong way. Which channels flatten and which sharpen was not measured.
-- **Why the ViT's arms swap roles.** Fog moves the levels of RF-DETR-M's blocks 1–3, and noise flattens them. No pure-operation test was run on the ViT.
+- **Why Faster R-CNN's flattening arm is weak.** The unsigned peak-share row catches what the signed arm misses (0.888 against 0.550, common), and under noise and strong blur the signed arm points peakier. Whether the signs differ across channels, stages or images was not measured.
+- **Why the stronger arms swap on the ViT.** On RF-DETR-M, fog raises the level arm more than the flattening arm (0.90 against 0.67 at severity 1), and noise does the reverse (0.96 against 0.89). No pure-operation test was run on the ViT.
 - **Why the margin over the CDFs is smaller off RT-DETR.** The method's choices were made on RT-DETR. These data do not say whether that is the reason.
 - **The method's runtime** on the three new detectors.
 - **Real fog and driving data.** All four detectors are tested on synthetic corruptions of COCO images, with a COCO clean bank.
