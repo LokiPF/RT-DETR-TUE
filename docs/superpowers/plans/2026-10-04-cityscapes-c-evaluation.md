@@ -1,3 +1,5 @@
+> **Superseded on 5 October 2026** by `cityscapes/evaluation/design.md` and `cityscapes/evaluation/plan.md`: both detectors, the image-quality baselines, and no pass/fail rule.
+
 # Cityscapes-C Evaluation Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

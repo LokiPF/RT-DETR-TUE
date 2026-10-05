@@ -1,0 +1,12 @@
+# YOLO11m fine-tuned on Cityscapes, on Cityscapes-C (cityscapes/evaluation/design.md). Stages:
+# python -m degradation_monitor.stages.detectors <check|fit|pass|report> --config cityscapes/evaluation/cityscapes-detectors.toml
+base = "cityscapes.toml"  # the dataset, the seed, the device and the workers
+run = "/home/yuchen/YuchenZ/UE/philip_sa/runs/cityscapes-detectors"  # one folder per detector
+reference_run = "/home/yuchen/YuchenZ/UE/philip_sa/runs/cityscapes"  # RT-DETR's run: the digests and DisCoPatch's scores
+gpu_memory_gib = 8.0  # the card is shared
+
+[weights]
+yolo11m = "/home/yuchen/YuchenZ/lab/Detector_test/yolo11m_cityscapes_100e.pt"
+
+[clean_ap_floor]  # Ultralytics' val AP of the frozen weights (0.356) minus 0.03, rounded down
+yolo11m = 0.32

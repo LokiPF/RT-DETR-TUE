@@ -1,0 +1,7 @@
+# The four image-quality baselines on Cityscapes-C (cityscapes/evaluation/design.md). Stages:
+# python -m degradation_monitor.stages.iqa <fit|pass|report> --config cityscapes/evaluation/cityscapes-iqa.toml
+base = "cityscapes.toml"  # the dataset, its train and evaluation images, the seed, the device and the workers
+run = "/home/yuchen/YuchenZ/UE/philip_sa/runs/cityscapes-iqa"
+reference_run = "/home/yuchen/YuchenZ/UE/philip_sa/runs/cityscapes"  # RT-DETR's run: the digests; also a detector run
+detectors_config = "cityscapes-detectors.toml"  # YOLO11m's run folder
+gpu_memory_gib = 16.0  # the card is shared; NIQE (float64) and CLIP read full 2048 x 1024 images
