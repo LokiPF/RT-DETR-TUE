@@ -43,8 +43,8 @@ All images; a negative Δ means the ARNIQA row is ahead. The untouched images gi
 
 - **Both ARNIQA rows are ahead on every detector, with every interval below 0** (table above). ARNIQA quality reaches 0.927 [0.925, 0.929] on the common families and 0.905 [0.903, 0.907] on the extra ones; the prototype 0.946 [0.944, 0.947] and 0.880 [0.878, 0.882].
 - **The margin grows as the two-axis score weakens.** The IQA rows' AUROC is fixed, while the two-axis score's falls from 0.917 [0.914, 0.920] on RT-DETRv2-R18 to 0.844 [0.841, 0.847] on RF-DETR-M (common families). Against ARNIQA quality, the gap on the common families runs from −0.010 on RT-DETRv2-R18 to −0.083 on RF-DETR-M.
-- **On AUROC, NIQE (refit) is ahead only on RF-DETR-M's common families:** two-axis − NIQE (refit) is −0.010 [−0.013, −0.007] on all images and −0.010 [−0.014, −0.007] on the untouched ones. Everywhere else the two-axis score is ahead of it, every interval above 0. The smallest margin is on Faster R-CNN's common families: +0.009 [+0.005, +0.013], and +0.008 [+0.003, +0.013] on the untouched images. The published NIQE is ahead nowhere on AUROC. The two NIQE models differ in their clean images: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model.
-- **On AUROC, the two-axis score is ahead of CLIP-IQA and of the published NIQE in every cell,** by +0.043 to +0.199 and +0.027 to +0.118 on all images, every interval above 0. On FPR95, two NIQE cells go the other way (the FPR95 bullets under "Headline").
+- **On AUROC, NIQE (refit) is ahead only on RF-DETR-M's common families:** two-axis − NIQE (refit) is −0.010 [−0.013, −0.007] on all images and −0.010 [−0.014, −0.007] on the untouched ones. Everywhere else the two-axis score is ahead of it, every interval above 0. The smallest margin is on Faster R-CNN's common families: +0.009 [+0.005, +0.013], and +0.008 [+0.003, +0.013] on the untouched images. There NIQE (refit) has the lower FPR95, 0.338 against 0.348 (the FPR95 bullets under "Headline"). The published NIQE is ahead nowhere on AUROC. The two NIQE models differ in their clean images: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model.
+- **On AUROC, the two-axis score is ahead of CLIP-IQA and of the published NIQE in every cell,** by +0.043 to +0.199 and +0.027 to +0.118 on all images, every interval above 0. On FPR95, the published NIQE has the lower value in one cell, RF-DETR-M's extra families: 0.408 against 0.438 (the FPR95 bullets under "Headline").
 - **Where ARNIQA leads:** averaged over the four detectors, most on saturate and brightness. There the two-axis score gives only 0.50–0.60 and 0.50–0.54 at severity 1. On RF-DETR-M, JPEG and pixelate are also among ARNIQA's largest leads. It leads on frost and fog on every detector, and by wide margins on blur, JPEG and pixelate where a detector's two-axis score is weak on them. **Where the two-axis score leads ARNIQA:**
   - spatter, on every detector;
   - elastic transform, against the quality row on all four detectors and against the prototype on three;
@@ -120,7 +120,7 @@ All images; a negative Δ means the ARNIQA row is ahead. The untouched images gi
 
 ### The GPU's precision against fp32
 
-On the GPU, ARNIQA's encoder runs under autocast and CLIP-IQA with fp16 weights, as their official code runs them. The plan's precision check (Task 6) compared two sets of scores, all 96 versions of the first three evaluation images, 288 values per row (`precision-check.txt`):
+On the GPU, ARNIQA's encoder runs under autocast and CLIP-IQA with fp16 weights, as their official code runs them. `scripts/iqa_precision_check.py`, the plan's precision check (Task 6) with the tie counts added, compared two sets of scores, all 96 versions of the first three evaluation images, 288 values per row (its output is `precision-check.txt`):
 - the GPU scores stored by the pass;
 - the same versions scored again on the CPU in fp32.
 
@@ -135,7 +135,7 @@ On the GPU, ARNIQA's encoder runs under autocast and CLIP-IQA with fp16 weights,
 - **The ranks barely move:** Kendall's τ is 0.9977 or more for every row.
 - **The 3 ties on both devices are identical versions.** In one of the three images, `000000040083.jpg`, the clean version and saturate at severities 1–3 are the same image: their digests match. The digests are stored with the per-image scores in `runs/coco-iqa/`, which is not in git.
 - **CLIP-IQA's fp16 scores tie more often:** 61 of 288 values, against 3 in fp32. How much this costs its AUROC was not measured.
-- NIQE's features are float64 on both devices. Its two rows differ only in the pristine model: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model. Where their small differences come from was not traced.
+- NIQE's features are float64 on both devices. Its two rows differ only in the pristine model: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model. Where NIQE's small differences between the GPU and the CPU come from was not traced.
 
 ## What each model saw in training
 
@@ -296,7 +296,11 @@ AUROC at severities 1 / 3 / 5, all images, from each report's `by_family`. `*` m
 | ARNIQA prototype | 84 | 86 | 81 | 90 |
 | CLIP-IQA | 18 | 26 | 34 | 35 |
 
-The published NIQE is above the two-axis score in more conditions than the refit on every detector, though its AUROC is lower on the common families. More of its conditions are on the extra families: 7 to 10 of the 20, against 5 for the refit. The two NIQE rows differ in their pristine model's clean images: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model.
+The published NIQE is above the two-axis score in more conditions than the refit on every detector, though its AUROC is lower on the common families. By family group, published against refit, on RT-DETRv2-R18, YOLO11m, Faster R-CNN and RF-DETR-M:
+- of the 20 extra-family conditions: 10 / 5, 8 / 5, 7 / 5 and 10 / 5;
+- of the 75 common-family conditions: 31 / 29, 26 / 25, 31 / 32 and 45 / 34.
+
+On the first three detectors the two rows' common-family counts differ by 2 or less, against 2 to 5 on the extra families. On RF-DETR-M they differ by 11 on the common families and by 5 on the extra ones, so most of its gap is on the common families. The two NIQE rows differ in their pristine model's clean images: JPEG-compressed COCO photos for the refit, 125 pristine photos for the published model.
 
 In the rest of this section, a family's lead is the mean, over severities 1–5, of the row's AUROC minus the two-axis score's, from `by_family`. These are point estimates, with no intervals.
 
@@ -310,8 +314,8 @@ In the rest of this section, a family's lead is the mean, over severities 1–5,
 - **Frost and fog, on every detector.**
   - On frost, ARNIQA quality is ahead by 0.088 to 0.221 and the prototype by 0.060 to 0.194.
   - On fog, ARNIQA quality is ahead by 0.003 to 0.154 and the prototype by 0.014 to 0.165. The smallest leads are on RT-DETRv2-R18, whose two-axis score gives 0.95 / 0.98 / 0.99 there: only 0.003 (quality) and 0.014 (prototype).
-- **Blur, JPEG and pixelation, by more where the two-axis score is weaker.** The largest of these leads, for ARNIQA quality and for the prototype:
-  - on Faster R-CNN, zoom blur (0.167 and 0.204) and glass blur (0.138 and 0.153);
+- **Blur, JPEG and pixelation, by more where the two-axis score is weaker.** The two largest leads in these families, for ARNIQA quality and for the prototype:
+  - on Faster R-CNN, zoom blur (0.167 and 0.204), then glass blur for the quality row (0.138) and pixelate for the prototype (0.161);
   - on RF-DETR-M, JPEG (0.256 and 0.400) and pixelate (0.283 and 0.322). There RF-DETR-M's two-axis score stays at 0.57–0.61 and 0.61–0.74 at severities 1 / 3 / 5.
 - **Noise is close to a tie on average, but not at severity 1.**
   - Averaged over the severities, both ARNIQA rows are within 0.024 of the two-axis score on gaussian, shot and impulse noise, on every detector. The largest gap is 0.0234: the prototype on shot noise, on RT-DETRv2-R18.
@@ -419,7 +423,7 @@ Both rows score the same test-image features; only the pristine model differs. *
   - The decisions are therefore unchanged. The headline is confirmed on RT-DETRv2-R18, YOLO11m and RF-DETR-M. On Faster R-CNN it reads "ahead of the activation CDFs, but the flattening adds nothing over the level score on the common families". The level score is confirmed on all four. The IQA rows enter neither rule.
 - **The IQA rows are identical in all four reports:** the headline, the intervals, and the tables by severity and by family.
 - **The corrupted images are the detectors'.** The pass compares every image's 96 digests with `runs/coco/`'s before it scores the image, and it wrote a file for each of the 5,000 images. It refuses a score that is not finite.
-- **NIQE scored every version** (`niqe-blocks.csv`), and the GPU precision check found Kendall's τ of 0.9977 or more for every row (`precision-check.txt`).
+- **NIQE scored every version** (`niqe-blocks.csv`), and the GPU precision check found Kendall's τ of 0.9977 or more for every row (`precision-check.txt`, from `scripts/iqa_precision_check.py`).
 - **Run facts, recorded in no result file:**
   - the plan's own check (Task 8, Step 2) compared the headline and the intervals with the detectors' reports in `runs/`, and found them identical on all four detectors;
   - `runs/coco/` and `runs/coco-detectors/` were listed before the IQA runs, and the listing was the same after them, so the detectors' run folders were left unchanged;
@@ -452,6 +456,6 @@ Everything in `docs/results/coco-iqa/`:
 - `timing.json`: the IQA models' ms per image, with the detector's.
 - `fit.json`: the counts of the NIQE refit and of the ARNIQA prototype.
 - `niqe-blocks.csv`: per condition, the versions with a block that holds a NaN and the versions NIQE could not score.
-- `precision-check.txt`: the GPU's scores against fp32 on the CPU, on three images.
+- `precision-check.txt`: the output of `scripts/iqa_precision_check.py`, the GPU's scores against fp32 on the CPU on three images, with the tied values.
 
 The per-image scores stay in `runs/coco-iqa/` in the main checkout, which is not in git.

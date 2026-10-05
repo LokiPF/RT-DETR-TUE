@@ -17,7 +17,8 @@ The documents behind the paper. Older work is in `archive/`.
   (5 October). Plan: `superpowers/plans/2026-10-05-iqa-baselines-coco-c.md`.
 - `results/coco-iqa/`: each detector's report with the five image-quality rows, the table of all four (`summary.md`,
   `summary.csv`), the timing (`timing.json`), the NIQE refit's counts (`fit.json`), NIQE's block counts per
-  condition (`niqe-blocks.csv`) and the GPU precision check (`precision-check.txt`).
+  condition (`niqe-blocks.csv`) and the GPU precision check (`precision-check.txt`, from
+  `../scripts/iqa_precision_check.py`).
 - `roundtable-2026-10-01-detection/`: the detection roundtable that proposed the two-axis score. Its
   `verify_panel_rows.py` imports the old `differential_uncertainty` package, so run it at the commit named in
   `../archive/README.md`.
