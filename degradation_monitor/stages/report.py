@@ -1,4 +1,4 @@
-"""The report stage: read every stored score and write the report to reports/coco/."""
+"""The report stage: read every stored score and write the report to reports/coco/, or to another folder (out)."""
 from __future__ import annotations
 
 import json

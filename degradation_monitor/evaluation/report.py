@@ -1,4 +1,5 @@
-"""The report: separation of our method and the baselines a detector has (all six for RT-DETR) on four image sets.
+"""The report: separation of our method, the baselines a detector has (all six for RT-DETR) and, when given, the
+five image-quality rows (EXTRA_ROWS), on four image sets.
 
 Every score is oriented so that higher means more likely corrupted. For each image set the report gives:
 - every row's AUROC, AUPR and FPR95 per condition;

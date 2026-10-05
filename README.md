@@ -31,7 +31,7 @@ degradation_monitor/
   stages/                  the runnable, resumable steps
 configs/coco.toml          this machine's paths and run options
 configs/coco-detectors.toml  the further detectors' weights, run root and clean-AP floors
-configs/coco-iqa.toml  the image-quality baselines' run root and reference run
+configs/coco-iqa.toml      the image-quality baselines' run root and reference run
 scripts/convert_runs.py    the one-time conversion of the old run folder
 archive/                   retired methods, read only (archive/README.md)
 docs/                      results, decisions and the dev log (docs/README.md)
@@ -48,10 +48,11 @@ tests/                     mirrors degradation_monitor/
 - **COCO 2017:** `train2017`, `val2017` and `annotations/instances_val2017.json`.
 - **DisCoPatch** (Caetano et al., ICCV 2025): a clone of github.com/caetas/DisCoPatch, with its own requirements. Its
   commit is recorded in each run's `manifest.json`.
-- **pyiqa** (the image-quality baselines): `pip install --no-deps pyiqa==0.1.16 openai-clip==1.0.1 ftfy==6.3.1`.
-  A plain install would add `opencv-python-headless`, whose `cv2` replaces the one of `opencv-python` that
-  imagecorruptions uses, and the corrupted images could change. `pip check` then lists pyiqa's unused optional
-  dependencies; that is expected.
+- **pyiqa** (the image-quality baselines):
+  `pip install --no-deps pyiqa==0.1.16 openai-clip==1.0.1 ftfy==6.3.1 wcwidth==0.8.2`. A plain install would add
+  `opencv-python-headless`, whose `cv2` replaces the one of `opencv-python` that imagecorruptions uses, and the
+  corrupted images could change. `wcwidth` is ftfy's only dependency, which `--no-deps` would leave out. `pip check`
+  then lists the dependencies pyiqa declares but this repository does not use; that is expected.
 
 Then edit the paths in `configs/coco.toml`.
 

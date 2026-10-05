@@ -48,6 +48,11 @@ def test_niqe_needs_one_whole_block():
         iqa.niqe_block_features(torch.zeros(1, 1, 64, 300, dtype=torch.float64))
 
 
+def test_the_protocol_records_the_niqe_floor():
+    assert iqa.NIQE_MIN_BLOCKS == 1
+    assert iqa.IqaModels.protocol["niqe"]["unscorable"] == f"no block without a NaN: {iqa.NIQE_UNSCORABLE:g}"
+
+
 WEIGHTS = [Path(torch.hub.get_dir()) / p for p in ("checkpoints/ARNIQA.pth", "checkpoints/resnet50-0676ba61.pth",
                                                    "pyiqa/regressor_kadid10k.pth", "pyiqa/niqe_modelparameters.mat",
                                                    "clip/RN50.pt")]
@@ -140,7 +145,7 @@ def test_niqe_scores_a_version_with_no_block_free_of_nan_as_most_degraded(models
     models.niqe_refit, models.prototype = iqa.published_niqe(), np.full(4096, 1 / 64.0)
     features = torch.from_numpy(np.random.default_rng(1).uniform(0.1, 1.0, (3, 4, 36)))
     features[1, 1:, 0] = float("nan")  # one block left without a NaN: pyiqa's covariance is zero, its score finite
-    features[2, :, 5] = float("nan")  # none left: pyiqa's NIQE would be NaN
+    features[2, :, 5] = float("nan")  # none left, so pyiqa gives it no score: its covariance is NaN and pinv fails
     monkeypatch.setattr(iqa, "niqe_block_features", lambda luma: (features, None))
     rows = models.niqe_rows([_image()] * 3)
     assert rows["niqe_blocks"].tolist() == [4, 1, 0]

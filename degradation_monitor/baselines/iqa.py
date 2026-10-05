@@ -17,8 +17,8 @@
   positional embedding removed, the softmax of its logits for "Good photo." against "Bad photo.", the first
   probability. On the GPU the weights are fp16, as the official build_model makes them; on the CPU, fp32.
 - NIQE in the scores: a version with no block free of NaN (snow and frost can blank blocks) has no NIQE features, and
-  pyiqa's NIQE is NaN for it. Both NIQE rows give it NIQE_UNSCORABLE, above every real distance, so it counts as
-  degraded; niqe_blocks records each version's count.
+  pyiqa gives it no score: its covariance is NaN and pinv fails. Both NIQE rows give it NIQE_UNSCORABLE, above every
+  real distance, so it counts as degraded; niqe_blocks records each version's count.
 
 Every model reads the uint8 RGB image at its own size.
 """
@@ -77,7 +77,9 @@ def niqe_block_features(luma: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]
 
 
 def niqe_test_model(features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Each image's Gaussian over its blocks: mean (N, 36) and covariance (N, 36, 36), blocks with a NaN left out."""
+    """Each image's Gaussian over its blocks, as pyiqa's NIQE fits it: the mean (N, 36) and the covariance
+    (N, 36, 36). pyiqa's nanmean leaves out each NaN value on its own, feature by feature; only its nancov leaves out
+    whole blocks, every block that holds a NaN."""
     from pyiqa.matlab_utils import nancov, nanmean
 
     return nanmean(features, dim=1), nancov(features)
@@ -127,8 +129,8 @@ class NiqeFit:
 CLIP_PROMPTS = ("Good photo.", "Bad photo.")
 ARNIQA_REGRESSOR = "kadid"
 ARNIQA_CROP = 224  # the paper's crops: the centre and the four corners, of the image and of its half-size version
-# a version needs one block without a NaN: with none, pyiqa's NIQE is NaN; with one, its covariance is zero and its
-# score finite
+# a version needs one block without a NaN. With none, pyiqa gives it no score: its covariance is NaN and pinv fails.
+# With one, its covariance is zero and its score finite.
 NIQE_MIN_BLOCKS = 1
 NIQE_UNSCORABLE = 1e6  # such a version's NIQE score: above every real distance, so it counts as degraded
 ROWS = ("niqe", "niqe_default", "arniqa", "arniqa_proto", "clipiqa")
