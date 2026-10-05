@@ -8,6 +8,8 @@ Every score is oriented so that higher means more likely corrupted. For each ima
 
 It also gives the two pre-registered decisions, each condition's mAP and the kNN baseline's k.
 
+A benchmark without a screening history (Cityscapes-C) passes its own image sets instead and gets no decisions.
+
 The image sets, by position in the seed-44 evaluation order:
 - all: every evaluation image (5,000), the headline, on the same images as every baseline;
 - untouched: positions UNTOUCHED_START and later (3,030), which nobody read while the method was designed;
@@ -67,6 +69,7 @@ BASELINE_FAMILIES = {"SAOD": ("saod_top3", "saod_min"), "ContrastiveConf": ("con
                      "NIQE": ("niqe", "niqe_default"), "ARNIQA": ("arniqa",), "ARNIQA prototype": ("arniqa_proto",),
                      "CLIP-IQA": ("clipiqa",)}  # the title counts the families a report's rows hold
 NUMBER_WORDS = ("no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten")
+TITLES = {"coco": "COCO", "cityscapes": "Cityscapes-C"}  # report titles by benchmark
 REFERENCES = ("two_axis", "level")  # rows whose differences with every other row get intervals
 METRICS = ("auroc", "aupr", "fpr95")
 GROUPS = ("common", "extra")
@@ -242,12 +245,14 @@ def _by_family(separation: list) -> dict:
 
 
 def build_tables(scores: dict, detector: dict, ap, folds, condition_map, *, seed: int,
-                 samples: int = BOOTSTRAP_SAMPLES, workers: int = 1, timing=None) -> tuple[dict, dict]:
+                 samples: int = BOOTSTRAP_SAMPLES, workers: int = 1, timing=None, sets=None,
+                 benchmark: str = "coco") -> tuple[dict, dict]:
     """Every table of the report, and its summary.
 
     `scores` holds every present row except ContrastiveConf as (images, 96) arrays in evaluation order.
     ContrastiveConf is built for each image set, and in every draw, from the detector's Conf+ and Conf- and the
-    clean images' AP.
+    clean images' AP. `sets` is None for COCO, whose screen, held-out and untouched sets and pre-registered decisions
+    come from its history; a benchmark without that history passes its own sets and gets no decisions.
     """
     folds, ap = np.asarray(folds), np.asarray(ap)
 
@@ -261,7 +266,8 @@ def build_tables(scores: dict, detector: dict, ap, folds, condition_map, *, seed
                                                            ap[chosen], folds[chosen])
         return {m: drawn[m] for m in ROWS if m in drawn}, lam
 
-    sets = image_sets(len(folds))
+    screened = sets is None
+    sets = image_sets(len(folds)) if screened else sets
     tables = {"separation": [], "aggregates": [], "intervals": []}
     headline, by_severity, by_family, intervals, lambdas = {}, {}, {}, {}, {}
     for name, rows in sets.items():
@@ -306,6 +312,10 @@ def build_tables(scores: dict, detector: dict, ap, folds, condition_map, *, seed
         "headline": headline, "by_severity": by_severity, "by_family": by_family, "intervals": intervals,
         "labels": {m: LABELS[m] for m in all_scores},
     }
+    if not screened:
+        for key in ("screen_images", "untouched_start", "headline_decision", "level_decision"):
+            del summary[key]
+        summary["benchmark"] = benchmark
     return tables, summary
 
 
@@ -323,12 +333,15 @@ def _cell(point, interval=None, show=_number) -> str:
 
 def _set_title(summary: dict, name: str) -> str:
     n = summary["image_sets"][name]
-    return {"all": f"All {n} images (the headline, on the same images as every baseline)",
-            "untouched": f"Untouched images ({n}, positions {summary['untouched_start']} and later, read by nobody "
-                         "while the method was designed)",
-            "held_out": f"Held-out images ({n}, positions {summary['screen_images']} and later: the pre-registered "
-                        "check of the level score)",
-            "screen": f"The {n} screening images"}[name]
+    if name == "all":
+        return f"All {n} images (the headline, on the same images as every baseline)"
+    if name == "untouched":
+        return (f"Untouched images ({n}, positions {summary['untouched_start']} and later, read by nobody "
+                "while the method was designed)")
+    if name == "held_out":
+        return (f"Held-out images ({n}, positions {summary['screen_images']} and later: the pre-registered "
+                "check of the level score)")
+    return f"The {n} screening images"
 
 
 def _set_section(summary: dict, name: str) -> list:
@@ -354,13 +367,15 @@ def _set_section(summary: dict, name: str) -> list:
 
 def markdown(summary: dict, tables: dict) -> str:
     families = sum(any(row in summary["rows"] for row in rows) for rows in BASELINE_FAMILIES.values())
-    lines = [f"# Corruption detection on COCO: our method and {NUMBER_WORDS[families]} "
-             f"baseline{'' if families == 1 else 's'}", "",
-             f"**Headline (two-axis score, all images and the untouched ones):** {summary['headline_decision']}.", "",
-             f"**Pre-registered level score (held-out images):** {summary['level_decision']}.", "",
-             "Every score is oriented so that higher means more likely corrupted. ↑ higher is better, ↓ lower is "
-             "better; an AUROC of 0.5 is chance. Brackets are 95% paired bootstrap intervals over images "
-             f"({summary['bootstrap_samples']} draws, seed {summary['seed']}).", ""]
+    benchmark = summary.get("benchmark", "coco")
+    lines = [f"# Corruption detection on {TITLES.get(benchmark, benchmark)}: our method and "
+             f"{NUMBER_WORDS[families]} baseline{'' if families == 1 else 's'}", ""]
+    if "headline_decision" in summary:
+        lines += [f"**Headline (two-axis score, all images and the untouched ones):** {summary['headline_decision']}.",
+                  "", f"**Pre-registered level score (held-out images):** {summary['level_decision']}.", ""]
+    lines += ["Every score is oriented so that higher means more likely corrupted. ↑ higher is better, ↓ lower is "
+              "better; an AUROC of 0.5 is chance. Brackets are 95% paired bootstrap intervals over images "
+              f"({summary['bootstrap_samples']} draws, seed {summary['seed']}).", ""]
     for name in summary["headline"]:
         lines += _set_section(summary, name)
     severity = summary["by_severity"]["all"]

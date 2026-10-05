@@ -219,3 +219,36 @@ def test_write_outputs_creates_csv_json_and_markdown(small_sets, tmp_path):
     assert json.loads((tmp_path / "summary.json").read_text())["images"] == 40
     text = (tmp_path / "report.md").read_text()
     assert text.startswith("# Corruption detection on COCO") and "DisCoPatch" in text and "AUPR common" in text
+
+
+def _plain_inputs(images=30):
+    """Three scored rows with a severity signal, and the kNN distances the report's kNN table reads."""
+    rng = np.random.default_rng(1)
+    severity = np.array([s for _, s in corruptions.CONDITIONS], float)
+    scores = {row: rng.normal(0, 1, (images, 1)) + strength * severity[None] + rng.normal(0, 1, (images, 96))
+              for row, strength in (("two_axis", 0.5), ("level", 0.3), ("cdf", 0.1))}
+    detector = {"knn": np.sort(rng.uniform(0.5, 1.5, (images, 96, 200)), axis=2).astype(np.float32)}
+    return scores, detector, np.full(images, np.nan), 0.5 - 0.05 * severity
+
+
+def test_a_benchmark_without_a_screening_history_reports_one_image_set_and_no_decisions():
+    scores, detector, ap, condition_map = _plain_inputs()
+    tables, summary = report.build_tables(scores, detector, ap, assign_folds(30), condition_map, seed=44, samples=10,
+                                          workers=1, sets={"all": np.arange(30)}, benchmark="cityscapes")
+    assert summary["image_sets"] == {"all": 30} and summary["benchmark"] == "cityscapes"
+    assert not {"headline_decision", "level_decision", "screen_images", "untouched_start"} & set(summary)
+    assert "two_axis - cdf:auroc_common" in summary["intervals"]["all"]
+    text = report.markdown(summary, tables)
+    assert text.startswith("# Corruption detection on Cityscapes-C: our method and ")
+    assert not any(word in text.lower() for word in ("untouched", "held-out", "screen", "pre-registered"))
+
+
+def test_a_coco_report_keeps_its_decisions_and_its_keys():
+    scores, detector, ap, condition_map = _plain_inputs()
+    tables, summary = report.build_tables(scores, detector, ap, assign_folds(30), condition_map, seed=44, samples=10,
+                                          workers=1)
+    assert "benchmark" not in summary
+    assert {"headline_decision", "level_decision", "screen_images", "untouched_start"} <= set(summary)
+    text = report.markdown(summary, tables)
+    assert text.startswith("# Corruption detection on COCO: our method and ")
+    assert "**Headline (two-axis score, all images and the untouched ones):**" in text

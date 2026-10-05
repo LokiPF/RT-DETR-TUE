@@ -164,3 +164,40 @@ def test_the_report_refuses_extra_rows_it_cannot_take(run, tmp_path):
                           ({"niqe": np.zeros((IMAGES - 1, 96))}, "one per image and condition: niqe")):
         with pytest.raises(ValueError, match=message):
             write_report(run, Manifest(run.layout), out=tmp_path, extra_rows=rows)
+
+
+class EightClassTap(QualityTap):
+    """QualityTap with the Cityscapes detector's 8 classes."""
+
+    def run(self, arrays, batch_size=32):
+        logits, boxes, pooled = super().run(arrays, batch_size)
+        return logits[:, :, :8], boxes, pooled
+
+
+def test_the_report_stage_writes_a_cityscapes_report_with_one_image_set(tmp_path, monkeypatch):
+    val = tmp_path / "val" / "city"
+    val.mkdir(parents=True)
+    rng = np.random.default_rng(3)
+    images = []
+    for index in range(IMAGES):
+        name = f"city_{index:06d}_000019_leftImg8bit.png"
+        Image.fromarray(rng.integers(0, 256, (48, 64, 3), dtype=np.uint8)).save(val / name)
+        images.append({"id": index, "file_name": f"val/city/{name}", "width": 64, "height": 48})
+    (tmp_path / "ann.json").write_text(json.dumps({
+        "images": images,
+        "annotations": [{"id": i, "image_id": i, "category_id": 0, "bbox": [8, 6, 24, 18], "area": 432, "iscrowd": 0}
+                        for i in range(IMAGES)],
+        "categories": [{"id": c, "name": f"c{c}"} for c in range(8)]}))
+    (tmp_path / "ckpt.pth").write_bytes(b"weights")
+    monkeypatch.setattr(baseline_stages, "DetectorTap", EightClassTap)
+    monkeypatch.setattr(tables, "BOOTSTRAP_SAMPLES", 5)
+    settings = Settings(run=tmp_path / "run", checkpoint=tmp_path / "ckpt.pth", train_images=tmp_path,
+                        val_images=tmp_path / "val", annotations=tmp_path / "ann.json", discopatch_root=tmp_path,
+                        benchmark="cityscapes", limit=IMAGES, workers=0, device="cpu")
+    settings.layout.knn_bank.parent.mkdir(parents=True)
+    np.save(settings.layout.knn_bank, rng.normal(size=(256, 512)).astype(np.float16))
+    run_stage("detector-pass", settings)
+    run_stage("report", settings)
+    summary = json.loads((settings.layout.report("cityscapes") / "summary.json").read_text())
+    assert summary["image_sets"] == {"all": IMAGES} and summary["benchmark"] == "cityscapes"
+    assert "headline_decision" not in summary and not settings.layout.report("coco").exists()

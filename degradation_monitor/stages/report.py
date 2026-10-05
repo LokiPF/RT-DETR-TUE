@@ -1,4 +1,4 @@
-"""The report stage: read every stored score and write the report to reports/coco/, or to another folder (out)."""
+"""The report stage: read every stored score and write the report to reports/<benchmark>/, or to another folder (out)."""
 from __future__ import annotations
 
 import json
@@ -82,7 +82,8 @@ def write_report(settings, manifest, out=None, extra_rows=None, extra_inputs=Non
     """
     layout = settings.layout
     reference = _method_reference(layout)  # checked first: the mAP below takes minutes on all 5,000 images
-    names = [p.name for p in settings.dataset.evaluation_images()]
+    dataset = settings.dataset
+    names = [p.name for p in dataset.evaluation_images()]
     detector = _stack_present(layout.scores("detector"), names, DETECTOR_ARRAYS, CONTRASTIVE_ARRAYS)
     discopatch = stack(layout.scores("discopatch"), names, ("dcp",))["dcp"] if layout.scores("discopatch").exists() \
         else None
@@ -99,7 +100,7 @@ def write_report(settings, manifest, out=None, extra_rows=None, extra_inputs=Non
             raise ValueError(f"extra rows need {shape[0]} x {shape[1]} values, one per image and condition: "
                              f"{', '.join(wrong)}")
         scores.update(extra_rows)
-    gt = settings.dataset.ground_truth()
+    gt = dataset.ground_truth()
     ids = [gt.image_id(n) for n in names]
     condition_map = condition_maps(gt, ids, detector, settings.workers)
     clean = {i: coco_results(i, detector["det_scores"][k, 0], detector["det_labels"][k, 0], detector["det_boxes"][k, 0],
@@ -108,10 +109,16 @@ def write_report(settings, manifest, out=None, extra_rows=None, extra_inputs=Non
     if reference:
         scores.update(_method_rows(layout, names))
     timing = json.loads(layout.timing.read_text()) if layout.timing.exists() else {}
-    report_tables, summary = tables.build_tables(scores, detector, ap, settings.dataset.folds(), condition_map,
+    sets = None if dataset.screened else {"all": np.arange(len(names))}
+    report_tables, summary = tables.build_tables(scores, detector, ap, dataset.folds(), condition_map,
                                                  seed=settings.seed, samples=tables.BOOTSTRAP_SAMPLES,
-                                                 workers=settings.workers, timing=timing)
+                                                 workers=settings.workers, timing=timing, sets=sets,
+                                                 benchmark=dataset.name)
     summary["inputs"] = {**manifest.read().get("inputs", {}), **({"method": reference} if reference else {}),
                          **(extra_inputs or {})}
-    tables.write_outputs(out or layout.report(), report_tables, summary)
-    print(f"[report] headline: {summary['headline_decision']}; level score: {summary['level_decision']}", flush=True)
+    tables.write_outputs(out or layout.report(dataset.name), report_tables, summary)
+    if "headline_decision" in summary:
+        print(f"[report] headline: {summary['headline_decision']}; level score: {summary['level_decision']}",
+              flush=True)
+    else:
+        print(f"[report] {dataset.name}: {summary['images']} images, one image set, no decision rule", flush=True)
