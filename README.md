@@ -40,12 +40,17 @@ tests/                     mirrors degradation_monitor/
 ## Setup
 
 - **Python packages:** Python 3.11 and the packages in `requirements.txt`. Install a PyTorch build for your machine
-  first.
+  first, then every package but pyiqa, `grep -v '^pyiqa' requirements.txt | pip install -r /dev/stdin`, then pyiqa
+  as below.
 - **The detector checkpoint:** RT-DETRv2-R18 trained on COCO, `rtdetrv2_r18vd_120e_coco` (48.1 AP). The vendored model
   code comes from github.com/lyuwenyu/RT-DETR (Apache-2.0).
 - **COCO 2017:** `train2017`, `val2017` and `annotations/instances_val2017.json`.
 - **DisCoPatch** (Caetano et al., ICCV 2025): a clone of github.com/caetas/DisCoPatch, with its own requirements. Its
   commit is recorded in each run's `manifest.json`.
+- **pyiqa** (the image-quality baselines): `pip install --no-deps pyiqa==0.1.16 openai-clip==1.0.1 ftfy==6.3.1`.
+  A plain install would add `opencv-python-headless`, whose `cv2` replaces the one of `opencv-python` that
+  imagecorruptions uses, and the corrupted images could change. `pip check` then lists pyiqa's unused optional
+  dependencies; that is expected.
 
 Then edit the paths in `configs/coco.toml`.
 

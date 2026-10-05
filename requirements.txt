@@ -9,3 +9,5 @@ uq-detr
 imagecorruptions==1.1.2
 rfdetr==1.11.2
 ultralytics==8.3.235
+# pyiqa: install with --no-deps (README, Setup): its opencv-python-headless would replace the cv2 imagecorruptions uses
+pyiqa==0.1.16
