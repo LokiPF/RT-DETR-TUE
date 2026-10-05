@@ -12,6 +12,12 @@ The documents behind the paper. Older work is in `archive/`.
   `superpowers/plans/2026-10-04-four-detectors-coco-c.md`.
 - `results/coco-detectors/`: each new detector's report, the table of all four (`summary.md`, `summary.csv`), each
   detector's two arms per condition (`arms.csv`, from `../scripts/paper/detector_arms.py`) and the tap explorations.
+- `coco-iqa-results.md`: four detector-free image-quality baselines against the two-axis score on all four
+  detectors: NIQE (refitted and published), ARNIQA's quality, ARNIQA's clean prototype and zero-shot CLIP-IQA
+  (5 October). Plan: `superpowers/plans/2026-10-05-iqa-baselines-coco-c.md`.
+- `results/coco-iqa/`: each detector's report with the five image-quality rows, the table of all four (`summary.md`,
+  `summary.csv`), the timing (`timing.json`), the NIQE refit's counts (`fit.json`), NIQE's block counts per
+  condition (`niqe-blocks.csv`) and the GPU precision check (`precision-check.txt`).
 - `roundtable-2026-10-01-detection/`: the detection roundtable that proposed the two-axis score. Its
   `verify_panel_rows.py` imports the old `differential_uncertainty` package, so run it at the commit named in
   `../archive/README.md`.
