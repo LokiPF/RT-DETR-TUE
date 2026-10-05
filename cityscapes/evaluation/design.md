@@ -62,7 +62,8 @@ The numbers of the two-axis score and of every baseline on Cityscapes-C, for RT-
 3. **A `benchmark` setting** chooses the dataset. The protocols' `"dataset"` field follows it, in `Settings.protocol()` and in the IQA stage's own protocol.
 4. **The check stages follow the benchmark:**
    - RT-DETR's check and the detectors stage's check list the val images through the dataset, so city subfolders are included;
-   - they compare the detector's classes with the annotation file's, and use the benchmark's floor.
+   - RT-DETR's check compares the detector's class count with the annotation file's; a YOLO with the wrong classes stops at its first label outside the file's classes;
+   - both use the benchmark's floor.
 5. **Reports for a benchmark without a screening history:**
    - one image set (`all`), no decision lines, and a title that names the benchmark;
    - the detectors' cross table and the IQA summary table lose their untouched-image columns.
@@ -87,7 +88,7 @@ The numbers of the two-axis score and of every baseline on Cityscapes-C, for RT-
   3. The IQA stages: `fit`, `pass`, `report`.
 - **First, a smoke run on a few val images,** to time each pass.
 - **Cost:** every pass regenerates the corruptions. That happens about 6 times, at roughly 1 h of CPU each, for 500 images at 2048 × 1024 (88 s per image on one core). With the fits, DisCoPatch's training and the IQA pass (about 2 h), the total is roughly 8–12 h, mostly on the CPU.
-- **GPU:** every stage runs under a memory cap. Ask explore, and ue-implement while its work runs, before each GPU job, and send "done" after.
+- **GPU:** every stage runs under a memory cap, except DisCoPatch's official training loop, which has none; its peak is measured in the smoke run. Ask explore, and ue-implement while its work runs, before each GPU job, and send "done" after.
 
 ## Results
 
