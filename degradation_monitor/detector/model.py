@@ -1,4 +1,4 @@
-"""Build the fixed RT-DETRv2-R18, load its frozen COCO checkpoint, and prepare images for it."""
+"""Build the fixed RT-DETRv2-R18, load a frozen checkpoint (COCO or Cityscapes), and prepare images for it."""
 from __future__ import annotations
 
 from collections.abc import Mapping
@@ -16,13 +16,15 @@ from .rtdetrv2.zoo.rtdetr.rtdetr import RTDETR
 from .rtdetrv2.zoo.rtdetr.rtdetrv2_decoder import RTDETRTransformerv2
 
 IMAGE_SIZE = (640, 640)  # RT-DETRv2 fixes its input size in training and at inference
+COCO_CLASSES = 80
+SCORE_HEAD = "decoder.dec_score_head.0.weight"  # (classes, 256) in every RT-DETRv2 checkpoint
 
 
-def build_fixed_detector() -> RTDETR:
+def build_fixed_detector(num_classes: int = COCO_CLASSES) -> RTDETR:
     spatial_size = [640, 640]
     backbone = PResNet(depth=18, variant="d", num_stages=4, return_idx=[1, 2, 3], act="relu", freeze_at=-1, freeze_norm=False, pretrained=False)
     encoder = HybridEncoder(in_channels=[128, 256, 512], feat_strides=[8, 16, 32], hidden_dim=256, nhead=8, dim_feedforward=1024, dropout=0.0, enc_act="gelu", use_encoder_idx=[2], num_encoder_layers=1, pe_temperature=10_000, expansion=0.5, depth_mult=1.0, act="silu", eval_spatial_size=spatial_size, version="v2")
-    decoder = RTDETRTransformerv2(num_classes=80, hidden_dim=256, num_queries=300, feat_channels=[256, 256, 256], feat_strides=[8, 16, 32], num_levels=3, num_points=[4, 4, 4], nhead=8, num_layers=3, dim_feedforward=1024, dropout=0.0, activation="relu", num_denoising=100, label_noise_ratio=0.5, box_noise_scale=1.0, learn_query_content=False, eval_spatial_size=spatial_size, eval_idx=-1, eps=1e-2, aux_loss=True, cross_attn_method="default", query_select_method="default")
+    decoder = RTDETRTransformerv2(num_classes=num_classes, hidden_dim=256, num_queries=300, feat_channels=[256, 256, 256], feat_strides=[8, 16, 32], num_levels=3, num_points=[4, 4, 4], nhead=8, num_layers=3, dim_feedforward=1024, dropout=0.0, activation="relu", num_denoising=100, label_noise_ratio=0.5, box_noise_scale=1.0, learn_query_content=False, eval_spatial_size=spatial_size, eval_idx=-1, eps=1e-2, aux_loss=True, cross_attn_method="default", query_select_method="default")
     return RTDETR(backbone=backbone, encoder=encoder, decoder=decoder)
 
 
@@ -47,10 +49,17 @@ def checkpoint_state(checkpoint: object) -> dict[str, Tensor]:
     return _tensor_state(checkpoint, "checkpoint direct")
 
 
+def checkpoint_classes(state: Mapping[str, Tensor]) -> int:
+    """How many classes a checkpoint detects: the rows of its decoder's first score head (COCO 80, Cityscapes 8)."""
+    head = state.get(SCORE_HEAD)
+    return COCO_CLASSES if head is None else int(head.shape[0])
+
+
 def load_frozen_detector(checkpoint_path: str | Path, device: torch.device) -> nn.Module:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-    model = build_fixed_detector()
-    incompatible = model.load_state_dict(checkpoint_state(checkpoint), strict=False)
+    state = checkpoint_state(checkpoint)
+    model = build_fixed_detector(num_classes=checkpoint_classes(state))
+    incompatible = model.load_state_dict(state, strict=False)
     if incompatible.missing_keys or incompatible.unexpected_keys:
         raise RuntimeError(f"checkpoint mismatch: missing={incompatible.missing_keys}, unexpected={incompatible.unexpected_keys}")
     return model.to(device).eval().requires_grad_(False)

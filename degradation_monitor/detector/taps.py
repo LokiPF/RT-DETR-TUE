@@ -10,7 +10,6 @@ from PIL import Image
 from .model import load_frozen_detector, prepare_image
 
 QUERY_COUNT = 300
-CLASS_COUNT = 80
 POOLED_DIM = 512
 DECODER_SHAPE = (QUERY_COUNT, 256)
 STAGE_COUNT = 5  # C1 (stem output after max-pooling) and the four residual stages
@@ -65,7 +64,7 @@ class DetectorTap:
         boxes = outputs["pred_boxes"].float().cpu().numpy()
         pooled = pooled.float().cpu().numpy()
         n = batch.shape[0]
-        if (logits.shape != (n, QUERY_COUNT, CLASS_COUNT) or boxes.shape != (n, QUERY_COUNT, 4)
+        if (logits.ndim != 3 or logits.shape[:2] != (n, QUERY_COUNT) or boxes.shape != (n, QUERY_COUNT, 4)
                 or pooled.shape != (n, POOLED_DIM)):
             raise ValueError("detector outputs do not have the expected shapes")
         if not (np.isfinite(logits).all() and np.isfinite(boxes).all() and np.isfinite(pooled).all()):

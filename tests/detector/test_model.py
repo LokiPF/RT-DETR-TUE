@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 import torch
 from PIL import Image
@@ -18,7 +20,7 @@ def test_load_frozen_detector_loads_cpu_state_and_freezes(tmp_path, monkeypatch)
     source = nn.Linear(3, 2)
     checkpoint = tmp_path / "model.pt"
     torch.save({"model": source.state_dict()}, checkpoint)
-    monkeypatch.setattr(extraction, "build_fixed_detector", lambda: nn.Linear(3, 2))
+    monkeypatch.setattr(extraction, "build_fixed_detector", lambda num_classes=80: nn.Linear(3, 2))
     model = load_frozen_detector(checkpoint, torch.device("cpu"))
     assert not model.training
     assert all(not parameter.requires_grad for parameter in model.parameters())
@@ -35,3 +37,24 @@ def test_prepare_image_keeps_an_already_exact_rgb_image_open_until_tensorized():
     actual = prepare_image(Image.new("RGB", (640, 640), "red"), (640, 640))
     assert actual.shape == (3, 640, 640)
     assert actual.dtype == torch.float32
+
+
+CITYSCAPES_CHECKPOINT = Path("/home/yuchen/YuchenZ/UE/RT-DETRv2-UE/pretrained_weights/rtdetrv2_r18vd_cityscapes_72e.pth")
+
+
+def test_checkpoint_classes_reads_the_decoder_score_head():
+    assert extraction.checkpoint_classes({extraction.SCORE_HEAD: torch.zeros(8, 256)}) == 8
+    assert extraction.checkpoint_classes({"x": torch.zeros(1)}) == 80
+
+
+def test_the_fixed_detector_takes_a_class_count():
+    model = extraction.build_fixed_detector(num_classes=8)
+    assert model.decoder.dec_score_head[0].out_features == 8
+    assert model.decoder.denoising_class_embed.num_embeddings == 9  # the classes plus the padding row
+
+
+def test_the_cityscapes_checkpoint_loads_as_an_8_class_detector():
+    if not CITYSCAPES_CHECKPOINT.exists():
+        pytest.skip("the Cityscapes fine-tune is not available")
+    model = load_frozen_detector(CITYSCAPES_CHECKPOINT, torch.device("cpu"))
+    assert model.decoder.dec_score_head[0].out_features == 8

@@ -137,3 +137,18 @@ def test_the_real_backbone_gives_the_four_early_channel_maps():
     with EarlyChannelTaps(model.backbone) as taps:
         inputs = taps(torch.rand(1, 3, 640, 640))
     assert [tuple(t.shape) for t in inputs] == [(1, 64, 160, 160), (1, 128, 80, 80), (1, 256, 40, 40), (1, 512, 20, 20)]
+
+
+class EightClassDetector(FakeDetector):
+    """FakeDetector with the Cityscapes detector's 8 classes."""
+
+    def forward(self, images):
+        out = super().forward(images)
+        return {**out, "pred_logits": out["pred_logits"][..., :8]}
+
+
+def test_the_tap_takes_any_class_count(monkeypatch):
+    monkeypatch.setattr(detector, "load_frozen_detector", lambda _p, _d: EightClassDetector())
+    with detector.DetectorTap("unused.pth", "cpu", image_size=(16, 16)) as tap:
+        logits, _, _ = tap.run([np.zeros((10, 10, 3), np.uint8)], batch_size=1)
+    assert logits.shape == (1, 300, 8)
