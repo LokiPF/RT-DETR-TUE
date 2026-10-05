@@ -7,6 +7,11 @@ The documents behind the paper. Older work is in `archive/`.
 - `conv-tu-conditioned-results.md`: the 5,000-image confirmation of the two-axis score (2 October). Tables:
   `results/conv-tu-conditioned/`.
 - `results/coco/`: the clean branch's report. It covers every row on all four image sets, with intervals.
+- `coco-detectors-results.md`: the two-axis score, unchanged, on three more frozen COCO detectors next to
+  RT-DETRv2-R18: YOLO11m, Faster R-CNN R50-FPN v2 and RF-DETR-M (5 October). Plan:
+  `superpowers/plans/2026-10-04-four-detectors-coco-c.md`.
+- `results/coco-detectors/`: each new detector's report, the table of all four (`summary.md`, `summary.csv`), each
+  detector's two arms per condition (`arms.csv`, from `../scripts/paper/detector_arms.py`) and the tap explorations.
 - `roundtable-2026-10-01-detection/`: the detection roundtable that proposed the two-axis score. Its
   `verify_panel_rows.py` imports the old `differential_uncertainty` package, so run it at the commit named in
   `../archive/README.md`.
