@@ -1,0 +1,8 @@
+niqe          max |GPU - CPU| 8.3e-03, Kendall's tau 0.9999, tied values GPU 3 / CPU 3 of 288
+niqe_default  max |GPU - CPU| 3.5e-02, Kendall's tau 0.9997, tied values GPU 3 / CPU 3 of 288
+arniqa        max |GPU - CPU| 9.1e-04, Kendall's tau 0.9992, tied values GPU 3 / CPU 3 of 288
+arniqa_proto  max |GPU - CPU| 9.7e-04, Kendall's tau 0.9993, tied values GPU 3 / CPU 3 of 288
+clipiqa       max |GPU - CPU| 6.7e-03, Kendall's tau 0.9977, tied values GPU 61 / CPU 3 of 288
+real	1m38.883s
+user	6m34.142s
+sys	2m20.154s

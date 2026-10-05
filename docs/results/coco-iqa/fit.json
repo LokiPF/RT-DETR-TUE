@@ -1,0 +1,10 @@
+{
+  "images": 118287,
+  "niqe_block": 96,
+  "niqe_blocks": 610748,
+  "niqe_dropped_blocks": 0,
+  "niqe_images": 118285,
+  "niqe_sharpness": 0.75,
+  "niqe_skipped": 2,
+  "prototype": "mean of the clean embeddings"
+}

@@ -33,8 +33,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from PIL import Image
-from torch.utils.data import DataLoader, Dataset
 
 from .. import corruptions
 from ..baselines.activation_cdf import BINS as CDF_BINS
@@ -55,7 +53,7 @@ from ..evaluation.report import OURS
 from ..method.statistics import KEYS, channel_statistics
 from ..runs import Manifest, RunLayout, atomic_json, atomic_npz, load_npz, progress, sha1
 from ..settings import load_settings
-from .common import cap_gpu_memory, image_size, variant_stream
+from .common import cap_gpu_memory, image_size, report_peak_memory, rgb_batches, variant_stream
 from .report import write_report
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[2] / "configs" / "coco-detectors.toml"
@@ -133,33 +131,10 @@ def _check_precision(manifest, name) -> None:
                            f"precision its protocol records: {manifest.path}")
 
 
-class _RgbImages(Dataset):
-    def __init__(self, paths):
-        self.paths = list(paths)
-
-    def __len__(self):
-        return len(self.paths)
-
-    def __getitem__(self, index):
-        with Image.open(self.paths[index]) as source:
-            return np.asarray(source.convert("RGB"), dtype=np.uint8).copy()
-
-
-def _batches(paths, size, workers):
-    """Lists of `size` RGB arrays, in the order of `paths`."""
-    return DataLoader(_RgbImages(paths), batch_size=size, num_workers=workers, collate_fn=list)
-
-
 def _method_statistics(out) -> dict:
     """Each channel's level and top-1% mean in the four levels: KEYS -> float32 (N, C)."""
     return {f"{statistic}_{level}": values for level in LEVELS
             for statistic, values in channel_statistics(out.levels[level]).items()}
-
-
-def _report_peak_memory(label, device) -> None:
-    """The process's peak GPU memory so far, for the sessions that share the card."""
-    if torch.device(device).type == "cuda":
-        print(f"[{label}] peak GPU memory {torch.cuda.max_memory_allocated(device) / 2**30:.2f} GiB", flush=True)
 
 
 def check(config) -> None:
@@ -173,7 +148,7 @@ def check(config) -> None:
         adapter = load_adapter(name, config.weights[name], settings.device)
         _check_precision(manifest, name)
         results = []
-        for path, arrays in zip(images, _batches(images, 1, settings.workers)):  # val images differ in size
+        for path, arrays in zip(images, rgb_batches(images, 1, settings.workers)):  # val images differ in size
             out = adapter(arrays)
             results += coco_results(gt.image_id(path.name), out.scores[0], out.labels[0], out.boxes[0],
                                     gt.category_ids)  # an empty slot scores 0 with an empty box: it never matches
@@ -210,7 +185,7 @@ def _clean_pass(adapter, settings) -> None:
     pooled, ranges, method = [], [ChannelRanges() for _ in CDF_STAGES], {}
     decoder = NeuronStats() if adapter.detr else None
     size, started = adapter.fit_batch_size, time.time()
-    for index, arrays in enumerate(_batches(paths, size, settings.workers)):
+    for index, arrays in enumerate(rgb_batches(paths, size, settings.workers)):
         names = [str(p) for p in paths[index * size:(index + 1) * size]]
         out = adapter(arrays, heads=adapter.detr)  # only Hashemi reads past the backbone
         pooled.append(normalize_rows(out.pooled).cpu().numpy().astype(np.float16))
@@ -247,7 +222,7 @@ def _cdf_histograms(adapter, settings) -> None:
         bounds = {stage: (data[f"{stage}_low"], data[f"{stage}_high"]) for stage in CDF_STAGES}
     reference = ReferenceHistograms(bounds, settings.device)
     size, started = adapter.fit_batch_size, time.time()
-    for index, arrays in enumerate(_batches(paths, size, settings.workers)):
+    for index, arrays in enumerate(rgb_batches(paths, size, settings.workers)):
         reference.update(adapter(arrays, heads=False).cdf)
         if index % max(1, PROGRESS_IMAGES // size) == 0:
             progress(f"fit {adapter.name} 2/3", min((index + 1) * size, len(paths)), len(paths), started)
@@ -263,7 +238,7 @@ def _cdf_zstats(adapter, settings) -> None:
     chosen = np.sort(np.random.default_rng(settings.seed).choice(len(paths), size=min(CDF_ZSTAT_IMAGES, len(paths)),
                                                                 replace=False))
     monitor, values = CdfMonitor(layout.cdf_reference, settings.device), []
-    for arrays in _batches([paths[i] for i in chosen], adapter.fit_batch_size, settings.workers):
+    for arrays in rgb_batches([paths[i] for i in chosen], adapter.fit_batch_size, settings.workers):
         values.append(monitor.stage_scores(adapter(arrays, heads=False).cdf))
     mean, std = stage_zstats(np.concatenate(values))
     atomic_json(layout.cdf_zstats, {"images": len(chosen), "seed": settings.seed, "stages": list(CDF_STAGES),
@@ -287,7 +262,7 @@ def fit(config) -> None:
         for step, _ in passes[start:]:  # a redone pass makes every later pass stale
             step(adapter, settings)
         adapter.close()
-        _report_peak_memory(f"fit {name}", settings.device)
+        report_peak_memory(f"fit {name}", settings.device)
 
 
 def _references(config, name) -> dict:
@@ -381,7 +356,7 @@ def shared_pass(config, first=None) -> None:
             progress("detectors pass", done, len(pending), started)
     for adapter in adapters.values():
         adapter.close()
-    _report_peak_memory("pass", base.device)
+    report_peak_memory("pass", base.device)
 
 
 def _link_discopatch(config, layout, manifest) -> None:

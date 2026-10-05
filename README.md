@@ -31,6 +31,7 @@ degradation_monitor/
   stages/                  the runnable, resumable steps
 configs/coco.toml          this machine's paths and run options
 configs/coco-detectors.toml  the further detectors' weights, run root and clean-AP floors
+configs/coco-iqa.toml      the image-quality baselines' run root and reference run
 scripts/convert_runs.py    the one-time conversion of the old run folder
 archive/                   retired methods, read only (archive/README.md)
 docs/                      results, decisions and the dev log (docs/README.md)
@@ -40,12 +41,18 @@ tests/                     mirrors degradation_monitor/
 ## Setup
 
 - **Python packages:** Python 3.11 and the packages in `requirements.txt`. Install a PyTorch build for your machine
-  first.
+  first, then every package but pyiqa, `grep -v '^pyiqa' requirements.txt | pip install -r /dev/stdin`, then pyiqa
+  as below.
 - **The detector checkpoint:** RT-DETRv2-R18 trained on COCO, `rtdetrv2_r18vd_120e_coco` (48.1 AP). The vendored model
   code comes from github.com/lyuwenyu/RT-DETR (Apache-2.0).
 - **COCO 2017:** `train2017`, `val2017` and `annotations/instances_val2017.json`.
 - **DisCoPatch** (Caetano et al., ICCV 2025): a clone of github.com/caetas/DisCoPatch, with its own requirements. Its
   commit is recorded in each run's `manifest.json`.
+- **pyiqa** (the image-quality baselines):
+  `pip install --no-deps pyiqa==0.1.16 openai-clip==1.0.1 ftfy==6.3.1 wcwidth==0.8.2`. A plain install would add
+  `opencv-python-headless`, whose `cv2` replaces the one of `opencv-python` that imagecorruptions uses, and the
+  corrupted images could change. `wcwidth` is ftfy's only dependency, which `--no-deps` would leave out. `pip check`
+  then lists the dependencies pyiqa declares but this repository does not use; that is expected.
 
 Then edit the paths in `configs/coco.toml`.
 
@@ -91,6 +98,16 @@ once, checks them against `runs/coco/`'s digests and feeds all three detectors; 
 smoke report on the first N images. Each detector reads the method's three earliest feature levels and its deepest as
 the key: stages for the CNNs, blocks 1-3 and 12 for RF-DETR's ViT. ContrastiveConf and Hashemi et al. exist for the
 DETR-type detectors only.
+
+### Image-quality baselines
+
+`python -m degradation_monitor.stages.iqa <fit|pass|timing|report> --config configs/coco-iqa.toml` scores four
+detector-free baselines on the same COCO-C images: NIQE (refitted on clean train, and the published model as a
+sensitivity row), ARNIQA's KADID-10k quality, ARNIQA's embedding against a clean prototype, and zero-shot CLIP-IQA.
+`fit` builds the clean references from all train images, `pass` checks each val image's 96 versions against
+`runs/coco/`'s digests and scores them once, `timing` measures each model at batch 1, and `report` writes each
+detector's report with the five rows under `runs/coco-iqa/reports/<detector>/` plus `runs/coco-iqa/summary.md`, the
+two-axis score against each row. The detectors' own run folders are only read.
 
 ## Results
 

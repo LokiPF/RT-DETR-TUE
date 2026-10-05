@@ -28,7 +28,7 @@ from ..detector.taps import DetectorTap
 from ..evaluation.metrics import stage_zstats, zscored_sum
 from ..runs import SCORE_KEYS, atomic_json, atomic_npz, progress, sha1
 from ..settings import PATH_FIELDS
-from .common import (cap_gpu_memory, check_digests, clean_loader, image_size, open_rgb, pending_images,
+from .common import (cap_gpu_memory, check_digests, clean_loader, image_size, median_ms, open_rgb, pending_images,
                      variant_stream)
 
 TIMING_IMAGES = 100
@@ -292,21 +292,9 @@ def timing(settings, manifest) -> None:
     layout = settings.layout
     images = [open_rgb(p) for p in settings.dataset.evaluation_images()[:TIMING_IMAGES]]
     bank = _load_bank(settings, settings.device)
-    on_gpu = torch.cuda.is_available() and settings.device.startswith("cuda")
 
     def timed(function):
-        for array in images[:TIMING_WARMUP]:
-            function(array)
-        values = []
-        for array in images:
-            if on_gpu:
-                torch.cuda.synchronize()
-            start = time.perf_counter()
-            function(array)
-            if on_gpu:
-                torch.cuda.synchronize()
-            values.append(1000.0 * (time.perf_counter() - start))
-        return float(np.median(values))
+        return median_ms(function, images, TIMING_WARMUP, settings.device)
 
     result = {"images": len(images), "batch_size": 1, "device": settings.device}
     with DetectorTap(settings.checkpoint, settings.device) as tap:

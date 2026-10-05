@@ -1,9 +1,10 @@
 """The run folder: where every stage reads and writes, atomic writes, resume checks and the manifest.
 
   manifest.json                    the protocol, the environment, and the inputs each score folder was computed from
-  reference/<name>/                what the clean train images provide: knn, activation_cdf, hashemi, discopatch, method
+  reference/<name>/                what the clean train images provide: knn, activation_cdf, hashemi, discopatch,
+                                   method, iqa
   scores/<pass>/<image stem>.npz   one file per evaluation image, 96 conditions each: detector, activations,
-                                   discopatch, method
+                                   discopatch, method, iqa (the five image-quality rows, niqe_blocks and digests)
   reports/<name>/                  the report stage's tables
   timing.json                      the timing stage's measurements
 """
@@ -26,6 +27,7 @@ SCORE_KEYS = {
                     "cdf_stages"),
     "discopatch": ("dcp",),
     "method": tuple(f"{statistic}_s{stage}" for statistic in ("means", "top") for stage in range(1, 5)),
+    "iqa": ("niqe", "niqe_default", "arniqa", "arniqa_proto", "clipiqa", "niqe_blocks", "digests"),
 }
 PACKAGES = ("torch", "torchvision", "numpy", "scipy", "scikit-image", "scikit-learn", "imagecorruptions", "uq-detr",
             "pycocotools", "Pillow", "ultralytics", "rfdetr")

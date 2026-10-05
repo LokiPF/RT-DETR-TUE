@@ -1,0 +1,9 @@
+{
+  "arniqa_ms": 5.028886487707496,
+  "batch_size": 1,
+  "clipiqa_ms": 4.820264468435198,
+  "detector_ms": 5.894464993616566,
+  "device": "cuda:0",
+  "images": 100,
+  "niqe_ms": 20.72215499356389
+}

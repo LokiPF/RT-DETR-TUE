@@ -13,7 +13,7 @@ def test_the_layout_names_every_reference_and_score_folder(tmp_path):
     assert layout.discopatch_checkpoint == tmp_path / "reference" / "discopatch" / "discriminator.pt"
     assert layout.score_file("method", "val/000000000139.jpg") == tmp_path / "scores" / "method" / "000000000139.npz"
     assert layout.report() == tmp_path / "reports" / "coco"
-    assert set(SCORE_KEYS) == {"detector", "activations", "discopatch", "method"}
+    assert set(SCORE_KEYS) == {"detector", "activations", "discopatch", "method", "iqa"}
     with pytest.raises(ValueError, match="unknown score folder"):
         layout.scores("test")
 
