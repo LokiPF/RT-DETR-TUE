@@ -65,6 +65,9 @@ K.~Oksuz, T.~Joy, and P.~K. Dokania, ``Towards building self-aware object detect
 \bibitem{park2026uncertainty}
 Y.-J. Park, C.~Sobolewski, and N.~Azizan, ``Uncertainty quantification in detection transformers: Object-level calibration and image-level reliability,'' \emph{IEEE Transactions on Pattern Analysis and Machine Intelligence}, pp. 1--14, 2026.
 
+\bibitem{carion2020detr}
+N.~Carion, F.~Massa, G.~Synnaeve, N.~Usunier, A.~Kirillov, and S.~Zagoruyko, ``End-to-end object detection with transformers,'' in \emph{Proceedings of the European Conference on Computer Vision ({ECCV})}, ser. Lecture Notes in Computer Science, vol. 12346.\hskip 1em plus 0.5em minus 0.4em\relax Springer, 2020, pp. 213--229.
+
 \bibitem{liu2020energy}
 W.~Liu, X.~Wang, J.~D. Owens, and Y.~Li, ``Energy-based out-of-distribution detection,'' in \emph{Advances in Neural Information Processing Systems (NeurIPS)}, vol.~33, 2020, pp. 21\,464--21\,475.
 
@@ -76,9 +79,6 @@ A.~Mittal, R.~Soundararajan, and A.~C. Bovik, ``Making a ``completely blind'' im
 
 \bibitem{caetano2025discopatch}
 F.~Caetano, C.~Viviers, L.~A. Zavala-Mondrag{\'o}n, P.~H.~N. {De With}, and F.~van~der Sommen, ``{DisCoPatch}: Taming adversarially-driven batch statistics for improved out-of-distribution detection,'' in \emph{Proceedings of the IEEE/CVF International Conference on Computer Vision (ICCV)}, 2025, pp. 2898--2908.
-
-\bibitem{uricar2019soilingnet}
-M.~U{\v{r}}i{\v{c}}{\'a}{\v{r}}, P.~K{\v{r}}{\'\i}{\v{z}}ek, G.~Sistu, and S.~Yogamani, ``{SoilingNet}: Soiling detection on automotive surround-view cameras,'' in \emph{Proceedings of the IEEE Intelligent Transportation Systems Conference (ITSC)}, 2019, pp. 67--72.
 
 \bibitem{pavlic2012image}
 M.~Pavli{\'c}, H.~Belzner, G.~Rigoll, and S.~Ili{\'c}, ``Image based fog detection in vehicles,'' in \emph{Proceedings of the {IEEE} Intelligent Vehicles Symposium ({IV})}, 2012, pp. 1132--1137.
@@ -94,6 +94,9 @@ L.~Agnolucci, L.~Galteri, M.~Bertini, and A.~Del~Bimbo, ``{ARNIQA}: Learning dis
 
 \bibitem{wang2023clipiqa}
 J.~Wang, K.~C.~K. Chan, and C.~C. Loy, ``Exploring {CLIP} for assessing the look and feel of images,'' in \emph{Proceedings of the AAAI Conference on Artificial Intelligence (AAAI)}, vol.~37, no.~2, 2023, pp. 2555--2563.
+
+\bibitem{radford2021clip}
+A.~Radford, J.~W. Kim, C.~Hallacy, A.~Ramesh, G.~Goh, S.~Agarwal, G.~Sastry, A.~Askell, P.~Mishkin, J.~Clark, G.~Krueger, and I.~Sutskever, ``Learning transferable visual models from natural language supervision,'' in \emph{Proceedings of the 38th International Conference on Machine Learning ({ICML})}, ser. Proceedings of Machine Learning Research, vol. 139, 2021, pp. 8748--8763.
 
 \bibitem{hashemi2023runtime}
 V.~Hashemi, J.~K{\v{r}}et{\'{i}}nsk{\'{y}}, S.~Rieder, and J.~Schmidt, ``Runtime monitoring for out-of-distribution detection in object detection neural networks,'' in \emph{Proceedings of the 25th International Symposium on Formal Methods (FM)}, ser. Lecture Notes in Computer Science, vol. 14000.\hskip 1em plus 0.5em minus 0.4em\relax Cham: Springer, 2023, pp. 622--634.
