@@ -107,4 +107,22 @@ S.~Becker, J.~Bayer, W.~H{\"u}bner, and M.~Arens, ``Operational readiness for ob
 \bibitem{becker2026degradation}
 S.~Becker, S.~Weiss, W.~H{\"u}bner, and M.~Arens, ``Self-aware object detection via degradation manifolds,'' arXiv preprint arXiv:2602.18394, 2026.
 
+\bibitem{lv2024rtdetrv2}
+W.~Lv, Y.~Zhao, Q.~Chang, K.~Huang, G.~Wang, and Y.~Liu, ``{RT-DETRv2}: Improved baseline with bag-of-freebies for real-time detection transformer,'' arXiv preprint arXiv:2407.17140, 2024.
+
+\bibitem{ren2015faster}
+S.~Ren, K.~He, R.~Girshick, and J.~Sun, ``Faster {R-CNN}: Towards real-time object detection with region proposal networks,'' in \emph{Advances in Neural Information Processing Systems (NeurIPS)}, vol.~28, 2015.
+
+\bibitem{cai2018cascade}
+Z.~Cai and N.~Vasconcelos, ``Cascade {R-CNN}: Delving into high quality object detection,'' in \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2018, pp. 6154--6162.
+
+\bibitem{zhao2024rtdetr}
+Y.~Zhao, W.~Lv, S.~Xu, J.~Wei, G.~Wang, Q.~Dang, Y.~Liu, and J.~Chen, ``{DETRs} beat {YOLOs} on real-time object detection,'' in \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2024, pp. 16\,965--16\,974.
+
+\bibitem{zeiler2014visualizing}
+M.~D. Zeiler and R.~Fergus, ``Visualizing and understanding convolutional networks,'' in \emph{Proceedings of the European Conference on Computer Vision ({ECCV})}, ser. Lecture Notes in Computer Science.\hskip 1em plus 0.5em minus 0.4em\relax Springer, 2014, pp. 818--833.
+
+\bibitem{lin2014coco}
+T.-Y. Lin, M.~Maire, S.~Belongie, J.~Hays, P.~Perona, D.~Ramanan, P.~Doll{\'a}r, and C.~L. Zitnick, ``Microsoft {COCO}: Common objects in context,'' in \emph{Proceedings of the European Conference on Computer Vision ({ECCV})}, ser. Lecture Notes in Computer Science.\hskip 1em plus 0.5em minus 0.4em\relax Springer, 2014, pp. 740--755.
+
 \end{thebibliography}

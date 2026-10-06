@@ -1,4 +1,4 @@
-This is pdfTeX, Version 3.141592653-2.6-1.40.25 (TeX Live 2023/Debian) (preloaded format=pdflatex 2026.10.5)  5 OCT 2026 17:34
+This is pdfTeX, Version 3.141592653-2.6-1.40.25 (TeX Live 2023/Debian) (preloaded format=pdflatex 2026.10.5)  6 OCT 2026 13:30
 entering extended mode
  restricted \write18 enabled.
  file:line:error style messages enabled.
@@ -307,12 +307,18 @@ File: umsb.fd 2013/01/14 v3.01 AMS symbols B
 )) (./chapters/04_Methods.tex [1{/var/lib/texmf/fonts/map/pdftex/updmap/pdftex.map}{/usr/share/texlive/texmf-dist/fonts/enc/dvips/base/8r.enc}
 
 
-]) (./chapters/05_Experiment.tex) (./chapters/06_Conclusion.tex) (./root.bbl
+]
+<./Figures/two_changes.pdf, id=11, 252.945pt x 115.97403pt>
+File: ./Figures/two_changes.pdf Graphic file (type pdf)
+<use ./Figures/two_changes.pdf>
+Package pdftex.def Info: ./Figures/two_changes.pdf  used on input line 10.
+(pdftex.def)             Requested size: 252.0pt x 115.54372pt.
+) (./chapters/05_Experiment.tex) (./chapters/06_Conclusion.tex) (./root.bbl
 Underfull \hbox (badness 4454) in paragraph at lines 24--25
 []\OT1/ptm/m/n/8 ``Road ve-hi-cles --- Safety of the in-tended func-tion-al-ity,'' ISO
  []
 
-)
+[2 <./Figures/two_changes.pdf>])
 
 ** Conference Paper **
 Before submitting the final camera ready copy, remember to:
@@ -324,25 +330,25 @@ Before submitting the final camera ready copy, remember to:
  uses only Type 1 fonts and that every step in the generation
  process uses the US letter (8.5in X 11in) paper size.
 
-[2] (./root.aux)
+[3] (./root.aux)
  ***********
 LaTeX2e <2023-11-01> patch level 1
 L3 programming layer <2024-01-22>
  ***********
  ) 
 Here is how much of TeX's memory you used:
- 4844 strings out of 476056
- 80039 string characters out of 5791604
- 1948975 words of memory out of 5000000
- 26805 multiletter control sequences out of 15000+600000
- 589222 words of font info for 92 fonts, out of 8000000 for 9000
+ 4890 strings out of 476056
+ 80832 string characters out of 5791604
+ 1951975 words of memory out of 5000000
+ 26844 multiletter control sequences out of 15000+600000
+ 592322 words of font info for 104 fonts, out of 8000000 for 9000
  60 hyphenation exceptions out of 8191
- 79i,9n,93p,1448b,309s stack positions out of 10000i,1000n,20000p,200000b,200000s
-</usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/share/texlive/texmf-dist/fonts/type1/urw/times/utmb8a.pfb></usr/share/texlive/texmf-dist/fonts/type1/urw/times/utmbi8a.pfb></usr/share/texlive/texmf-dist/fonts/type1/urw/times/utmr8a.pfb></usr/share/texlive/texmf-dist/fonts/type1/urw/times/utmri8a.pfb>
-Output written on root.pdf (2 pages, 71488 bytes).
+ 79i,9n,93p,1454b,309s stack positions out of 10000i,1000n,20000p,200000b,200000s
+</usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmex10.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi10.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi5.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi7.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmmi8.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr10.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmr7.pfb></usr/share/texlive/texmf-dist/fonts/type1/public/amsfonts/cm/cmsy10.pfb></usr/share/texlive/texmf-dist/fonts/type1/urw/times/utmb8a.pfb></usr/share/texlive/texmf-dist/fonts/type1/urw/times/utmbi8a.pfb></usr/share/texlive/texmf-dist/fonts/type1/urw/times/utmr8a.pfb></usr/share/texlive/texmf-dist/fonts/type1/urw/times/utmri8a.pfb>
+Output written on root.pdf (3 pages, 2972066 bytes).
 PDF statistics:
- 37 PDF objects out of 1000 (max. 8388607)
- 22 compressed objects within 1 object stream
+ 129 PDF objects out of 1000 (max. 8388607)
+ 64 compressed objects within 1 object stream
  0 named destinations out of 1000 (max. 500000)
- 1 words of extra memory for PDF output out of 10000 (max. 10000000)
+ 6 words of extra memory for PDF output out of 10000 (max. 10000000)
 

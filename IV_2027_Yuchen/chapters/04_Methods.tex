@@ -1,8 +1,66 @@
 \section{Method}
 \label{sec:method}
 
+The detector is trained on a training set whose images follow a distribution $P$. At test time, it receives clean test images $x$, assumed to follow the same distribution $P$, and their corrupted versions $\tilde{x} = T(x)$, where $T$ is an unknown corruption such as fog, blur, noise or compression. We seek a score $s(\cdot)$ that is higher for corrupted test images $\tilde{x}$ than for clean test images $x$. The score may draw on only two sources. The first is the set of features that the frozen detector already computes on the test image. Reading only these keeps the validated detector unchanged and adds no second network on every frame. The second is a set $\mathcal{R}$ of clean reference images, taken from the training set, that shows how these features behave on clean images. Thus $s$ is fitted without any corrupted images.
+
+We build $s$ by answering four questions in turn, one per subsection, namely what to measure on a feature map (Sec.~\ref{sec:what}), at which stages of the backbone to measure it (Sec.~\ref{sec:where}), what to compare the measurements with (Sec.~\ref{sec:against}), and how to combine the comparisons into one score (Sec.~\ref{sec:score}). The method was developed on RT-DETRv2~\cite{lv2024rtdetrv2}. Sec.~\ref{sec:Experiment} later shows that it applies to other detectors as well.
+
+\begin{figure}[t]
+  \centering
+  \includegraphics[width=\columnwidth]{two_changes}
+  \caption{A backbone channel of RT-DETRv2-R18 on one image. Top: clean image, image under fog and image under Gaussian noise. Bottom: the channel's response maps, where brighter means a stronger response. Relative to the clean image, fog lowers the peak response $p$, and noise raises the mean response $\mu$.}
+  \label{fig:two-changes}
+\end{figure}
+
+\subsection{What to Measure}
+\label{sec:what}
+
+Object detectors typically compute feature maps with a backbone and then turn them into detections with modules specific to their design, such as the region proposal and box heads of two-stage detectors~\cite{ren2015faster,cai2018cascade} or the transformer decoder of DETR-style detectors~\cite{carion2020detr,zhao2024rtdetr}. We measure on the backbone for two reasons. First, along a detector, the features shift from describing the image to describing its objects. A corruption changes the image's appearance, not its objects, so its trace is strongest before the detection-specific modules, in the backbone. Second, these modules differ from design to design, whereas a backbone is common to them, so a monitor built on it carries over across detectors. The backbone computes its maps at stages $\ell = 1, \dots, L$, where a transformer block counts as one stage. We write $a^{\ell}_{c,n}(x)$ for the activation of channel $c$ at position $n \in \{1, \dots, N_\ell\}$ of stage $\ell$.
+
+A channel responds to one visual pattern, such as an edge or a texture~\cite{zeiler2014visualizing}. Its value at a single position is not comparable across images, since the same position may show sky in one image and a car in the next. We therefore summarize each channel over all of its positions by two numbers, its \emph{mean response} $\mu$ and its \emph{peak-to-mean ratio} $\rho$, defined as
+\begin{equation}
+  \mu^{\ell}_{c}(x) = \frac{1}{N_\ell} \sum_{n=1}^{N_\ell} \bigl| a^{\ell}_{c,n}(x) \bigr| , \qquad
+  \rho^{\ell}_{c}(x) = \log \frac{p^{\ell}_{c}(x)}{\mu^{\ell}_{c}(x)} ,
+  \label{eq:measures}
+\end{equation}
+where the \emph{peak response} $p^{\ell}_{c}(x)$ is the mean of $|a^{\ell}_{c,n}(x)|$ over the channel's strongest 1\% of positions, and the absolute value covers signed activations such as transformer tokens. Thus $\mu$ captures how strongly a channel responds, and $\rho$ how its response is distributed.
+% Implementation detail for Sec. IV: 1e-6 is added to p and mu before the logarithm.
+
+A corruption can change a channel's responses in two ways. Corruptions that remove contrast or sharpness, such as fog and blur, weaken the edges and textures on which a channel's strongest responses lie. Their peak responses therefore tend to fall, while their mean responses change much less, so $\rho$ drops. Corruptions that add fine structure, such as noise, tend to move the mean responses instead, in both directions. The first layer's rectification turns the zero-mean noise into extra response and raises the mean response of nearly every first-layer channel. Later layers combine their inputs with positive and negative weights and turn this into rises in some channels and falls in others. Fig.~\ref{fig:two-changes} illustrates both trends on one channel, whose peak response falls by 34\% under fog and whose mean response rises by 56\% under noise. Across the COCO validation images~\cite{lin2014coco}, fog, contrast reduction and the five blur types lower $\rho$ in 75--84\% of the stage-1 channels, for mild and strong corruptions alike. The four noise types lower it in only about half of the channels, but move the mean responses of 72--92\% of them by more than 10\%, up or down. Since corruptions change the two numbers in different ways, we compute both for every channel and next ask where in the backbone to compute them.
+
+\subsection{Where to Measure}
+\label{sec:where}
+% To draft. Plan (agreed 6 October):
+% - Measure: the relative shift, |change of a channel's mean response (or peak-to-mean ratio) against the image's clean version| in
+%   units of the channel's spread over the clean reference images; averaged over channels and development images.
+% - Observation on RT-DETRv2-R18: stages 1-3 move most, stage 4 least, for both numbers; the flattening also fades
+%   with depth (under fog 83% of the channels flatten at stage 1, about half at stage 4, i.e. no shared direction).
+%   The relative-shift numbers so far (0.70 / 0.67 / 0.56 / 0.40, common families, severity 1) are on all 5,000
+%   images: recompute them on the development images before they go in.
+% - Choice: measure stages 1-3. Stage 4 moves least but is not unmoved ("reacts least", never "ignores").
+% - Bridge: is the shift at stages 1-3 large enough to notice in a single image?
+
+\subsection{What to Compare With}
+\label{sec:against}
+% To draft. Plan (agreed 6 October):
+% - Observation: even at stage 1, a mild corruption moves a channel by less than one clean-scene SD, so it hides
+%   among the ordinary differences between clean scenes; those differences are mostly content.
+% - Choice: compare each image only with the k = 50 reference images nearest in stage-4 mean responses, the stage that
+%   moves least under corruption yet still describes the scene. Why neighbours, not a regression from the key: the
+%   regression follows the corrupted key.
+%
 % --- Notes moved from the related work (former II-D, 5 October), for where the method motivates its
 % content-matched reference. Every claim and citation below was checked against its source.
 % Our reference builds on a division of labor inside deep networks. Style transfer represents an image's content by the responses of a deep layer and its style by feature-map statistics~\cite{gatys2016style}. Channel means and variances alone suffice to transfer a style~\cite{huang2017adain}. Appearance variation such as color and style is encoded mainly in shallow layers, content mainly in deep ones~\cite{pan2018ibnnet}. Consistent with this, mixing the channel statistics of shallow layers between images simulates new domains~\cite{zhou2021mixstyle}, and adapting to image corruptions works best when only the first block is fine-tuned~\cite{lee2023surgical}. Corruptions shift these statistics: merely re-estimating the batch-normalization statistics on corrupted images raises the ImageNet-C accuracy of a ResNet-50 from 39.2\% to 50.7\%~\cite{schneider2020improving}. Full-spectrum OOD detection uses the split in the opposite direction. Its SEM score divides a density of first-layer channel statistics out of a deep-feature density, treating the two as independent, so that covariate shift is tolerated and only unseen classes are flagged~\cite{yang2023fsood}.
 %
 % To detect covariate shift, we instead judge the shallow statistics given the content. This is the principle of conditional anomaly detection, which judges a sample's indicator attributes given its environmental ones~\cite{song2007conditional}, for instance against normal samples with similar environmental attributes~\cite{valko2008distance}. CovariateFlow~\cite{viviers2024generative} follows a similar idea in pixel space, with a flow that models fine image detail given coarse content. Closest in structure, SPADE~\cite{cohen2020spade} retrieves the 50 nearest normal images by the deepest pooled feature of an ImageNet network, then densely matches the features of the network's first three blocks against them to localize defects. To our knowledge, no monitor uses the nearest clean scenes, retrieved in a detector's own deepest stage, as a per-image reference for the channel statistics of its earlier stages, to detect corruption without any training.
+
+\subsection{How to Combine}
+\label{sec:score}
+% To draft. Plan (agreed 6 October):
+% - Per channel, the deviation from the neighbours' mean, scaled by the channel's spread over the reference images.
+% - Re-weighting arm: unsigned deviations of the mean responses, averaged over channels, because noise moves them in
+%   both directions.
+% - Flattening arm: signed drop of the peak-to-mean ratio, averaged over channels, because the flattening is shared.
+% - Each arm: per-stage z-scores on 500 further clean reference images, summed over stages 1-3, standardized again.
+% - s(x) = max of the two arms: a corruption moves mainly along one of them.
