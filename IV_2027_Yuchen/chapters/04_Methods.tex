@@ -5,13 +5,6 @@ The detector is trained on a training set whose images follow a distribution $P$
 
 We build $s$ by answering four questions in turn, one per subsection, namely what to measure on a feature map (Sec.~\ref{sec:what}), at which stages of the backbone to measure it (Sec.~\ref{sec:where}), what to compare the measurements with (Sec.~\ref{sec:against}), and how to combine the comparisons into one score (Sec.~\ref{sec:score}). The method was developed on RT-DETRv2~\cite{lv2024rtdetrv2}. Sec.~\ref{sec:Experiment} later shows that it applies to other detectors as well.
 
-\begin{figure}[t]
-  \centering
-  \includegraphics[width=\columnwidth]{two_changes}
-  \caption{A backbone channel of RT-DETRv2-R18 on one image. Top: clean image, image under fog and image under Gaussian noise. Bottom: the channel's response maps, where brighter means a stronger response. Relative to the clean image, fog lowers the peak response $p$, and noise raises the mean response $\mu$.}
-  \label{fig:two-changes}
-\end{figure}
-
 \subsection{What to Measure}
 \label{sec:what}
 
@@ -28,26 +21,66 @@ where the \emph{peak response} $p^{\ell}_{c}(x)$ is the mean of $|a^{\ell}_{c,n}
 
 A corruption can change a channel's responses in two ways. Corruptions that remove contrast or sharpness, such as fog and blur, weaken the edges and textures on which a channel's strongest responses lie. Their peak responses therefore tend to fall, while their mean responses change much less, so $\rho$ drops. Corruptions that add fine structure, such as noise, tend to move the mean responses instead, in both directions. The first layer's rectification turns the zero-mean noise into extra response and raises the mean response of nearly every first-layer channel. Later layers combine their inputs with positive and negative weights and turn this into rises in some channels and falls in others. Fig.~\ref{fig:two-changes} illustrates both trends on one channel, whose peak response falls by 34\% under fog and whose mean response rises by 56\% under noise. Across the COCO validation images~\cite{lin2014coco}, fog, contrast reduction and the five blur types lower $\rho$ in 75--84\% of the stage-1 channels, for mild and strong corruptions alike. The four noise types lower it in only about half of the channels, but move the mean responses of 72--92\% of them by more than 10\%, up or down. Since corruptions change the two numbers in different ways, we compute both for every channel and next ask where in the backbone to compute them.
 
+\begin{figure}[!htb]
+  \centering
+  \includegraphics[width=\columnwidth]{two_changes}
+  \caption{A backbone channel of RT-DETRv2-R18 on one image. Top: clean image, image under fog and image under Gaussian noise. Bottom: the channel's response maps, where brighter means a stronger response. Relative to the clean image, fog lowers the peak response $p$, and noise raises the mean response $\mu$.}
+  \label{fig:two-changes}
+\end{figure}
+
 \subsection{Where to Measure}
 \label{sec:where}
-% To draft. Plan (agreed 6 October):
-% - Measure: the relative shift, |change of a channel's mean response (or peak-to-mean ratio) against the image's clean version| in
-%   units of the channel's spread over the clean reference images; averaged over channels and development images.
-% - Observation on RT-DETRv2-R18: stages 1-3 move most, stage 4 least, for both numbers; the flattening also fades
-%   with depth (under fog 83% of the channels flatten at stage 1, about half at stage 4, i.e. no shared direction).
-%   The relative-shift numbers so far (0.70 / 0.67 / 0.56 / 0.40, common families, severity 1) are on all 5,000
-%   images: recompute them on the development images before they go in.
-% - Choice: measure stages 1-3. Stage 4 moves least but is not unmoved ("reacts least", never "ignores").
-% - Bridge: is the shift at stages 1-3 large enough to notice in a single image?
+
+Within the backbone, the early stages describe how the image looks, and the later stages increasingly describe the objects the detector has to find. A corruption changes how the image looks, so we expect it to show most in the early stages. To find where corruptions show most, we measure how far a corruption moves each channel, relative to how much the channel varies between clean scenes. For channel $c$ of stage $\ell$, let $\sigma^{\ell}_{c}$ be the standard deviation of its mean response over the reference images $\mathcal{R}$. For a clean test image $x$ and its corrupted version $\tilde{x}$, the shift of the channel's mean response is
+\begin{equation}
+  \delta^{\ell}_{c} = \frac{\bigl| \mu^{\ell}_{c}(\tilde{x}) - \mu^{\ell}_{c}(x) \bigr|}{\sigma^{\ell}_{c}} ,
+  \label{eq:shift}
+\end{equation}
+and the shift of its peak-to-mean ratio is defined in the same way, with the standard deviation of $\rho$. A shift of 1 means that the corruption moved the channel by one standard deviation of its variation across clean scenes. We average the shift over all channels of a stage and over the test images.
+
+As Fig.~\ref{fig:stages} shows for the four stages of RT-DETRv2-R18, averaged over the 19 corruption types of~\cite{hendrycks2019benchmarking} at five strengths, the shift of both numbers decreases with depth and is smallest at stage 4. Which early stage moves most, however, depends on the corruption type. Noise, fog and contrast reduction move stage 1 most, whereas elastic transform, pixelation and JPEG compression move stages 2 or 3 most. We therefore measure at stages 1 to 3.
+% Sec. IV implementation details: RT-DETRv2-R18's stage-l map is the output of the first residual block of stage l
+% (64 / 128 / 256 / 512 channels at strides 4 / 8 / 16 / 32 for a 640 x 640 input). sigma is floored at 1% of the
+% median sigma of its stage. Evidence: docs/results/paper-evidence/channel_changes.csv (flattening shares),
+% docs/results/paper-evidence/stage_shift.csv (Fig. 2 and the per-type peaks, from scripts/paper/stage_shift.py;
+% the figure from scripts/paper/stage_shift_figure.py), untrained_shift.csv (the random-weight control).
+
+\begin{figure}[!htb]
+  \centering
+  \includegraphics[width=\columnwidth]{stage_shift}
+  \caption{How far corruptions move the channels of RT-DETRv2-R18 at each stage, in clean standard deviations, for $\mu$ and $\rho$ averaged over the 19 corruption types at five strengths.}
+  \label{fig:stages}
+\end{figure}
 
 \subsection{What to Compare With}
 \label{sec:against}
-% To draft. Plan (agreed 6 October):
-% - Observation: even at stage 1, a mild corruption moves a channel by less than one clean-scene SD, so it hides
-%   among the ordinary differences between clean scenes; those differences are mostly content.
-% - Choice: compare each image only with the k = 50 reference images nearest in stage-4 mean responses, the stage that
-%   moves least under corruption yet still describes the scene. Why neighbours, not a regression from the key: the
-%   regression follows the corrupted key.
+
+Sec.~\ref{sec:where} measured each shift against the clean version of the same image. At inference, the monitor has no such version, so it needs a reference built from the clean images in $\mathcal{R}$. Their overall mean is the plainest choice, but a test image differs from it for two reasons, its corruption and its scene. A busy street drives edge channels more strongly than an empty sky, even when both images are clean. To isolate the corruption, we compare the test image only with reference images of a similar scene.
+
+To find them, we need a description of the scene that a corruption leaves largely intact. The feature maps of later stages relate more and more to the detector's output, the objects in the scene (Sec.~\ref{sec:what}), so we expect the last stage to serve best. Table~\ref{tab:key} tests every stage of RT-DETRv2-R18. For each test image, a stage retrieves the 50 reference images nearest in its standardized channel means. The first row shows how many COCO panoptic categories~\cite{kirillov2019panoptic} these neighbours share with the test image, relative to random reference images. The second row shows how many of them are retrieved again after the test image is corrupted. The last stage, stage 4, leads on both, so we use its channel means as the content key. Even when a corruption swaps some neighbours, their mean stays clean, because the neighbours are always clean images of a similar scene. Under mild fog, for instance, the test image's stage-1 peak-to-mean ratios fall by 0.83 standard deviations on average, those of its neighbours' mean by only 0.06.
+
+\begin{table}[!htb]
+  \centering
+  \caption{Each backbone stage of RT-DETRv2-R18 as the content key.}
+  \label{tab:key}
+  \begin{tabular}{lcccc}
+    \toprule
+    Stage & 1 & 2 & 3 & 4 \\
+    \midrule
+    Shared categories & 1.7$\times$ & 1.8$\times$ & 2.1$\times$ & 2.6$\times$ \\
+    Found again & 24\% & 24\% & 29\% & 42\% \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+Formally, let $\mathcal{N}(x) \subset \mathcal{R}$ be the $k = 50$ nearest reference images of a test image $x$ in this key. Their mean replaces the clean version in Eq.~\eqref{eq:shift}, so the deviation of channel $c$ at stage $\ell \in \{1, 2, 3\}$ is
+\begin{equation}
+  d^{\ell}_{c}(x) = \frac{1}{\sigma^{\ell}_{c}} \Bigl( \mu^{\ell}_{c}(x) - \frac{1}{k} \sum_{r \in \mathcal{N}(x)} \mu^{\ell}_{c}(r) \Bigr) ,
+  \label{eq:deviation}
+\end{equation}
+and likewise for $\rho$. Sec.~\ref{sec:score} combines these deviations into one score.
+
+% Evidence: docs/results/paper-evidence/key_by_stage.csv (Table, scripts/paper/key_by_stage.py), key_stability.csv (fog 1: image rho -0.83, neighbours' mean -0.06 at stage 1).
 %
 % --- Notes moved from the related work (former II-D, 5 October), for where the method motivates its
 % content-matched reference. Every claim and citation below was checked against its source.

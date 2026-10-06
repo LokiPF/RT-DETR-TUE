@@ -125,4 +125,7 @@ M.~D. Zeiler and R.~Fergus, ``Visualizing and understanding convolutional networ
 \bibitem{lin2014coco}
 T.-Y. Lin, M.~Maire, S.~Belongie, J.~Hays, P.~Perona, D.~Ramanan, P.~Doll{\'a}r, and C.~L. Zitnick, ``Microsoft {COCO}: Common objects in context,'' in \emph{Proceedings of the European Conference on Computer Vision ({ECCV})}, ser. Lecture Notes in Computer Science.\hskip 1em plus 0.5em minus 0.4em\relax Springer, 2014, pp. 740--755.
 
+\bibitem{kirillov2019panoptic}
+A.~Kirillov, K.~He, R.~Girshick, C.~Rother, and P.~Doll{\'a}r, ``Panoptic segmentation,'' in \emph{Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)}, 2019, pp. 9396--9405.
+
 \end{thebibliography}
